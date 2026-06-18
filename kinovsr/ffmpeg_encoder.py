@@ -1,0 +1,400 @@
+"""ffmpeg (software-codec) encode backend for LTX-2 outputs.
+
+This is one of two encode backends. The other is the VideoToolbox /
+AVAssetWriter backend in `videotoolbox/encode.py`
+(`encode_video_videotoolbox`), which hardware-encodes the `default` tier.
+The `default` tier auto-routes to VideoToolbox; this ffmpeg backend handles
+the tiers VideoToolbox does not: `web` (libx264 - software x264 produces
+higher-quality H.264 than the hardware h264_videotoolbox encoder), `hq`
+(libx265 4:4:4), and the ProRes `export` / `reference` tiers.
+
+Five tiers cover the practical use cases. Pick by *destination*, not by
+encoder flags - the flags are an implementation detail.
+
+  web        Browser <video> tags, social uploads, platforms that don't
+             re-transcode. Universal compat from old browsers to current.
+             H.264 SW 8-bit 4:2:0 CRF 18 + AAC 320k.
+
+  default    Everyday output, viewed in Apple / Safari / modern Chrome.
+             Best size-to-quality on Apple Silicon at the cost of browser
+             reach. Hardware-encoded so essentially free runtime.
+             HEVC HW 10-bit 4:2:0 q=65 + ALAC.
+
+  hq         Local viewing where 4:4:4 chroma is wanted (sharp color edges,
+             neon, skin against bright backgrounds). Won't play in any
+             browser - IINA / QuickTime / FCP only.
+             HEVC SW 10-bit 4:4:4 CRF 14 + ALAC.
+
+  export     Hand off to an editor or colorist. Industry-standard ProRes 422
+             HQ in MOV with 24-bit PCM audio. NLE-friendly, no alpha.
+             ProRes 422 HQ + PCM 24-bit (.mov), 10-bit 4:2:2.
+
+  reference  Canonical highest-fidelity copy to re-derive other tiers from
+             later. Has alpha for compositing/VFX work. Large files.
+             ProRes 4444 + PCM 24-bit + alpha (.mov), 10-bit 4:4:4.
+
+Call `encode_video_ffmpeg(frames, output_path, tier=...)` from generate.py / pipelines.
+Importers may read `TIERS` and extend with additional `EncodePreset` entries;
+the encode_modes_harness.py benchmarking script does exactly this, so keep
+tier names and the `EncodePreset` shape stable.
+
+Encoder-choice details that aren't obvious from the flags alone:
+  - The libswscale `scale` filter is used instead of `zscale` because zscale
+    needs ffmpeg built against zimg, which isn't shipped on every machine.
+    Behavior for our 8/10-bit BT.709 conversions is equivalent.
+  - For RGB-domain streams (the harness has one; none of the five tiers do),
+    color tagging must go inside `-x265-params` - the global `-colorspace`
+    flag is forwarded to libx265 under a parameter name the encoder rejects.
+  - For ProRes 4444 the alpha plane is filled implicitly with opaque; we
+    feed yuva444p10le even though the source has no real alpha.
+"""
+
+from __future__ import annotations
+
+import itertools
+import subprocess
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import mlx.core as mx
+
+
+def _human_size(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
+NATIVE_FPS = 24.0
+
+# BT.709 SDR tagging. The encoder writes these into the bitstream VUI / atoms
+# so players don't have to guess. Without them QuickTime defaults to BT.601 on
+# small frames, which produces a subtle green-shift on skies / skin.
+COLOR_TAGS_BT709 = [
+    "-color_primaries", "bt709",
+    "-color_trc", "bt709",
+    "-colorspace", "bt709",
+    "-color_range", "tv",
+]
+
+# For RGB-domain streams (gbrp10le etc.), set matrix_coefficients=0 (identity)
+# so the decoder doesn't apply a YUV->RGB conversion. Required when encoding
+# RGB-direct (e.g. libx265 lossless gbrp10le). Currently used only by the
+# harness's benchmark presets; documented here for future HDR / extended tiers.
+COLOR_TAGS_RGB = [
+    "-color_primaries", "bt709",
+    "-color_trc", "bt709",
+    "-colorspace", "gbr",
+    "-color_range", "pc",
+]
+
+
+def scale_filter(pix_fmt: str) -> list[str]:
+    """RGB->{YUV or RGB} color conversion filter chain.
+
+    Uses libswscale's `scale` filter (always present) rather than `zscale`
+    (which needs an ffmpeg built against zimg). For YUV outputs applies a
+    BT.709 matrix with full->limited range conversion; for RGB outputs it's
+    a pure bit-depth/layout promotion. accurate_rnd + full_chroma_int +
+    full_chroma_inp give the cleanest 8->10-bit gradient handling that
+    swscale supports.
+    """
+    base_flags = "flags=accurate_rnd+full_chroma_int+full_chroma_inp"
+    if pix_fmt.startswith(("gbrp", "rgb", "bgr")):
+        return ["-vf", f"scale={base_flags},format={pix_fmt}"]
+    return [
+        "-vf",
+        (
+            f"scale={base_flags}"
+            ":in_color_matrix=bt709:in_range=pc"
+            ":out_color_matrix=bt709:out_range=tv,"
+            f"format={pix_fmt}"
+        ),
+    ]
+
+
+def h264_baseline_video() -> list[str]:
+    return ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"]
+
+
+@dataclass
+class EncodePreset:
+    name: str
+    container: str = "mp4"
+    video: list[str] = field(default_factory=list)
+    audio: list[str] = field(default_factory=list)
+    extra: list[str] = field(default_factory=list)
+    frame_bit_depth: int = 8        # 8 -> rgb24 source; 16 -> rgb48le source
+    notes: str = ""
+
+
+TIERS: dict[str, EncodePreset] = {
+    "web": EncodePreset(
+        name="web",
+        video=[*h264_baseline_video(), *COLOR_TAGS_BT709],
+        audio=["-c:a", "aac", "-b:a", "320k"],
+        notes="Universal browser/player compat. H.264 SW 8-bit 4:2:0 CRF 18 + AAC 320k.",
+    ),
+    "default": EncodePreset(
+        name="default",
+        video=[
+            *scale_filter("p010le"),
+            "-c:v", "hevc_videotoolbox", "-profile:v", "main10",
+            "-q:v", "65",
+            # -realtime 0 lets VideoToolbox spend more cycles per frame on
+            # rate-distortion. Free quality gain; only hurts live streaming.
+            "-realtime", "0",
+            "-tag:v", "hvc1",
+            *COLOR_TAGS_BT709,
+        ],
+        audio=["-c:a", "alac"],
+        notes="Everyday output for Apple / Safari / modern Chrome. HEVC HW 10-bit 4:2:0 q=65 + ALAC.",
+    ),
+    "hq": EncodePreset(
+        name="hq",
+        video=[
+            *scale_filter("yuv444p10le"),
+            "-c:v", "libx265", "-profile:v", "main444-10",
+            "-crf", "14", "-preset", "slow",
+            "-x265-params", "aq-mode=3",
+            "-tag:v", "hvc1",
+            *COLOR_TAGS_BT709,
+        ],
+        audio=["-c:a", "alac"],
+        notes="Local viewing, full chroma. HEVC SW 10-bit 4:4:4 CRF 14 + ALAC (no browser support).",
+    ),
+    "export": EncodePreset(
+        name="export",
+        container="mov",
+        video=[
+            *scale_filter("yuv422p10le"),
+            "-c:v", "prores_ks", "-profile:v", "hq",
+            "-pix_fmt", "yuv422p10le", "-vendor", "apl0",
+            *COLOR_TAGS_BT709,
+        ],
+        audio=["-c:a", "pcm_s24le"],
+        frame_bit_depth=16,
+        notes="Editor / colorist hand-off. ProRes 422 HQ + PCM 24-bit (.mov), 10-bit 4:2:2.",
+    ),
+    "reference": EncodePreset(
+        name="reference",
+        container="mov",
+        video=[
+            *scale_filter("yuva444p10le"),
+            "-c:v", "prores_ks", "-profile:v", "4444",
+            "-pix_fmt", "yuva444p10le", "-vendor", "apl0",
+            *COLOR_TAGS_BT709,
+        ],
+        audio=["-c:a", "pcm_s24le"],
+        frame_bit_depth=16,
+        notes="Canonical highest-fidelity copy; alpha for VFX/compositing. ProRes 4444 + PCM 24-bit (.mov), 10-bit 4:4:4.",
+    ),
+}
+
+
+def build_ffmpeg_cmd(
+    preset: EncodePreset,
+    *,
+    raw_pix_fmt: str,
+    width: int,
+    height: int,
+    fps: float,
+    audio_path: Path | None,
+    output_path: Path,
+) -> list[str]:
+    """Build the ffmpeg command for a preset, reading raw frames from stdin."""
+    cmd: list[str] = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", raw_pix_fmt,
+        "-s", f"{width}x{height}",
+        "-framerate", str(fps),
+        "-i", "-",
+    ]
+    if audio_path is not None:
+        cmd.extend(["-i", str(audio_path)])
+    cmd.extend(preset.video)
+    if audio_path is not None:
+        cmd.extend(preset.audio)
+    cmd.extend(preset.extra)
+    if audio_path is not None:
+        cmd.append("-shortest")
+    if preset.container == "mp4":
+        cmd.extend(["-movflags", "+faststart"])
+    cmd.extend(["-loglevel", "error"])
+    cmd.append(str(output_path))
+    return cmd
+
+
+def _frame_to_bytes(frame: Any, bit_depth: int) -> bytes:
+    """One (H, W, 3) frame -> raw little-endian bytes at the target bit depth.
+
+    Accepts an mlx array or anything ``mlx.core.array()`` can adopt (a numpy
+    frame, a buffer). For 16-bit tiers the 8->16 promotion uses *257 (so
+    0xFF -> 0xFFFF), the bit-exact full-range stretch, not a left-shift; 16->8 is
+    a right shift by 8. The conversion runs in MLX and the bytes come straight
+    from the array's buffer, so no numpy and no per-video materialization.
+    """
+    f = frame if isinstance(frame, mx.array) else mx.array(frame)
+    if f.ndim != 3 or f.shape[-1] != 3:
+        raise ValueError(f"frame must be (H,W,3); got shape {f.shape}")
+    if bit_depth == 16:
+        if f.dtype == mx.uint16:
+            out = f
+        elif f.dtype == mx.uint8:
+            out = (f.astype(mx.uint16) * 257).astype(mx.uint16)
+        else:
+            raise ValueError(f"Cannot use {f.dtype} frames for a 16-bit tier")
+    elif f.dtype == mx.uint8:
+        out = f
+    elif f.dtype == mx.uint16:
+        out = (f // 256).astype(mx.uint8)
+    else:
+        raise ValueError(f"Cannot use {f.dtype} frames for an 8-bit tier")
+    out = mx.contiguous(out)
+    mx.eval(out)
+    return bytes(memoryview(out))
+
+
+def encode_video_ffmpeg(
+    frames: Any,
+    output_path: str | Path,
+    *,
+    tier: str = "default",
+    fps: float = NATIVE_FPS,
+    audio_waveform: Any = None,
+    audio_sample_rate: int | None = None,
+    audio_bit_depth: str = "int16",
+    save_audio_sidecar: bool = False,
+    audio_onset_trim_mode: str = "auto",
+    audio_onset_trim_ms: float | None = None,
+    verbose: bool = True,
+) -> Path:
+    """Encode frames (+ optional audio) into the chosen output tier.
+
+    Returns the actual output path. If the tier requires a different container
+    extension (ProRes -> .mov), the supplied path is rewritten accordingly.
+
+    `frames` can be a list/iterator of (H,W,3) frames or a (T,H,W,3) array
+    (mlx or numpy); frames stream to ffmpeg one at a time, so the whole video is
+    never resident at once. 8/16-bit conversion is handled per frame based on the
+    tier's frame_bit_depth.
+
+    `audio_waveform` is anything castable to MLX with shape (B,C,T) or (C,T).
+    Pass None to skip audio and produce a video-only file.
+
+    When `save_audio_sidecar=True`, the WAV intermediate is preserved as
+    `<output>.wav` next to the encoded video (useful for A/B comparison
+    against the codec-compressed audio). Otherwise it's written to a hidden
+    temp path and deleted once ffmpeg consumes it.
+
+    `audio_onset_trim_mode` / `audio_onset_trim_ms` route through to
+    `LTX_2_MLX.audio.onset.mitigate_onset()` before WAV writing.  Default
+    is "auto" (detect-then-zero-fill); pass "off" to disable.  The trim
+    is applied to BOTH the ffmpeg input and (if kept) the sidecar so the
+    on-disk artifact and the muxed track agree.
+    """
+    if tier not in TIERS:
+        raise ValueError(
+            f"Unknown encode tier {tier!r}. Options: {sorted(TIERS)}"
+        )
+    preset = TIERS[tier]
+
+    # Normalize 'frames' to an iterator of per-frame arrays and peek the first for
+    # the dimensions; ffmpeg infers the frame count from the raw byte stream, so
+    # the whole video is never materialized (one frame resident at a time).
+    if hasattr(frames, "shape") and len(frames.shape) == 4:
+        frame_iter: Any = (frames[i] for i in range(frames.shape[0]))
+    else:
+        frame_iter = iter(frames)
+    try:
+        first_frame = next(frame_iter)
+    except StopIteration:
+        raise ValueError("encode_video_ffmpeg: no frames to encode") from None
+    f0 = first_frame if isinstance(first_frame, mx.array) else mx.array(first_frame)
+    if f0.ndim != 3 or f0.shape[-1] != 3:
+        raise ValueError(f"frames must be (H,W,3); got shape {f0.shape}")
+    height, width = int(f0.shape[0]), int(f0.shape[1])
+    frame_stream = itertools.chain([first_frame], frame_iter)
+
+    output_path = Path(output_path)
+    if output_path.suffix.lstrip(".").lower() != preset.container:
+        output_path = output_path.with_suffix(f".{preset.container}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if verbose:
+        print(f"  encode tier: {tier} - {preset.notes}")
+        print(f"  -> {output_path}")
+
+    audio_path: Path | None = None
+    sidecar_kept = False
+    if audio_waveform is not None:
+        if audio_sample_rate is None:
+            raise ValueError(
+                "audio_sample_rate is required when audio_waveform is provided"
+            )
+        # Sequence-start onset mitigation, applied once here so both the
+        # ffmpeg input WAV and the optional sidecar carry the cleaned
+        # waveform.  See LTX_2_MLX.audio.onset for the detector spec.
+        from .audio import DEFAULT_TRIM_MS, mitigate_onset
+
+        onset_trim_ms = (
+            audio_onset_trim_ms if audio_onset_trim_ms is not None else DEFAULT_TRIM_MS
+        )
+        onset_result = mitigate_onset(
+            audio_waveform, audio_sample_rate,
+            mode=audio_onset_trim_mode, trim_ms=onset_trim_ms,
+        )
+        audio_waveform = onset_result.samples
+        if verbose and onset_result.applied:
+            print(f"  audio onset: {onset_result.detail}")
+        if save_audio_sidecar:
+            # Public sidecar: lives next to the output, survives encode.
+            audio_path = output_path.with_suffix(".wav")
+            sidecar_kept = True
+        else:
+            # Hidden temp: removed once ffmpeg consumes it.
+            audio_path = output_path.with_name(f".{output_path.stem}.audio.wav")
+        from .videotoolbox.audio import write_wav_float32, write_wav_int16
+        if audio_bit_depth == "float32":
+            write_wav_float32(audio_waveform, audio_path, audio_sample_rate)
+        else:
+            write_wav_int16(audio_waveform, audio_path, audio_sample_rate)
+        if verbose and sidecar_kept:
+            print(f"  audio sidecar: {audio_path}  ({audio_bit_depth}, {audio_sample_rate} Hz)")
+
+    raw_pix_fmt = "rgb48le" if preset.frame_bit_depth == 16 else "rgb24"
+    cmd = build_ffmpeg_cmd(
+        preset,
+        raw_pix_fmt=raw_pix_fmt,
+        width=width, height=height, fps=fps,
+        audio_path=audio_path, output_path=output_path,
+    )
+
+    started = time.perf_counter()
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        try:
+            for frame in frame_stream:
+                proc.stdin.write(_frame_to_bytes(frame, preset.frame_bit_depth))
+        finally:
+            proc.stdin.close()
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(
+                f"ffmpeg failed (rc={rc}) for encode tier {tier!r}"
+            )
+    finally:
+        if audio_path is not None and not sidecar_kept and audio_path.exists():
+            audio_path.unlink()
+
+    if verbose:
+        elapsed = time.perf_counter() - started
+        size = output_path.stat().st_size
+        print(f"  done: {_human_size(size)} in {elapsed:.1f}s")
+
+    return output_path
