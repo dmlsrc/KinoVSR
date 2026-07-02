@@ -283,7 +283,11 @@ def _attn_merge(xs: Any, yp: Any, p: dict) -> Any:
     o = (attn @ vh).transpose(0, 3, 1, 2).reshape(xs.shape)
     o = _conv(o, p, "attn_merge.attn.project_out")
     o = _ln_biasfree(o, p, "attn_merge.norm_out")
-    y = _conv(mx.concatenate([xs, o], axis=-1), p, "attn_merge.ffn.0")
+    # The concat side is the NORMALIZED query (the reference rebinds x to
+    # norm_q(x) before both the attention and the concat), not the raw shallow
+    # features. Raw features here shift the FFN's operating point with the
+    # source's noise energy and destabilize the history-vs-current balance.
+    y = _conv(mx.concatenate([xn, o], axis=-1), p, "attn_merge.ffn.0")
     y = _gelu(_dw3x3(y, p, "attn_merge.ffn.1"))
     return _conv(y, p, "attn_merge.ffn.3")
 

@@ -235,6 +235,43 @@ temporal consistency at barely more than a per-frame net's cost. ESC's numbers
 are attention-bound (section 2); its value is output quality plus the only
 fidelity/perceptual twin pair above the SRVGG class.
 
+### Case study: the "river" artifact was a merge-normalization port bug
+
+On heavily degraded sources (old low-bitrate footage) RealViformer produced
+"rolling waves": dense crocodile micro-texture hallucinated out of compression
+noise, position-locked by the recurrence, with smooth wakes sweeping through it
+wherever motion broke the flow. Clean sources (DAVIS-class) looked fine. Every
+in-repo attribution instrument said "network behavior": raw pre-encode fp32
+reproduced it (not fp16, not the encoder), and the port passed its 113+ dB
+torch parity gate.
+
+The actual cause was a one-line port deviation in the channel-attention merge
+-- the block the paper builds its degradation-robustness claim on. The
+reference REBINDS the query to its LayerNorm before both the attention and the
+output concat (`x = self.norm_q(x); ... cat([x, norm_out(v)])`); the port
+concatenated the RAW shallow features. Raw feature magnitude scales with the
+source's noise energy, so the merge FFN ran off its trained operating point
+exactly on degraded content, over-locking history and amplifying hallucinated
+texture. One line fixed both the river and a mild softness on clean content.
+
+Lessons, now part of the validation protocol:
+
+- Gate 1 (parity vs your own torch reimplementation) is blind to a SHARED
+  misreading of the reference: both sides implement the same wrong spec and
+  agree to 120 dB. When transcribing a reference forward, hunt specifically
+  for variable REBINDING (`x = self.norm(x)` followed by later uses of `x`) --
+  a reimplementation that inlines expressions reads past it silently.
+- If an artifact contradicts the paper's central claim (here: channel
+  attention chosen FOR degradation robustness), suspect the port before the
+  network, no matter how many internal instruments agree.
+- Behavior gates (fp32/fp16, pre/post-encode, per-frame control) attribute an
+  artifact to the net-as-implemented; only a line-level re-audit of the
+  reference attributes net-as-implemented to net-as-published.
+
+`--cut-detect hist` (default off) remains relevant for recurrent upscalers on
+content with hard cuts. Probe and before/after contact sheets:
+`$SHARED_TEMP_DIR/trace_analysis/river_diag/`.
+
 Peak MLX memory, one pass at 854x480 (1 GB cache cap): stdf 0.8 GB, fastdvd
 1.0, general 1.2, fbcnn 1.9, nafnet-fp32 2.3, bsrgan 4.0, realbasicvsr-5-window
 6.4, basicvsrpp-5-window 7.2 GB. Scales roughly linearly with window length and
@@ -307,7 +344,11 @@ rejecting SMFANet). These cost real debugging time; follow them in order.
    vestigial checkpoint params as unused so strict=True verifies everything
    else), load the checkpoint with weights_only=True, and gate the MLX port
    against that. Expect 110-130 dB at fp32 on small inputs; test both the
-   size-aligned and the padding code paths.
+   size-aligned and the padding code paths. KNOWN BLIND SPOT: a misreading of
+   the reference shared by both reimplementations passes at full dB (see the
+   river case study in section 7) -- transcribe the reference forward
+   line-by-line watching for variable rebinding, and re-audit it whenever an
+   artifact contradicts the model's published behavior.
 2. **fp16 on REAL frames at REAL resolution.** The fp32 small-input gate cannot
    see fp16 range problems; the full-spatial-reduction overflows (section 4)
    only appear here. Check `mx.all(mx.isfinite(...))` on actual video frames.
