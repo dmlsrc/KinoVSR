@@ -346,6 +346,20 @@ footage hides under motion blur.
   `--realviformer-flow-mode zero` are diagnostic controls for separating
   recurrence-only state from motion-compensated recurrence; they are not
   quality presets.
+
+  The improve gate ports to RealBasicVSR's bidirectional propagation
+  (`--realbasicvsr-history-gate improve` + `--realbasicvsr-history-strength`):
+  the same per-pixel admission map (shared `history_improve_gate` in
+  vsr_blocks) multiplies the warped features after each of the backward and
+  forward warps, computed from the CLEANED frames the flows were estimated on.
+  A zero gate equals the trained window-start zero features, so gating is
+  in-distribution. Verified on the selfie clip at the default window 14: the
+  dark scratchy propagation streaks on the face (the artifact the old
+  window=1 workaround dodged) are eliminated, at the cost of slight softness
+  where those streaks had passed for detail; moving-background regions lose
+  some propagation crunch. Composes multiplicatively with the older
+  `--realbasicvsr-flow-consistency` occlusion mask; default off = reference
+  behavior, untouched math.
 - Output-encode visibility: a downstream HEVC encode makes the weave read
   STRONGER while halving measured fine-detail energy -- the encoder strips
   the incoherent noise floor and the coherent periodic pattern survives

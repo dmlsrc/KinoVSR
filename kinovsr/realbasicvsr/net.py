@@ -20,6 +20,7 @@ from ..vsr_blocks import (
     compiled_resblocks,
     conv,
     flow_warp,
+    history_improve_gate,
     lrelu,
     pad_spynet_gates,
     resize,
@@ -200,7 +201,8 @@ def _flow_consistency_mask(flow_use: Any, flow_rev: Any, dtype: Any) -> Any:
 
 
 def _basicvsr(frames: list, p: dict, residual_strength: float,
-              flow_consistency: float = 0.0, flow_mode: str = "spynet") -> list:
+              flow_consistency: float = 0.0, flow_mode: str = "spynet",
+              history_strength: float = 1.0, history_gate: str = "off") -> list:
     n, h, w, _ = frames[0].shape
     mid = int(p["basicvsr.backward_resblocks.main.0.bias"].shape[0])
     dt = frames[0].dtype
@@ -222,6 +224,25 @@ def _basicvsr(frames: list, p: dict, residual_strength: float,
             mask_f.append(1.0 - s * (1.0 - mf))
             mx.eval(mask_b[-1], mask_f[-1])
 
+    # History-admission gates (frames+flow only, independent of feat_prop):
+    # admit warped history only where the warp measurably improves the
+    # photometric residual. Backward step i pulls frame i+1's features to
+    # frame i via flows_backward[i]; forward step i pulls frame i-1's via
+    # flows_forward[i-1]. A zero gate equals the window-start zero features
+    # (in-distribution). history_strength scales history unconditionally;
+    # the default (1.0, gate off) leaves the math untouched.
+    use_gate = history_gate == "improve"
+    use_scalar = (not use_gate) and history_strength != 1.0
+    gate_b: list = []
+    gate_f: list = []
+    if use_gate:
+        for i in range(len(frames) - 1):
+            gate_b.append(history_improve_gate(
+                frames[i], frames[i + 1], flows_backward[i], dt, history_strength))
+            gate_f.append(history_improve_gate(
+                frames[i + 1], frames[i], flows_forward[i], dt, history_strength))
+            mx.eval(gate_b[-1], gate_f[-1])
+
     feat_prop = mx.zeros((n, h, w, mid), dtype=dt)
     backward_feats: list[Any] = [None] * len(frames)
     for i in range(len(frames) - 1, -1, -1):
@@ -229,6 +250,10 @@ def _basicvsr(frames: list, p: dict, residual_strength: float,
             feat_prop = flow_warp(feat_prop, flows_backward[i])
             if use_mask:
                 feat_prop = feat_prop * mask_b[i]
+            if use_gate:
+                feat_prop = feat_prop * gate_b[i]
+            elif use_scalar:
+                feat_prop = feat_prop * float(history_strength)
         parts = [frames[i], feat_prop]
         bpad = (p["basicvsr.backward_resblocks.main.0.weight"].shape[-1]
                 - sum(t.shape[-1] for t in parts))
@@ -249,6 +274,10 @@ def _basicvsr(frames: list, p: dict, residual_strength: float,
             feat_prop = flow_warp(feat_prop, flows_forward[i - 1])
             if use_mask:
                 feat_prop = feat_prop * mask_f[i - 1]
+            if use_gate:
+                feat_prop = feat_prop * gate_f[i - 1]
+            elif use_scalar:
+                feat_prop = feat_prop * float(history_strength)
         feat_prop, residual = _compiled_fwd(p)(frame, feat_prop, backward_feats[i])
         base = resize(frame, h * 4, w * 4, False)
         out = mx.clip(base + residual * float(residual_strength), 0.0, 1.0)
@@ -266,6 +295,8 @@ def upscale(
     residual_strength: float = 1.0,
     flow_consistency: float = 0.0,
     flow_mode: str = "spynet",
+    history_strength: float = 1.0,
+    history_gate: str = "off",
 ) -> list:
     """Upscale an LR clip 4x.
 
@@ -273,14 +304,18 @@ def upscale(
     GAN RealBasicVSR configs use ``dynamic_refine_thres=5`` for test-time
     iterative cleaning; pass 255 to force a single cleaning pass. Values below
     1 for ``residual_strength`` attenuate GAN/pixel-shuffle artifacts while
-    keeping the 4x bilinear base.
+    keeping the 4x bilinear base. ``history_gate="improve"`` admits propagated
+    features per pixel only where the flow warp measurably improves the
+    photometric residual (the window>1 propagation-smear mitigation);
+    ``history_strength`` scales the propagated features (1.0 = reference).
     """
     if not frames:
         return []
     dt = p["basicvsr.conv_last.weight"].dtype
     frames = [mx.clip(f, 0.0, 1.0).astype(dt) for f in frames]
     cleaned = _clean(frames, p, dynamic_refine_thres, clean_iters)
-    return _basicvsr(cleaned, p, residual_strength, flow_consistency, flow_mode)
+    return _basicvsr(cleaned, p, residual_strength, flow_consistency, flow_mode,
+                     history_strength, history_gate)
 
 
 if __name__ == "__main__":

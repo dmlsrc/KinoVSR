@@ -798,6 +798,8 @@ def run(args: argparse.Namespace) -> None:
                 residual_strength=args.realbasicvsr_residual_strength,
                 flow_consistency=args.realbasicvsr_flow_consistency,
                 flow_mode=args.realbasicvsr_flow_mode,
+                history_strength=args.realbasicvsr_history_strength,
+                history_gate=args.realbasicvsr_history_gate,
             )
         elif args.spatial_mode == "realesrgan":
             from LTX_2_MLX.videotoolbox.realesrgan.upscaler import RealEsrganUpscaler
@@ -1574,6 +1576,26 @@ def main() -> None:
             "Optical-flow source for --spatial-mode realbasicvsr (default spynet). "
             "zero disables motion compensation while keeping recurrent propagation, "
             "as a control for flow-painted temporal artifacts."
+        ),
+    )
+    parser.add_argument(
+        "--realbasicvsr-history-strength", type=float, default=1.0, metavar="S",
+        help=(
+            "Scale RealBasicVSR's propagated features before each trunk (default "
+            "1.0 = reference strength). 0 disables temporal propagation entirely "
+            "(per-frame within the cleaning + upsampler)."
+        ),
+    )
+    parser.add_argument(
+        "--realbasicvsr-history-gate", choices=["off", "improve"], default="off",
+        help=(
+            "Per-pixel history admission for RealBasicVSR's propagation (default "
+            "off = reference behavior). improve admits warped history only where "
+            "the flow warp measurably improves the photometric residual against "
+            "the current cleaned frame -- the mitigation for the window>1 "
+            "propagation smear (dark ghosting trails around faces/movers); "
+            "regions the flow cannot explain fall back to the trained "
+            "window-start (zero history) behavior."
         ),
     )
     parser.add_argument(

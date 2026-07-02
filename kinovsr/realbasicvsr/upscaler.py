@@ -36,9 +36,19 @@ class RealBasicVsrUpscaler(WindowedUpscaler):
         residual_strength: float = 1.0,
         flow_consistency: float = 0.0,
         flow_mode: str = "spynet",
+        history_strength: float = 1.0,
+        history_gate: str = "off",
     ):
         if flow_mode not in ("spynet", "zero"):
             raise ValueError(f"RealBasicVSR flow_mode must be 'spynet' or 'zero'; got {flow_mode!r}")
+        if history_gate not in ("off", "improve"):
+            raise ValueError(
+                f"RealBasicVSR history_gate must be 'off' or 'improve'; got {history_gate!r}"
+            )
+        if history_strength < 0.0:
+            raise ValueError(
+                f"RealBasicVSR history_strength must be >= 0; got {history_strength!r}"
+            )
         self._p = net.load_params(net.resolve_weights(weights))
         t, w = int(trim), int(window)
         if t < 0:
@@ -56,6 +66,8 @@ class RealBasicVsrUpscaler(WindowedUpscaler):
         self._residual_strength = float(residual_strength)
         self._flow_consistency = float(flow_consistency)
         self._flow_mode = flow_mode
+        self._history_strength = float(history_strength)
+        self._history_gate = history_gate
         super().__init__(window=w, trim=t)
 
     def _upscale_window(self, frames: list) -> list:
@@ -67,4 +79,6 @@ class RealBasicVsrUpscaler(WindowedUpscaler):
             residual_strength=self._residual_strength,
             flow_consistency=self._flow_consistency,
             flow_mode=self._flow_mode,
+            history_strength=self._history_strength,
+            history_gate=self._history_gate,
         )

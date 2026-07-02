@@ -71,6 +71,33 @@ def flow_warp(x: Any, flow: Any, pad: str = "zeros") -> Any:
     return _bilinear(x, sy, sx, pad)
 
 
+def history_improve_gate(curr: Any, prev: Any, flow: Any, dtype: Any,
+                         strength: float = 1.0) -> Any:
+    """Per-pixel history-admission gate in [0, strength], shape (N,H,W,1).
+
+    Admits recurrent history only where the flow warp measurably IMPROVES the
+    photometric residual against the current frame (versus using the previous
+    frame unwarped) and the warped match is close. Near-static regions with no
+    demonstrable improvement get ~0 history, which prevents the recurrence from
+    locking and re-sharpening its own hallucinations (etching / propagation
+    smear); regions with real, well-tracked motion pass through. A zero gate
+    reproduces the nets' trained cold-start distribution (zero-initialized
+    propagation features), so gating is in-distribution.
+
+    Same formula and constants as RealViformer's driver gate: the improve ramp
+    saturates at one 8-bit level (0.004) of residual improvement; the match
+    falloff sigma is 0.035 (~9 levels). Arithmetic runs in fp32, cast at the end.
+    """
+    curr32 = curr.astype(mx.float32)
+    prev32 = prev.astype(mx.float32)
+    warped_prev = flow_warp(prev32, flow.astype(mx.float32), "border")
+    resid_warp = mx.mean(mx.abs(curr32 - warped_prev), axis=-1, keepdims=True)
+    resid_zero = mx.mean(mx.abs(curr32 - prev32), axis=-1, keepdims=True)
+    improve = mx.clip((resid_zero - resid_warp) / 0.004, 0.0, 1.0)
+    match = mx.exp(-((resid_warp / 0.035) ** 2))
+    return (float(strength) * improve * match).astype(dtype)
+
+
 def resize(x: Any, oh: int, ow: int, align_corners: bool) -> Any:
     """Bilinear resize NHWC x to (oh, ow) (edge-clamped), matching torch's
     align_corners True/False coordinate maps."""

@@ -5,7 +5,7 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from LTX_2_MLX.videotoolbox.vsr_blocks import _compute_flows
+from LTX_2_MLX.videotoolbox.vsr_blocks import _compute_flows, history_improve_gate
 from LTX_2_MLX.videotoolbox.basicvsrpp.upscaler import BasicVsrUpscaler
 from LTX_2_MLX.videotoolbox.realbasicvsr.upscaler import RealBasicVsrUpscaler
 from LTX_2_MLX.videotoolbox.realviformer.upscaler import RealViformerUpscaler
@@ -57,6 +57,41 @@ def test_realviformer_rejects_bad_history_controls_before_loading_weights():
         RealViformerUpscaler(history_gate="bogus")
     with pytest.raises(ValueError, match="history_strength"):
         RealViformerUpscaler(history_strength=-0.1)
+
+
+def test_realbasicvsr_rejects_bad_history_controls_before_loading_weights():
+    with pytest.raises(ValueError, match="history_gate"):
+        RealBasicVsrUpscaler(history_gate="bogus")
+    with pytest.raises(ValueError, match="history_strength"):
+        RealBasicVsrUpscaler(history_strength=-0.1)
+
+
+def test_history_improve_gate_closes_on_static_content():
+    # Identical frames + zero flow: warping cannot improve the residual, so the
+    # gate must close (this is the anti-etch property).
+    mx.random.seed(0)
+    curr = mx.random.uniform(shape=(1, 12, 16, 3))
+    flow = mx.zeros((1, 12, 16, 2))
+    gate = history_improve_gate(curr, curr, flow, mx.float32)
+    mx.eval(gate)
+    assert gate.shape == (1, 12, 16, 1)
+    assert float(mx.max(gate)) == 0.0
+
+
+def test_history_improve_gate_opens_on_well_tracked_motion():
+    # prev shifted by exactly +2 px, flow pointing back at it: the warp
+    # reconstructs curr almost exactly while the unwarped residual is large,
+    # so interior gate values saturate toward strength.
+    mx.random.seed(1)
+    prev = mx.random.uniform(shape=(1, 16, 24, 3))
+    curr = mx.roll(prev, 2, axis=2)
+    flow = mx.concatenate(
+        [mx.full((1, 16, 24, 1), -2.0), mx.zeros((1, 16, 24, 1))], axis=-1)
+    gate = history_improve_gate(curr, prev, flow, mx.float32, strength=0.75)
+    mx.eval(gate)
+    interior = gate[:, 2:-2, 4:-4]
+    assert float(mx.min(interior)) > 0.7
+    assert float(mx.max(gate)) <= 0.75 + 1e-6
 
 
 def test_realviformer_pad4_matches_reference_left_top_reflect():
