@@ -99,6 +99,14 @@ def main() -> int:
     )
     ap.add_argument("--keep-fp64", action="store_true", help="Keep float64 tensors as-is (default: demote to float32).")
     ap.add_argument("--force", action="store_true", help="Convert even if the static scan flags non-tensor globals.")
+    ap.add_argument(
+        "--param-key", default=None,
+        help="Nested checkpoint dict to extract (e.g. 'params' or 'params_ema'). "
+             "Checkpoints often carry BOTH; pick the one the model's reference "
+             "inference loads -- they are different weights. Default: auto-probe "
+             "(params_ema before params), which is only right when the reference "
+             "tests the EMA weights.",
+    )
     args = ap.parse_args()
 
     src = Path(args.input)
@@ -137,12 +145,25 @@ def main() -> int:
 
     # ---- 3. find the state_dict (handle common nesting) --------------------
     sd = obj
-    if not (hasattr(sd, "items") and any(torch.is_tensor(v) for v in sd.values())):
+    if args.param_key:
+        if not (isinstance(obj, dict) and args.param_key in obj
+                and hasattr(obj[args.param_key], "items")):
+            have = list(obj.keys()) if isinstance(obj, dict) else type(obj).__name__
+            print(f"error: --param-key '{args.param_key}' not in checkpoint (has: {have})",
+                  file=sys.stderr)
+            return 1
+        sd = obj[args.param_key]
+        print(f"[load] using nested checkpoint key '{args.param_key}' (explicit)")
+    elif not (hasattr(sd, "items") and any(torch.is_tensor(v) for v in sd.values())):
         for key in ("state_dict", "model", "net", "weights", "params_ema", "params"):
             if isinstance(obj, dict) and key in obj and hasattr(obj[key], "items"):
                 sd = obj[key]
                 print(f"[load] using nested checkpoint key '{key}'")
                 break
+        if isinstance(obj, dict) and "params" in obj and "params_ema" in obj and sd is obj.get("params_ema"):
+            print("[load] WARNING: checkpoint carries BOTH 'params' and 'params_ema' and "
+                  "they differ; auto-picked params_ema. Pass --param-key to match what "
+                  "the model's reference inference loads.")
 
     # ---- 4. make MLX-friendly: strip prefix, demote fp64, drop non-tensors -
     prefix = args.strip_prefix
