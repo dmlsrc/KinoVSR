@@ -382,7 +382,12 @@ code > paper equations.
 BasicSR-style checkpoints often carry BOTH `params` and `params_ema`, and they
 are DIFFERENT weights (here: summed max-abs 0.1-0.6 over the tensor set --
 visibly different GAN texture, softer edges around movers on the EMA dict).
-Which one is "the model" varies per repo, so read the reference inference:
+The dicts also differ in texture prior, not just sharpness: RealViformer's
+`params` synthesizes a crisp woven micro-texture ("crosshatch") on ambiguous
+mid-tone surfaces (animal hide, skin) where `params_ema` renders soft felt --
+both hallucinate, with different styles; the selectivity is the GAN prior
+keying on surface class. Which one is "the model" varies per repo, so read
+the reference inference:
 SAFMN's loaders (`app.py`, `inference_real_safmn.py`, AIS2024) and
 RealViformer's `inference_realviformer.py` load `['params']`; ESC's
 `scripts/inference.py` loads `['params_ema']`. `pth_to_safetensors.py
