@@ -392,6 +392,17 @@ picks the wrong dict passes every parity gate you build on the same choice:
 the parity reimplementation must load the dict THE REFERENCE loads, not the
 dict the converter picked.
 
+Full audit of every shipped videotoolbox weight against its source checkpoint
+(2026-07): only the BasicSR-trained trio was ever ambiguous. SAFMN (all
+variants) and RealViformer carried both dicts (fixed to `params`); ESC carries
+both and correctly ships `params_ema`. Everything else is single-dict by
+construction and therefore unambiguous: mmedit checkpoints (BasicVSR++ x4,
+RealBasicVSR) are `state_dict`-only; Real-ESRGAN releases each contain exactly
+one dict (x2plus/x4plus/anime/RealESRNet are params_ema-only -- EMA IS the
+released model there; SRVGG general/animevideo and ESRGAN are params-only);
+KAIR-style FBCNN, BSRGAN/BSRNet, FastDVDnet, and STDF are flat single
+state_dicts; NAFNet ships `params` only.
+
 ### Structure notes
 
 - Causal/unidirectional recurrent nets (RealViformer) want a STREAMING driver:
