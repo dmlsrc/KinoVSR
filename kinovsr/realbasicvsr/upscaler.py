@@ -39,8 +39,9 @@ class RealBasicVsrUpscaler(WindowedUpscaler):
         history_strength: float = 1.0,
         history_gate: str = "off",
     ):
-        if flow_mode not in ("spynet", "zero"):
-            raise ValueError(f"RealBasicVSR flow_mode must be 'spynet' or 'zero'; got {flow_mode!r}")
+        if flow_mode not in ("spynet", "zero", "vt"):
+            raise ValueError(
+                f"RealBasicVSR flow_mode must be 'spynet', 'zero', or 'vt'; got {flow_mode!r}")
         if history_gate not in ("off", "improve"):
             raise ValueError(
                 f"RealBasicVSR history_gate must be 'off' or 'improve'; got {history_gate!r}"

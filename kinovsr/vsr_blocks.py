@@ -235,6 +235,48 @@ def _pixelshuffle_pack(x: Any, p: dict, prefix: str, r: int = 2) -> Any:
     return _pixel_shuffle(conv(x, p, f"{prefix}.upsample_conv"), r)
 
 
+# VTOpticalFlow sessions for flow_mode="vt", cached per frame geometry. The
+# McTemporalDenoiser owns the session plumbing (Quality tier + the mandatory
+# synthetic-shift self-test that catches VT's silent-zero sizes/orientations);
+# strength/window are irrelevant here, it is used purely as a flow service.
+_VT_FLOW_CACHE: dict = {}
+
+
+def _vt_flow_service(w: int, h: int):
+    key = (int(w), int(h))
+    if key not in _VT_FLOW_CACHE:
+        from .denoise import McTemporalDenoiser   # lazy: pyobjc + VT session
+        _VT_FLOW_CACHE[key] = McTemporalDenoiser(
+            w, h, strength=0.0, window=1, self_test=True)
+    return _VT_FLOW_CACHE[key]
+
+
+def _vt_flows(frames: list) -> tuple:
+    """VTOpticalFlow for both propagation directions, in _compute_flows'
+    conventions: flows_forward[i] pulls frame i into frame i+1's geometry
+    (anchored at i+1); flows_backward[i] pulls frame i+1 into frame i's.
+
+    One VT call per direction per pair: the service's forward flow with
+    (source=a, next=b) negated is the pull-flow anchored at b -- the mc
+    denoiser's own empirically validated convention (warp(ref, -fwd)).
+    """
+    if frames[0].shape[0] != 1:
+        raise ValueError("flow_mode='vt' supports batch-1 frames only")
+    h, w = int(frames[0].shape[1]), int(frames[0].shape[2])
+    svc = _vt_flow_service(w, h)
+    dt = frames[0].dtype
+    ff, fb = [], []
+    for i in range(len(frames) - 1):
+        a = frames[i][0].astype(mx.float32)
+        b = frames[i + 1][0].astype(mx.float32)
+        fwd_ab, _ = svc._compute_flows(b, [a])[0]   # source=a, next=b
+        fwd_ba, _ = svc._compute_flows(a, [b])[0]   # source=b, next=a
+        ff.append((-fwd_ab)[None].astype(dt))
+        fb.append((-fwd_ba)[None].astype(dt))
+        mx.eval(ff[-1], fb[-1])
+    return ff, fb
+
+
 def _compute_flows(frames: list, p: dict, flow_mode: str = "spynet") -> tuple:
     """flows_forward[i] = flow(i+1 -> i); flows_backward[i] = flow(i -> i+1).
 
@@ -247,8 +289,11 @@ def _compute_flows(frames: list, p: dict, flow_mode: str = "spynet") -> tuple:
         if zeros:
             mx.eval(*zeros)
         return list(zeros), list(zeros)
+    if flow_mode == "vt":
+        return _vt_flows(frames)
     if flow_mode != "spynet":
-        raise ValueError(f"unknown flow_mode {flow_mode!r}; expected 'spynet' or 'zero'")
+        raise ValueError(
+            f"unknown flow_mode {flow_mode!r}; expected 'spynet', 'zero', or 'vt'")
     fb, ff = [], []
     for i in range(len(frames) - 1):
         b = compiled_spynet_flow(p, frames[i], frames[i + 1])

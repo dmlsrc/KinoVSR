@@ -360,6 +360,25 @@ footage hides under motion blur.
   some propagation crunch. Composes multiplicatively with the older
   `--realbasicvsr-flow-consistency` occlusion mask; default off = reference
   behavior, untouched math.
+
+  BasicVSR++ has the same knobs (`--basicvsrpp-history-gate` /
+  `--basicvsrpp-history-strength`): the gate multiplies the deform-aligned
+  history bundle, and the second-order source gates with the better of its two
+  flows (the alignment can draw from either). Measured effect on the selfie
+  clip is subtle -- fidelity training plus the learned deformable offset
+  correction leave little smear to fix -- so it is a knob for content where
+  its ghosting actually shows, not a general preset.
+
+  `vt` is available as a flow source on all three recurrent upscalers
+  (`--{basicvsrpp,realbasicvsr,realviformer}-flow-mode vt`): VTOpticalFlow at
+  the Quality tier through frame-sized flow buffers, with the startup
+  synthetic-shift self-test (VT silently returns zeros for portrait input and
+  small flow-buffer sizes; the self-test turns that into a loud error). The
+  windowed nets take one VT call per direction per frame pair, using the
+  empirically validated pull-flow convention (negated forward flow of a
+  source->next pair, anchored at next). Character per the flow study above:
+  smooth fields, no content-shaped noise, conservative on local motion --
+  an option to A/B per content, not a proven preset.
 - Output-encode visibility: a downstream HEVC encode makes the weave read
   STRONGER while halving measured fine-detail energy -- the encoder strips
   the incoherent noise floor and the coherent periodic pattern survives

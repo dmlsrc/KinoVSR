@@ -786,6 +786,8 @@ def run(args: argparse.Namespace) -> None:
                 or args.basicvsrpp_variant,
                 window=args.basicvsrpp_window, trim=args.basicvsrpp_trim,
                 flow_mode=args.basicvsrpp_flow_mode,
+                history_strength=args.basicvsrpp_history_strength,
+                history_gate=args.basicvsrpp_history_gate,
             )
         elif args.spatial_mode == "realbasicvsr":
             from LTX_2_MLX.videotoolbox.realbasicvsr.upscaler import RealBasicVsrUpscaler
@@ -1505,11 +1507,31 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--basicvsrpp-flow-mode", choices=["spynet", "zero"], default="spynet",
+        "--basicvsrpp-flow-mode", choices=["spynet", "zero", "vt"], default="spynet",
         help=(
             "Optical-flow source for --spatial-mode basicvsrpp (default spynet). "
             "zero disables motion compensation while keeping recurrent propagation, "
-            "as a control for flow-painted temporal artifacts."
+            "as a control for flow-painted temporal artifacts. vt uses "
+            "VTOpticalFlow (Quality tier, self-tested at startup; smooth fields, "
+            "no content-shaped flow noise)."
+        ),
+    )
+    parser.add_argument(
+        "--basicvsrpp-history-strength", type=float, default=1.0, metavar="S",
+        help=(
+            "Scale BasicVSR++'s aligned propagation features (default 1.0 = "
+            "reference strength). 0 disables temporal propagation entirely."
+        ),
+    )
+    parser.add_argument(
+        "--basicvsrpp-history-gate", choices=["off", "improve"], default="off",
+        help=(
+            "Per-pixel history admission for BasicVSR++'s propagation (default "
+            "off = reference behavior). improve admits aligned history only "
+            "where the flow warp measurably improves the photometric residual "
+            "against the current frame; second-order sources gate with the "
+            "better of their two flows. Mitigates propagation ghosting on "
+            "content optical flow cannot explain."
         ),
     )
     parser.add_argument(
@@ -1571,11 +1593,13 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--realbasicvsr-flow-mode", choices=["spynet", "zero"], default="spynet",
+        "--realbasicvsr-flow-mode", choices=["spynet", "zero", "vt"], default="spynet",
         help=(
             "Optical-flow source for --spatial-mode realbasicvsr (default spynet). "
             "zero disables motion compensation while keeping recurrent propagation, "
-            "as a control for flow-painted temporal artifacts."
+            "as a control for flow-painted temporal artifacts. vt uses "
+            "VTOpticalFlow (Quality tier, self-tested at startup; smooth fields, "
+            "no content-shaped flow noise)."
         ),
     )
     parser.add_argument(

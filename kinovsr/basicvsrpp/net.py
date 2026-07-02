@@ -25,6 +25,7 @@ from ..vsr_blocks import (
     compiled_resblocks,
     conv,
     flow_warp,
+    history_improve_gate,
     lrelu,
     pad_spynet_gates,
     resize,
@@ -163,7 +164,9 @@ def _compiled_deform_align(p: dict, key: str):
 
 
 # ---- recurrent forward -----------------------------------------------------
-def _propagate(feats: dict, flows: list, module: str, p: dict) -> dict:
+def _propagate(feats: dict, flows: list, module: str, p: dict,
+               frames: list | None = None, history_strength: float = 1.0,
+               history_gate: str = "off") -> dict:
     nf = len(feats["spatial"])
     frame_idx = list(range(nf))
     flow_idx = list(range(-1, nf - 1))
@@ -171,7 +174,17 @@ def _propagate(feats: dict, flows: list, module: str, p: dict) -> dict:
         frame_idx = frame_idx[::-1]
         flow_idx = frame_idx
     n, h, w, mid = feats["spatial"][0].shape
-    feat_prop = mx.zeros((n, h, w, mid), dtype=feats["spatial"][0].dtype)
+    dt = feats["spatial"][0].dtype
+    # History admission (see vsr_blocks.history_improve_gate): the aligned
+    # history bundle is multiplied per pixel by how much the warp actually
+    # explains the current frame. Second-order alignment can draw from either
+    # source, so the two per-source gates combine with max. A zero gate equals
+    # the branch's window-start zero features (in-distribution). The scalar
+    # history_strength path scales history unconditionally; the default
+    # (1.0, gate off) leaves the reference math untouched.
+    use_gate = history_gate == "improve" and frames is not None
+    use_scalar = (not use_gate) and history_strength != 1.0
+    feat_prop = mx.zeros((n, h, w, mid), dtype=dt)
     out: list = []
     for i, idx in enumerate(frame_idx):
         feat_current = feats["spatial"][idx]
@@ -188,6 +201,15 @@ def _propagate(feats: dict, flows: list, module: str, p: dict) -> dict:
             cond = mx.concatenate([cond_n1, feat_current, cond_n2], axis=-1)
             feat_prop = _compiled_deform_align(p, f"deform_align.{module}")(
                 mx.concatenate([feat_prop, feat_n2], axis=-1), cond, flow_n1, flow_n2)
+            if use_gate:
+                gate = history_improve_gate(
+                    frames[idx], frames[frame_idx[i - 1]], flow_n1, dt, history_strength)
+                if i > 1:
+                    gate = mx.maximum(gate, history_improve_gate(
+                        frames[idx], frames[frame_idx[i - 2]], flow_n2, dt, history_strength))
+                feat_prop = feat_prop * gate
+            elif use_scalar:
+                feat_prop = feat_prop * float(history_strength)
         feat = [feat_current] + [feats[k][idx] for k in feats if k not in ("spatial", module)] + [feat_prop]
         feat_prop = feat_prop + compiled_resblocks(mx.concatenate(feat, axis=-1), p, f"backbone.{module}")
         # Materialize each step so the recurrent graph (and the large transient
@@ -216,9 +238,13 @@ def _upsample(frames: list, feats: dict, p: dict) -> list:
     return outs
 
 
-def upscale(frames: list, p: dict, flow_mode: str = "spynet") -> list:
+def upscale(frames: list, p: dict, flow_mode: str = "spynet",
+            history_strength: float = 1.0, history_gate: str = "off") -> list:
     """Upscale an LR clip 4x. frames: list of (N,H,W,3) f32 [0,1]; out: same len,
-    each (N,4H,4W,3). Bidirectional + second-order, so the whole clip is needed."""
+    each (N,4H,4W,3). Bidirectional + second-order, so the whole clip is needed.
+    ``history_gate="improve"`` admits aligned history per pixel only where the
+    flow warp measurably improves the photometric residual; ``history_strength``
+    scales the aligned history (1.0 = reference)."""
     dt = p["conv_last.weight"].dtype
     # Clip to [0,1] - the model trained on uint8-derived [0,1] LR, but the
     # RGBAHalf decode can overshoot (~[-0.07, 1.04]); keep input in-distribution.
@@ -233,7 +259,9 @@ def upscale(frames: list, p: dict, flow_mode: str = "spynet") -> list:
     for it in (1, 2):
         for direction in ("backward", "forward"):
             mod = f"{direction}_{it}"
-            feats = _propagate(feats, fb if direction == "backward" else ff, mod, p)
+            feats = _propagate(feats, fb if direction == "backward" else ff, mod, p,
+                               frames=frames, history_strength=history_strength,
+                               history_gate=history_gate)
             # _propagate already mx.eval's each step internally (see net.py:176), so every
             # element of feats[mod] is materialized here -- no extra sync barrier needed.
     return _upsample(frames, feats, p)

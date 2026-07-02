@@ -66,6 +66,13 @@ def test_realbasicvsr_rejects_bad_history_controls_before_loading_weights():
         RealBasicVsrUpscaler(history_strength=-0.1)
 
 
+def test_basicvsrpp_rejects_bad_history_controls_before_loading_weights():
+    with pytest.raises(ValueError, match="history_gate"):
+        BasicVsrUpscaler(history_gate="bogus")
+    with pytest.raises(ValueError, match="history_strength"):
+        BasicVsrUpscaler(history_strength=-0.1)
+
+
 def test_history_improve_gate_closes_on_static_content():
     # Identical frames + zero flow: warping cannot improve the residual, so the
     # gate must close (this is the anti-etch property).
