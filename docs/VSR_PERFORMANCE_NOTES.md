@@ -370,6 +370,28 @@ against the paper's 2.0. Derive EVERYTHING derivable from tensor shapes
 (widths, block counts, expansion ratios, scale) and read the key layout before
 writing the forward.
 
+The same rule ranks the paper below the code: RealViformer's paper writes its
+merge FFN input as the RAW current-frame features (`C[At*Vt; ft]`) while the
+released code concatenates the LayerNormed ones -- the weights were trained
+with the code, and porting the paper's equation reproduces the river artifact
+above. Precedence when sources disagree: checkpoint keys > reference inference
+code > paper equations.
+
+### `params` vs `params_ema`: pick the dict the reference loads
+
+BasicSR-style checkpoints often carry BOTH `params` and `params_ema`, and they
+are DIFFERENT weights (here: summed max-abs 0.1-0.6 over the tensor set --
+visibly different GAN texture, softer edges around movers on the EMA dict).
+Which one is "the model" varies per repo, so read the reference inference:
+SAFMN's loaders (`app.py`, `inference_real_safmn.py`, AIS2024) and
+RealViformer's `inference_realviformer.py` load `['params']`; ESC's
+`scripts/inference.py` loads `['params_ema']`. `pth_to_safetensors.py
+--param-key <key>` pins the choice explicitly (the auto-probe order is a trap
+when both exist -- it prefers params_ema and warns). A converter that silently
+picks the wrong dict passes every parity gate you build on the same choice:
+the parity reimplementation must load the dict THE REFERENCE loads, not the
+dict the converter picked.
+
 ### Structure notes
 
 - Causal/unidirectional recurrent nets (RealViformer) want a STREAMING driver:

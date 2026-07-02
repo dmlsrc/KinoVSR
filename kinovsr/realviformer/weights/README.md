@@ -10,11 +10,16 @@ publishes a single pretrained model (Google Drive only; no direct URL exists):
 Convert -- the output name must match `net.py`'s `_VARIANTS`:
 
 ```bash
-python scripts/pth_to_safetensors.py weights.pth \
+python scripts/pth_to_safetensors.py weights.pth --param-key params \
   -o LTX_2_MLX/videotoolbox/realviformer/weights/realviformer_x4.safetensors
 ```
 
-The checkpoint carries a vestigial `attn_merge.attn.masktemp` parameter that the
-reference inference ignores (it loads strict=False); the loader here drops it.
+`--param-key params` matters: the checkpoint carries BOTH `params` and
+`params_ema` and they are different weights. The reference inference loads
+`['params']`; the EMA dict produces a subtly different (mushier) model.
+
+The checkpoint also carries a vestigial `attn_merge.attn.masktemp` parameter
+that the reference inference ignores (it loads strict=False); the loader here
+drops it.
 
 Source: https://github.com/Yuehan717/RealViformer
