@@ -269,8 +269,46 @@ Lessons, now part of the validation protocol:
   reference attributes net-as-implemented to net-as-published.
 
 `--cut-detect hist` (default off) remains relevant for recurrent upscalers on
-content with hard cuts. Probe and before/after contact sheets:
-`$SHARED_TEMP_DIR/trace_analysis/river_diag/`.
+content with hard cuts. The attribution instrument, when this class of question
+comes up again: feed decoded LR frames straight to the upscaler in-process
+(bypassing the output encoder), stack output crops of the artifact region
+across consecutive frames, and compare the same crop across variants (fp16 vs
+fp32, per-frame control net, weight dicts) as tiled contact sheets.
+
+### Known model behaviors on calm/degraded content (net, not port)
+
+Verified on ancient-web-rip degradations: re-encode a clean master with a
+hardware H.264 encode at ~0.07 bpp (High profile, long GOP, ~400 kb/s at
+544x408 or ~220 kb/s at CIF) and upscale that. The Xiph derf CIF talking-head
+masters (akiyo, mother-daughter -- freely downloadable y4m) are the right calm
+test content: near-static people expose behaviors that DAVIS-class action
+footage hides under motion blur.
+
+- Woven micro-texture ("crosshatch") prior: the params model fills ambiguous
+  mid-tone surfaces (animal hide, teeth) with a fabric-like weave. Selective
+  by surface class -- truly flat walls stay clean, strong structure gets
+  correct material (wood grain, thatch). Identical in fp16 and fp32, present
+  pre-encode, absent from the input: pure GAN texture prior.
+- Recurrent etching on near-static content: with an almost motionless subject
+  the recurrence re-sharpens its own hallucinated shading lines frame after
+  frame; small jitter turns locked highlights into notched ridges (nose seam
+  on a news anchor). High-contrast lines engrave within ~100 frames then
+  saturate; low-amplitude structure (encoder banding on a smooth gradient)
+  takes longer -- measured horizontal-structure energy on a static background
+  crosses from negative to positive anisotropy around frame ~200 and keeps
+  growing, so ripples surface only after ~8 s of static content. Relevant
+  integration difference: the reference inference chunks sequences at 100
+  frames (a CUDA-memory workaround that incidentally caps recurrence depth),
+  while the streaming driver here never resets between cuts -- long static
+  shots run the recurrence deeper than the released tool ever does. A periodic
+  state reset caps the etching at its depth-N level (at the cost of a texture
+  refresh pop, which the reference's chunking also has); the per-frame safmn
+  real weights cannot produce it at all.
+- Output-encode visibility: a downstream HEVC encode makes the weave read
+  STRONGER while halving measured fine-detail energy -- the encoder strips
+  the incoherent noise floor and the coherent periodic pattern survives
+  quantization, standing out against the cleaner background. Judge texture
+  artifacts on the encoded deliverable, not only on raw net output.
 
 Peak MLX memory, one pass at 854x480 (1 GB cache cap): stdf 0.8 GB, fastdvd
 1.0, general 1.2, fbcnn 1.9, nafnet-fp32 2.3, bsrgan 4.0, realbasicvsr-5-window
