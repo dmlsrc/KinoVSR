@@ -208,12 +208,20 @@ def _pixelshuffle_pack(x: Any, p: dict, prefix: str, r: int = 2) -> Any:
     return _pixel_shuffle(conv(x, p, f"{prefix}.upsample_conv"), r)
 
 
-def _compute_flows(frames: list, p: dict) -> tuple:
+def _compute_flows(frames: list, p: dict, flow_mode: str = "spynet") -> tuple:
     """flows_forward[i] = flow(i+1 -> i); flows_backward[i] = flow(i -> i+1).
 
     Each flow is materialized as computed: SPyNet upsizes to a multiple of 32 and
     builds a 6-level pyramid, so holding all 2*(T-1) of them as one lazy graph
     spikes memory; per-flow eval keeps only the small (H,W,2) results alive."""
+    if flow_mode == "zero":
+        zeros = [mx.zeros((*frames[0].shape[:3], 2), dtype=frames[0].dtype)
+                 for _ in range(len(frames) - 1)]
+        if zeros:
+            mx.eval(*zeros)
+        return list(zeros), list(zeros)
+    if flow_mode != "spynet":
+        raise ValueError(f"unknown flow_mode {flow_mode!r}; expected 'spynet' or 'zero'")
     fb, ff = [], []
     for i in range(len(frames) - 1):
         b = compiled_spynet_flow(p, frames[i], frames[i + 1])

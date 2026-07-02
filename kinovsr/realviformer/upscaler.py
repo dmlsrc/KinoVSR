@@ -4,6 +4,13 @@ RealViformer's recurrence is CAUSAL (forward-only), so unlike the bidirectional
 VSR nets there is no window/trim buffering: each frame upscales as it arrives,
 carrying the propagated features (and the previous frame, for the flow) across
 calls. reset() drops the temporal state -- the harness calls it at hard cuts.
+
+`window` chunks the recurrence: the state resets cold every `window` frames,
+matching the reference inference's 100-frame interval processing. Unbounded
+recurrence (window=0) runs the net into state depths the released tool never
+reaches; on long near-static shots the texture lock then engraves hallucinated
+detail (notched ridges on locked highlights, ripple contours on smooth
+gradients) that keeps accumulating for hundreds of frames.
 """
 from __future__ import annotations
 
@@ -23,47 +30,129 @@ except ImportError:   # running directly as a script
 class RealViformerUpscaler:
     """Streaming feed()/flush() driver for the causal RealViformer."""
 
-    def __init__(self, weights: Any = None, dtype: Any = mx.float16, compile: bool = True):
+    def __init__(
+        self, weights: Any = None, dtype: Any = mx.float16, compile: bool = True,
+        window: int = 100, flow_mode: str = "spynet",
+        history_strength: float = 1.0, history_gate: str = "off",
+    ):
+        if flow_mode not in ("spynet", "zero", "vt"):
+            raise ValueError(
+                f"RealViformer flow_mode must be 'spynet', 'zero', or 'vt'; got {flow_mode!r}"
+            )
+        if history_gate not in ("off", "improve"):
+            raise ValueError(
+                f"RealViformer history_gate must be 'off' or 'improve'; got {history_gate!r}"
+            )
+        if history_strength < 0.0:
+            raise ValueError(
+                f"RealViformer history_strength must be >= 0; got {history_strength!r}"
+            )
         self._p = net.load_params(weights, dtype=dtype)
         self._cfg = net._config(self._p)
         self.scale = 4
+        self._window = max(0, int(window))
+        self._flow_mode = flow_mode
+        self._history_strength = float(history_strength)
+        self._history_gate = history_gate
+        self._vt_flow: Any = None
         self._first, self._next = net.make_steps(self._p, self._cfg, compile=compile)
         self.reset()
 
     def reset(self) -> None:
         self._prev: Any = None       # previous input frame (for the flow)
         self._feat: Any = None       # propagated features
+        self._depth = 0              # frames since the last cold start
 
     def close(self) -> None:
-        pass
+        if self._vt_flow is not None:
+            self._vt_flow.close()
+            self._vt_flow = None
 
     @staticmethod
-    def _pad4(x: Any) -> Any:
-        """Replicate-pad bottom/right to multiples of 4 (the U-Net has two 2x downs)."""
+    def _pad4(x: Any) -> tuple[Any, int, int]:
+        """Reflect-pad top/left to multiples of 4, matching reference inference.
+
+        RealViformer's U-Net downsamples twice, so arbitrary input sizes need
+        padding to a multiple of 4. The reference pads left/top with torch
+        ``reflect`` and later crops that scaled offset from the output.
+        """
         _, h, w, _ = x.shape
         ph, pw = (-h) % 4, (-w) % 4
         if ph:
-            x = mx.concatenate(
-                [x, mx.broadcast_to(x[:, h - 1:h], (x.shape[0], ph, x.shape[2], x.shape[3]))], axis=1)
+            if h <= ph:
+                raise ValueError(f"RealViformer reflect padding needs height > {ph}; got {h}")
+            yidx = mx.arange(ph, 0, -1)
+            x = mx.concatenate([mx.take(x, yidx, axis=1), x], axis=1)
         if pw:
-            x = mx.concatenate(
-                [x, mx.broadcast_to(x[:, :, w - 1:w], (x.shape[0], x.shape[1], pw, x.shape[3]))], axis=2)
-        return x
+            if w <= pw:
+                raise ValueError(f"RealViformer reflect padding needs width > {pw}; got {w}")
+            xidx = mx.arange(pw, 0, -1)
+            x = mx.concatenate([mx.take(x, xidx, axis=2), x], axis=2)
+        return x, ph, pw
+
+    def _vt_current_to_prev_flow(self, curr: Any, prev: Any, dtype: Any) -> Any:
+        """VTOpticalFlow in the convention RealViformer's warp expects.
+
+        McTemporalDenoiser's helper returns source -> next flow. For recurrent SR
+        we need current -> previous so flow_warp(previous_features, flow) samples
+        the previous feature map at p + flow[p].
+        """
+        if self._vt_flow is None:
+            from ..denoise import McTemporalDenoiser
+
+            _, h, w, _ = curr.shape
+            self._vt_flow = McTemporalDenoiser(
+                w, h, strength=0.0, window=1, self_test=True,
+            )
+        flow, _ = self._vt_flow._compute_flows(
+            prev[0].astype(mx.float32), [curr[0].astype(mx.float32)],
+        )[0]
+        return flow[None].astype(dtype)
+
+    def _history_gate_map(self, curr: Any, prev: Any, flow: Any, dtype: Any) -> Any:
+        gate = mx.full((*curr.shape[:3], 1), self._history_strength, dtype=dtype)
+        if self._history_gate == "off" or self._history_strength <= 0.0:
+            return gate
+
+        curr32 = curr.astype(mx.float32)
+        prev32 = prev.astype(mx.float32)
+        flow32 = flow.astype(mx.float32)
+        warped_prev = flow_warp(prev32, flow32, "border")
+        resid_warp = mx.mean(mx.abs(curr32 - warped_prev), axis=-1, keepdims=True)
+        resid_zero = mx.mean(mx.abs(curr32 - prev32), axis=-1, keepdims=True)
+
+        # Conservative alignment: history is useful only where the flow warp
+        # measurably improves the source-frame residual. Near-static regions with
+        # no clear improvement get little history, which prevents self-etching.
+        improve = mx.clip((resid_zero - resid_warp) / 0.004, 0.0, 1.0)
+        match = mx.exp(-((resid_warp / 0.035) ** 2))
+        return (gate.astype(mx.float32) * improve * match).astype(dtype)
 
     def feed(self, rgb: Any, token: Any = None) -> list:
         x = to_rgb_batch(rgb)
         h, w = x.shape[1], x.shape[2]
-        xp = self._pad4(x)
+        xp, pad_top, pad_left = self._pad4(x)
+        if self._window and self._depth >= self._window:
+            self.reset()
         if self._prev is None:
             sr, feat = self._first(xp)
         else:
             dt = self._feat.dtype
-            flow = compiled_spynet_flow(self._p, xp.astype(dt), self._prev.astype(dt))
+            if self._flow_mode == "zero":
+                flow = mx.zeros((*xp.shape[:3], 2), dtype=dt)
+            elif self._flow_mode == "vt":
+                flow = self._vt_current_to_prev_flow(xp, self._prev, dt)
+            else:
+                flow = compiled_spynet_flow(self._p, xp.astype(dt), self._prev.astype(dt))
             warped = flow_warp(self._feat, flow, "zeros")
-            sr, feat = self._next(xp, warped)
-        sr = sr[:, :h * 4, :w * 4, :]
+            history_gate = self._history_gate_map(xp, self._prev, flow, dt)
+            sr, feat = self._next(xp, warped, history_gate)
+        sy = pad_top * 4
+        sx = pad_left * 4
+        sr = sr[:, sy:sy + h * 4, sx:sx + w * 4, :]
         mx.eval(sr, feat)
         self._prev, self._feat = xp, feat
+        self._depth += 1
         return [(sr[0], token)]
 
     def flush(self) -> list:

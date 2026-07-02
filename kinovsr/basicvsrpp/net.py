@@ -216,7 +216,7 @@ def _upsample(frames: list, feats: dict, p: dict) -> list:
     return outs
 
 
-def upscale(frames: list, p: dict) -> list:
+def upscale(frames: list, p: dict, flow_mode: str = "spynet") -> list:
     """Upscale an LR clip 4x. frames: list of (N,H,W,3) f32 [0,1]; out: same len,
     each (N,4H,4W,3). Bidirectional + second-order, so the whole clip is needed."""
     dt = p["conv_last.weight"].dtype
@@ -229,7 +229,7 @@ def upscale(frames: list, p: dict) -> list:
         mx.eval(s)                       # materialize per frame, not all at once
         spatial.append(s)
     feats: dict = {"spatial": spatial}
-    ff, fb = _compute_flows(frames, p)   # evals each flow internally
+    ff, fb = _compute_flows(frames, p, flow_mode=flow_mode)   # evals each flow internally
     for it in (1, 2):
         for direction in ("backward", "forward"):
             mod = f"{direction}_{it}"

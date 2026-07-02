@@ -200,12 +200,12 @@ def _flow_consistency_mask(flow_use: Any, flow_rev: Any, dtype: Any) -> Any:
 
 
 def _basicvsr(frames: list, p: dict, residual_strength: float,
-              flow_consistency: float = 0.0) -> list:
+              flow_consistency: float = 0.0, flow_mode: str = "spynet") -> list:
     n, h, w, _ = frames[0].shape
     mid = int(p["basicvsr.backward_resblocks.main.0.bias"].shape[0])
     dt = frames[0].dtype
 
-    flows_forward, flows_backward = _compute_flows(frames, p)
+    flows_forward, flows_backward = _compute_flows(frames, p, flow_mode=flow_mode)
 
     # Precompute soft occlusion masks (flow-only, independent of feat_prop). With
     # strength s, mask = 1 - s*(1 - m_raw): s=0 reproduces the reference (no
@@ -265,6 +265,7 @@ def upscale(
     clean_iters: int = 3,
     residual_strength: float = 1.0,
     flow_consistency: float = 0.0,
+    flow_mode: str = "spynet",
 ) -> list:
     """Upscale an LR clip 4x.
 
@@ -279,7 +280,7 @@ def upscale(
     dt = p["basicvsr.conv_last.weight"].dtype
     frames = [mx.clip(f, 0.0, 1.0).astype(dt) for f in frames]
     cleaned = _clean(frames, p, dynamic_refine_thres, clean_iters)
-    return _basicvsr(cleaned, p, residual_strength, flow_consistency)
+    return _basicvsr(cleaned, p, residual_strength, flow_consistency, flow_mode)
 
 
 if __name__ == "__main__":

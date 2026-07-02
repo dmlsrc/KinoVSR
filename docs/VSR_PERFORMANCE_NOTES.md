@@ -204,6 +204,13 @@ session setup) amortized over too few frames. Harness startup is ~4-5 s
 (imports + pyobjc lazy-attribute initialization); it only matters for short
 clips. Use 60+ frames for wall-clock numbers.
 
+**VTOpticalFlow denoise gotcha:** use `Quality`, not `Normal`, for mc denoise.
+The Normal tier can under-read known global motion badly enough to make history
+blending unsafe. The mc denoiser now runs a synthetic global-shift self-test at
+startup and refuses clips/devices where VT returns all-zero or wrong-scale flow
+while reporting success. Frame-sized destination buffers and source-pixel flow
+units are correct; do not reintroduce a fake "native grid" rescale.
+
 ## 7. Reference numbers (854x480 input, M1 Max, post-campaign)
 
 Per-frame processing cost, fp16, compiled, capped cache. Preprocessors:
@@ -289,21 +296,56 @@ footage hides under motion blur.
   by surface class -- truly flat walls stay clean, strong structure gets
   correct material (wood grain, thatch). Identical in fp16 and fp32, present
   pre-encode, absent from the input: pure GAN texture prior.
-- Recurrent etching on near-static content: with an almost motionless subject
-  the recurrence re-sharpens its own hallucinated shading lines frame after
-  frame; small jitter turns locked highlights into notched ridges (nose seam
-  on a news anchor). High-contrast lines engrave within ~100 frames then
-  saturate; low-amplitude structure (encoder banding on a smooth gradient)
-  takes longer -- measured horizontal-structure energy on a static background
-  crosses from negative to positive anisotropy around frame ~200 and keeps
-  growing, so ripples surface only after ~8 s of static content. Relevant
-  integration difference: the reference inference chunks sequences at 100
-  frames (a CUDA-memory workaround that incidentally caps recurrence depth),
-  while the streaming driver here never resets between cuts -- long static
-  shots run the recurrence deeper than the released tool ever does. A periodic
-  state reset caps the etching at its depth-N level (at the cost of a texture
-  refresh pop, which the reference's chunking also has); the per-frame safmn
-  real weights cannot produce it at all.
+- Recurrent etching on near-static content: hallucinated shading lines get
+  locked by the recurrence and re-sharpened every frame; small jitter turns
+  them into notched ridges (a ladder seam down a news anchor's nose) and, on
+  smooth gradients, slow ripple contours. Measured mechanism: FORMATION is
+  input-gated and fast -- the seam appears within ~10 frames whenever the
+  degraded input's structure in that region spikes (tracked seam-region edge
+  energy follows the input's own encode-refresh cycle across every config) --
+  while PERSISTENCE is state-driven: once formed, a deep state carries the
+  etch through quiet input stretches where a fresh state stays clean, and on
+  long static shots low-amplitude ripples keep accumulating for hundreds of
+  frames (background horizontal-structure energy crosses visibility around
+  frame ~200 unbounded). The same frame can render clean or etched depending
+  only on hidden state history. The reference inference chunks sequences at
+  100 frames (a CUDA-memory workaround that incidentally bounds this);
+  `--realviformer-window` (default 100) reproduces that envelope, 0 restores
+  unbounded streaming. The window bounds how long a formed etch survives and
+  caps slow accumulation; it cannot prevent formation (even window 12 re-forms
+  the seam within a chunk when the input triggers), and each chunk join is a
+  small texture refresh. For near-static talking heads the recurrent tool is
+  simply fragile; the per-frame safmn real weights cannot etch at all.
+
+  Current flow evidence: the checkpoint's END-TO-END FINE-TUNED SpyNet is a
+  measurably degraded flow estimator. On controlled synthetic translations of
+  Akiyo frame 184, median endpoint error was VT 0.057 px, stock SpyNet 0.064
+  px, checkpoint `params` SpyNet 0.488 px, and checkpoint `params_ema` SpyNet
+  0.479 px. `params_ema` improves the checkpoint flow slightly, mostly in the
+  tail, but it is still far behind VT/stock and the reference loads `params`.
+  On a procedural periodic texture, VT stayed sane (0.014 px median EPE), the
+  checkpoint variants stayed mediocre (0.544/0.528 px), and stock SpyNet locked
+  to wrong repeated offsets (7.788 px). The practical ranking is therefore
+  CONTENT-DEPENDENT: VT is the most robust generic flow, stock is excellent on
+  simple real-frame shifts but can alias badly, and the fine-tuned checkpoint
+  flow is model-compatible but inaccurate.
+
+  Raw flow accuracy still does not predict final VSR quality. In the 300-frame
+  Akiyo pre-encoder comparison with `history_gate=improve`, VT was the cleanest
+  artifact-wise, finetuned SpyNet had a tiny/noise-level VMAF edge, and stock
+  SpyNet changed the nose/face region most despite good simple-shift flow. The
+  gate proxy explains the split: on the blue-screen ROI all flows increase
+  photometric residual and the gate mostly closes, matching the visible line
+  reduction; on face/nose ROIs stock often looks photometrically best and opens
+  history hardest, yet produces the most objectionable changes. The working
+  failure model is the recurrent loop plus model compatibility: bilinear warp
+  resampling low-passes the state, the restoration body re-sharpens it, and
+  sub-pixel/content-shaped flow or over-admitted history turns locked edges
+  into ridges. RealBasicVSR's black-line ghosting belongs to the same class.
+  `--basicvsrpp-flow-mode zero`, `--realbasicvsr-flow-mode zero`, and
+  `--realviformer-flow-mode zero` are diagnostic controls for separating
+  recurrence-only state from motion-compensated recurrence; they are not
+  quality presets.
 - Output-encode visibility: a downstream HEVC encode makes the weave read
   STRONGER while halving measured fine-detail energy -- the encoder strips
   the incoherent noise floor and the coherent periodic pattern survives
@@ -424,16 +466,19 @@ The dicts also differ in texture prior, not just sharpness: RealViformer's
 `params` synthesizes a crisp woven micro-texture ("crosshatch") on ambiguous
 mid-tone surfaces (animal hide, skin) where `params_ema` renders soft felt --
 both hallucinate, with different styles; the selectivity is the GAN prior
-keying on surface class. Which one is "the model" varies per repo, so read
-the reference inference:
+keying on surface class. The embedded SpyNet differs too: in the synthetic
+translation probe, RealViformer `params_ema` improved median EPE only from
+0.488 to 0.479 px on Akiyo and from 0.544 to 0.528 px on the texture case, so
+switching to EMA is not a flow fix. Which dict is "the model" varies per repo,
+so read the reference inference:
 SAFMN's loaders (`app.py`, `inference_real_safmn.py`, AIS2024) and
 RealViformer's `inference_realviformer.py` load `['params']`; ESC's
 `scripts/inference.py` loads `['params_ema']`. `pth_to_safetensors.py
---param-key <key>` pins the choice explicitly (the auto-probe order is a trap
-when both exist -- it prefers params_ema and warns). A converter that silently
-picks the wrong dict passes every parity gate you build on the same choice:
-the parity reimplementation must load the dict THE REFERENCE loads, not the
-dict the converter picked.
+--param-key <key>` pins the choice explicitly; if both dicts exist and no
+`--param-key` is given, the converter refuses to guess. A converter that
+silently picks the wrong dict passes every parity gate you build on the same
+choice: the parity reimplementation must load the dict THE REFERENCE loads, not
+the dict the converter picked.
 
 Full audit of every shipped videotoolbox weight against its source checkpoint
 (2026-07): only the BasicSR-trained trio was ever ambiguous. SAFMN (all
@@ -452,10 +497,12 @@ state_dicts; NAFNet ships `params` only.
   per-frame feed with carried state and reset() at cuts -- no window buffering,
   no trim. Bidirectional nets (BasicVSR++ class) need the windowed driver.
 - U-Nets constrain input divisibility (2 downs -> /4; deepest pool -> /8;
-  window attention -> /32 handled internally). Replicate-pad at the driver or
-  net entry and crop the scaled output; document which the reference does --
-  torch adaptive pooling at non-multiple sizes has different semantics than
-  pad-then-uniform-pool (invisible in practice, but it moves parity numbers).
+  window attention -> /32 handled internally). Match the reference pad/crop
+  exactly. RealViformer reflect-pads TOP/LEFT to a multiple of 4, then crops
+  the scaled top/left offset from the output; bottom/right replicate padding
+  was a port bug. Akiyo is already divisible by 4, so the earlier Akiyo flow
+  and gate metrics were unaffected, but arbitrary untagged video sizes need the
+  reference geometry.
 - Reuse the shared blocks: a checkpoint's SpyNet is usually BasicSR's or
   mmagic's -- semantically identical to `vsr_blocks.spynet_flow`; remap key
   names at load and the compiled + gate-padded implementation comes free.

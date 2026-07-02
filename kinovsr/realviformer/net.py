@@ -265,7 +265,7 @@ def _pixel_unshuffle(x: Any, r: int) -> Any:
     return x.reshape(n, h // r, w // r, c * r * r)
 
 
-def _attn_merge(xs: Any, yp: Any, p: dict) -> Any:
+def _attn_merge(xs: Any, yp: Any, p: dict, history_gate: Any | None = None) -> Any:
     """Cross channel attention merging the shallow features (query) with the
     warped propagated features (key/value), then a gated conv FFN on the concat."""
     xn = _ln_biasfree(xs, p, "attn_merge.norm_q")
@@ -283,6 +283,8 @@ def _attn_merge(xs: Any, yp: Any, p: dict) -> Any:
     o = (attn @ vh).transpose(0, 3, 1, 2).reshape(xs.shape)
     o = _conv(o, p, "attn_merge.attn.project_out")
     o = _ln_biasfree(o, p, "attn_merge.norm_out")
+    if history_gate is not None:
+        o = o * history_gate.astype(o.dtype)
     # The concat side is the NORMALIZED query (the reference rebinds x to
     # norm_q(x) before both the attention and the concat), not the raw shallow
     # features. Raw features here shift the FFN's operating point with the
@@ -329,7 +331,8 @@ def step_first(x_i: Any, p: dict, cfg: tuple) -> tuple:
     return _reconstruct(out, x_i, p), feat_prop
 
 
-def step_next(x_i: Any, x_prev: Any, feat_prop: Any, p: dict, cfg: tuple) -> tuple:
+def step_next(x_i: Any, x_prev: Any, feat_prop: Any, p: dict, cfg: tuple,
+              history_gate: Any | None = None) -> tuple:
     """Subsequent frames: flow-warp the propagated features, merge, refine."""
     nf, blocks = cfg
     dt = p["shallow_extraction.0.weight"].dtype
@@ -338,7 +341,7 @@ def step_next(x_i: Any, x_prev: Any, feat_prop: Any, p: dict, cfg: tuple) -> tup
                       "shallow_extraction.1", masked=False)
     flow = compiled_spynet_flow(p, x_i, x_prev.astype(dt))
     warped = flow_warp(feat_prop, flow, "zeros")
-    prop = _attn_merge(shallow, warped, p)
+    prop = _attn_merge(shallow, warped, p, history_gate)
     out, feat_prop = _unet(prop, p, blocks)
     return _reconstruct(out, x_i, p), feat_prop
 
@@ -356,19 +359,19 @@ def make_steps(p: dict, cfg: tuple | None = None, compile: bool = True) -> tuple
     def first(x_i):
         return step_first(x_i, p, cfg)
 
-    def merge_and_refine(x_i, warped):
+    def merge_and_refine(x_i, warped, history_gate):
         dt = p["shallow_extraction.0.weight"].dtype
         x_i = x_i.astype(dt)
         shallow = _tblock(_conv(x_i, p, "shallow_extraction.0", pad=1), p,
                           "shallow_extraction.1", masked=False)
-        prop = _attn_merge(shallow, warped, p)
+        prop = _attn_merge(shallow, warped, p, history_gate)
         out, feat_prop = _unet(prop, p, cfg[1])
         return _reconstruct(out, x_i, p), feat_prop
 
     if not compile:
         return first, merge_and_refine
     f = _cached(_COMPILE_CACHE, (id(p), cfg, "first"), lambda: mx.compile(first))
-    n = _cached(_COMPILE_CACHE, (id(p), cfg, "next"), lambda: mx.compile(merge_and_refine))
+    n = _cached(_COMPILE_CACHE, (id(p), cfg, "next_gated"), lambda: mx.compile(merge_and_refine))
     return f, n
 
 

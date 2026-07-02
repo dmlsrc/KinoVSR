@@ -149,7 +149,7 @@ class McTemporalDenoiser:
     def __init__(
         self, width: int, height: int, strength: float = 0.5,
         window: int = 0, clamp: bool = False, occlusion: bool = False,
-        confidence: bool = False,
+        confidence: bool = False, self_test: bool = True,
     ):
         require_pyobjc()
         self.w, self.h = int(width), int(height)
@@ -187,11 +187,17 @@ class McTemporalDenoiser:
         self._prev: Any = None       # previous OUTPUT frame (recursive mode)
         self._hist: list[Any] = []   # last N INPUT frames, oldest first (FIR mode)
         self._idx = 0
+        if self_test:
+            try:
+                self._self_test_flow()
+            except Exception:
+                self.close()
+                raise
 
     def _make_worker(self, cls: Any) -> dict:
         cfg = cls.alloc().initWithFrameWidth_frameHeight_qualityPrioritization_revision_(
             self.w, self.h,
-            vt.VTOpticalFlowConfigurationQualityPrioritizationNormal,
+            vt.VTOpticalFlowConfigurationQualityPrioritizationQuality,
             cls.defaultRevision(),
         )
         if cfg is None:
@@ -212,6 +218,71 @@ class McTemporalDenoiser:
             "fwd": _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._dst_attrs),
             "bwd": _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._dst_attrs),
         }
+
+    def _self_test_frames(self, shift: int) -> tuple[Any, Any]:
+        ys, xs = mx.meshgrid(mx.arange(self.h), mx.arange(self.w), indexing="ij")
+        xi = xs.astype(mx.int32)
+        yi = ys.astype(mx.int32)
+        noise = (
+            (xi * 37 + yi * 17 + (xi // 13) * 29 + (yi // 11) * 31) % 256
+        ).astype(mx.float32) / 255.0
+        blocks = (((xi // 8 + yi // 8) % 2).astype(mx.float32) - 0.5) * 0.25
+        base = 0.5 + (noise - 0.5) * 0.65 + blocks
+        xs = xs.astype(mx.float32)
+        ys = ys.astype(mx.float32)
+        ref = mx.clip(
+            mx.stack(
+                [
+                    base,
+                    0.5 + (noise - 0.5) * 0.45 + 0.2 * mx.sin(xs * 0.31),
+                    0.5 + (noise - 0.5) * 0.35 + 0.2 * mx.cos(ys * 0.27),
+                ],
+                axis=-1,
+            ),
+            0.0,
+            1.0,
+        ).astype(mx.float32)
+        left = mx.broadcast_to(ref[:, :1], (self.h, shift, 3))
+        curr = mx.concatenate([left, ref[:, : self.w - shift]], axis=1)
+        mx.eval(ref, curr)
+        return ref, curr
+
+    def _self_test_flow(self) -> None:
+        """Catch VTOpticalFlow silent-zero and bad-priority failures up front."""
+        if self.w < 16 or self.h < 16:
+            raise RuntimeError(
+                f"VTOpticalFlow self-test requires at least 16x16; got {self.w}x{self.h}"
+            )
+        shift = 3 if self.w >= 32 else 1
+        ref, curr = self._self_test_frames(shift)
+        fwd, _ = self._compute_flows(curr, [ref])[0]
+        y0, y1 = self.h // 4, self.h - self.h // 4
+        x0, x1 = self.w // 4, self.w - self.w // 4
+        crop = fwd[y0:y1, x0:x1] if y1 > y0 and x1 > x0 else fwd
+        mean_x = mx.mean(crop[..., 0])
+        mean_y = mx.mean(crop[..., 1])
+        max_abs = mx.max(mx.abs(fwd))
+        mx.eval(mean_x, mean_y, max_abs)
+        mean_x_f = float(mean_x)
+        mean_y_f = float(mean_y)
+        max_abs_f = float(max_abs)
+        expected = float(shift)
+        if max_abs_f < 0.25:
+            raise RuntimeError(
+                "VTOpticalFlow self-test returned all-zero/near-zero flow for "
+                f"{self.w}x{self.h}; --denoise mc is unsafe on this clip/device."
+            )
+        if (
+            mean_x_f < expected * 0.65
+            or mean_x_f > expected * 1.35
+            or abs(mean_y_f) > max(0.75, expected * 0.5)
+        ):
+            raise RuntimeError(
+                "VTOpticalFlow self-test failed for "
+                f"{self.w}x{self.h}: expected about +{expected:.1f}px horizontal "
+                f"flow, got mean=({mean_x_f:.3f}, {mean_y_f:.3f}), "
+                f"max_abs={max_abs_f:.3f}."
+            )
 
     def reset(self) -> None:
         """Drop temporal history (call at scene cuts)."""

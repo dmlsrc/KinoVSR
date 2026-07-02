@@ -35,7 +35,10 @@ class RealBasicVsrUpscaler(WindowedUpscaler):
         clean_iters: int = 3,
         residual_strength: float = 1.0,
         flow_consistency: float = 0.0,
+        flow_mode: str = "spynet",
     ):
+        if flow_mode not in ("spynet", "zero"):
+            raise ValueError(f"RealBasicVSR flow_mode must be 'spynet' or 'zero'; got {flow_mode!r}")
         self._p = net.load_params(net.resolve_weights(weights))
         t, w = int(trim), int(window)
         if t < 0:
@@ -52,6 +55,7 @@ class RealBasicVsrUpscaler(WindowedUpscaler):
         self._clean_iters = int(clean_iters)
         self._residual_strength = float(residual_strength)
         self._flow_consistency = float(flow_consistency)
+        self._flow_mode = flow_mode
         super().__init__(window=w, trim=t)
 
     def _upscale_window(self, frames: list) -> list:
@@ -62,4 +66,5 @@ class RealBasicVsrUpscaler(WindowedUpscaler):
             clean_iters=self._clean_iters,
             residual_strength=self._residual_strength,
             flow_consistency=self._flow_consistency,
+            flow_mode=self._flow_mode,
         )

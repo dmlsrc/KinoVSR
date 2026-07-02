@@ -31,13 +31,17 @@ class BasicVsrUpscaler(WindowedUpscaler):
     enough lookahead has arrived; flush() drains the tail. Memory is bounded to
     ~`window` buffered LR frames regardless of clip length."""
 
-    def __init__(self, weights: Any = None, window: int = 14, trim: int = 2):
+    def __init__(self, weights: Any = None, window: int = 14, trim: int = 2,
+                 flow_mode: str = "spynet"):
+        if flow_mode not in ("spynet", "zero"):
+            raise ValueError(f"BasicVSR++ flow_mode must be 'spynet' or 'zero'; got {flow_mode!r}")
         self._p = net.load_params(net.resolve_weights(weights))
+        self._flow_mode = flow_mode
         # Window must span both trim edges plus >=1 interior frame to emit.
         super().__init__(window=max(int(window), 2 * int(trim) + 1), trim=trim)
 
     def _upscale_window(self, frames: list) -> list:
-        return net.upscale(frames, self._p)
+        return net.upscale(frames, self._p, flow_mode=self._flow_mode)
 
 
 if __name__ == "__main__":

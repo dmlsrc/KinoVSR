@@ -785,6 +785,7 @@ def run(args: argparse.Namespace) -> None:
                 args.basicvsrpp_weights or os.environ.get("BASICVSRPP_WEIGHTS")
                 or args.basicvsrpp_variant,
                 window=args.basicvsrpp_window, trim=args.basicvsrpp_trim,
+                flow_mode=args.basicvsrpp_flow_mode,
             )
         elif args.spatial_mode == "realbasicvsr":
             from LTX_2_MLX.videotoolbox.realbasicvsr.upscaler import RealBasicVsrUpscaler
@@ -796,6 +797,7 @@ def run(args: argparse.Namespace) -> None:
                 clean_iters=args.realbasicvsr_clean_iters,
                 residual_strength=args.realbasicvsr_residual_strength,
                 flow_consistency=args.realbasicvsr_flow_consistency,
+                flow_mode=args.realbasicvsr_flow_mode,
             )
         elif args.spatial_mode == "realesrgan":
             from LTX_2_MLX.videotoolbox.realesrgan.upscaler import RealEsrganUpscaler
@@ -811,7 +813,12 @@ def run(args: argparse.Namespace) -> None:
             up = EscUpscaler(args.esc_weights)
         elif args.spatial_mode == "realviformer":
             from LTX_2_MLX.videotoolbox.realviformer import RealViformerUpscaler
-            up = RealViformerUpscaler(args.realviformer_weights)
+            up = RealViformerUpscaler(
+                args.realviformer_weights, window=args.realviformer_window,
+                flow_mode=args.realviformer_flow_mode,
+                history_strength=args.realviformer_history_strength,
+                history_gate=args.realviformer_history_gate,
+            )
 
         naf: Any = None
         if args.nafnet != "off":
@@ -1148,6 +1155,8 @@ def run(args: argparse.Namespace) -> None:
             session.close()
         if denoiser is not None:
             denoiser.close()
+        if upscaler is not None and hasattr(upscaler, "close"):
+            upscaler.close()
         if nafnet is not None:
             nafnet.close()
         for writer in (post_writer, comparison_writer):
@@ -1403,9 +1412,10 @@ def main() -> None:
             "correct order - SR amplifies noise). off (default); spatial = "
             "per-frame CoreImage CINoiseReduction (cheap, no temporal state); "
             "mc = motion-compensated temporal denoise via VideoToolbox optical "
-            "flow (recursive, GPU; averages static regions over time without "
-            "ghosting moving edges); fastdvd = FastDVDnet CNN denoiser (MLX, "
-            "learned; causal 5-frame window, strongest denoise, weights bundled). "
+            "flow (Quality tier plus startup self-test; recursive, GPU; averages "
+            "static regions over time without ghosting moving edges); fastdvd = "
+            "FastDVDnet CNN denoiser (MLX, learned; causal 5-frame window, "
+            "strongest denoise, weights bundled). "
             "Enabling denoise routes frames through the MLX upload path instead of "
             "the zero-copy direct feed."
         ),
@@ -1493,6 +1503,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--basicvsrpp-flow-mode", choices=["spynet", "zero"], default="spynet",
+        help=(
+            "Optical-flow source for --spatial-mode basicvsrpp (default spynet). "
+            "zero disables motion compensation while keeping recurrent propagation, "
+            "as a control for flow-painted temporal artifacts."
+        ),
+    )
+    parser.add_argument(
         "--realbasicvsr-weights", default=None, metavar="VARIANT|PATH",
         help=(
             "RealBasicVSR weights for --spatial-mode realbasicvsr: the bundled variant "
@@ -1551,6 +1569,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--realbasicvsr-flow-mode", choices=["spynet", "zero"], default="spynet",
+        help=(
+            "Optical-flow source for --spatial-mode realbasicvsr (default spynet). "
+            "zero disables motion compensation while keeping recurrent propagation, "
+            "as a control for flow-painted temporal artifacts."
+        ),
+    )
+    parser.add_argument(
         "--realesrgan-weights", default=None, metavar="VARIANT|PATH",
         help=(
             "RRDBNet/SRVGG weights for --spatial-mode realesrgan: a variant token or a "
@@ -1578,6 +1604,45 @@ def main() -> None:
             "4x video upscaler (channel-attention transformer); streams frame by frame "
             "with temporal state, reset at cuts. Not bundled; see "
             "videotoolbox/realviformer/weights/README.md."
+        ),
+    )
+    parser.add_argument(
+        "--realviformer-window", type=int, default=100, metavar="N",
+        help=(
+            "Recurrence chunk length (frames) for --spatial-mode realviformer: the "
+            "temporal state resets cold every N frames, matching the reference "
+            "inference's 100-frame chunking (default 100). The reset caps the "
+            "texture-lock etching that unbounded recurrence engraves on long static "
+            "shots, at the cost of a texture refresh at each chunk join (the "
+            "reference tool has the same one). 0 = never reset: unbounded streaming "
+            "recurrence, deeper temporal lock than the released tool ever runs."
+        ),
+    )
+    parser.add_argument(
+        "--realviformer-flow-mode", choices=["spynet", "zero", "vt"], default="spynet",
+        help=(
+            "Optical-flow source for --spatial-mode realviformer (default spynet). "
+            "zero disables motion compensation while keeping recurrent state, "
+            "as a control for flow-painted etching; vt uses VideoToolbox "
+            "VTOpticalFlow in the current-to-previous warp convention."
+        ),
+    )
+    parser.add_argument(
+        "--realviformer-history-strength", type=float, default=1.0, metavar="S",
+        help=(
+            "Scale RealViformer's normalized propagated-history branch before the "
+            "merge FFN (default 1.0 = reference strength). 0 disables temporal "
+            "history while still exercising the recurrent code path; values below "
+            "1 soften temporal etching."
+        ),
+    )
+    parser.add_argument(
+        "--realviformer-history-gate", choices=["off", "improve"], default="off",
+        help=(
+            "History confidence gate for --spatial-mode realviformer. off = "
+            "reference merge. improve = pass history only where the flow-warped "
+            "previous RGB frame improves the current-vs-previous residual; this "
+            "drops ambiguous near-static/compressed regions that otherwise etch."
         ),
     )
     parser.add_argument(
@@ -1703,6 +1768,10 @@ def main() -> None:
                 "--realbasicvsr-window must be greater than 2*--realbasicvsr-trim; "
                 "use --realbasicvsr-trim 0 for reference-like chunks"
             )
+    if args.spatial_mode == "realviformer" and args.realviformer_window < 0:
+        parser.error("--realviformer-window must be >= 0")
+    if args.spatial_mode == "realviformer" and args.realviformer_history_strength < 0:
+        parser.error("--realviformer-history-strength must be >= 0")
 
     if args.mlx_cache_limit_gb and args.mlx_cache_limit_gb > 0:
         mx.set_cache_limit(int(args.mlx_cache_limit_gb * (1000 ** 3)))
