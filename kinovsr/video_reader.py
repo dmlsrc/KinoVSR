@@ -64,27 +64,63 @@ def _assert_decodable(track: Any, path: Path) -> None:
         )
 
 
-def probe_video(path: Path) -> tuple[int, int, float, int, Any]:
-    """(width, height, fps, n_frames, transform) for the first video track.
+def _encoded_dimensions(track: Any) -> tuple[int, int]:
+    """Stored raster dimensions for the first video format description.
 
-    Dimensions are the track's stored naturalSize. `transform` is the track's
+    ``AVAssetTrack.naturalSize`` is a presentation/display size. For anamorphic
+    SD sources it can include pixel-aspect expansion (e.g. 352x288 with SAR
+    128:117 reports as ~385x288), while ``AVAssetReader`` still decodes
+    352x288 pixel buffers. VSR/model geometry must follow the encoded raster.
+    """
+    fmts = track.formatDescriptions()
+    if fmts and len(fmts) > 0:
+        dims = CoreMedia.CMVideoFormatDescriptionGetDimensions(fmts[0])
+        w, h = int(dims.width), int(dims.height)
+        if w > 0 and h > 0:
+            return w, h
+    size = track.naturalSize()
+    return int(round(size.width)), int(round(size.height))
+
+
+def _pixel_aspect_ratio(track: Any) -> tuple[int, int] | None:
+    """Return source pixel aspect ratio as (horizontal, vertical), if tagged."""
+    fmts = track.formatDescriptions()
+    if not fmts or len(fmts) == 0:
+        return None
+    ext = CoreMedia.CMFormatDescriptionGetExtensions(fmts[0]) or {}
+    par = ext.get(CoreMedia.kCMFormatDescriptionExtension_PixelAspectRatio)
+    if not par:
+        return None
+    h = int(par.get(CoreMedia.kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing, 0))
+    v = int(par.get(CoreMedia.kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing, 0))
+    if h <= 0 or v <= 0 or h == v:
+        return None
+    return h, v
+
+
+def probe_video(path: Path) -> tuple[int, int, float, int, Any, tuple[int, int] | None]:
+    """(width, height, fps, n_frames, transform, pixel_aspect) for the first track.
+
+    Dimensions are encoded raster pixels, not display/presentation size.
+    `transform` is the track's
     preferredTransform (a CGAffineTransform) - identity for upright content,
     a rotation/flip for camera footage; the writer applies it as output
     metadata so pixels never need rotating. n_frames is round(duration * fps),
     exact for constant-frame-rate content (everything VSR consumes).
+    ``pixel_aspect`` carries anamorphic display geometry to the writer.
     """
     require_pyobjc()
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)
     _assert_decodable(track, path)
-    size = track.naturalSize()
-    w, h = int(round(size.width)), int(round(size.height))
+    w, h = _encoded_dimensions(track)
     fps = float(track.nominalFrameRate())
     duration = CoreMedia.CMTimeGetSeconds(asset.duration())
     n = int(round(duration * fps)) if fps > 0 else 0
     transform = track.preferredTransform()
-    return w, h, fps, n, transform
+    pixel_aspect = _pixel_aspect_ratio(track)
+    return w, h, fps, n, transform, pixel_aspect
 
 
 def probe_color(path: Path) -> dict:

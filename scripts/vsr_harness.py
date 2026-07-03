@@ -112,6 +112,13 @@ from LTX_2_MLX.videotoolbox.writer import (
 NATIVE_FPS = 24.0
 
 
+def parse_mlx_dtype_name(name: str) -> Any:
+    try:
+        return {"float16": mx.float16, "float32": mx.float32}[name]
+    except KeyError:
+        raise ValueError(f"unknown MLX dtype {name!r}") from None
+
+
 def parse_time_or_frames(spec: str, fps: float) -> int:
     """Convert a position/duration spec to a frame count at `fps`.
 
@@ -453,6 +460,7 @@ def run(args: argparse.Namespace) -> None:
 
     audio_track: AudioTrack | None = None
     src_transform: Any = None  # source rotation/flip (set on the --video path)
+    src_pixel_aspect: tuple[int, int] | None = None
     # Input frame window [loop_win_start, loop_win_end). The --video reader
     # trims at decode time (efficient seek), so for that path these stay
     # (0, None) and the trim happens upstream; the --latent path enforces the
@@ -539,7 +547,7 @@ def run(args: argparse.Namespace) -> None:
         from LTX_2_MLX.videotoolbox.vsr import source_format_for_mode
 
         print(f"Reading video: {args.video}")
-        in_w, in_h, source_fps, total_frames, src_transform = _vr.probe_video(
+        in_w, in_h, source_fps, total_frames, src_transform, src_pixel_aspect = _vr.probe_video(
             Path(args.video),
         )
         _src_color = _vr.probe_color(Path(args.video))
@@ -646,6 +654,8 @@ def run(args: argparse.Namespace) -> None:
         f"total frames: {total_frames or 'unknown'}, "
         f"fps: {source_fps:.3f}"
     )
+    if src_pixel_aspect is not None:
+        print(f"Source pixel aspect: {src_pixel_aspect[0]}:{src_pixel_aspect[1]}")
     print(
         f"Target: {out_w}x{out_h} (spatial {spatial_scale}x), "
         f"fps: {target_fps:.3f}"
@@ -721,6 +731,7 @@ def run(args: argparse.Namespace) -> None:
                 transform=src_transform,
                 source_attrs=producer_attrs,
                 color_props=color_props,
+                pixel_aspect=src_pixel_aspect,
                 cv_color=cv_color,
                 full_range=output_full_range,
                 **audio_kwargs,
@@ -739,6 +750,7 @@ def run(args: argparse.Namespace) -> None:
                 quality=args.encode_quality,
                 label="comparison",
                 color_props=color_props,
+                pixel_aspect=src_pixel_aspect,
                 **audio_kwargs,
             )
 
@@ -819,9 +831,14 @@ def run(args: argparse.Namespace) -> None:
             from LTX_2_MLX.videotoolbox.realviformer import RealViformerUpscaler
             up = RealViformerUpscaler(
                 args.realviformer_weights, window=args.realviformer_window,
+                dtype=parse_mlx_dtype_name(args.realviformer_dtype),
                 flow_mode=args.realviformer_flow_mode,
                 history_strength=args.realviformer_history_strength,
                 history_gate=args.realviformer_history_gate,
+                history_cleanup=args.realviformer_history_cleanup,
+                history_gate_drop=args.realviformer_history_gate_drop,
+                history_risk_decay=args.realviformer_history_risk_decay,
+                history_static_cap=args.realviformer_history_static_cap,
             )
 
         naf: Any = None
@@ -1653,6 +1670,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--realviformer-dtype", choices=["float16", "float32"], default="float16",
+        help=(
+            "Compute/weight dtype for --spatial-mode realviformer. float16 is the "
+            "default MLX fast path; float32 is closer to the PyTorch reference and "
+            "useful when isolating recurrent-flow artifacts."
+        ),
+    )
+    parser.add_argument(
         "--realviformer-window", type=int, default=100, metavar="N",
         help=(
             "Recurrence chunk length (frames) for --spatial-mode realviformer: the "
@@ -1683,12 +1708,43 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--realviformer-history-gate", choices=["off", "improve"], default="off",
+        "--realviformer-history-gate", choices=["off", "improve", "holistic"], default="off",
         help=(
             "History confidence gate for --spatial-mode realviformer. off = "
             "reference merge. improve = pass history only where the flow-warped "
             "previous RGB frame improves the current-vs-previous residual; this "
-            "drops ambiguous near-static/compressed regions that otherwise etch."
+            "drops ambiguous near-static/compressed regions that otherwise etch. "
+            "holistic = opt-in HSA-lite risk policy: relative warp benefit + match "
+            "confidence + risk memory, with optional hidden-state cleanup."
+        ),
+    )
+    parser.add_argument(
+        "--realviformer-history-cleanup", type=float, default=0.25, metavar="S",
+        help=(
+            "For --realviformer-history-gate holistic, max blend toward a 3x3 "
+            "box-blurred warped hidden state in risky regions (default 0.25)."
+        ),
+    )
+    parser.add_argument(
+        "--realviformer-history-gate-drop", type=float, default=0.85, metavar="S",
+        help=(
+            "For --realviformer-history-gate holistic, max fraction of temporal "
+            "history gate removed in risky regions (default 0.85)."
+        ),
+    )
+    parser.add_argument(
+        "--realviformer-history-risk-decay", type=float, default=0.80, metavar="S",
+        help=(
+            "For --realviformer-history-gate holistic, decay for the flow-warped "
+            "risk memory between frames (default 0.80; must be <1)."
+        ),
+    )
+    parser.add_argument(
+        "--realviformer-history-static-cap", type=float, default=0.0, metavar="S",
+        help=(
+            "For --realviformer-history-gate holistic, capped confidence admitted "
+            "for perfectly static regions (default 0.0 until long-static etch "
+            "tests prove a nonzero cap is safe)."
         ),
     )
     parser.add_argument(
@@ -1818,6 +1874,15 @@ def main() -> None:
         parser.error("--realviformer-window must be >= 0")
     if args.spatial_mode == "realviformer" and args.realviformer_history_strength < 0:
         parser.error("--realviformer-history-strength must be >= 0")
+    if args.spatial_mode == "realviformer":
+        if not 0.0 <= args.realviformer_history_cleanup <= 1.0:
+            parser.error("--realviformer-history-cleanup must be in [0, 1]")
+        if not 0.0 <= args.realviformer_history_gate_drop <= 1.0:
+            parser.error("--realviformer-history-gate-drop must be in [0, 1]")
+        if not 0.0 <= args.realviformer_history_risk_decay < 1.0:
+            parser.error("--realviformer-history-risk-decay must be in [0, 1)")
+        if not 0.0 <= args.realviformer_history_static_cap <= 1.0:
+            parser.error("--realviformer-history-static-cap must be in [0, 1]")
 
     if args.mlx_cache_limit_gb and args.mlx_cache_limit_gb > 0:
         mx.set_cache_limit(int(args.mlx_cache_limit_gb * (1000 ** 3)))

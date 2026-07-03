@@ -12,6 +12,7 @@ flow_warp.
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import mlx.core as mx
@@ -71,6 +72,23 @@ def flow_warp(x: Any, flow: Any, pad: str = "zeros") -> Any:
     return _bilinear(x, sy, sx, pad)
 
 
+def box3(x: Any) -> Any:
+    """Replicate-padded 3x3 mean for NHWC tensors.
+
+    Used for cheap hidden-state cleanup/risk smoothing. Avoids MLX grouped
+    conv's slow path for small depthwise filters.
+    """
+    _, h, w, _ = x.shape
+    yp = mx.concatenate([x[:, :1], x, x[:, -1:]], axis=1)
+    xp = mx.concatenate([yp[:, :, :1], yp, yp[:, :, -1:]], axis=2)
+    acc = None
+    for i in range(3):
+        for j in range(3):
+            t = xp[:, i:i + h, j:j + w, :]
+            acc = t if acc is None else acc + t
+    return (acc / 9.0).astype(x.dtype)
+
+
 def history_improve_gate(curr: Any, prev: Any, flow: Any, dtype: Any,
                          strength: float = 1.0) -> Any:
     """Per-pixel history-admission gate in [0, strength], shape (N,H,W,1).
@@ -121,6 +139,18 @@ def _avgpool2(x: Any) -> Any:
     return x.reshape(n, h // 2, 2, w // 2, 2, c).mean(axis=(2, 4))
 
 
+def _replicate_pad_to(x: Any, oh: int, ow: int) -> Any:
+    """Replicate-pad bottom/right to an exact spatial size."""
+    h, w = x.shape[1], x.shape[2]
+    if h < oh:
+        rows = mx.broadcast_to(x[:, -1:, :, :], (x.shape[0], oh - h, w, x.shape[3]))
+        x = mx.concatenate([x, rows], axis=1)
+    if w < ow:
+        cols = mx.broadcast_to(x[:, :, -1:, :], (x.shape[0], x.shape[1], ow - w, x.shape[3]))
+        x = mx.concatenate([x, cols], axis=2)
+    return x
+
+
 # ---- SPyNet ----------------------------------------------------------------
 def pad_spynet_gates(p: dict) -> None:
     """Zero-pad each SPyNet basic module's FIRST conv from 8 to 16 input channels
@@ -154,16 +184,21 @@ def spynet_flow(p: dict, ref: Any, supp: Any) -> Any:
     mean, std = p["spynet.mean"], p["spynet.std"]
     refs = [(ref - mean) / std]
     supps = [(supp - mean) / std]
-    for _ in range(5):
+    levels = 6 if w_up > 32 else max(1, int(math.log2(w_up)))
+    for _ in range(levels - 1):
         refs.append(_avgpool2(refs[-1]))
         supps.append(_avgpool2(supps[-1]))
     refs = refs[::-1]
     supps = supps[::-1]
-    flow = mx.zeros((n, h_up // 32, w_up // 32, 2), dtype=ref.dtype)   # keep flow in the feature dtype
+    # Match BasicSR/RealViformer SPyNet exactly: the initial flow is half the
+    # coarsest pyramid level, then every level starts with 2x upsampling and
+    # replicate bottom/right padding if the coarsest level is odd.
+    flow = mx.zeros((n, refs[0].shape[1] // 2, refs[0].shape[2] // 2, 2), dtype=ref.dtype)
     # Gate-padded first conv (pad_spynet_gates): append zero channels to match.
     inp_pad = p["spynet.basic_module.0.basic_module.0.conv.weight"].shape[-1] - 8
-    for lvl in range(6):
-        flow_up = flow if lvl == 0 else resize(flow, flow.shape[1] * 2, flow.shape[2] * 2, True) * 2.0
+    for lvl in range(levels):
+        flow_up = resize(flow, flow.shape[1] * 2, flow.shape[2] * 2, True) * 2.0
+        flow_up = _replicate_pad_to(flow_up, refs[lvl].shape[1], refs[lvl].shape[2])
         warped = flow_warp(supps[lvl], flow_up, "border")
         parts = [refs[lvl], warped, flow_up]                          # (N,h,w,8)
         if inp_pad:
@@ -245,7 +280,7 @@ _VT_FLOW_CACHE: dict = {}
 def _vt_flow_service(w: int, h: int):
     key = (int(w), int(h))
     if key not in _VT_FLOW_CACHE:
-        from .denoise import McTemporalDenoiser   # lazy: pyobjc + VT session
+        from .denoise import McTemporalDenoiser   # noqa: I001  # lazy: pyobjc + VT session
         _VT_FLOW_CACHE[key] = McTemporalDenoiser(
             w, h, strength=0.0, window=1, self_test=True)
     return _VT_FLOW_CACHE[key]
@@ -281,7 +316,7 @@ def _compute_flows(frames: list, p: dict, flow_mode: str = "spynet") -> tuple:
     """flows_forward[i] = flow(i+1 -> i); flows_backward[i] = flow(i -> i+1).
 
     Each flow is materialized as computed: SPyNet upsizes to a multiple of 32 and
-    builds a 6-level pyramid, so holding all 2*(T-1) of them as one lazy graph
+    builds the BasicSR pyramid, so holding all 2*(T-1) of them as one lazy graph
     spikes memory; per-flow eval keeps only the small (H,W,2) results alive."""
     if flow_mode == "zero":
         zeros = [mx.zeros((*frames[0].shape[:3], 2), dtype=frames[0].dtype)

@@ -28,14 +28,17 @@ HEVC_PROFILE_MAIN422_10 = "HEVC_Main42210_AutoLevel"   # 4:2:2 10-bit (Range Ext
 def hevc_video_settings(
     width: int, height: int, quality: float, profile: str,
     color_props: dict | None = None,
+    pixel_aspect: tuple[int, int] | None = None,
 ) -> dict:
     """AVAssetWriterInput output settings for HEVC at the given size + profile.
 
     ``color_props`` is an AVVideoColorPropertiesKey dict (primaries/transfer/
     matrix) tagging the output to match the source; defaults to BT.709.
+    ``pixel_aspect`` preserves anamorphic source display geometry while the
+    encoded raster stays in model/VSR pixel coordinates.
     """
     require_pyobjc()
-    return {
+    settings = {
         av.AVVideoCodecKey: av.AVVideoCodecTypeHEVC,
         av.AVVideoWidthKey: width,
         av.AVVideoHeightKey: height,
@@ -49,6 +52,13 @@ def hevc_video_settings(
             av.AVVideoQualityKey: quality,
         },
     }
+    if pixel_aspect is not None:
+        h, v = pixel_aspect
+        settings[av.AVVideoPixelAspectRatioKey] = {
+            av.AVVideoPixelAspectRatioHorizontalSpacingKey: int(h),
+            av.AVVideoPixelAspectRatioVerticalSpacingKey: int(v),
+        }
+    return settings
 
 
 def _color_label(color_props: dict | None) -> str:
@@ -95,6 +105,7 @@ class AVWriter:
         transform: Any = None,
         source_attrs: dict | None = None,
         color_props: dict | None = None,
+        pixel_aspect: tuple[int, int] | None = None,
         cv_color: tuple | None = None,
         full_range: bool = False,
     ):
@@ -111,7 +122,8 @@ class AVWriter:
 
         # Video input + pixel buffer adaptor ---------------------------------
         video_input = av.AVAssetWriterInput.assetWriterInputWithMediaType_outputSettings_(
-            av.AVMediaTypeVideo, hevc_video_settings(width, height, quality, profile, color_props),
+            av.AVMediaTypeVideo,
+            hevc_video_settings(width, height, quality, profile, color_props, pixel_aspect),
         )
         video_input.setExpectsMediaDataInRealTime_(False)
         # Carry the source track's rotation/flip as output metadata. The pixels
