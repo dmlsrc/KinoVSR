@@ -222,8 +222,42 @@ Per-frame processing cost, fp16, compiled, capped cache. Preprocessors:
 | fbcnn deblock | ~230 | flat U-Net; audited, nothing actionable |
 | nafnet gopro (fp32) | ~340 | 1.4x (manual depthwise) |
 
+Decoded RGBAHalf video can carry legal YUV->RGB overshoot outside [0,1]
+(observed around -0.4..1.25 on saturated compressed SD material). Learned
+preprocessors are trained on clipped RGB, so their entry points clamp before
+inference rather than suppressing large residuals afterward. On the 640x480
+news stress clip, this changes the failure mode directly: GoPro32 residuals
+on frame 60 drop from mean 9.92 to 2.44 when NAFNet sees clipped input, and
+FBCNN->GoPro32 on frame 115 drops from mean 0.067 to 0.030 when FBCNN also
+gets clipped input. Blocky sources can still need an upstream deblocker, but
+the model input domain must be fixed first.
+
 The full upscaler ladder (all parity-gated against independent torch
 reimplementations and visually verified on real motion-blurred video):
+
+NAFNet's official GoPro/REDS eval configs instantiate `NAFNetLocal`, not plain
+`NAFNet`: their TLC/TLSC converter replaces each SCA global average pool with a
+fixed local-window average pool, with window sizes frozen by a dummy 256x256
+training-crop forward. SIDD denoise configs stay plain `NAFNet`. The harness
+default is `--nafnet-pool auto`, which follows the selected variant:
+GoPro/GoPro32/REDS -> local, SIDD/SIDD32 -> global. `--nafnet-pool global`
+disables TLSC for deblur checkpoints and keeps the plain global-pooling behavior
+suggested in upstream artifact discussions as a possible out-of-distribution
+fallback. Keep the resolved mode explicit in reports.
+
+GoPro/GoPro32 NAFNet can still resonate on periodic compression/scanline luma
+structure: the deep SimpleGate + SCA stack turns a block lattice into a residual
+lattice. After compressed/scanline clips still corrupted under forced
+`control-source`, `--nafnet-guard auto` is deliberately conservative: it
+defaults to `reject` for the GoPro variants and `off` elsewhere. Reject mode
+keeps healthy frames bit-exact, but when the residual magnitude or high-pass
+residual structure exceeds `--nafnet-guard-threshold` (default 0.12), it rejects
+NAFNet for that shot and returns the input until reset. The older experimental
+guards remain explicit A/B tools: `residual` applies an output-side soft knee,
+`control` does regional two-pass luma-control blending, `control-source`
+predicts a whole-frame residual from a luma-control input, and `fast` applies
+compiled single-pass residual attenuation. Use `--nafnet-guard off` for raw
+model A/Bs.
 
 | ms/frame | --spatial-mode / weights | character |
 | --- | --- | --- |

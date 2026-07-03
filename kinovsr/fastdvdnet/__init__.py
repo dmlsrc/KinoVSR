@@ -319,6 +319,7 @@ class FastDvdDenoiser:
 
     def feed(self, frame: Any, token: Any = None) -> list:
         """Buffer one input frame; return [(denoised, token), ...] now ready."""
+        frame = mx.clip(frame[..., :3].astype(mx.float32), 0.0, 1.0)
         padded = _reflect_pad_to4(frame[None].astype(self.net.dtype))[0]
         if self._nm is None:
             _, hp, wp, _ = padded.shape

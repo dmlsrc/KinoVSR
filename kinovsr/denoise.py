@@ -93,6 +93,7 @@ class SpatialDenoiser:
     def denoise(self, rgb_f32: Any) -> Any:
         # fp16 in / fp16 out: feed CoreImage a half-float CIImage and render back
         # to half-float (kCIFormatRGBAh), so no 8-bit quantization round trip.
+        rgb_f32 = mx.clip(rgb_f32[..., :3].astype(mx.float32), 0.0, 1.0)
         h, w = int(rgb_f32.shape[0]), int(rgb_f32.shape[1])
         rgba = mx.concatenate(
             [rgb_f32.astype(mx.float16), mx.ones((h, w, 1), dtype=mx.float16)], axis=-1,
@@ -388,6 +389,7 @@ class McTemporalDenoiser:
         return w
 
     def denoise(self, rgb_f32: Any) -> Any:
+        rgb_f32 = mx.clip(rgb_f32[..., :3].astype(mx.float32), 0.0, 1.0)
         refs = ([self._prev] if self._prev is not None else []) if self.window == 0 \
             else list(self._hist)
         if not refs:

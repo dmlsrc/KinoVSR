@@ -213,3 +213,230 @@ def test_pth_converter_refuses_ambiguous_params_dict(tmp_path):
     assert result.returncode == 1
     assert "checkpoint carries BOTH 'params' and 'params_ema'" in result.stderr
     assert not out.exists()
+
+
+def test_nafnet_model_rgb_clips_decode_overshoot():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import model_rgb
+
+    rgb = mx.array([[[[-0.25, 0.5, 1.25, 42.0]]]], dtype=mx.float32)
+    inp = model_rgb(rgb)
+    mx.eval(inp)
+    assert inp.shape == (1, 1, 1, 3)
+    assert float(mx.min(inp)) == 0.0
+    assert float(mx.max(inp)) == 1.0
+    assert float(inp[0, 0, 0, 1]) == 0.5
+
+
+def test_nafnet_restorer_rejects_bad_pool_mode_before_loading_weights():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import resolve_pool_mode
+
+    with pytest.raises(ValueError, match="pool_mode"):
+        resolve_pool_mode("gopro32", pool_mode="bogus")
+
+
+def test_nafnet_pool_auto_matches_reference_variants():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import resolve_pool_mode
+
+    assert resolve_pool_mode("gopro", pool_mode="auto") == "local"
+    assert resolve_pool_mode("gopro32", pool_mode="auto") == "local"
+    assert resolve_pool_mode("reds", pool_mode="auto") == "local"
+    assert resolve_pool_mode("sidd", pool_mode="auto") == "global"
+    assert resolve_pool_mode("sidd32", pool_mode="auto") == "global"
+    assert resolve_pool_mode("/tmp/nafnet_sidd_width64.safetensors", pool_mode="auto") == "global"
+
+    with pytest.raises(ValueError, match="cannot infer"):
+        resolve_pool_mode("/tmp/custom.safetensors", pool_mode="auto")
+
+
+def test_nafnet_guard_auto_protects_gopro_variants_only():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import resolve_guard_mode
+
+    assert resolve_guard_mode("gopro", guard_mode="auto") == "reject"
+    assert resolve_guard_mode("gopro32", guard_mode="auto") == "reject"
+    assert resolve_guard_mode("sidd", guard_mode="auto") == "off"
+    assert resolve_guard_mode("sidd32", guard_mode="auto") == "off"
+    assert resolve_guard_mode("reds", guard_mode="auto") == "off"
+    assert resolve_guard_mode("gopro32", guard_mode="residual") == "residual"
+    assert resolve_guard_mode("sidd", guard_mode="control") == "control"
+    assert resolve_guard_mode("gopro32", guard_mode="control-source") == "control-source"
+    assert resolve_guard_mode("gopro32", guard_mode="fast") == "fast"
+    assert resolve_guard_mode("gopro32", guard_mode="reject") == "reject"
+
+    with pytest.raises(ValueError, match="guard_mode"):
+        resolve_guard_mode("gopro32", guard_mode="bogus")
+
+
+def test_nafnet_residual_guard_map_quadratic_knee():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import residual_guard_map
+
+    low = mx.full((1, 7, 7, 3), 0.06)
+    high = mx.full((1, 7, 7, 3), 0.24)
+    low_knee = residual_guard_map(low, guard=0.12)
+    high_knee = residual_guard_map(high, guard=0.12)
+    mx.eval(low_knee, high_knee)
+
+    assert float(mx.min(low_knee)) == 1.0
+    assert abs(float(mx.mean(high_knee)) - 0.25) < 1e-6
+
+
+def test_nafnet_guard_probe_map_marks_framewide_risk():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import guard_probe_map
+
+    safe = mx.full((1, 9, 9, 3), 0.02)
+    risky = mx.full((1, 9, 9, 3), 0.08)
+    safe_probe = guard_probe_map(safe, guard=0.12)
+    risky_probe = guard_probe_map(risky, guard=0.12)
+    mx.eval(safe_probe, risky_probe)
+
+    assert float(mx.max(safe_probe)) == 0.0
+    assert 0.2 < float(mx.mean(risky_probe)) < 0.4
+
+
+def test_nafnet_guard_probe_map_marks_low_amplitude_structure():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import guard_probe_map
+
+    rows = [[0.04 if r % 2 else -0.04 for _c in range(9)] for r in range(9)]
+    residual = mx.array([[[[v, v, v] for v in row] for row in rows]], dtype=mx.float32)
+    risk = guard_probe_map(residual, guard=0.12)
+    mx.eval(risk)
+
+    assert float(mx.max(risk)) > 0.1
+
+
+def test_nafnet_luma_control_smooths_vertical_luma_not_chroma():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import luma_control_input
+
+    rgb = mx.array(
+        [[
+            [[0.0, 0.0, 0.0]],
+            [[0.9, 0.9, 0.9]],
+            [[0.0, 0.0, 0.0]],
+        ]],
+        dtype=mx.float32,
+    )
+    control = luma_control_input(rgb)
+    mx.eval(control)
+
+    assert control.shape == rgb.shape
+    assert 0.29 < float(control[0, 1, 0, 0]) < 0.31
+    assert 0.29 < float(control[0, 0, 0, 0]) < 0.31
+    assert float(mx.max(mx.abs((control[..., :1] - control[..., 1:2])))) == 0.0
+
+
+def test_nafnet_control_risk_map_uses_residual_disagreement():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import control_risk_map
+
+    residual = mx.full((1, 9, 9, 3), 0.08)
+    control_residual = mx.zeros((1, 9, 9, 3))
+    risk = control_risk_map(residual, control_residual, guard=0.12)
+    mx.eval(risk)
+    assert float(mx.min(risk[:, 2:-2, 2:-2])) > 0.7
+
+    same = control_risk_map(residual, residual, guard=0.12)
+    mx.eval(same)
+    assert float(mx.max(same)) < 0.5
+
+
+def test_nafnet_control_guard_framewide_risk_locks_to_control_source():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import NafnetRestorer
+
+    restorer = object.__new__(NafnetRestorer)
+    restorer._guard = 0.12
+    restorer._guard_fast_fraction = 0.5
+    restorer._control_source_locked = False
+    restorer._guarded_frames = 0
+    messages: list[str] = []
+    restorer._progress_message = messages.append
+
+    def control_source(inp):
+        return inp + 0.25
+
+    restorer._control_source_fwd = control_source
+    inp = mx.zeros((1, 9, 9, 3), dtype=mx.float32)
+    out = mx.full((1, 9, 9, 3), 0.5, dtype=mx.float32)
+    guarded = restorer._apply_control_guard(inp, out)
+    mx.eval(guarded)
+
+    assert restorer._control_source_locked
+    assert abs(float(mx.mean(guarded)) - 0.25) < 1e-6
+    assert messages and "control-source guard" in messages[0]
+
+
+def test_nafnet_reject_guard_locks_out_bad_residual_and_reset_clears_it():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import NafnetRestorer
+
+    restorer = object.__new__(NafnetRestorer)
+    restorer._guard = 0.12
+    restorer._control_source_locked = True
+    restorer._reject_locked = False
+    restorer._guarded_frames = 0
+    messages: list[str] = []
+    restorer._progress_message = messages.append
+
+    inp = mx.zeros((1, 9, 9, 3), dtype=mx.float32)
+    out = mx.full((1, 9, 9, 3), 0.5, dtype=mx.float32)
+    guarded = restorer._apply_reject_guard(inp, out)
+    mx.eval(guarded)
+
+    assert restorer._reject_locked
+    assert float(mx.max(guarded)) == 0.0
+    assert messages and "reject guard" in messages[0]
+
+    restorer.reset()
+    assert not restorer._reject_locked
+    assert not restorer._control_source_locked
+    assert restorer._guarded_frames == 0
+
+
+def test_nafnet_guard_notice_uses_progress_callback(capsys):
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import NafnetRestorer
+
+    restorer = object.__new__(NafnetRestorer)
+    restorer._guard = 0.12
+    restorer._guarded_frames = 0
+    messages: list[str] = []
+    restorer._progress_message = messages.append
+
+    restorer._notice_once("control", peak=0.5, frac=0.25)
+    restorer._notice_once("control", peak=0.6, frac=0.5)
+
+    assert capsys.readouterr().out == ""
+    assert len(messages) == 1
+    assert messages[0].startswith("[nafnet] control guard:")
+
+
+def test_nafnet_tlsc_windows_match_reference_dummy_crop_scales():
+    from LTX_2_MLX.videotoolbox.nafnet import net
+
+    cfg = (32, (1, 1, 1, 28), 1, (1, 1, 1, 1))
+    assert net._tlsc_kernel("encoders.0.0.sca.1", cfg) == (384, 384)
+    assert net._tlsc_kernel("encoders.1.0.sca.1", cfg) == (192, 192)
+    assert net._tlsc_kernel("encoders.3.0.sca.1", cfg) == (48, 48)
+    assert net._tlsc_kernel("middle_blks.0.sca.1", cfg) == (24, 24)
+    assert net._tlsc_kernel("decoders.0.0.sca.1", cfg) == (48, 48)
+    assert net._tlsc_kernel("decoders.3.0.sca.1", cfg) == (384, 384)
+
+
+def test_nafnet_local_avg_pool_matches_reference_padding():
+    from LTX_2_MLX.videotoolbox.nafnet import net
+
+    h, w = 5, 6
+    values = [[r * w + c for c in range(w)] for r in range(h)]
+    x = mx.array([[[[float(values[r][c])] for c in range(w)] for r in range(h)]])
+    out = net._local_avg_pool2d(x, (3, 4))
+    mx.eval(out)
+
+    inner = []
+    for r in range(h - 3 + 1):
+        row = []
+        for c in range(w - 4 + 1):
+            total = sum(values[rr][cc] for rr in range(r, r + 3) for cc in range(c, c + 4))
+            row.append(total / 12.0)
+        inner.append(row)
+
+    expected = []
+    for r in [0, 0, 1, 2, 2]:
+        expected.append([inner[r][c] for c in [0, 0, 1, 2, 2, 2]])
+
+    actual = [[float(out[0, r, c, 0]) for c in range(w)] for r in range(h)]
+    assert actual == expected

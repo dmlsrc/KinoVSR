@@ -4,8 +4,10 @@ basicsr/models/archs/NAFNet_arch.py as a spec; no upstream code run.
 
 A residual U-Net of NAFBlocks. Each NAFBlock has no nonlinear activations: it uses
 SimpleGate (split channels in half, multiply) instead of GELU/ReLU, and a Simplified
-Channel Attention (global-avg-pool -> 1x1 conv -> multiply). Two residual sub-blocks
-with learnable per-channel scales beta/gamma:
+Channel Attention (avg-pool -> 1x1 conv -> multiply). The official NAFNetLocal
+test configs replace the global pool with TLC/TLSC local pooling at inference; this
+port supports both the reference-default local mode and the plain NAFNet global mode.
+Two residual sub-blocks with learnable per-channel scales beta/gamma:
   x = norm1(inp); x = conv1(1x1) -> conv2(3x3 depthwise) -> SimpleGate -> x*SCA(x)
       -> conv3(1x1);  y = inp + beta*x
   x = conv4(1x1, on norm2(y)) -> SimpleGate -> conv5(1x1);  out = y + gamma*x
@@ -30,6 +32,7 @@ from ..compile_cache import cached as _cached
 from ..weights import resolve_weights as _resolve_weights
 
 _WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
+_TLSC_TRAIN_HW = (256, 256)
 # NAFNet task variants (same arch, different training + width); not bundled (see
 # weights/README.md). width64 = quality, width32 = ~4x faster per frame.
 _VARIANTS = {
@@ -147,19 +150,92 @@ def _simplegate(x: Any) -> Any:
     return x[..., :c] * x[..., c:]
 
 
-def _sca(x: Any, p: dict, key: str) -> Any:
-    """Simplified channel attention: global avg pool -> 1x1 conv -> per-channel scale."""
-    pooled = mx.mean(x, axis=(1, 2), keepdims=True)          # (N,1,1,C)
+def _tlsc_kernel(key: str, cfg: tuple, train_hw: tuple[int, int] = _TLSC_TRAIN_HW) -> tuple[int, int]:
+    """NAFNetLocal's frozen local-pool window for one SCA site.
+
+    The reference convert() pass first runs a dummy crop through the net, so each
+    AvgPool2d lazily fixes its kernel from the training crop feature-map size. At
+    real inference the kernel stays fixed; it is not recomputed from the frame size.
+    """
+    _, enc_nums, _, _ = cfg
+    n_stages = len(enc_nums)
+    train_h, train_w = train_hw
+    padder = 2 ** n_stages
+    crop_h = train_h + (-train_h) % padder
+    crop_w = train_w + (-train_w) % padder
+
+    if key.startswith("encoders."):
+        stage = int(key.split(".")[1])
+        div = 2 ** stage
+    elif key.startswith("middle_blks."):
+        div = 2 ** n_stages
+    elif key.startswith("decoders."):
+        stage = int(key.split(".")[1])
+        div = 2 ** (n_stages - 1 - stage)
+    else:
+        div = 1
+
+    base_h = int(train_h * 1.5)
+    base_w = int(train_w * 1.5)
+    feat_h = crop_h // div
+    feat_w = crop_w // div
+    return max(1, feat_h * base_h // train_h), max(1, feat_w * base_w // train_w)
+
+
+def _local_avg_pool2d(x: Any, kernel: tuple[int, int]) -> Any:
+    """NAFNetLocal/TLC AvgPool2d, NHWC, fast_imp=False, auto_pad=True."""
+    h, w = x.shape[1], x.shape[2]
+    kh, kw = kernel
+    if kh >= h and kw >= w:
+        return mx.mean(x, axis=(1, 2), keepdims=True)
+
+    kh = min(h, kh)
+    kw = min(w, kw)
+    s = mx.cumsum(mx.cumsum(x, axis=2), axis=1)
+    s = mx.pad(s, [(0, 0), (1, 0), (1, 0), (0, 0)])
+    out = s[:, kh:, kw:, :] + s[:, :-kh, :-kw, :] - s[:, :-kh, kw:, :] - s[:, kh:, :-kw, :]
+    out = out / (kh * kw)
+
+    oh, ow = out.shape[1], out.shape[2]
+    pad_top = (h - oh) // 2
+    pad_bottom = (h - oh + 1) // 2
+    pad_left = (w - ow) // 2
+    pad_right = (w - ow + 1) // 2
+    return mx.pad(out, [(0, 0), (pad_top, pad_bottom), (pad_left, pad_right), (0, 0)], mode="edge")
+
+
+def _sca(
+    x: Any,
+    p: dict,
+    key: str,
+    cfg: tuple,
+    pool_mode: str = "local",
+    tlsc_train_hw: tuple[int, int] = _TLSC_TRAIN_HW,
+) -> Any:
+    """Simplified channel attention: avg pool -> 1x1 conv -> per-channel scale."""
+    if pool_mode == "local":
+        pooled = _local_avg_pool2d(x, _tlsc_kernel(key, cfg, tlsc_train_hw))
+    elif pool_mode == "global":
+        pooled = mx.mean(x, axis=(1, 2), keepdims=True)      # (N,1,1,C)
+    else:
+        raise ValueError(f"unknown NAFNet pool_mode {pool_mode!r}")
     return _conv(pooled, p, key)
 
 
-def _naf_block(x: Any, p: dict, prefix: str) -> Any:
+def _naf_block(
+    x: Any,
+    p: dict,
+    prefix: str,
+    cfg: tuple,
+    pool_mode: str,
+    tlsc_train_hw: tuple[int, int],
+) -> Any:
     inp = x
     y = _layernorm(x, p[f"{prefix}.norm1.weight"], p[f"{prefix}.norm1.bias"])
     y = _conv(y, p, f"{prefix}.conv1")                       # 1x1, c -> 2c
     y = _depthwise3x3(y, p, f"{prefix}.conv2")               # 3x3 depthwise (manual shift-add)
     y = _simplegate(y)                                       # 2c -> c
-    y = y * _sca(y, p, f"{prefix}.sca.1")
+    y = y * _sca(y, p, f"{prefix}.sca.1", cfg, pool_mode, tlsc_train_hw)
     y = _conv(y, p, f"{prefix}.conv3")                       # 1x1, c -> c
     x = inp + y * p[f"{prefix}.beta"]
     z = _layernorm(x, p[f"{prefix}.norm2.weight"], p[f"{prefix}.norm2.bias"])
@@ -187,7 +263,14 @@ def _pad(x: Any, m: int) -> Any:
     return x
 
 
-def nafnet(inp: Any, p: dict, cfg: tuple | None = None, strength: float = 1.0) -> Any:
+def nafnet(
+    inp: Any,
+    p: dict,
+    cfg: tuple | None = None,
+    strength: float = 1.0,
+    pool_mode: str = "local",
+    tlsc_train_hw: tuple[int, int] = _TLSC_TRAIN_HW,
+) -> Any:
     """Restore one batch. inp: (N,H,W,3) in [0,1]. strength scales the predicted residual
     (out = inp + strength*body(inp); 1.0 = full, <1 = light). Returns (N,H,W,3)."""
     if cfg is None:
@@ -202,17 +285,17 @@ def nafnet(inp: Any, p: dict, cfg: tuple | None = None, strength: float = 1.0) -
     encs = []
     for i in range(n_stages):
         for b in range(enc_nums[i]):
-            x = _naf_block(x, p, f"encoders.{i}.{b}")
+            x = _naf_block(x, p, f"encoders.{i}.{b}", cfg, pool_mode, tlsc_train_hw)
         encs.append(x)
         x = _conv(x, p, f"downs.{i}", stride=2)             # 2x2 stride-2, chan -> 2*chan
     for b in range(mid_num):
-        x = _naf_block(x, p, f"middle_blks.{b}")
+        x = _naf_block(x, p, f"middle_blks.{b}", cfg, pool_mode, tlsc_train_hw)
     for i in range(n_stages):
         x = mx.conv2d(x, p[f"ups.{i}.0.weight"], padding=0)  # 1x1, no bias
         x = _pixel_shuffle(x, 2)                            # -> chan/2 at 2x
         x = x + encs[n_stages - 1 - i]
         for b in range(dec_nums[i]):
-            x = _naf_block(x, p, f"decoders.{i}.{b}")
+            x = _naf_block(x, p, f"decoders.{i}.{b}", cfg, pool_mode, tlsc_train_hw)
     residual = _conv(x, p, "ending", pad=1)                 # 3x3, width -> 3
     out = x_pad + strength * residual
     return out[:, :h, :w, :]
@@ -221,18 +304,32 @@ def nafnet(inp: Any, p: dict, cfg: tuple | None = None, strength: float = 1.0) -
 _COMPILE_CACHE: dict = {}
 
 
-def make_forward(p: dict, strength: float = 1.0, cfg: tuple | None = None, compile: bool = True):
+def make_forward(
+    p: dict,
+    strength: float = 1.0,
+    cfg: tuple | None = None,
+    compile: bool = True,
+    pool_mode: str = "local",
+    tlsc_train_hw: tuple[int, int] = _TLSC_TRAIN_HW,
+):
     """Per-frame forward x -> restored image for a fixed strength, mx.compiled once per
     checkpoint + strength (pair with a capped MLX cache, which the harness sets)."""
     if cfg is None:
         cfg = _config(p)
 
     def run(x):
-        return nafnet(x, p, cfg=cfg, strength=strength)
+        return nafnet(
+            x, p, cfg=cfg, strength=strength,
+            pool_mode=pool_mode, tlsc_train_hw=tlsc_train_hw,
+        )
 
     if not compile:
         return run
-    return _cached(_COMPILE_CACHE, (id(p), float(strength), cfg), lambda: mx.compile(run))
+    return _cached(
+        _COMPILE_CACHE,
+        (id(p), float(strength), cfg, pool_mode, tlsc_train_hw),
+        lambda: mx.compile(run),
+    )
 
 
 if __name__ == "__main__":

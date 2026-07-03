@@ -47,6 +47,7 @@ class FbcnnDeblocker:
     def denoise(self, rgb_f32: Any) -> Any:
         """Restore one RGB frame (H,W,3) in [0,1]; returns (H,W,3)."""
         a = rgb_f32 if rgb_f32.ndim == 4 else rgb_f32[None]
-        out = mx.clip(self._fwd(a[..., :3]), 0.0, 1.0)
+        inp = mx.clip(a[..., :3].astype(mx.float32), 0.0, 1.0)
+        out = mx.clip(self._fwd(inp), 0.0, 1.0)
         mx.eval(out)
         return out[0]

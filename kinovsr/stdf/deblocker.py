@@ -60,6 +60,7 @@ class StdfDeblocker:
 
     def _split(self, rgb: Any) -> tuple:
         a = (rgb if rgb.ndim == 4 else rgb[None])[..., :3].astype(mx.float32)
+        a = mx.clip(a, 0.0, 1.0)
         y = self._kr * a[..., 0:1] + self._kg * a[..., 1:2] + self._kb * a[..., 2:3]
         return y, a
 

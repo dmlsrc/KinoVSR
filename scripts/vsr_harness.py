@@ -847,6 +847,11 @@ def run(args: argparse.Namespace) -> None:
             naf = NafnetRestorer(
                 args.nafnet_weights or os.environ.get("NAFNET_WEIGHTS") or args.nafnet,
                 strength=args.nafnet_strength,
+                pool_mode=args.nafnet_pool,
+                variant=args.nafnet,
+                guard_mode=args.nafnet_guard,
+                residual_guard=args.nafnet_guard_threshold,
+                guard_fast_fraction=args.nafnet_guard_fast_fraction,
             )
 
         return s, v, pw, cw, deb, den, up, naf
@@ -1038,6 +1043,8 @@ def run(args: argparse.Namespace) -> None:
                 msg = _buf.getvalue().rstrip("\n")
                 if msg:
                     bars.write(msg)
+                if nafnet is not None and hasattr(nafnet, "set_progress_message"):
+                    nafnet.set_progress_message(bars.write)
             for i in range(chunk_len):
                 if max_frames is not None and appended >= max_frames:
                     break
@@ -1405,6 +1412,46 @@ def main() -> None:
             "Scale NAFNet's residual for --nafnet: out = input + A*residual. 1.0 = full "
             "(default); lower keeps it a LIGHT pass -- recommended on video, since it is a "
             "single-image net and a strong pass can flicker. >1 over-drives."
+        ),
+    )
+    parser.add_argument(
+        "--nafnet-pool", choices=["auto", "local", "global"], default="auto",
+        help=(
+            "NAFNet SCA pooling mode. auto (default) follows the reference config for the "
+            "selected variant: gopro/gopro32/reds use NAFNetLocal TLSC/TLC, sidd/sidd32 use "
+            "plain global-pool NAFNet. local forces TLSC; global disables TLSC."
+        ),
+    )
+    parser.add_argument(
+        "--nafnet-guard",
+        choices=["auto", "off", "residual", "control", "control-source", "fast", "reject"],
+        default="auto",
+        help=(
+            "Guard against out-of-domain NAFNet residual blow-ups. auto (default) uses "
+            "reject for gopro/gopro32 and off for other variants. reject locks out "
+            "the GoPro residual for a shot when magnitude or grid-like residual "
+            "structure looks unsafe. residual applies a local output-side soft knee; "
+            "control reruns localized risky frames on a vertically luma-smoothed "
+            "control input, but locks into control-source if risk is frame-wide. "
+            "control-source predicts the residual from a stable luma-control input "
+            "and adds it to the original; fast always uses single-pass residual "
+            "attenuation."
+        ),
+    )
+    parser.add_argument(
+        "--nafnet-guard-threshold", type=float, default=0.12, metavar="T",
+        help=(
+            "Local residual magnitude threshold for --nafnet-guard (default 0.12). "
+            "Healthy frames skip the guard bit-exactly; lower catches more lattice "
+            "but can replace more legitimate deblur residual."
+        ),
+    )
+    parser.add_argument(
+        "--nafnet-guard-fast-fraction", type=float, default=0.85, metavar="F",
+        help=(
+            "Fraction of frame-risk coverage where control guard switches to a "
+            "stable control-source residual instead of per-region blending "
+            "(default 0.85). Set <=0 or >1 to force the slower two-pass regional path."
         ),
     )
     parser.add_argument(
