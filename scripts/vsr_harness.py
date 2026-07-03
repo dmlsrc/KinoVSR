@@ -852,6 +852,9 @@ def run(args: argparse.Namespace) -> None:
                 guard_mode=args.nafnet_guard,
                 residual_guard=args.nafnet_guard_threshold,
                 guard_fast_fraction=args.nafnet_guard_fast_fraction,
+                guard_lockout_frames=args.nafnet_guard_lockout,
+                guard_ramp_frames=args.nafnet_guard_ramp,
+                guard_fall_frames=args.nafnet_guard_fall,
             )
 
         return s, v, pw, cw, deb, den, up, naf
@@ -1428,9 +1431,11 @@ def main() -> None:
         default="auto",
         help=(
             "Guard against out-of-domain NAFNet residual blow-ups. auto (default) uses "
-            "reject for gopro/gopro32 and off for other variants. reject locks out "
-            "the GoPro residual for a shot when magnitude or grid-like residual "
-            "structure looks unsafe. residual applies a local output-side soft knee; "
+            "reject for gopro/gopro32 and off for other variants. reject emits "
+            "passthrough for frames whose residual explosion covers a visible area, "
+            "locks the net out after two consecutive such frames (or one catastrophic "
+            "one), and re-probes on a --nafnet-guard-lockout cadence so a scene "
+            "change recovers the stage. residual applies a local output-side soft knee; "
             "control reruns localized risky frames on a vertically luma-smoothed "
             "control input, but locks into control-source if risk is frame-wide. "
             "control-source predicts the residual from a stable luma-control input "
@@ -1452,6 +1457,37 @@ def main() -> None:
             "Fraction of frame-risk coverage where control guard switches to a "
             "stable control-source residual instead of per-region blending "
             "(default 0.85). Set <=0 or >1 to force the slower two-pass regional path."
+        ),
+    )
+    parser.add_argument(
+        "--nafnet-guard-lockout", type=int, default=48, metavar="N",
+        help=(
+            "Reject-guard lockout period: frames to hold passthrough between "
+            "re-probes of the net once the reject guard has locked (default 48, "
+            "about 1.6-2s). 0 = never re-probe; stay locked for the rest of the "
+            "clip. Locked frames skip the net entirely, so long lockouts also "
+            "run faster."
+        ),
+    )
+    parser.add_argument(
+        "--nafnet-guard-ramp", type=int, default=12, metavar="N",
+        help=(
+            "Reject-guard transition smoothing: restoration strength eases in "
+            "over N clean frames (smoothstep, so fades start and stop without a "
+            "visible temporal edge) and eases OUT on moderate trips instead of "
+            "cutting to passthrough (default 12; fall length from "
+            "--nafnet-guard-fall). Catastrophic or large-area explosions still "
+            "cut instantly. 0 = hard switching both ways."
+        ),
+    )
+    parser.add_argument(
+        "--nafnet-guard-fall", type=int, default=None, metavar="N",
+        help=(
+            "Frames to fade restoration OUT on a moderate reject-guard trip "
+            "(the fade emits the knee-damped residual). Default: derived from "
+            "--nafnet-guard-ramp as ramp/4, min 2. 0 = hard cut on trips while "
+            "keeping the eased fade-in. Longer = softer off-switch but more "
+            "frames carrying damped trip residual."
         ),
     )
     parser.add_argument(

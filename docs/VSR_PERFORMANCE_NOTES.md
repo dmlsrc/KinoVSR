@@ -250,9 +250,51 @@ structure: the deep SimpleGate + SCA stack turns a block lattice into a residual
 lattice. After compressed/scanline clips still corrupted under forced
 `control-source`, `--nafnet-guard auto` is deliberately conservative: it
 defaults to `reject` for the GoPro variants and `off` elsewhere. Reject mode
-keeps healthy frames bit-exact, but when the residual magnitude or high-pass
-residual structure exceeds `--nafnet-guard-threshold` (default 0.12), it rejects
-NAFNet for that shot and returns the input until reset. The older experimental
+keeps healthy frames bit-exact and judges each frame on explosion *area*, not
+peak: a real resonance covers a visible patch of the frame (measured 4-100% of
+pixels with smoothed local residual above half of
+`--nafnet-guard-threshold`, default 0.12), while healthy deblur residuals
+spike on isolated pixels (<0.1% area), so a raw peak threshold false-trips on
+good clips. A tripped frame is emitted as passthrough on the spot; the net is
+locked out only after two consecutive trips (or one catastrophic frame, mean
+local residual above the threshold), and a locked stage re-probes on a
+`--nafnet-guard-lockout` cadence (default 48 frames, about 1.6-2s; 0 = stay
+locked for the rest of the clip) so a scene change wins the stage back instead
+of losing everything after one bad segment. Intermittent single-frame
+explosions therefore get per-frame passthrough while the rest of the clip
+still restores, and locked frames skip the net entirely. Guard transitions are
+flicker-smoothed twice over. First, a locked stage resumes only on a
+clearly-clean probe (hysteresis at half the trip area -- marginal probes stay
+locked, so the guard cannot oscillate around the trip line). Second, emission
+strength is a gain eased through a smoothstep: it rises over
+`--nafnet-guard-ramp` clean frames (default 12, about 0.4s; 0 = hard
+switching) and falls over `--nafnet-guard-fall` frames on moderate trips
+(default ramp/4, min 2; 0 = hard cut on trips only), emitting the
+knee-damped residual on the way down instead of cutting -- a linear
+fade-in-only ramp reads as flicker no matter how long it is, because it
+starts and stops with a temporal edge and every trip still pops to raw in
+one frame (the longer the ramp, the harder a mid-ramp trip pops).
+Catastrophic frames (mean local residual above the threshold) or explosions
+past 4x the trip area still cut to passthrough immediately; trip evidence is
+always measured on the raw residual, and once the gain settles healthy frames
+pass through bit-exact. Measured on the flapping worst case (short lockout on
+boundary content), hysteresis plus the eased gain cut peak blockwise excess
+temporal delta about 15x versus hard switching.
+
+Upstream deblock/denoise composes with the guard but is NOT a safety dial for
+this failure. The resonance responds non-monotonically to preprocessing
+strength (measured on a 480p lattice stress clip: half-strength FBCNN trips
+more frames than full strength while full strength enlarges the explosions
+that survive; sweeping luma denoise, severity collapses through 0.15-0.2 and
+then spikes again in a pocket around 0.3 before defusing by 0.5), so
+intermediate settings can land ON the resonant band that stronger or weaker
+settings miss. The trigger is luma-borne: any moderate luma denoising defuses
+it, while chroma-only denoising (--denoise-luma-strength 0) makes the peak
+explosion WORSE than no denoising at all -- chroma noise was acting as dither
+decorrelating the lattice. The guard measures its evidence on NAFNet's actual
+input (whatever the chain produced) and a rejected frame emits that input, so
+upstream work is preserved and every preprocessing config lands in one of two
+safe outcomes: the net behaves, or the guard locks it out. The older experimental
 guards remain explicit A/B tools: `residual` applies an output-side soft knee,
 `control` does regional two-pass luma-control blending, `control-source`
 predicts a whole-frame residual from a luma-control input, and `fast` applies

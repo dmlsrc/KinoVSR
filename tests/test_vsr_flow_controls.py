@@ -362,16 +362,73 @@ def test_nafnet_control_guard_framewide_risk_locks_to_control_source():
     assert messages and "control-source guard" in messages[0]
 
 
-def test_nafnet_reject_guard_locks_out_bad_residual_and_reset_clears_it():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import NafnetRestorer
+def _reject_test_restorer(messages: list[str], lockout: int = 48, ramp: int = 0,
+                          fall: int | None = None):
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import NafnetRestorer, _derived_fall_frames
 
     restorer = object.__new__(NafnetRestorer)
     restorer._guard = 0.12
+    restorer._guard_mode = "reject"
+    restorer._guard_lockout_frames = lockout
+    restorer._guard_ramp_frames = ramp
+    restorer._guard_fall_frames = _derived_fall_frames(ramp) if fall is None else fall
     restorer._control_source_locked = True
     restorer._reject_locked = False
+    restorer._reject_streak = 0
+    restorer._reject_probe_countdown = 0
+    restorer._reject_gain = 1.0
+    restorer._reject_notices = 0
     restorer._guarded_frames = 0
-    messages: list[str] = []
     restorer._progress_message = messages.append
+    return restorer
+
+
+def test_nafnet_reject_guard_needs_consecutive_area_evidence():
+    messages: list[str] = []
+    restorer = _reject_test_restorer(messages)
+
+    inp = mx.zeros((1, 16, 16, 3), dtype=mx.float32)
+    # Isolated hot pixel: high raw peak, negligible smoothed area -- the healthy
+    # deblur-residual shape that must never trip the guard.
+    fluke = mx.zeros((1, 16, 16, 3), dtype=mx.float32)
+    fluke[0, 8, 8, :] = 0.5
+    guarded = restorer._apply_reject_guard(inp, fluke)
+    mx.eval(guarded)
+    assert not restorer._reject_locked
+    assert float(mx.max(guarded)) > 0.0  # fluke frame passes through restored
+    assert messages == []
+
+    # Frame-wide moderate explosion: trips, first trip emits passthrough but
+    # does not lock yet.
+    explosion = mx.full((1, 16, 16, 3), 0.09, dtype=mx.float32)
+    guarded = restorer._apply_reject_guard(inp, explosion)
+    mx.eval(guarded)
+    assert not restorer._reject_locked
+    assert float(mx.max(guarded)) == 0.0
+    # Second consecutive trip locks.
+    guarded = restorer._apply_reject_guard(inp, explosion)
+    mx.eval(guarded)
+    assert restorer._reject_locked
+    assert restorer._reject_probe_countdown > 0
+    assert messages and "reject guard locked" in messages[0]
+
+    # A clean probe unlocks and emits the restored frame.
+    guarded = restorer._apply_reject_guard(inp, fluke)
+    mx.eval(guarded)
+    assert not restorer._reject_locked
+    assert float(mx.max(guarded)) > 0.0
+    assert len(messages) == 2 and "resumed" in messages[1]
+
+    restorer.reset()
+    assert not restorer._reject_locked
+    assert not restorer._control_source_locked
+    assert restorer._reject_streak == 0
+    assert restorer._guarded_frames == 0
+
+
+def test_nafnet_reject_guard_catastrophic_frame_locks_immediately():
+    messages: list[str] = []
+    restorer = _reject_test_restorer(messages)
 
     inp = mx.zeros((1, 9, 9, 3), dtype=mx.float32)
     out = mx.full((1, 9, 9, 3), 0.5, dtype=mx.float32)
@@ -380,12 +437,186 @@ def test_nafnet_reject_guard_locks_out_bad_residual_and_reset_clears_it():
 
     assert restorer._reject_locked
     assert float(mx.max(guarded)) == 0.0
-    assert messages and "reject guard" in messages[0]
+    assert messages and "reject guard locked" in messages[0]
 
-    restorer.reset()
+
+def test_nafnet_reject_guard_lockout_sets_probe_cadence():
+    messages: list[str] = []
+    restorer = _reject_test_restorer(messages, lockout=3)
+    calls = []
+    healthy = {"flag": False}
+
+    def fake_fwd(x):
+        calls.append(1)
+        if healthy["flag"]:
+            return x
+        return x + 0.5  # catastrophic explosion
+
+    restorer._fwd = fake_fwd
+    frame = mx.zeros((9, 9, 3), dtype=mx.float32)
+
+    restorer.denoise(frame)  # catastrophic -> locks, countdown 3
+    assert restorer._reject_locked and len(calls) == 1
+    restorer.denoise(frame)  # locked, countdown 3->2: passthrough, no net
+    restorer.denoise(frame)  # locked, countdown 2->1: passthrough, no net
+    assert len(calls) == 1
+    healthy["flag"] = True
+    out = restorer.denoise(frame)  # countdown 1->0: probe runs, clean -> unlock
+    assert len(calls) == 2
     assert not restorer._reject_locked
-    assert not restorer._control_source_locked
-    assert restorer._guarded_frames == 0
+    mx.eval(out)
+    assert len(messages) == 2 and "re-probing every 3 frames" in messages[0] \
+        and "resumed" in messages[1]
+
+
+def test_nafnet_reject_guard_lockout_zero_never_reprobes():
+    messages: list[str] = []
+    restorer = _reject_test_restorer(messages, lockout=0)
+    calls = []
+    restorer._fwd = lambda x: (calls.append(1), x + 0.5)[1]
+    frame = mx.zeros((9, 9, 3), dtype=mx.float32)
+
+    restorer.denoise(frame)  # catastrophic -> locks
+    assert restorer._reject_locked and len(calls) == 1
+    for _ in range(5):
+        out = restorer.denoise(frame)
+    assert len(calls) == 1  # net never re-runs
+    assert restorer._reject_locked
+    assert float(mx.max(mx.abs(out - frame))) == 0.0
+    assert len(messages) == 1 and "for the rest of the clip" in messages[0]
+
+
+def test_nafnet_restorer_rejects_negative_lockout_before_loading_weights():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import NafnetRestorer
+
+    with pytest.raises(ValueError, match="guard_lockout_frames"):
+        NafnetRestorer("gopro32", guard_lockout_frames=-1)
+    with pytest.raises(ValueError, match="guard_ramp_frames"):
+        NafnetRestorer("gopro32", guard_ramp_frames=-1)
+    with pytest.raises(ValueError, match="guard_fall_frames"):
+        NafnetRestorer("gopro32", guard_fall_frames=-1)
+
+
+def test_nafnet_reject_guard_explicit_fall_overrides_derived():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import (
+        _REJECT_TRIP_AREA, _REJECT_HARD_CUT_AREA, _local_mag, _derived_fall_frames,
+    )
+
+    assert _derived_fall_frames(12) == 3
+    assert _derived_fall_frames(8) == 2
+    assert _derived_fall_frames(0) == 0
+
+    def moderate_trip(restorer):
+        for size in (5, 6, 7, 8):
+            cand = mx.zeros((1, 48, 48, 3), dtype=mx.float32)
+            cand[0, 20:20 + size, 20:20 + size, :] = 0.3
+            mag = _local_mag(cand)
+            area = float(mx.mean((mag > 0.5 * restorer._guard).astype(mx.float32)))
+            if _REJECT_TRIP_AREA <= area < _REJECT_HARD_CUT_AREA:
+                return cand
+        raise AssertionError("no candidate landed in the moderate-trip band")
+
+    inp = mx.zeros((1, 48, 48, 3), dtype=mx.float32)
+
+    # Explicit long fall: one moderate trip only drops the gain by 1/8.
+    restorer = _reject_test_restorer([], ramp=8, fall=8)
+    trip = moderate_trip(restorer)
+    restorer._apply_reject_guard(inp, trip)
+    assert abs(restorer._reject_gain - 0.875) < 1e-9
+
+    # fall=0 with an eased rise: trips hard-cut, recovery still ramps.
+    restorer = _reject_test_restorer([], ramp=8, fall=0)
+    guarded = restorer._apply_reject_guard(inp, trip)
+    mx.eval(guarded)
+    assert restorer._reject_gain == 0.0
+    assert float(mx.max(guarded)) == 0.0
+    clean = mx.full((1, 48, 48, 3), 0.05, dtype=mx.float32)
+    guarded = restorer._apply_reject_guard(inp, clean)
+    mx.eval(guarded)
+    assert 0.0 < float(mx.mean(guarded)) < 0.05  # partial strength, easing back in
+
+
+def test_nafnet_reject_guard_marginal_probe_stays_locked():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import (
+        _REJECT_TRIP_AREA, _REJECT_RESUME_AREA_RATIO, _local_mag,
+    )
+
+    messages: list[str] = []
+    restorer = _reject_test_restorer(messages, lockout=5, ramp=3)
+    restorer._reject_locked = True
+
+    # Self-tuned marginal residual: explosion area between the resume line and
+    # the trip line (the hysteresis band).
+    inp = mx.zeros((1, 64, 64, 3), dtype=mx.float32)
+    marginal = None
+    for size in (2, 3, 4, 5):
+        cand = mx.zeros((1, 64, 64, 3), dtype=mx.float32)
+        cand[0, 20:20 + size, 20:20 + size, :] = 0.3
+        mag = _local_mag(cand)
+        area = float(mx.mean((mag > 0.5 * restorer._guard).astype(mx.float32)))
+        if _REJECT_TRIP_AREA * _REJECT_RESUME_AREA_RATIO < area < _REJECT_TRIP_AREA:
+            marginal = cand
+            break
+    assert marginal is not None, "no candidate landed in the hysteresis band"
+
+    guarded = restorer._apply_reject_guard(inp, marginal)
+    mx.eval(guarded)
+    assert restorer._reject_locked           # marginal probe does not resume
+    assert float(mx.max(guarded)) == 0.0     # emits passthrough
+    assert restorer._reject_probe_countdown == 5  # next probe rescheduled
+    assert messages == []                    # no resume notice
+
+    # A clearly clean probe (below the resume line) does resume.
+    guarded = restorer._apply_reject_guard(inp, inp)
+    assert not restorer._reject_locked
+    assert messages and "resumed" in messages[0]
+
+
+def test_nafnet_reject_guard_gain_eases_out_and_back_in():
+    from LTX_2_MLX.videotoolbox.nafnet.restorer import (
+        _REJECT_TRIP_AREA, _REJECT_HARD_CUT_AREA, _local_mag,
+    )
+
+    messages: list[str] = []
+    restorer = _reject_test_restorer(messages, ramp=8)  # fall = max(2, 8//4) = 2
+
+    inp = mx.zeros((1, 48, 48, 3), dtype=mx.float32)
+    clean = mx.full((1, 48, 48, 3), 0.05, dtype=mx.float32)  # healthy residual
+
+    # Self-tuned moderate trip: explosion area in [trip, hard-cut) so the
+    # fade-out path (not the hard cut) is exercised.
+    moderate = None
+    for size in (5, 6, 7, 8):
+        cand = mx.zeros((1, 48, 48, 3), dtype=mx.float32)
+        cand[0, 20:20 + size, 20:20 + size, :] = 0.3
+        mag = _local_mag(cand)
+        area = float(mx.mean((mag > 0.5 * restorer._guard).astype(mx.float32)))
+        if _REJECT_TRIP_AREA <= area < _REJECT_HARD_CUT_AREA:
+            moderate = cand
+            break
+    assert moderate is not None, "no candidate landed in the moderate-trip band"
+
+    # Moderate trip from settled gain: fades out (knee-damped, partial), not a cut.
+    guarded = restorer._apply_reject_guard(inp, moderate)
+    mx.eval(guarded)
+    peak = float(mx.max(guarded))
+    assert 0.0 < peak < float(mx.max(moderate))
+    assert restorer._reject_streak == 1 and not restorer._reject_locked
+
+    # Recovery eases back in monotonically and settles bit-exact at full strength.
+    means = []
+    for _ in range(4):
+        guarded = restorer._apply_reject_guard(inp, clean)
+        means.append(float(mx.mean(guarded)))
+    assert all(b > a for a, b in zip(means, means[1:]))
+    assert abs(means[-1] - 0.05) < 1e-7  # gain settled -> exact `out`
+
+    # Catastrophic frame still cuts hard to passthrough.
+    catastrophic = mx.full((1, 48, 48, 3), 0.5, dtype=mx.float32)
+    guarded = restorer._apply_reject_guard(inp, catastrophic)
+    mx.eval(guarded)
+    assert float(mx.max(guarded)) == 0.0
+    assert restorer._reject_gain == 0.0
 
 
 def test_nafnet_guard_notice_uses_progress_callback(capsys):
