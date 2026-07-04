@@ -437,7 +437,7 @@ def _pick_hevc_profile(spatial_mode: str, encode_chroma: str) -> str:
     # balanced/image/none/learned upscalers carry RGB (4:4:4 chroma) to the encoder -> 4:2:2.
     return (HEVC_PROFILE_MAIN422_10
             if spatial_mode in ("balanced", "image", "none", "basicvsrpp", "realbasicvsr",
-                                "realesrgan", "safmn", "esc", "realviformer")
+                                "realesrgan", "safmn", "esc", "realviformer", "realplksr")
             else HEVC_PROFILE_MAIN10)
 
 
@@ -824,6 +824,11 @@ def run(args: argparse.Namespace) -> None:
     elif args.spatial_mode == "esc":
         from LTX_2_MLX.videotoolbox.esc import net as _enet
         spatial_scale = _enet._config(_enet.load_params(args.esc_weights))[6]
+    elif args.spatial_mode == "realplksr":
+        # realplksr covers 2x (public2x) and 4x (nomos4x); read the scale from the
+        # checkpoint so output dims + encoder match the frames.
+        from LTX_2_MLX.videotoolbox.realplksr import net as _pnet
+        spatial_scale = _pnet._config(_pnet.load_params(args.realplksr_weights))[4]
     out_w, out_h = in_w * spatial_scale, in_h * spatial_scale
     profile = _pick_hevc_profile(args.spatial_mode, args.encode_chroma)
     target_fps = args.target_fps if args.target_fps is not None else source_fps
@@ -885,10 +890,10 @@ def run(args: argparse.Namespace) -> None:
         s: Any
         if args.spatial_mode == "none":
             s = NativePassthrough(in_w, in_h, fps=source_fps)
-        elif args.spatial_mode in ("basicvsrpp", "realbasicvsr", "realesrgan", "safmn", "esc", "realviformer"):
-            # Learned MLX upscalers do the 4x upscale in the loop (windowed); the
-            # session is a passthrough at the 4x output dims that just packs the
-            # already-upscaled frame for the encoder.
+        elif args.spatial_mode in ("basicvsrpp", "realbasicvsr", "realesrgan", "safmn", "esc", "realviformer", "realplksr"):
+            # Learned MLX upscalers do the upscale in the loop; the session is a
+            # passthrough at the output dims that just packs the already-upscaled
+            # frame for the encoder.
             s = NativePassthrough(out_w, out_h, fps=source_fps, label=f"{args.spatial_mode} packer")
         else:
             s = VsrSession(in_w, in_h, mode=args.spatial_mode, fps=source_fps)
@@ -1017,6 +1022,10 @@ def run(args: argparse.Namespace) -> None:
         elif args.spatial_mode == "esc":
             from LTX_2_MLX.videotoolbox.esc import EscUpscaler
             up = EscUpscaler(args.esc_weights)
+        elif args.spatial_mode == "realplksr":
+            from LTX_2_MLX.videotoolbox.realplksr import RealPlksrUpscaler
+            up = RealPlksrUpscaler(args.realplksr_weights,
+                                   dtype=parse_mlx_dtype_name(args.realplksr_dtype))
         elif args.spatial_mode == "realviformer":
             from LTX_2_MLX.videotoolbox.realviformer import RealViformerUpscaler
             up = RealViformerUpscaler(
@@ -1546,12 +1555,16 @@ def main() -> None:
     parser.add_argument(
         "--spatial-mode",
         choices=["fast", "balanced", "image", "none", "basicvsrpp", "realbasicvsr",
-                 "realesrgan", "safmn", "esc", "realviformer"],
+                 "realesrgan", "safmn", "esc", "realviformer", "realplksr"],
         default="balanced",
         help=(
             "VSR spatial mode.  Scale factor is implied by the mode (fast=2x, "
             "balanced=4x, image=4x, none=1x, basicvsrpp=4x, realbasicvsr=4x, "
-            "realesrgan=4x, safmn=4x, esc=4x, realviformer=4x). "
+            "realesrgan=4x, safmn=4x, esc=4x, realviformer=4x, realplksr=2x/4x). "
+            "realplksr = MLX RealPLKSR per-frame SR (Phhofm checkpoints; scale from "
+            "the checkpoint -- nomos4x is 4x, public2x is 2x). Single-image, no "
+            "pooled modulation gate so it cannot produce SAFMN's block lattice; "
+            "choose the checkpoint with --realplksr-weights. "
             "realesrgan = MLX Real-ESRGAN / ESRGAN RRDBNet 4x per-frame SR "
             "(single-image: no temporal propagation, so no flow ghosting; choose "
             "the checkpoint with --realesrgan-weights). "
@@ -2227,6 +2240,30 @@ def main() -> None:
             "path (or $ESC_WEIGHTS). Tokens: gan (default; perceptual, Real-ESRGAN-style "
             "degradation training) and mse (fidelity twin). Neither is bundled; see "
             "videotoolbox/esc/weights/README.md."
+        ),
+    )
+    parser.add_argument(
+        "--realplksr-weights", default=None, metavar="VARIANT|PATH",
+        help=(
+            "RealPLKSR weights for --spatial-mode realplksr: a variant token or a "
+            ".safetensors path (or $REALPLKSR_WEIGHTS). Tokens: public2x (default; "
+            "2x LayerNorm+DySample, real-world photo/JPEG, Apache-2.0), public2x-nn "
+            "(same trained without noise -- for cleaner sources), nomos4x "
+            "(4xNomosWebPhoto, 4x GroupNorm+PixelShuffle photo restoration, CC-BY). "
+            "Scale (2x/4x) is read from the checkpoint. Single-image, no pooled gate "
+            "so no SAFMN block lattice; no denoising prior beyond its training, so "
+            "prefer it on decent sources or pair with --denoise. None are bundled; "
+            "see videotoolbox/realplksr/weights/README.md."
+        ),
+    )
+    parser.add_argument(
+        "--realplksr-dtype", choices=["float16", "float32"], default="float16",
+        help=(
+            "Compute/storage dtype for --spatial-mode realplksr. float16 (default) "
+            "runs the convs in half precision with fp32 precision islands in the norm "
+            "reductions and Mish (visually lossless, ~72 dB vs fp32, and it is these "
+            "islands that make the fp16-flagged GroupNorm 4x checkpoint safe). float32 "
+            "forces a full single-precision run (slower, more memory)."
         ),
     )
     parser.add_argument(
