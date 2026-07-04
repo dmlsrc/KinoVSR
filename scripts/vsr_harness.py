@@ -2205,8 +2205,12 @@ def main() -> None:
             "2x output); purescale / purescale2x / purescale2x-sharp (PureScale 2.0, "
             "SAFMN-L retrained with a fixed SAFM branch that eliminates the known "
             "transient block-lattice artifact of the stock models; sharp adds deblur. "
-            "CAUTION: PureScale weights are CC BY-NC-SA 4.0 -- NON-COMMERCIAL use "
-            "only). None are bundled; see videotoolbox/safmn/weights/README.md."
+            "For DECENT-quality sources: it has no denoising prior, so noisy or "
+            "compressed video gets its noise rendered as etched, flickering "
+            "texture -- use real with --safmn-pool-clamp there. CAUTION: "
+            "PureScale weights are CC BY-NC-SA "
+            "4.0 -- NON-COMMERCIAL use only). None are bundled; see "
+            "videotoolbox/safmn/weights/README.md."
         ),
     )
     parser.add_argument(

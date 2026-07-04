@@ -357,12 +357,16 @@ def read_rgbahalf_rgb(pb: Any) -> Any:
 
 
 def read_buffer_rgb_f32(pb: Any) -> Any:
-    """Read any CVPixelBuffer into (H,W,3) float32 RGB in [0, 1].
+    """Read any CVPixelBuffer into (H,W,3) float32 RGB, NOMINALLY [0, 1].
 
-    RGBAHalf is read direct (fp16-preserving; see read_rgbahalf_rgb); other
-    formats (NV12, BGRA, ...) go through CoreImage and are 8-bit. Lets the
-    denoise path keep 10-bit precision when the decode is RGBAHalf
-    (balanced/image/none) and degrade gracefully to 8-bit for NV12 (fast).
+    RGBAHalf is read direct (fp16-preserving; see read_rgbahalf_rgb) and can
+    carry legal YUV->RGB overshoot OUTSIDE [0,1] (measured -0.14..+1.25 at
+    saturated color edges) -- consumers that need the training domain must
+    clip (learned-net entries do; see upscaler_base.to_rgb_batch). Other
+    formats (NV12, BGRA, ...) go through CoreImage and are 8-bit, hence
+    clipped by construction. Lets the denoise path keep 10-bit precision when
+    the decode is RGBAHalf (balanced/image/none) and degrade gracefully to
+    8-bit for NV12 (fast).
     """
     require_pyobjc()
     if Quartz.CVPixelBufferGetPixelFormatType(pb) == PIX_RGBAHALF:

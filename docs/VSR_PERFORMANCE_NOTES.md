@@ -314,6 +314,40 @@ model A/Bs.
 | ~2400 | realesrgan bsrgan (RRDBNet) | heavy perceptual (1.5x from dense restack) |
 | ~3900 | esc gan / mse | window-attention quality tier; mse = fidelity twin |
 
+Input-domain rule: decoded RGBAHalf carries legal YUV->RGB overshoot
+(measured -0.14..+1.25; ~2% of pixels beyond gamut at saturated color edges,
+worst in dark scenes with colored lights), and every learned net is trained
+on clipped RGB. Feeding the overshoot drives the nets outside their input
+domain -- measured 56x the confetti-speck area on one GAN checkpoint, with
+per-frame noise re-rolling the overshoot pattern into flickering specks.
+The preprocessor entries were clamped when this was first found; the learned
+UPSCALER entries were missed until it resurfaced -- `to_rgb_batch` now clips
+once for all of them. When reproducing artifacts in-process, match the
+harness read path (`read_buffer_rgb_f32`, unclipped) -- probes that read
+via uint8 or pre-clip their input can never reproduce overshoot-driven
+artifacts.
+
+The full range audit, so this never needs re-deriving. WHY overshoot exists:
+(a) the legal YUV gamut is larger than the RGB unit cube, so saturated-chroma
+video maps outside [0,1] on conversion -- inherent colorimetry, not a defect;
+(b) codec DCT ringing pushes values past the original near hard edges;
+(c) our own Lanczos/bicubic resamplers have negative lobes and re-create
+overshoot from in-range input at hard edges. WHERE it enters: only the
+fp16-preserving decode path (`read_rgbahalf_rgb`, used by balanced/image/none
+and all learned-upscaler modes) -- the NV12/fast path reads 8-bit (clipped by
+construction) and the latent path's VAE converter clips. GUARDS, both
+boundaries: every learned-net ENTRY clips (preprocessors:
+nafnet/fbcnn/stdf/spatial/mc/fastdvd; upscalers via `to_rgb_batch`;
+realviformer also locally), and every stage OUTPUT clips (audited: safmn,
+realesrgan, esc, realviformer, basicvsrpp, realbasicvsr, stdf, fastdvd,
+fbcnn, luma_chroma_blend; the one gap was the nafnet reject-guard's
+raw/blended emissions, now clipped once in denoise()). So between-stage
+overshoot is doubly impossible: outputs are in-range and entries clip anyway.
+Deliberately UNCLAMPED: the VT-session/writer path (VideoToolbox and the
+encoder handle extended-range fp16 correctly; the passthrough stays
+authentic) and the restore-borders composite (original border content is
+restored verbatim).
+
 RealViformer streams (causal recurrence, per-frame state, reset at cuts) --
 temporal consistency at barely more than a per-frame net's cost. ESC's numbers
 are attention-bound (section 2); its value is output quality plus the only
@@ -326,7 +360,20 @@ and the winner flips frame to frame. This is trained-in (swapping the pooling
 at inference on the stock weights corrupts the output -- the gate expects
 max-pool peak statistics). The `purescale*` variants are third-party SAFMN-L
 retrains with the fixed branch (avg pool + bicubic upsample, both trained in;
-the SAFM mode follows the weights filename) that eliminate the artifact; the
+the SAFM mode follows the weights filename) that eliminate the artifact. Their
+domain is DECENT-QUALITY sources. Their genuine limit, isolated with
+single-factor tests: NO denoising prior -- the curated-HD training reads
+noise as detail, so temporally random noise becomes rendered etched texture
+(gray-snow overlay multiplies output high-frequency energy 29x; fresh noise
+per frame passes through as flicker at 0.74x where the stock real model
+suppresses to 0.22x), and sharp in-gamut color edges add mild chroma specks
+(7.5x clean area). Pure blockiness is benign, and the stock real model
+behaves inversely (more degradation = smoother output; restorer vs upscaler
+training). Historical note: the frame-wide confetti epidemic originally
+blamed on purescale was a harness bug -- unclipped decode overshoot at the
+upscaler entry (see the input-domain rule below); fixing it cut the speck
+area 1000x on the stress clip. Use purescale on clean to lightly-noisy
+material, real + --safmn-pool-clamp on noisy or compressed video. The
 bicubic phases cost ~20% over stock SAFMN-L (872 vs 729 ms measured same-run). They also degrade far more
 gracefully on hard out-of-distribution frame edges (a junk half-dark border
 row becomes a near-scale thin line rather than a thick smeared band with

@@ -17,8 +17,9 @@ claim about the task.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import mlx.core as mx
 
@@ -391,7 +392,11 @@ class NafnetRestorer:
                 out = self._apply_control_guard(inp, self._fwd(inp))
                 out = mx.clip(out, 0.0, 1.0)
         else:
-            out = mx.clip(self._fwd(inp), 0.0, 1.0)
+            out = self._fwd(inp)
+        # Single output-contract clip for every path above: the reject guard's
+        # raw/blended emissions were the one place overshoot could leave a
+        # stage. Idempotent for the already-clipped paths.
+        out = mx.clip(out, 0.0, 1.0)
         mx.eval(out)
         return out[0]
 

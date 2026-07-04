@@ -13,9 +13,14 @@ import mlx.core as mx
 
 
 def to_rgb_batch(rgb: Any) -> Any:
-    """Frame -> (1,H,W,3) fp32: add a batch axis if missing, drop alpha, cast f32."""
+    """Frame -> (1,H,W,3) fp32: add a batch axis if missing, drop alpha, cast f32,
+    and CLIP to [0,1]. Decoded RGBAHalf carries legal YUV->RGB overshoot (measured
+    -0.14..1.25 at saturated color edges) and every learned upscaler is trained on
+    clipped RGB; feeding the overshoot drives the nets outside their input domain
+    -- measured 56x the confetti-speck area on one GAN checkpoint. Same rule as
+    the preprocessor entry points (see nafnet.restorer.model_rgb)."""
     a = rgb if rgb.ndim == 4 else rgb[None]
-    return a[..., :3].astype(mx.float32)
+    return mx.clip(a[..., :3].astype(mx.float32), 0.0, 1.0)
 
 
 class WindowedUpscaler:
