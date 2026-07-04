@@ -101,6 +101,21 @@ from LTX_2_MLX.videotoolbox import video_reader as _vr
 from LTX_2_MLX.videotoolbox import yuv as _yuv
 from LTX_2_MLX.videotoolbox.comparison import render_comparison
 from LTX_2_MLX.videotoolbox.denoise import LumaChromaDenoiser, McTemporalDenoiser, SpatialDenoiser
+from LTX_2_MLX.videotoolbox.edge_sanitize import (
+    compute_aspect_crop,
+    detect_bars,
+    detect_junk_edges,
+    parse_edges_spec,
+)
+from LTX_2_MLX.videotoolbox.edge_sanitize import (
+    crop_rgb as _crop_rgb,
+)
+from LTX_2_MLX.videotoolbox.edge_sanitize import (
+    restore_borders as _restore_borders,
+)
+from LTX_2_MLX.videotoolbox.edge_sanitize import (
+    sanitize_rgb as _sanitize_rgb,
+)
 from LTX_2_MLX.videotoolbox.fastdvdnet import FastDvdDenoiser
 from LTX_2_MLX.videotoolbox.images import save_image
 from LTX_2_MLX.videotoolbox.vsr import NativePassthrough
@@ -513,6 +528,11 @@ def run(args: argparse.Namespace) -> None:
         print(f"[setup] video VAE loaded in {time.perf_counter() - t:.2f}s")
         total_frames, in_h, in_w = latent_dims(latent)
         source_fps = args.source_fps
+        src_w, src_h = in_w, in_h
+        crop_box = None
+        _edge_samples = None
+        if args.crop_bars or args.crop_aspect:
+            print("[crop] --crop-bars/--crop-aspect need --video; disabled")
 
         # --start/--end trim the decoded frames. The VAE still decodes the whole
         # latent (it is temporally tiled, not seekable), so the window is
@@ -562,6 +582,80 @@ def run(args: argparse.Namespace) -> None:
         if args.source_color != "auto":
             print(f"  (forcing the source to be DECODED as {args.source_color}, "
                   "overriding VideoToolbox's resolution guess)")
+
+        # ---- Bar crop + border sampling (before any dims are consumed) -----
+        src_w, src_h = in_w, in_h
+        if (src_w % 2) or (src_h % 2):
+            print(f"[warn] source has ODD dimensions {src_w}x{src_h}: 4:2:0 "
+                  "paths (--spatial-mode fast NV12 input; Main10/H.264 encodes "
+                  "at 1x) may misalign chroma or fail downstream. Consider "
+                  "--crop-bars 0,1,0,1-style trims to even them.")
+        crop_box = None
+        _edge_samples = None
+        if args.crop_bars or args.sanitize_edges == "auto":
+            _edge_samples, s_idx = [], 0
+            want = set(range(0, 24, 4))
+            for s_chunk in _vr.iter_video_buffer_chunks(
+                    Path(args.video), _pb.PIX_RGBAHALF, chunk_size=8):
+                for s_buf in s_chunk:
+                    if s_idx in want:
+                        _edge_samples.append(mx.clip(
+                            _pb.read_pixel_buffer_rgb(s_buf).astype(mx.float32) / 255.0,
+                            0, 1))
+                    s_idx += 1
+                if s_idx > max(want):
+                    break
+        if args.crop_bars:
+            if args.crop_bars == "auto":
+                bars = detect_bars(_edge_samples)
+            else:
+                bars = list(parse_edges_spec(args.crop_bars))
+                # Keep the active area even (4:2:0 chroma / NV12 paths): bump
+                # the bottom/right trim into the content by one px if needed.
+                bumped = []
+                if (in_h - bars[0] - bars[1]) % 2:
+                    bars[1] += 1
+                    bumped.append("bottom")
+                if (in_w - bars[2] - bars[3]) % 2:
+                    bars[3] += 1
+                    bumped.append("right")
+                if bumped:
+                    print(f"[crop] bumped {'/'.join(bumped)} by 1 px so the "
+                          "active area keeps even dimensions")
+                bars = tuple(bars)
+            if any(bars):
+                if bars[0] + bars[1] >= in_h or bars[2] + bars[3] >= in_w:
+                    raise SystemExit(f"--crop-bars {bars} leaves no active area")
+                crop_box = bars
+                in_h -= bars[0] + bars[1]
+                in_w -= bars[2] + bars[3]
+                print(f"[crop] bars: top={bars[0]} bottom={bars[1]} left={bars[2]} "
+                      f"right={bars[3]} px -> active {in_w}x{in_h}")
+            elif args.crop_bars == "auto":
+                print("[crop] auto: no bars detected")
+        if args.crop_aspect:
+            try:
+                ar_w, ar_h = (int(p) for p in args.crop_aspect.split(":"))
+            except ValueError:
+                raise SystemExit(f"--crop-aspect must be W:H, got {args.crop_aspect!r}") from None
+            try:
+                dx, dy = (int(p) for p in args.crop_offset.split(","))
+            except ValueError:
+                raise SystemExit(f"--crop-offset must be dx,dy, got {args.crop_offset!r}") from None
+            asp = compute_aspect_crop(in_w, in_h, ar_w, ar_h, dx, dy,
+                                      anchor=args.crop_anchor)
+            if any(asp):
+                base = crop_box or (0, 0, 0, 0)
+                crop_box = tuple(b + a for b, a in zip(base, asp, strict=True))
+                in_h -= asp[0] + asp[1]
+                in_w -= asp[2] + asp[3]
+                off = f" offset {dx:+d},{dy:+d}" if (dx or dy) else ""
+                print(f"[crop] aspect {ar_w}:{ar_h} anchor {args.crop_anchor}{off}: "
+                      f"window at x={crop_box[2]} y={crop_box[0]} "
+                      f"-> active {in_w}x{in_h}")
+        if crop_box is not None and _edge_samples:
+            _edge_samples = [_crop_rgb(s, crop_box) for s in _edge_samples]
+
         # Decode straight into VSR's source format (NV12 for fast, RGBAHalf for
         # balanced/image) and feed the buffers directly to VSR - no RGB
         # intermediate, no MLX round-trip, no re-quantization. Size the decode
@@ -572,7 +666,7 @@ def run(args: argparse.Namespace) -> None:
             else source_format_for_mode(args.spatial_mode)
         )
         bytes_per_px = 8 if vsr_src_fmt == _pb.PIX_RGBAHALF else 2
-        frame_bytes = max(1, in_w * in_h * bytes_per_px)
+        frame_bytes = max(1, src_w * src_h * bytes_per_px)   # decode happens at source size
         buf_chunk = max(1, min(args.video_chunk_size, (64 * 1024 * 1024) // frame_bytes))
         # --start/--end trim the input. The reader seeks to the window so the
         # head of a long clip is never decoded (frame-exact, see video_reader).
@@ -860,6 +954,53 @@ def run(args: argparse.Namespace) -> None:
 
         return s, v, pw, cw, deb, den, up, naf
 
+    # ---- Synthetic-border sanitizer ----------------------------------------
+    # Detect junk edge rows/cols (letterbox lines, capture garbage) and
+    # replicate-fill them before ANY processor sees the frame; the learned
+    # stages are trained on photographic content and hallucinate around
+    # synthetic edges. Frame dims are untouched, so aspect and pixel-aspect
+    # handling are unaffected.
+    sanitize_edges: tuple | None = None
+    if args.sanitize_edges:
+        if args.sanitize_edges == "auto":
+            if _edge_samples is None:
+                print("[sanitize] auto detection needs --video; disabled "
+                      "(pass explicit T,B,L,R to force)")
+            else:
+                edges, notices = detect_junk_edges(_edge_samples)
+                for note in notices:
+                    print(f"[sanitize] {note}")
+                if any(edges):
+                    sanitize_edges = edges
+                    print(f"[sanitize] junk edges detected: top={edges[0]} "
+                          f"bottom={edges[1]} left={edges[2]} right={edges[3]} px "
+                          "-- sanitized before processing")
+                else:
+                    print("[sanitize] auto: no junk edges detected")
+        else:
+            sanitize_edges = parse_edges_spec(args.sanitize_edges)
+            print(f"[sanitize] manual edges: top={sanitize_edges[0]} "
+                  f"bottom={sanitize_edges[1]} left={sanitize_edges[2]} "
+                  f"right={sanitize_edges[3]} px")
+
+    # Output-side policy: a replicate fill that reaches the screen turns a
+    # quiet static-dark border into moving light content. 1 px fills are
+    # imperceptible (and remove the junk); wider bands get the ORIGINAL
+    # border composited back over the processed frame.
+    sanitize_restore: tuple | None = None
+    if sanitize_edges is not None:
+        restore = (0, 0, 0, 0) if args.sanitize_edges_fill == "extend" else sanitize_edges
+        if any(restore):
+            sanitize_restore = restore
+        names = ("top", "bottom", "left", "right")
+        policy = ", ".join(
+            f"{n}={d}px {'restore' if rr else 'extend'}"
+            for n, d, rr in zip(names, sanitize_edges, restore, strict=True) if d
+        )
+        feather = (f", feather {args.sanitize_edges_feather}px"
+                   if sanitize_restore is not None else "")
+        print(f"[sanitize] fill policy: {policy}{feather}")
+
     # ---- Cut detector ------------------------------------------------------
     cut_detector: CutDetector | None = None
     cut_log = None
@@ -912,6 +1053,9 @@ def run(args: argparse.Namespace) -> None:
         share one emit path."""
         nonlocal processed, appended
         if den_rgb is not None:
+            if sanitize_restore is not None and src_arr is not None:
+                den_rgb = _restore_borders(den_rgb, src_arr, sanitize_restore,
+                                           feather=args.sanitize_edges_feather)
             den_rgba = mx.concatenate(
                 [den_rgb.astype(mx.float16),
                  mx.ones((den_rgb.shape[0], den_rgb.shape[1], 1), mx.float16)],
@@ -1024,9 +1168,9 @@ def run(args: argparse.Namespace) -> None:
                 t_w, t_h = _pb.buffer_dims(chunk[0])
             else:
                 t_h, t_w = int(chunk[0].shape[0]), int(chunk[0].shape[1])
-            if (t_w, t_h) != (in_w, in_h):
+            if (t_w, t_h) != (src_w, src_h):
                 raise RuntimeError(
-                    f"chunk dims {t_w}x{t_h} don't match VSR config {in_w}x{in_h}"
+                    f"chunk dims {t_w}x{t_h} don't match the source {src_w}x{src_h}"
                 )
             if vae_pbar is not None:
                 vae_pbar.update(1)
@@ -1085,11 +1229,14 @@ def run(args: argparse.Namespace) -> None:
                         cut_detector is not None
                         or args.save_pre_frames
                         or comparison_writer is not None
+                        or sanitize_restore is not None
                     ):
                         src_arr = (
                             _pb.read_pixel_buffer_rgb(src_frame)
                             if frames_are_buffers else src_frame
                         )
+                        if crop_box is not None:
+                            src_arr = _crop_rgb(src_arr, crop_box)
 
                     if cut_detector is not None and cut_detector.is_cut(src_arr):
                         # Flush the lookahead deblock + denoiser's buffered (pre-cut)
@@ -1116,7 +1263,9 @@ def run(args: argparse.Namespace) -> None:
                     # step; fastdvd buffers and emits centered-window frames once
                     # their two future neighbours have arrived (feed() may return
                     # nothing now; the tail drains after the loop). f32 RGB [0,1].
-                    if deblocker is not None or denoiser is not None or nafnet is not None:
+                    if (deblocker is not None or denoiser is not None
+                            or nafnet is not None or sanitize_edges is not None
+                            or crop_box is not None):
                         # fp16-preserving for RGBAHalf (balanced/image/none); 8-bit
                         # CoreImage fallback for NV12 (fast). Deblock (compression)
                         # runs before denoise (analog), both ahead of the upscaler.
@@ -1124,6 +1273,10 @@ def run(args: argparse.Namespace) -> None:
                             base_rgb = _pb.read_buffer_rgb_f32(src_frame)
                         else:
                             base_rgb = src_frame[..., :3].astype(mx.float32)
+                        if crop_box is not None:
+                            base_rgb = _crop_rgb(base_rgb, crop_box)
+                        if sanitize_edges is not None:
+                            base_rgb = _sanitize_rgb(base_rgb, sanitize_edges)
                         ready = _preprocess(base_rgb, src_arr)
                     else:
                         ready = [(None, (src_frame, src_arr))]
@@ -1499,6 +1652,89 @@ def main() -> None:
             "(compression) first, and a denoiser's white-noise assumption is broken by "
             "structured blocking. Use --denoise-first only when noise was added AFTER "
             "compression (regrained master, analog/transmission noise)."
+        ),
+    )
+    parser.add_argument(
+        "--sanitize-edges", default=None, metavar="auto|T,B,L,R",
+        help=(
+            "Detect and clean synthetic border junk (letterbox lines, capture "
+            "garbage rows) BEFORE any processor sees the frame: the affected "
+            "edge rows/cols are overwritten with the adjacent interior line "
+            "(replicate fill), because learned restorers are trained on "
+            "photographic content and hallucinate texture around synthetic "
+            "edges. Frame dimensions and pixel-aspect are untouched, so the "
+            "output geometry is identical. auto (needs --video) samples early "
+            "frames and only trims edges that are anomalous in every sample, "
+            "capped at 8 px per edge; thick constant bars (letterbox-class) "
+            "are reported but never filled -- crop those instead. T,B,L,R "
+            "forces explicit per-edge pixel counts. Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--sanitize-edges-fill", choices=["restore", "extend"], default="restore",
+        help=(
+            "What the VIEWER sees where junk was sanitized (the nets always "
+            "see the replicate-extended frame). restore (default) = composite "
+            "the ORIGINAL border back over the processed output, feathered "
+            "into the content (--sanitize-edges-feather): the border stays "
+            "exactly as quiet/static/dark as the source, nothing fabricated. "
+            "extend = keep the replicated content in the output, removing the "
+            "junk -- but replicated content MOVES with the interior, visible "
+            "shimmer where the eye expects a static border."
+        ),
+    )
+    parser.add_argument(
+        "--sanitize-edges-feather", type=int, default=2, metavar="N",
+        help=(
+            "Crossfade width (source px) from a restored border band into the "
+            "processed content (default 2). Softens the seam between the "
+            "authentic soft border and the crisply processed interior. "
+            "0 = hard splice."
+        ),
+    )
+    parser.add_argument(
+        "--crop-bars", default=None, metavar="auto|T,B,L,R",
+        help=(
+            "Crop constant letterbox/pillarbox bars off BEFORE processing and "
+            "output only the active picture (e.g. 16:9 letterboxed in 4:3 "
+            "becomes true 16:9 out; 9:16 pillarboxed in 16:9 becomes true "
+            "9:16). auto detects bars that are constant-extreme in every "
+            "sampled frame, up to 45 percent per edge, and rounds so the "
+            "active area keeps even dimensions; T,B,L,R forces explicit "
+            "counts. The pixel aspect is unchanged -- the display aspect "
+            "becomes the content's true aspect, which is the point. Composes "
+            "with --sanitize-edges (junk detection runs on the cropped "
+            "picture). Needs --video. Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--crop-aspect", default=None, metavar="W:H",
+        help=(
+            "Center-crop the picture to the largest even-dimension window "
+            "with this display aspect (e.g. 16:9 on a 4:3 source, 1:1, 9:16 "
+            "for a portrait extract). Applies AFTER --crop-bars, so a "
+            "letterboxed source can be bar-cropped and then reframed in one "
+            "run. Shift the window with --crop-offset. Needs --video."
+        ),
+    )
+    parser.add_argument(
+        "--crop-anchor",
+        choices=["top-left", "top", "top-right", "left", "center", "right",
+                 "bottom-left", "bottom", "bottom-right"],
+        default="center",
+        help=(
+            "Where to place the --crop-aspect window (default center). "
+            "E.g. 16:9 from a 4:3 source anchored at 'bottom' keeps the "
+            "lower two-thirds; 'top-right' pins the window to that corner. "
+            "--crop-offset nudges from the anchor."
+        ),
+    )
+    parser.add_argument(
+        "--crop-offset", default="0,0", metavar="DX,DY",
+        help=(
+            "Pixel offset of the --crop-aspect window from its anchor "
+            "(right/down positive, clamped so the window stays inside the "
+            "frame). Default 0,0."
         ),
     )
     parser.add_argument(

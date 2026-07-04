@@ -320,7 +320,7 @@ def test_nafnet_luma_control_smooths_vertical_luma_not_chroma():
     assert control.shape == rgb.shape
     assert 0.29 < float(control[0, 1, 0, 0]) < 0.31
     assert 0.29 < float(control[0, 0, 0, 0]) < 0.31
-    assert float(mx.max(mx.abs((control[..., :1] - control[..., 1:2])))) == 0.0
+    assert float(mx.max(mx.abs(control[..., :1] - control[..., 1:2]))) == 0.0
 
 
 def test_nafnet_control_risk_map_uses_residual_disagreement():
@@ -499,7 +499,10 @@ def test_nafnet_restorer_rejects_negative_lockout_before_loading_weights():
 
 def test_nafnet_reject_guard_explicit_fall_overrides_derived():
     from LTX_2_MLX.videotoolbox.nafnet.restorer import (
-        _REJECT_TRIP_AREA, _REJECT_HARD_CUT_AREA, _local_mag, _derived_fall_frames,
+        _REJECT_HARD_CUT_AREA,
+        _REJECT_TRIP_AREA,
+        _derived_fall_frames,
+        _local_mag,
     )
 
     assert _derived_fall_frames(12) == 3
@@ -538,7 +541,9 @@ def test_nafnet_reject_guard_explicit_fall_overrides_derived():
 
 def test_nafnet_reject_guard_marginal_probe_stays_locked():
     from LTX_2_MLX.videotoolbox.nafnet.restorer import (
-        _REJECT_TRIP_AREA, _REJECT_RESUME_AREA_RATIO, _local_mag,
+        _REJECT_RESUME_AREA_RATIO,
+        _REJECT_TRIP_AREA,
+        _local_mag,
     )
 
     messages: list[str] = []
@@ -574,7 +579,9 @@ def test_nafnet_reject_guard_marginal_probe_stays_locked():
 
 def test_nafnet_reject_guard_gain_eases_out_and_back_in():
     from LTX_2_MLX.videotoolbox.nafnet.restorer import (
-        _REJECT_TRIP_AREA, _REJECT_HARD_CUT_AREA, _local_mag,
+        _REJECT_HARD_CUT_AREA,
+        _REJECT_TRIP_AREA,
+        _local_mag,
     )
 
     messages: list[str] = []
@@ -608,7 +615,7 @@ def test_nafnet_reject_guard_gain_eases_out_and_back_in():
     for _ in range(4):
         guarded = restorer._apply_reject_guard(inp, clean)
         means.append(float(mx.mean(guarded)))
-    assert all(b > a for a, b in zip(means, means[1:]))
+    assert all(b > a for a, b in zip(means, means[1:], strict=False))
     assert abs(means[-1] - 0.05) < 1e-7  # gain settled -> exact `out`
 
     # Catastrophic frame still cuts hard to passthrough.
@@ -771,7 +778,8 @@ def test_safmn_pool_clamp_touches_only_interior_outliers():
     assert float(out[0, 6, 8, 2]) < 25.0
     # ...to roughly mu + 4 sigma of its channel's INTERIOR statistics...
     core = spiked.astype(mx.float32)[:, 1:-1, 1:-1, 2]
-    mu = float(mx.mean(core)); sd = float(mx.sqrt(mx.mean((core - mu) ** 2)))
+    mu = float(mx.mean(core))
+    sd = float(mx.sqrt(mx.mean((core - mu) ** 2)))
     assert abs(float(out[0, 6, 8, 2]) - (mu + 4.0 * sd)) < 1e-4
     # ...an untouched channel passes through numerically unchanged...
     assert float(mx.max(mx.abs(out[..., 0] - spiked[..., 0]))) < 1e-6
@@ -782,3 +790,205 @@ def test_safmn_pool_clamp_touches_only_interior_outliers():
     # Degenerate pooled maps (no interior) pass through whole.
     tiny = mx.full((1, 2, 2, 1), 9.0)
     assert float(mx.max(mx.abs(_pool_clamp(tiny, 4.0) - tiny))) == 0.0
+
+
+def test_edge_sanitize_parse_spec():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import parse_edges_spec
+
+    assert parse_edges_spec("0,1,0,0") == (0, 1, 0, 0)
+    assert parse_edges_spec(" 2, 3 ,4,5 ") == (2, 3, 4, 5)
+    with pytest.raises(ValueError, match="four integers"):
+        parse_edges_spec("1,2,3")
+    with pytest.raises(ValueError, match=">= 0"):
+        parse_edges_spec("1,-2,3,4")
+
+
+def _sanitize_samples(junk_bottom=False, bar_rows=0):
+    mx.random.seed(7)
+    out = []
+    for _ in range(5):
+        fr = mx.clip(mx.random.uniform(shape=(48, 64, 3)) * 0.5 + 0.35, 0, 1)
+        if junk_bottom:
+            fr[-1:] = fr[-2:-1] * 0.3   # dark junk line, tracks content
+        if bar_rows:
+            fr[:bar_rows] = 0.02        # constant near-black bar at the top
+            fr[-bar_rows:] = 0.02
+        out.append(fr)
+    return out
+
+
+def test_edge_sanitize_detects_dark_junk_row():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import detect_junk_edges
+
+    edges, notices = detect_junk_edges(_sanitize_samples(junk_bottom=True))
+    assert edges == (0, 1, 0, 0)
+    assert notices == []
+
+
+def test_edge_sanitize_clean_content_untouched():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import detect_junk_edges
+
+    edges, notices = detect_junk_edges(_sanitize_samples())
+    assert edges == (0, 0, 0, 0)
+
+
+def test_edge_sanitize_letterbox_reported_not_filled():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import detect_junk_edges
+
+    edges, notices = detect_junk_edges(_sanitize_samples(bar_rows=12))
+    assert edges == (0, 0, 0, 0)
+    assert any("letterbox-class" in n for n in notices)
+
+
+def test_edge_sanitize_blank_samples_yield_no_detection():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import detect_junk_edges
+
+    blanks = [mx.full((32, 32, 3), 0.02) for _ in range(5)]
+    edges, notices = detect_junk_edges(blanks)
+    assert edges == (0, 0, 0, 0)
+    assert any("too few" in n for n in notices)
+
+
+def test_edge_sanitize_rgb_replaces_bands_and_keeps_dims():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import sanitize_rgb
+
+    fr = mx.broadcast_to(mx.arange(10, dtype=mx.float32)[:, None, None], (10, 8, 3))
+    out = sanitize_rgb(fr, (2, 1, 0, 0))
+    mx.eval(out)
+    assert out.shape == fr.shape
+    assert float(mx.max(mx.abs(out[0] - fr[2]))) == 0.0   # top rows <- first interior
+    assert float(mx.max(mx.abs(out[1] - fr[2]))) == 0.0
+    assert float(mx.max(mx.abs(out[-1] - fr[-2]))) == 0.0  # bottom row <- neighbor
+    assert float(mx.max(mx.abs(out[2:-1] - fr[2:-1]))) == 0.0  # interior untouched
+
+    with pytest.raises(ValueError, match="interior"):
+        sanitize_rgb(fr, (5, 5, 0, 0))
+
+
+def test_edge_sanitize_restore_borders_composites_original():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import restore_borders
+
+    mx.random.seed(9)
+    src = mx.random.uniform(shape=(8, 10, 3))
+    out = mx.random.uniform(shape=(16, 20, 3))       # processed at 2x
+    res = restore_borders(out, src, (0, 1, 2, 0), feather=0)
+    mx.eval(res)
+
+    assert res.shape == out.shape
+    # bottom band (2 out rows) = nearest-2x of src's last row
+    assert float(mx.max(mx.abs(res[14] - mx.repeat(src[7], 2, axis=0)))) < 1e-6
+    assert float(mx.max(mx.abs(res[15] - res[14]))) < 1e-6
+    # left band (4 out cols) = nearest-2x of src's first 2 cols
+    assert float(mx.max(mx.abs(res[0, 0] - src[0, 0]))) < 1e-6
+    assert float(mx.max(mx.abs(res[0, 3] - src[0, 1]))) < 1e-6
+    # interior untouched
+    assert float(mx.max(mx.abs(res[2:14, 4:] - out[2:14, 4:]))) < 1e-6
+
+    # uint8 sources normalize to [0,1]
+    src8 = mx.full((8, 10, 3), 255, dtype=mx.uint8)
+    res = restore_borders(out, src8, (1, 0, 0, 0), feather=0)
+    assert abs(float(mx.mean(res[0])) - 1.0) < 1e-6
+
+    with pytest.raises(ValueError, match="integer multiple"):
+        restore_borders(mx.zeros((15, 20, 3)), src, (1, 0, 0, 0), feather=0)
+
+
+def test_edge_sanitize_restore_feather_ramps_into_content():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import restore_borders
+
+    src = mx.zeros((8, 6, 3), dtype=mx.float32)
+    out = mx.ones((16, 12, 3), dtype=mx.float32)   # processed at 2x
+    res = restore_borders(out, src, (1, 0, 0, 0), feather=2)
+    mx.eval(res)
+
+    col = [float(res[r, 5, 0]) for r in range(8)]
+    # band rows (2 at 2x) fully restored to source (0), then a linear ramp
+    # across the 4-row feather zone, then untouched processed content (1).
+    assert col[0] == 0.0 and col[1] == 0.0
+    expect = [0.125, 0.375, 0.625, 0.875]
+    for got, want in zip(col[2:6], expect, strict=True):
+        assert abs(got - want) < 1e-6
+    assert col[6] == 1.0 and col[7] == 1.0
+
+
+def test_edge_sanitize_detect_bars_letterbox_and_pillarbox():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import detect_bars
+
+    mx.random.seed(11)
+    letter, pillar = [], []
+    for _ in range(5):
+        fr = mx.clip(mx.random.uniform(shape=(48, 64, 3)) * 0.5 + 0.35, 0, 1)
+        lb = fr[:]
+        lb[:12] = 0.02
+        lb[-12:] = 0.02
+        letter.append(lb)
+        pb_ = fr[:]
+        pb_[:, :22] = 0.02
+        pb_[:, -22:] = 0.02
+        pillar.append(pb_)
+    assert detect_bars(letter) == (12, 12, 0, 0)
+    assert detect_bars(pillar) == (0, 0, 22, 22)
+
+    # even-ization: an 11-row top bar leaves 37 rows -> bottom bumped by 1
+    odd = []
+    for _ in range(5):
+        fr = mx.clip(mx.random.uniform(shape=(48, 64, 3)) * 0.5 + 0.35, 0, 1)
+        fr[:11] = 0.02
+        odd.append(fr)
+    assert detect_bars(odd) == (11, 1, 0, 0)
+
+    # clean content: no bars
+    clean = [mx.clip(mx.random.uniform(shape=(48, 64, 3)) * 0.5 + 0.35, 0, 1)
+             for _ in range(5)]
+    assert detect_bars(clean) == (0, 0, 0, 0)
+
+
+def test_edge_sanitize_crop_rgb():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import crop_rgb
+
+    fr = mx.arange(6 * 8 * 3, dtype=mx.float32).reshape(6, 8, 3)
+    out = crop_rgb(fr, (1, 2, 3, 0))
+    assert out.shape == (3, 5, 3)
+    assert float(mx.max(mx.abs(out - fr[1:4, 3:]))) == 0.0
+    batched = crop_rgb(fr[None], (1, 2, 3, 0))
+    assert batched.shape == (1, 3, 5, 3)
+
+
+def test_edge_sanitize_compute_aspect_crop():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import compute_aspect_crop
+
+    # 16:9 window on a 4:3 frame: full width, centered vertically.
+    assert compute_aspect_crop(640, 480, 16, 9) == (60, 60, 0, 0)
+    # 9:16 portrait extract from 16:9: nearest even width, centered.
+    t, b, left, r = compute_aspect_crop(1920, 1080, 9, 16)
+    assert (left + r) + (1920 - left - r) == 1920
+    w = 1920 - left - r
+    h = 1080 - t - b
+    assert w % 2 == 0 and h % 2 == 0
+    assert abs(w / h - 9 / 16) < 0.01
+    assert abs(left - r) <= 2  # centered
+    # offsets shift and clamp
+    t2, b2, l2, r2 = compute_aspect_crop(1920, 1080, 9, 16, dx=-10000)
+    assert l2 == 0 and r2 == left + r
+    # same aspect as the frame: no crop
+    assert compute_aspect_crop(640, 480, 4, 3) == (0, 0, 0, 0)
+    with pytest.raises(ValueError, match="positive"):
+        compute_aspect_crop(640, 480, 0, 9)
+
+
+def test_edge_sanitize_aspect_crop_anchors():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import compute_aspect_crop
+
+    # 16:9 on 4:3 (640x480 -> 640x360): the vertical slack is 120.
+    assert compute_aspect_crop(640, 480, 16, 9, anchor="top") == (0, 120, 0, 0)
+    assert compute_aspect_crop(640, 480, 16, 9, anchor="bottom") == (120, 0, 0, 0)
+    assert compute_aspect_crop(640, 480, 16, 9, anchor="center") == (60, 60, 0, 0)
+    # corners on a window with slack in both axes: 1:1 on 640x480 -> 480x480.
+    assert compute_aspect_crop(640, 480, 1, 1, anchor="top-left") == (0, 0, 0, 160)
+    assert compute_aspect_crop(640, 480, 1, 1, anchor="bottom-right") == (0, 0, 160, 0)
+    assert compute_aspect_crop(640, 480, 1, 1, anchor="right") == (0, 0, 160, 0)
+    # offset nudges from the anchor and clamps.
+    assert compute_aspect_crop(640, 480, 16, 9, anchor="bottom", dy=-20) == (100, 20, 0, 0)
+    assert compute_aspect_crop(640, 480, 16, 9, anchor="bottom", dy=50) == (120, 0, 0, 0)
+    with pytest.raises(ValueError, match="anchor"):
+        compute_aspect_crop(640, 480, 16, 9, anchor="middle-ish")

@@ -365,6 +365,58 @@ reaches exactly zero lattice at zero cost -- the purescale retrains remain
 the root fix; this dial is for when the stock models' rendering (or the
 PureScale license) rules them out.
 
+### Synthetic borders: sanitize before the chain (`--sanitize-edges`)
+
+Every learned stage is trained on photographic content run through a
+synthetic degradation pipeline; a synthetic border embedded in the frame
+(letterbox line, junk capture row, analog edge ramp) has zero probability
+under that distribution. GAN stages hallucinate around such edges -- a
+1-px junk row measurably corrupts ~35 input rows above it through the
+receptive field -- and feature-space mitigations do not compose there (see
+the pool-clamp border exemption above).
+
+`--sanitize-edges auto` samples early frames and detects edge lines that are
+anomalous in EVERY sample (two rules: near-constant extreme bar rows, and
+edge rows sitting far darker than their interior neighbor), capped at 8 px
+per edge. The nets always receive the frame with those lines replicate-
+extended from the interior; what the VIEWER sees is a separate policy
+(`--sanitize-edges-fill`), because a replicate fill that reaches the screen
+turns a quiet static-dark border into visible MOVING content -- worse than
+the junk it replaced, and perceptible even at 1 px (replicated content
+shimmers with the interior where the eye expects stillness). `restore` (the
+default) composites the original border back over the processed output,
+nearest-scaled and feathered into the content over
+`--sanitize-edges-feather` source px (default 2) so the seam between the
+soft authentic border and the crisply processed interior does not read as a
+line; the restored band is exactly as static as the source itself. `extend`
+keeps the fill for those who want the junk gone and accept the shimmer.
+Dimensions and pixel-aspect are untouched in every mode. `--sanitize-edges
+T,B,L,R` forces explicit counts. Old test captures routinely carry junk on
+multiple edges (a classic CIF clip: one junk bottom row plus a 3-px
+black-to-dim ramp on the left; another: a near-black right column) and the
+auto detector finds these while leaving clean modern content untouched.
+
+True letterbox/pillarbox bars are a different job: `--crop-bars auto`
+detects constant-extreme bars (scanned up to 45% per edge -- a 9:16 portrait
+shoved into 16:9 leaves ~35% per side), crops them off BEFORE processing,
+and outputs only the active picture, rounded so dimensions stay even. The
+pixel aspect is unchanged; the display aspect becomes the content's true
+aspect, which is the point (16:9-in-4:3 comes out true 16:9). It composes
+with `--sanitize-edges` -- junk-line detection runs on the cropped picture,
+so a letterboxed VHS capture with a garbage line at the content boundary
+gets both treatments. Thick bars are never replicate-filled (that would
+fabricate imagery); cropping is the only correct handling for them.
+`--crop-bars T,B,L,R` is a general edge-anchored manual crop; if the
+requested active area comes out odd, the bottom/right trim is bumped by one
+pixel (printed) rather than erroring. `--crop-aspect W:H` center-crops to
+the largest even-dimension window with that display aspect (16:9 on 4:3,
+1:1, 9:16 portrait extracts), placed with `--crop-anchor` (nine positions), applied after the bar crop; `--crop-offset
+DX,DY` shifts the window from center, clamped inside the frame. Even
+dimensions matter beyond cropping: 4:2:0 stores one chroma sample per 2x2
+luma block, so odd-dimension video misaligns or fails on the NV12 input path
+(--spatial-mode fast) and 4:2:0 encodes; the harness now warns at setup when
+the source itself has odd dimensions.
+
 ### Case study: the "river" artifact was a merge-normalization port bug
 
 On heavily degraded sources (old low-bitrate footage) RealViformer produced
