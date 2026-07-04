@@ -756,21 +756,29 @@ def test_safmn_upscaler_validates_args_before_loading_weights():
         SafmnUpscaler(pool_clamp=-1.0)
 
 
-def test_safmn_pool_clamp_touches_only_outliers():
+def test_safmn_pool_clamp_touches_only_interior_outliers():
     from LTX_2_MLX.videotoolbox.safmn.net import _pool_clamp
 
     mx.random.seed(4)
     s = mx.random.normal(shape=(1, 12, 16, 4)) * 0.1
     spiked = s[:]
-    spiked[0, 6, 8, 2] = 25.0  # far beyond k sigma
+    spiked[0, 6, 8, 2] = 25.0    # interior spike, far beyond k sigma
+    spiked[0, 0, 5, 3] = 25.0    # frame-boundary spike (exempt margin)
     out = _pool_clamp(spiked, 4.0)
     mx.eval(out)
 
-    # The spike is bounded...
+    # The interior spike is bounded...
     assert float(out[0, 6, 8, 2]) < 25.0
-    # ...to roughly mu + 4 sigma of its channel...
-    sf = spiked.astype(mx.float32)[..., 2]
-    mu = float(mx.mean(sf)); sd = float(mx.sqrt(mx.mean((sf - mu) ** 2)))
+    # ...to roughly mu + 4 sigma of its channel's INTERIOR statistics...
+    core = spiked.astype(mx.float32)[:, 1:-1, 1:-1, 2]
+    mu = float(mx.mean(core)); sd = float(mx.sqrt(mx.mean((core - mu) ** 2)))
     assert abs(float(out[0, 6, 8, 2]) - (mu + 4.0 * sd)) < 1e-4
-    # ...while an untouched channel passes through numerically unchanged.
+    # ...an untouched channel passes through numerically unchanged...
     assert float(mx.max(mx.abs(out[..., 0] - spiked[..., 0]))) < 1e-6
+    # ...and the frame-boundary margin is exempt (synthetic borders saturate
+    # there; clamping them re-engages texture hallucination).
+    assert float(out[0, 0, 5, 3]) == 25.0
+
+    # Degenerate pooled maps (no interior) pass through whole.
+    tiny = mx.full((1, 2, 2, 1), 9.0)
+    assert float(mx.max(mx.abs(_pool_clamp(tiny, 4.0) - tiny))) == 0.0

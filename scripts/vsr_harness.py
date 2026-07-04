@@ -1881,7 +1881,11 @@ def main() -> None:
             "recommended setting); 2.5 = boundary, specular-rich content "
             "starts dulling; 2 = visibly muted highlights and flattened "
             "texture sparkle. Failure is graceful at any K (it can only "
-            "under-modulate, never corrupt). The purescale variants fix the "
+            "under-modulate, never corrupt). Frame-boundary pooled cells are "
+            "exempt (one cell = 2/4/8 px per level): synthetic border "
+            "rows/bars saturate the features into a quiet self-limiting "
+            "response, and clamping them re-engages texture hallucination "
+            "and makes borders bloom. The purescale variants fix the "
             "artifact at the root and do not need this."
         ),
     )

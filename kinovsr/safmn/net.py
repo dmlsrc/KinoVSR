@@ -266,11 +266,27 @@ def _pool_clamp(s: Any, k: float) -> Any:
     constant block into the modulation gate (the stock models' transient lattice);
     clamping only the outliers bounds that block's amplitude while leaving frames
     with no outliers numerically untouched -- unlike swapping the pooling, which
-    shifts every value's statistics and breaks the trained gate."""
+    shifts every value's statistics and breaks the trained gate.
+
+    Frame-boundary pooled cells are EXEMPT (a one-cell margin, so 2/4/8 input px
+    per level): synthetic border structures (letterbox bars, junk capture rows)
+    saturate the features there, and that saturated response is self-limiting -- a
+    quiet band in the output. Clamping it back into the plausible-texture range
+    re-engages the GAN's texture machinery on garbage input and makes the border
+    visibly bloom (measured on a junk border row; clamp direction does not matter).
+    Statistics are computed over the same interior region, so an extreme border
+    cannot inflate sigma and weaken mid-frame suppression."""
+    n, h, w, c = s.shape
+    if h <= 2 or w <= 2:
+        return s
     sf = s.astype(mx.float32)
-    mu = mx.mean(sf, axis=(1, 2), keepdims=True)
-    sd = mx.sqrt(mx.mean((sf - mu) ** 2, axis=(1, 2), keepdims=True))
-    return mx.clip(sf, mu - k * sd, mu + k * sd).astype(s.dtype)
+    core = sf[:, 1:-1, 1:-1]
+    mu = mx.mean(core, axis=(1, 2), keepdims=True)
+    sd = mx.sqrt(mx.mean((core - mu) ** 2, axis=(1, 2), keepdims=True))
+    cl = mx.clip(core, mu - k * sd, mu + k * sd)
+    mid = mx.concatenate([sf[:, 1:-1, :1], cl, sf[:, 1:-1, -1:]], axis=2)
+    out = mx.concatenate([sf[:, :1], mid, sf[:, -1:]], axis=1)
+    return out.astype(s.dtype)
 
 
 def _safm(x: Any, p: dict, pre: str, mode: str = "stock", up: str = "nearest",

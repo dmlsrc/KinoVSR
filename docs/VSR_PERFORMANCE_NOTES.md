@@ -352,11 +352,18 @@ the lattice imperceptible at still-negligible cost (0.001-0.002 mean) -- the
 recommended setting; K=2.5 is the boundary where specular-rich content starts
 dulling; K=2 visibly mutes highlights and flattens texture sparkle. Failure
 is graceful at any K: the clamp pulls outliers toward each frame's own
-statistics, so it can only under-modulate, never corrupt. The artifact and
-legitimate speculars overlap in feature distribution, so no K reaches exactly
-zero lattice at zero cost -- the purescale retrains remain the root fix; this
-dial is for when the stock models' rendering (or the PureScale license) rules
-them out.
+statistics, so it can only under-modulate, never corrupt. Frame-boundary
+pooled cells (a one-cell margin: 2/4/8 input px per level) are exempt, and
+the statistics are computed over the interior only: synthetic border
+structures (letterbox bars, junk capture rows) saturate the features there
+into a quiet self-limiting response, and clamping them back into the
+plausible-texture range re-engages the GAN's texture machinery -- measured
+on a junk border row, the clamped border visibly bloomed where the
+unclamped one stayed a quiet band, regardless of clamp direction. The
+artifact and legitimate speculars overlap in feature distribution, so no K
+reaches exactly zero lattice at zero cost -- the purescale retrains remain
+the root fix; this dial is for when the stock models' rendering (or the
+PureScale license) rules them out.
 
 ### Case study: the "river" artifact was a merge-normalization port bug
 
