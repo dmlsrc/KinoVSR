@@ -133,6 +133,59 @@ def resize(x: Any, oh: int, ow: int, align_corners: bool) -> Any:
     return _bilinear(x, sy, sx, "border")
 
 
+def make_lanczos_plan(n_in: int, n_out: int) -> tuple:
+    """Precomputed 1-D Lanczos-3 resample plan: (indices, weights) with shape
+    (taps, n_out), int32/float32. Built once (pure Python), applied per frame
+    as `taps` gathers + a weighted sum -- GPU-resident, no per-frame CoreImage
+    round trip, and no dense resample matrix (which would be >99% zeros).
+
+    Handles both directions: downscales stretch the kernel by 1/scale for
+    proper antialiasing. Tap indices are edge-clamped (replicate boundary);
+    weights are normalized per output position (windowed sinc does not sum to
+    exactly 1). At n_in == n_out the plan is an exact identity."""
+    import math
+
+    scale = n_out / n_in
+    support = 3.0 * max(1.0, 1.0 / scale)
+    taps = max(2, int(math.ceil(support * 2)))
+
+    def lanczos3(t: float) -> float:
+        t = abs(t)
+        if t < 1e-9:
+            return 1.0
+        if t >= 3.0:
+            return 0.0
+        pt = math.pi * t
+        return 3.0 * math.sin(pt) * math.sin(pt / 3.0) / (pt * pt)
+
+    k_scale = min(1.0, scale)      # stretch the kernel when downscaling
+    idx_rows: list = [[] for _ in range(taps)]
+    w_rows: list = [[] for _ in range(taps)]
+    for j in range(n_out):
+        src = (j + 0.5) / scale - 0.5
+        first = int(math.floor(src - support)) + 1
+        ws = [lanczos3((src - (first + k)) * k_scale) for k in range(taps)]
+        total = sum(ws) or 1.0
+        for k in range(taps):
+            idx_rows[k].append(min(max(first + k, 0), n_in - 1))
+            w_rows[k].append(ws[k] / total)
+    return (mx.array(idx_rows, dtype=mx.int32), mx.array(w_rows, dtype=mx.float32))
+
+
+def resample_width(x: Any, plan: tuple) -> Any:
+    """Apply a make_lanczos_plan along the width axis of (H, W, C) or
+    (N, H, W, C); returns the same rank with the new width."""
+    idx, w = plan
+    axis = 1 if x.ndim == 3 else 2
+    shape = [1] * x.ndim
+    shape[axis] = int(w.shape[1])
+    acc = None
+    for k in range(int(idx.shape[0])):
+        t = mx.take(x, idx[k], axis=axis) * w[k].reshape(shape)
+        acc = t if acc is None else acc + t
+    return acc
+
+
 def _avgpool2(x: Any) -> Any:
     """2x2 average pool, stride 2 (input dims even)."""
     n, h, w, c = x.shape

@@ -119,6 +119,7 @@ from LTX_2_MLX.videotoolbox.edge_sanitize import (
 from LTX_2_MLX.videotoolbox.fastdvdnet import FastDvdDenoiser
 from LTX_2_MLX.videotoolbox.images import save_image
 from LTX_2_MLX.videotoolbox.vsr import NativePassthrough
+from LTX_2_MLX.videotoolbox.vsr_blocks import make_lanczos_plan, resample_width
 from LTX_2_MLX.videotoolbox.writer import (
     HEVC_PROFILE_MAIN10,
     HEVC_PROFILE_MAIN422_10,
@@ -531,6 +532,8 @@ def run(args: argparse.Namespace) -> None:
         src_w, src_h = in_w, in_h
         crop_box = None
         _edge_samples = None
+        square_resample: tuple | None = None
+        square_apply = None
         if args.crop_bars or args.crop_aspect:
             print("[crop] --crop-bars/--crop-aspect need --video; disabled")
 
@@ -631,8 +634,47 @@ def run(args: argparse.Namespace) -> None:
                 in_w -= bars[2] + bars[3]
                 print(f"[crop] bars: top={bars[0]} bottom={bars[1]} left={bars[2]} "
                       f"right={bars[3]} px -> active {in_w}x{in_h}")
+                if _edge_samples:
+                    _edge_samples = [_crop_rgb(s, bars) for s in _edge_samples]
             elif args.crop_bars == "auto":
                 print("[crop] auto: no bars detected")
+
+        # Junk-edge TRIM: fold detected junk lines into the crop instead of
+        # filling them, BEFORE the aspect window is computed, so the aspect
+        # math runs on the clean picture.
+        if args.sanitize_edges and args.sanitize_edges_fill == "trim":
+            if args.sanitize_edges == "auto":
+                trim_edges, notices = detect_junk_edges(_edge_samples or [])
+                for note in notices:
+                    print(f"[sanitize] {note}")
+            else:
+                trim_edges = parse_edges_spec(args.sanitize_edges)
+            if any(trim_edges):
+                te = list(trim_edges)
+                bumped = []
+                if (in_h - te[0] - te[1]) % 2:
+                    te[1] += 1
+                    bumped.append("bottom")
+                if (in_w - te[2] - te[3]) % 2:
+                    te[3] += 1
+                    bumped.append("right")
+                if te[0] + te[1] >= in_h or te[2] + te[3] >= in_w:
+                    raise SystemExit(
+                        f"--sanitize-edges trim {tuple(te)} leaves no active area")
+                if bumped:
+                    print(f"[sanitize] trim bumped {'/'.join(bumped)} by 1 px so "
+                          "the active area keeps even dimensions")
+                te = tuple(te)
+                base = crop_box or (0, 0, 0, 0)
+                crop_box = tuple(b + a for b, a in zip(base, te, strict=True))
+                in_h -= te[0] + te[1]
+                in_w -= te[2] + te[3]
+                print(f"[sanitize] trim: top={te[0]} bottom={te[1]} left={te[2]} "
+                      f"right={te[3]} px cropped off -> active {in_w}x{in_h}")
+                if _edge_samples:
+                    _edge_samples = [_crop_rgb(s, te) for s in _edge_samples]
+            else:
+                print("[sanitize] trim: no junk edges detected")
         if args.crop_aspect:
             try:
                 ar_w, ar_h = (int(p) for p in args.crop_aspect.split(":"))
@@ -642,7 +684,18 @@ def run(args: argparse.Namespace) -> None:
                 dx, dy = (int(p) for p in args.crop_offset.split(","))
             except ValueError:
                 raise SystemExit(f"--crop-offset must be dx,dy, got {args.crop_offset!r}") from None
-            asp = compute_aspect_crop(in_w, in_h, ar_w, ar_h, dx, dy,
+            eff_w, eff_h = ar_w, ar_h
+            if src_pixel_aspect and src_pixel_aspect[0] != src_pixel_aspect[1]:
+                # The requested ratio is a DISPLAY aspect; on anamorphic
+                # sources the storage-pixel target must fold the PAR in
+                # (display = storage x PAR), or a "16:9" crop of 128:117-wide
+                # pixels would display at ~1.95:1.
+                eff_w = ar_w * src_pixel_aspect[1]
+                eff_h = ar_h * src_pixel_aspect[0]
+                print(f"[crop] aspect {ar_w}:{ar_h} at source pixel aspect "
+                      f"{src_pixel_aspect[0]}:{src_pixel_aspect[1]} -> "
+                      f"storage target {eff_w}:{eff_h}")
+            asp = compute_aspect_crop(in_w, in_h, eff_w, eff_h, dx, dy,
                                       anchor=args.crop_anchor)
             if any(asp):
                 base = crop_box or (0, 0, 0, 0)
@@ -653,8 +706,30 @@ def run(args: argparse.Namespace) -> None:
                 print(f"[crop] aspect {ar_w}:{ar_h} anchor {args.crop_anchor}{off}: "
                       f"window at x={crop_box[2]} y={crop_box[0]} "
                       f"-> active {in_w}x{in_h}")
-        if crop_box is not None and _edge_samples:
-            _edge_samples = [_crop_rgb(s, crop_box) for s in _edge_samples]
+                if _edge_samples:
+                    _edge_samples = [_crop_rgb(s, asp) for s in _edge_samples]
+
+        # ---- Square-pixel resample (anamorphic sources) --------------------
+        # Horizontal-only bilinear at SOURCE resolution: the cheapest point,
+        # and the upscaler re-synthesizes the mild resample softness. Output
+        # is then tagged 1:1. Runs AFTER the crops (which are PAR-aware).
+        square_resample: tuple | None = None
+        square_apply = None
+        if args.square_pixels and src_pixel_aspect and src_pixel_aspect[0] != src_pixel_aspect[1]:
+            sq_w = int(round(in_w * src_pixel_aspect[0] / src_pixel_aspect[1]))
+            sq_w -= sq_w % 2
+            if sq_w != in_w and sq_w >= 2:
+                square_resample = make_lanczos_plan(in_w, sq_w)
+                square_apply = mx.compile(
+                    lambda t: resample_width(t, square_resample))
+                square_ratio = sq_w / in_w
+                print(f"[square-pixels] pixel aspect {src_pixel_aspect[0]}:"
+                      f"{src_pixel_aspect[1]} -> width {in_w} -> {sq_w} "
+                      "(Lanczos-3 at source resolution); output tagged 1:1")
+                in_w = sq_w
+            src_pixel_aspect = None
+        elif args.square_pixels:
+            square_resample = None   # already square; no-op
 
         # Decode straight into VSR's source format (NV12 for fast, RGBAHalf for
         # balanced/image) and feed the buffers directly to VSR - no RGB
@@ -961,7 +1036,11 @@ def run(args: argparse.Namespace) -> None:
     # synthetic edges. Frame dims are untouched, so aspect and pixel-aspect
     # handling are unaffected.
     sanitize_edges: tuple | None = None
-    if args.sanitize_edges:
+    if args.sanitize_edges and args.sanitize_edges_fill == "trim":
+        if not args.video:
+            print("[sanitize] trim mode needs --video; disabled")
+        # otherwise handled in the crop pre-pass: junk folded into crop_box.
+    elif args.sanitize_edges:
         if args.sanitize_edges == "auto":
             if _edge_samples is None:
                 print("[sanitize] auto detection needs --video; disabled "
@@ -982,6 +1061,7 @@ def run(args: argparse.Namespace) -> None:
             print(f"[sanitize] manual edges: top={sanitize_edges[0]} "
                   f"bottom={sanitize_edges[1]} left={sanitize_edges[2]} "
                   f"right={sanitize_edges[3]} px")
+    _edge_samples = None   # detection done; release the sampled frames
 
     # Output-side policy: a replicate fill that reaches the screen turns a
     # quiet static-dark border into moving light content. 1 px fills are
@@ -990,6 +1070,13 @@ def run(args: argparse.Namespace) -> None:
     sanitize_restore: tuple | None = None
     if sanitize_edges is not None:
         restore = (0, 0, 0, 0) if args.sanitize_edges_fill == "extend" else sanitize_edges
+        if any(restore) and square_resample is not None:
+            # The restore composite runs on the resampled grid: scale the
+            # left/right band widths by the resample ratio (feather hides
+            # the sub-pixel rounding).
+            restore = (restore[0], restore[1],
+                       int(round(restore[2] * square_ratio)),
+                       int(round(restore[3] * square_ratio)))
         if any(restore):
             sanitize_restore = restore
         names = ("top", "bottom", "left", "right")
@@ -1237,6 +1324,11 @@ def run(args: argparse.Namespace) -> None:
                         )
                         if crop_box is not None:
                             src_arr = _crop_rgb(src_arr, crop_box)
+                        if square_apply is not None:
+                            sa = (src_arr.astype(mx.float32) / 255.0
+                                  if src_arr.dtype == mx.uint8
+                                  else src_arr[..., :3].astype(mx.float32))
+                            src_arr = square_apply(sa)
 
                     if cut_detector is not None and cut_detector.is_cut(src_arr):
                         # Flush the lookahead deblock + denoiser's buffered (pre-cut)
@@ -1265,7 +1357,7 @@ def run(args: argparse.Namespace) -> None:
                     # nothing now; the tail drains after the loop). f32 RGB [0,1].
                     if (deblocker is not None or denoiser is not None
                             or nafnet is not None or sanitize_edges is not None
-                            or crop_box is not None):
+                            or crop_box is not None or square_apply is not None):
                         # fp16-preserving for RGBAHalf (balanced/image/none); 8-bit
                         # CoreImage fallback for NV12 (fast). Deblock (compression)
                         # runs before denoise (analog), both ahead of the upscaler.
@@ -1277,6 +1369,8 @@ def run(args: argparse.Namespace) -> None:
                             base_rgb = _crop_rgb(base_rgb, crop_box)
                         if sanitize_edges is not None:
                             base_rgb = _sanitize_rgb(base_rgb, sanitize_edges)
+                        if square_apply is not None:
+                            base_rgb = square_apply(base_rgb)
                         ready = _preprocess(base_rgb, src_arr)
                     else:
                         ready = [(None, (src_frame, src_arr))]
@@ -1671,16 +1765,20 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--sanitize-edges-fill", choices=["restore", "extend"], default="restore",
+        "--sanitize-edges-fill", choices=["restore", "extend", "trim"],
+        default="restore",
         help=(
-            "What the VIEWER sees where junk was sanitized (the nets always "
-            "see the replicate-extended frame). restore (default) = composite "
-            "the ORIGINAL border back over the processed output, feathered "
+            "What happens where junk edges were detected. restore (default) "
+            "= the nets see a replicate-extended frame and the ORIGINAL "
+            "border is composited back over the processed output, feathered "
             "into the content (--sanitize-edges-feather): the border stays "
-            "exactly as quiet/static/dark as the source, nothing fabricated. "
-            "extend = keep the replicated content in the output, removing the "
-            "junk -- but replicated content MOVES with the interior, visible "
-            "shimmer where the eye expects a static border."
+            "exactly as quiet/static/dark as the source. extend = keep the "
+            "replicated content in the output, removing the junk -- but "
+            "replicated content MOVES with the interior, visible shimmer "
+            "where the eye expects a static border. trim = CROP the junk "
+            "lines off entirely (folded into the crop before --crop-aspect "
+            "runs, so the aspect window is computed on the clean picture; "
+            "bottom/right bumped 1 px if needed to keep even dimensions)."
         ),
     )
     parser.add_argument(
@@ -1710,11 +1808,15 @@ def main() -> None:
     parser.add_argument(
         "--crop-aspect", default=None, metavar="W:H",
         help=(
-            "Center-crop the picture to the largest even-dimension window "
-            "with this display aspect (e.g. 16:9 on a 4:3 source, 1:1, 9:16 "
-            "for a portrait extract). Applies AFTER --crop-bars, so a "
-            "letterboxed source can be bar-cropped and then reframed in one "
-            "run. Shift the window with --crop-offset. Needs --video."
+            "Crop the picture to the largest even-dimension window with this "
+            "DISPLAY aspect (e.g. 16:9 on a 4:3 source, 1:1, 9:16 for a "
+            "portrait extract). On anamorphic sources the pixel aspect is "
+            "folded into the target automatically, so 16:9 means 16:9 on "
+            "screen, not in storage pixels. Even-integer windows approximate "
+            "most ratios; the closest fit is chosen. Applies AFTER "
+            "--crop-bars, so a letterboxed source can be bar-cropped and then "
+            "reframed in one run. Place with --crop-anchor, shift with "
+            "--crop-offset. Needs --video."
         ),
     )
     parser.add_argument(
@@ -1727,6 +1829,19 @@ def main() -> None:
             "E.g. 16:9 from a 4:3 source anchored at 'bottom' keeps the "
             "lower two-thirds; 'top-right' pins the window to that corner. "
             "--crop-offset nudges from the anchor."
+        ),
+    )
+    parser.add_argument(
+        "--square-pixels", action="store_true",
+        help=(
+            "Resample anamorphic sources to square pixels (1:1 pixel aspect) "
+            "before processing: a horizontal-only resample at SOURCE "
+            "resolution (Lanczos-3, GPU-resident precomputed plan) -- the "
+            "cheapest point, and the upscaler re-synthesizes the mild resample "
+            "softness -- with the output tagged 1:1 for "
+            "PAR-ignorant players and toolchains. Default behavior (off) "
+            "passes the source pixel aspect through losslessly instead. "
+            "No-op on square-pixel sources."
         ),
     )
     parser.add_argument(

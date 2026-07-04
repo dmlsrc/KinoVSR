@@ -389,7 +389,14 @@ nearest-scaled and feathered into the content over
 `--sanitize-edges-feather` source px (default 2) so the seam between the
 soft authentic border and the crisply processed interior does not read as a
 line; the restored band is exactly as static as the source itself. `extend`
-keeps the fill for those who want the junk gone and accept the shimmer.
+keeps the fill for those who want the junk gone and accept the shimmer;
+`trim` crops the junk lines off entirely, folded into the crop BEFORE the
+aspect window is computed (bottom/right bumped 1 px when needed to keep
+even dimensions) -- the right mode when reframing anyway. `--square-pixels`
+resamples anamorphic sources to a 1:1 pixel aspect (horizontal-only bilinear
+at SOURCE resolution, where the upscaler re-synthesizes the mild softness;
+output tagged square) for PAR-ignorant toolchains; the default passes the
+source pixel aspect through losslessly.
 Dimensions and pixel-aspect are untouched in every mode. `--sanitize-edges
 T,B,L,R` forces explicit counts. Old test captures routinely carry junk on
 multiple edges (a classic CIF clip: one junk bottom row plus a 3-px
@@ -410,7 +417,10 @@ fabricate imagery); cropping is the only correct handling for them.
 requested active area comes out odd, the bottom/right trim is bumped by one
 pixel (printed) rather than erroring. `--crop-aspect W:H` center-crops to
 the largest even-dimension window with that display aspect (16:9 on 4:3,
-1:1, 9:16 portrait extracts), placed with `--crop-anchor` (nine positions), applied after the bar crop; `--crop-offset
+1:1, 9:16 portrait extracts) -- a DISPLAY aspect: on anamorphic sources
+the pixel aspect is folded into the storage target automatically, and the
+closest even-integer window is chosen -- placed with `--crop-anchor` (nine
+positions), applied after the bar crop; `--crop-offset
 DX,DY` shifts the window from center, clamped inside the frame. Even
 dimensions matter beyond cropping: 4:2:0 stores one chroma sample per 2x2
 luma block, so odd-dimension video misaligns or fails on the NV12 input path

@@ -74,38 +74,59 @@ def _luma(rgb: Any) -> Any:
     return f[..., 0] * 0.299 + f[..., 1] * 0.587 + f[..., 2] * 0.114
 
 
-def _edge_depth(lumas: list, max_dim: int) -> tuple[int, int]:
-    """(fix_depth, bar_depth) for one edge given per-sample luma views where
-    row 0 is the outermost line of that edge."""
+def _edge_stats(samples: Sequence[Any]) -> list:
+    """Per usable (non-blank) sample: {edge: (line_means, line_stds)} with the
+    lists ordered outermost-first for that edge.
+
+    All statistics for a sample are computed as four axis reductions and
+    ONE batched eval -- per-line `float(mx.mean(row))` calls are a GPU sync
+    per line and made the detection pre-pass take seconds at 1080p."""
+    pending = []
+    for fr in samples:
+        lu = _luma(fr)
+        mu_r = mx.mean(lu, axis=1)
+        sd_r = mx.sqrt(mx.mean((lu - mu_r[:, None]) ** 2, axis=1))
+        mu_c = mx.mean(lu, axis=0)
+        sd_c = mx.sqrt(mx.mean((lu - mu_c[None, :]) ** 2, axis=0))
+        mu = mx.mean(lu)
+        sd = mx.sqrt(mx.mean((lu - mu) ** 2))
+        pending.append((mu_r, sd_r, mu_c, sd_c, sd))
+    mx.eval(*[t for tup in pending for t in tup])
+    out = []
+    for mu_r, sd_r, mu_c, sd_c, sd in pending:
+        if float(sd) < _BLANK_STD:
+            continue
+        rm, rs = mu_r.tolist(), sd_r.tolist()
+        cm, cs = mu_c.tolist(), sd_c.tolist()
+        out.append({
+            "top": (rm, rs), "bottom": (rm[::-1], rs[::-1]),
+            "left": (cm, cs), "right": (cm[::-1], cs[::-1]),
+        })
+    return out
+
+
+def _edge_depth(stats: list, max_dim: int) -> tuple[int, int]:
+    """(fix_depth, bar_depth) for one edge given per-sample (means, stds)
+    lists where index 0 is the outermost line of that edge."""
     n_rows = min(MAX_FIX_DEPTH + 1, max_dim - 1)
-    stats = []                                    # [sample][row] -> (mean, std)
-    for lu in lumas:
-        rows = []
-        for k in range(n_rows):
-            r = lu[k]
-            m = float(mx.mean(r))
-            sd = float(mx.sqrt(mx.mean((r - m) ** 2)))
-            rows.append((m, sd))
-        stats.append(rows)
 
     def is_bar(k: int) -> bool:
-        means = [s[k][0] for s in stats]
-        stds = [s[k][1] for s in stats]
-        if any(sd >= _BAR_STD for sd in stds):
+        if any(s[1][k] >= _BAR_STD for s in stats):
             return False
-        return all(m < _BAR_DARK for m in means) or all(m > _BAR_BRIGHT for m in means)
+        return (all(s[0][k] < _BAR_DARK for s in stats)
+                or all(s[0][k] > _BAR_BRIGHT for s in stats))
 
     bar_depth = 0
     while bar_depth < min(MAX_FIX_DEPTH, n_rows - 1) and is_bar(bar_depth):
         bar_depth += 1
 
-    # Junk step: rows 0..d-1 all far darker than row d, in every sample.
+    # Junk step: lines 0..d-1 all far darker than line d, in every sample.
     step_depth = 0
     for d in range(1, min(_STEP_DEPTH, n_rows - 1) + 1):
         ok = True
-        for s in stats:
-            ref = s[d][0]
-            if any(s[k][0] > ref - _STEP_THR for k in range(d)):
+        for means, _stds in stats:
+            ref = means[d]
+            if any(means[k] > ref - _STEP_THR for k in range(d)):
                 ok = False
                 break
         if ok:
@@ -113,21 +134,16 @@ def _edge_depth(lumas: list, max_dim: int) -> tuple[int, int]:
     return max(bar_depth, step_depth), bar_depth
 
 
-def _deep_bar_depth(lumas: list, max_dim: int, limit: int | None = None) -> int:
+def _deep_bar_depth(stats: list, max_dim: int, limit: int | None = None) -> int:
     """Bar-rule depth scanned past the fix cap (letterbox/pillarbox bars)."""
     if limit is None:
         limit = max_dim // 4
     depth = 0
     while depth < limit:
-        means, stds = [], []
-        for lu in lumas:
-            r = lu[depth]
-            m = float(mx.mean(r))
-            means.append(m)
-            stds.append(float(mx.sqrt(mx.mean((r - m) ** 2))))
-        if any(sd >= _BAR_STD for sd in stds):
+        if any(s[1][depth] >= _BAR_STD for s in stats):
             break
-        if not (all(m < _BAR_DARK for m in means) or all(m > _BAR_BRIGHT for m in means)):
+        if not (all(s[0][depth] < _BAR_DARK for s in stats)
+                or all(s[0][depth] > _BAR_BRIGHT for s in stats)):
             break
         depth += 1
     return depth
@@ -142,25 +158,15 @@ def detect_bars(samples: Sequence[Any]) -> tuple[int, int, int, int]:
     (4:2:0 chroma and encoders want even); the adjustment eats one content
     pixel rather than leaving one bar line. Requires 3 usable (non-blank)
     samples; bars must be constant-extreme in every one."""
-    lumas = []
-    for fr in samples:
-        lu = _luma(fr)
-        m = float(mx.mean(lu))
-        sd = float(mx.sqrt(mx.mean((lu - m) ** 2)))
-        if sd >= _BLANK_STD:
-            lumas.append(lu)
-    if len(lumas) < 3:
+    stats = _edge_stats(samples)
+    if len(stats) < 3:
         return (0, 0, 0, 0)
-    h, w = lumas[0].shape
-    views = {
-        "top": lumas,
-        "bottom": [lu[::-1] for lu in lumas],
-        "left": [mx.transpose(lu) for lu in lumas],
-        "right": [mx.transpose(lu)[::-1] for lu in lumas],
-    }
+    h = len(stats[0]["top"][0])
+    w = len(stats[0]["left"][0])
     dims = {"top": h, "bottom": h, "left": w, "right": w}
-    bars = {e: _deep_bar_depth(v, dims[e], limit=(dims[e] * 45) // 100)
-            for e, v in views.items()}
+    bars = {e: _deep_bar_depth([s[e] for s in stats], dims[e],
+                               limit=(dims[e] * 45) // 100)
+            for e in dims}
     t, b = bars["top"], bars["bottom"]
     left, r = bars["left"], bars["right"]
     if (h - t - b) % 2:
@@ -194,13 +200,28 @@ def compute_aspect_crop(w: int, h: int, ar_w: int, ar_h: int,
         raise ValueError(f"aspect must be positive, got {ar_w}:{ar_h}")
     if anchor not in _ANCHORS:
         raise ValueError(f"anchor must be one of {sorted(_ANCHORS)}, got {anchor!r}")
-    tw = min(w, (h * ar_w) // ar_h)
-    th = min(h, (tw * ar_h) // ar_w)
-    tw = min(tw, (th * ar_w) // ar_h)
-    tw -= tw % 2
-    th -= th % 2
-    if tw < 2 or th < 2:
+    # Even-integer boxes can only approximate most ratios; evaluate the three
+    # natural fit orders and keep the pair with the smallest relative ratio
+    # error (ties broken toward the larger area).
+    tw0 = min(w, (h * ar_w) // ar_h)
+    th0 = min(h, (tw0 * ar_h) // ar_w)
+    tw0 = min(tw0, (th0 * ar_w) // ar_h)
+    chain = (tw0 - tw0 % 2, th0 - th0 % 2)
+    fw = min(w, (h * ar_w) // ar_h)
+    fw -= fw % 2
+    fh = min(h, (fw * ar_h) // ar_w)
+    fh -= fh % 2
+    width_first = (fw, fh)
+    gh = min(h, (w * ar_h) // ar_w)
+    gh -= gh % 2
+    gw = min(w, (gh * ar_w) // ar_h)
+    gw -= gw % 2
+    height_first = (gw, gh)
+    target = ar_w / ar_h
+    valid = [c for c in {chain, width_first, height_first} if c[0] >= 2 and c[1] >= 2]
+    if not valid:
         raise ValueError(f"aspect {ar_w}:{ar_h} leaves no picture in {w}x{h}")
+    tw, th = min(valid, key=lambda c: (abs(c[0] / c[1] / target - 1.0), -(c[0] * c[1])))
     ax, ay = _ANCHORS[anchor]
     left = max(0, min(int(round((w - tw) * ax)) + int(dx), w - tw))
     top = max(0, min(int(round((h - th) * ay)) + int(dy), h - th))
@@ -224,30 +245,20 @@ def detect_junk_edges(samples: Sequence[Any]) -> tuple[tuple[int, int, int, int]
     notices lists letterbox-class findings that are reported but not fixed.
     Blank/fade samples are skipped; with fewer than 3 usable samples nothing
     is detected (too little evidence to overwrite pixels)."""
-    lumas = []
-    for fr in samples:
-        lu = _luma(fr)
-        m = float(mx.mean(lu))
-        sd = float(mx.sqrt(mx.mean((lu - m) ** 2)))
-        if sd >= _BLANK_STD:
-            lumas.append(lu)
-    if len(lumas) < 3:
+    stats = _edge_stats(samples)
+    if len(stats) < 3:
         return (0, 0, 0, 0), ["too few usable sample frames; no detection"]
 
-    h, w = lumas[0].shape
-    views = {
-        "top": list(lumas),
-        "bottom": [lu[::-1] for lu in lumas],
-        "left": [mx.transpose(lu) for lu in lumas],
-        "right": [mx.transpose(lu)[::-1] for lu in lumas],
-    }
+    h = len(stats[0]["top"][0])
+    w = len(stats[0]["left"][0])
     dims = {"top": h, "bottom": h, "left": w, "right": w}
     fix = {}
     notices = []
-    for edge, vs in views.items():
-        d, bar = _edge_depth(vs, dims[edge])
+    for edge, dim in dims.items():
+        es = [s[edge] for s in stats]
+        d, bar = _edge_depth(es, dim)
         if bar >= MAX_FIX_DEPTH:
-            deep = _deep_bar_depth(vs, dims[edge])
+            deep = _deep_bar_depth(es, dim)
             notices.append(
                 f"{edge}: {deep}px constant bar (letterbox-class) -- not filled; "
                 "crop the active area instead"
@@ -268,13 +279,23 @@ def _to_unit(rgb: Any) -> Any:
     return f / 255.0 if rgb.dtype == mx.uint8 else f
 
 
+# Feather weight vectors are identical every frame for a given (band, feather)
+# in output px -- build once, cast per use (they are tiny).
+_FEATHER_CACHE: dict = {}
+
+
 def _feather_weights(band_px: int, feather_px: int, dt: Any) -> Any:
     """Composite weights for one edge zone: 1.0 across the band, then a linear
     ramp to 0 across the feather. Length band_px + feather_px."""
-    w = [1.0] * band_px
-    for i in range(feather_px):
-        w.append(1.0 - (i + 0.5) / feather_px)
-    return mx.array(w, dtype=dt)
+    key = (band_px, feather_px)
+    base = _FEATHER_CACHE.get(key)
+    if base is None:
+        w = [1.0] * band_px
+        for i in range(feather_px):
+            w.append(1.0 - (i + 0.5) / feather_px)
+        base = mx.array(w, dtype=mx.float32)
+        _FEATHER_CACHE[key] = base
+    return base.astype(dt)
 
 
 def restore_borders(out_rgb: Any, src_rgb: Any, edges: tuple[int, int, int, int],
@@ -287,7 +308,11 @@ def restore_borders(out_rgb: Any, src_rgb: Any, edges: tuple[int, int, int, int]
     show it (static, quiet), while the nets never saw it. `feather` (source px)
     crossfades from the restored band into the processed content so the seam
     between the soft original border and the crisply processed interior does
-    not read as a hard line; 0 = hard splice."""
+    not read as a hard line; 0 = hard splice.
+
+    Splices are combined per axis (one concatenate for top+bottom, one for
+    left+right) so a frame costs at most two full-size copies; only the edge
+    zones of the source are converted/upscaled."""
     t, b, left, r = edges
     feather = max(0, int(feather))
     sh, sw = int(src_rgb.shape[0]), int(src_rgb.shape[1])
@@ -295,60 +320,86 @@ def restore_borders(out_rgb: Any, src_rgb: Any, edges: tuple[int, int, int, int]
     if oh % sh or ow % sw or (oh // sh) != (ow // sw):
         raise ValueError(f"output {oh}x{ow} is not an integer multiple of source {sh}x{sw}")
     ratio = oh // sh
-    src = _to_unit(src_rgb)
     dt = out_rgb.dtype if out_rgb.dtype != mx.uint8 else mx.float32
 
-    # Per-edge sequential composite; corners blend toward the source twice,
-    # which is harmless (same source content).
-    def apply_edge(o, axis, from_end, band, fe):
+    def mixed_zone(o, axis, from_end, band, fe):
+        """The blended zone tensor for one edge (band+feather, output px)."""
         zone_src = band + fe
         zone_out = zone_src * ratio
         if axis == 0:
-            s_slice = src[sh - zone_src:] if from_end else src[:zone_src]
+            s_slice = src_rgb[sh - zone_src:] if from_end else src_rgb[:zone_src]
             o_slice = o[oh - zone_out:] if from_end else o[:zone_out]
         else:
-            s_slice = src[:, sw - zone_src:] if from_end else src[:, :zone_src]
+            s_slice = src_rgb[:, sw - zone_src:] if from_end else src_rgb[:, :zone_src]
             o_slice = o[:, ow - zone_out:] if from_end else o[:, :zone_out]
-        band_up = _nn_up(s_slice, ratio).astype(dt)
+        band_up = _nn_up(_to_unit(s_slice), ratio).astype(dt)
         w = _feather_weights(band * ratio, fe * ratio, dt)
         if from_end:
             w = w[::-1]
         w = w[:, None, None] if axis == 0 else w[None, :, None]
-        mixed = (band_up * w + o_slice.astype(dt) * (1.0 - w)).astype(o.dtype)
-        if axis == 0:
-            return (mx.concatenate([o[:oh - zone_out], mixed], axis=0) if from_end
-                    else mx.concatenate([mixed, o[zone_out:]], axis=0))
-        return (mx.concatenate([o[:, :ow - zone_out], mixed], axis=1) if from_end
-                else mx.concatenate([mixed, o[:, zone_out:]], axis=1))
+        return (band_up * w + o_slice.astype(dt) * (1.0 - w)).astype(o.dtype), zone_out
 
-    if t:
-        out_rgb = apply_edge(out_rgb, 0, False, t, min(feather, sh - t - 1))
-    if b:
-        out_rgb = apply_edge(out_rgb, 0, True, b, min(feather, sh - b - 1))
-    if left:
-        out_rgb = apply_edge(out_rgb, 1, False, left, min(feather, sw - left - 1))
-    if r:
-        out_rgb = apply_edge(out_rgb, 1, True, r, min(feather, sw - r - 1))
+    fe_t = min(feather, sh - t - 1) if t else 0
+    fe_b = min(feather, sh - b - 1) if b else 0
+    fe_l = min(feather, sw - left - 1) if left else 0
+    fe_r = min(feather, sw - r - 1) if r else 0
+
+    # Rows first, then columns (column zones blend over the already-restored
+    # rows at the corners, same as the previous sequential order). Zones that
+    # would overlap fall back to sequential splices.
+    if t or b:
+        zt = (t + fe_t) * ratio
+        zb = (b + fe_b) * ratio
+        if t and b and zt + zb <= oh:
+            top_mix, _ = mixed_zone(out_rgb, 0, False, t, fe_t)
+            bot_mix, _ = mixed_zone(out_rgb, 0, True, b, fe_b)
+            out_rgb = mx.concatenate([top_mix, out_rgb[zt:oh - zb], bot_mix], axis=0)
+        else:
+            if t:
+                mix, zo = mixed_zone(out_rgb, 0, False, t, fe_t)
+                out_rgb = mx.concatenate([mix, out_rgb[zo:]], axis=0)
+            if b:
+                mix, zo = mixed_zone(out_rgb, 0, True, b, fe_b)
+                out_rgb = mx.concatenate([out_rgb[:oh - zo], mix], axis=0)
+    if left or r:
+        zl = (left + fe_l) * ratio
+        zr = (r + fe_r) * ratio
+        if left and r and zl + zr <= ow:
+            l_mix, _ = mixed_zone(out_rgb, 1, False, left, fe_l)
+            r_mix, _ = mixed_zone(out_rgb, 1, True, r, fe_r)
+            out_rgb = mx.concatenate([l_mix, out_rgb[:, zl:ow - zr], r_mix], axis=1)
+        else:
+            if left:
+                mix, zo = mixed_zone(out_rgb, 1, False, left, fe_l)
+                out_rgb = mx.concatenate([mix, out_rgb[:, zo:]], axis=1)
+            if r:
+                mix, zo = mixed_zone(out_rgb, 1, True, r, fe_r)
+                out_rgb = mx.concatenate([out_rgb[:, :ow - zo], mix], axis=1)
     return out_rgb
 
 
 def sanitize_rgb(rgb: Any, edges: tuple[int, int, int, int]) -> Any:
     """Overwrite the given edge bands (top, bottom, left, right px) with the
-    adjacent interior row/column. (H,W,3) in, same shape out; dtype preserved."""
+    adjacent interior row/column. (H,W,3) in, same shape out; dtype preserved.
+    One concatenate per touched axis, so at most two full-frame copies."""
     t, b, left, r = edges
     h, w = int(rgb.shape[0]), int(rgb.shape[1])
     if t + b >= h or left + r >= w:
         raise ValueError(f"edge bands {edges} do not leave an interior for {h}x{w}")
-    if t:
-        rgb = mx.concatenate(
-            [mx.broadcast_to(rgb[t:t + 1], (t, *rgb.shape[1:])), rgb[t:]], axis=0)
-    if b:
-        rgb = mx.concatenate(
-            [rgb[:h - b], mx.broadcast_to(rgb[h - b - 1:h - b], (b, *rgb.shape[1:]))], axis=0)
-    if left:
-        rgb = mx.concatenate(
-            [mx.broadcast_to(rgb[:, left:left + 1], (h, left, rgb.shape[-1])), rgb[:, left:]], axis=1)
-    if r:
-        rgb = mx.concatenate(
-            [rgb[:, :w - r], mx.broadcast_to(rgb[:, w - r - 1:w - r], (h, r, rgb.shape[-1]))], axis=1)
+    if t or b:
+        parts = []
+        if t:
+            parts.append(mx.broadcast_to(rgb[t:t + 1], (t, *rgb.shape[1:])))
+        parts.append(rgb[t:h - b])
+        if b:
+            parts.append(mx.broadcast_to(rgb[h - b - 1:h - b], (b, *rgb.shape[1:])))
+        rgb = mx.concatenate(parts, axis=0)
+    if left or r:
+        parts = []
+        if left:
+            parts.append(mx.broadcast_to(rgb[:, left:left + 1], (h, left, rgb.shape[-1])))
+        parts.append(rgb[:, left:w - r])
+        if r:
+            parts.append(mx.broadcast_to(rgb[:, w - r - 1:w - r], (h, r, rgb.shape[-1])))
+        rgb = mx.concatenate(parts, axis=1)
     return rgb

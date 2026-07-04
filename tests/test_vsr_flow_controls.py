@@ -992,3 +992,50 @@ def test_edge_sanitize_aspect_crop_anchors():
     assert compute_aspect_crop(640, 480, 16, 9, anchor="bottom", dy=50) == (120, 0, 0, 0)
     with pytest.raises(ValueError, match="anchor"):
         compute_aspect_crop(640, 480, 16, 9, anchor="middle-ish")
+
+
+def test_edge_sanitize_aspect_crop_picks_closest_even_fit():
+    from LTX_2_MLX.videotoolbox.edge_sanitize import compute_aspect_crop
+
+    # 16:9 in storage px on 348x288: even boxes can only approximate;
+    # 344x194 (-0.26%) beats 346x194 (+0.32%) and 348x194 (+0.90%).
+    assert compute_aspect_crop(348, 288, 16, 9) == (47, 47, 2, 2)
+    # Display 16:9 on 128:117 anamorphic pixels = storage 13:8 (16*117:9*128
+    # reduced): full width, 214 rows.
+    assert compute_aspect_crop(348, 288, 16 * 117, 9 * 128) == (37, 37, 0, 0)
+
+
+def test_lanczos_resample_plan_properties():
+    from LTX_2_MLX.videotoolbox.vsr_blocks import make_lanczos_plan, resample_width
+
+    # identity when sizes match
+    plan = make_lanczos_plan(12, 12)
+    x = mx.random.uniform(shape=(4, 12, 3))
+    assert float(mx.max(mx.abs(resample_width(x, plan) - x))) < 1e-6
+
+    # constants preserved exactly on up AND down (weights sum to 1)
+    up = make_lanczos_plan(87, 95)      # the 128:117 PAR ratio reduced
+    dn = make_lanczos_plan(95, 87)
+    const = mx.full((3, 87, 2), 0.4)
+    out = resample_width(const, up)
+    assert out.shape == (3, 95, 2)
+    assert float(mx.max(mx.abs(out - 0.4))) < 1e-5
+    constd = mx.full((3, 95, 2), 0.4)
+    outd = resample_width(constd, dn)
+    assert outd.shape == (3, 87, 2)
+    assert float(mx.max(mx.abs(outd - 0.4))) < 1e-5
+
+    # downscale kernel widens for antialiasing (more taps than upscale)
+    assert dn[0].shape[0] > up[0].shape[0]
+
+    # a linear ramp is reproduced closely in the interior on upscale
+    ramp = mx.broadcast_to(mx.arange(87, dtype=mx.float32)[None, :, None], (2, 87, 1))
+    r = resample_width(ramp, up)
+    j = mx.arange(95, dtype=mx.float32)
+    expect = (j + 0.5) * (87.0 / 95.0) - 0.5
+    err = mx.abs(r[0, :, 0] - expect)[8:-8]
+    assert float(mx.max(err)) < 0.02
+
+    # batched 4D input works too
+    x4 = mx.random.uniform(shape=(2, 4, 87, 3))
+    assert resample_width(x4, up).shape == (2, 4, 95, 3)
