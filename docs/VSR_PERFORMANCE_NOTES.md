@@ -348,6 +348,29 @@ encoder handle extended-range fp16 correctly; the passthrough stays
 authentic) and the restore-borders composite (original border content is
 restored verbatim).
 
+LEVELS are part of the input domain too. Every model in the harness trains
+on full-range images (image datasets have no limited-range notion; the
+Real-ESRGAN recipe additionally clamps the synthesized LQ to the uint8
+lattice), so a correctly-flagged limited-range source -- expanded to
+full-range RGB at decode -- lands exactly in the training domain. A
+MIS-flagged source does not, and measurably: fed a range-shifted frame and
+compared after un-shifting, outputs match the correct render at only
+29-35 dB, because full-range-trained GANs contrast-pump toward full swing
+(squeezed input still produces 0..1 output) -- the shift is not linearly
+recoverable downstream. Direction asymmetry: read-as-full when really
+limited (washed out) makes the stock GAN over-etch (+23-26% luma high-pass);
+read-as-limited when really full (the default assumption for untagged
+sources, e.g. screen recordings) crushes shadows to flat black before any
+model runs and inflates GAN chroma specks (+86% area on one checkpoint).
+`--source-range video|full` forces the interpretation for mis-flagged
+sources: the forced path decodes YUV in the container's own range format
+(code values pass through unrescaled) and retypes the buffer to the
+overridden range variant, so VideoToolbox's converter applies the other
+scaling to identical bytes -- a true reinterpretation; asking the decoder
+for the other range format directly would rescale instead. Output tags
+follow. Not available on the NV12 fast path (its YUV never crosses a range
+conversion point).
+
 RealViformer streams (causal recurrence, per-frame state, reset at cuts) --
 temporal consistency at barely more than a per-frame net's cost. ESC's numbers
 are attention-bound (section 2); its value is output quality plus the only

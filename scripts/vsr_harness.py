@@ -574,7 +574,7 @@ def run(args: argparse.Namespace) -> None:
             Path(args.video),
         )
         _src_color = _vr.probe_color(Path(args.video))
-        _resolved_color = _color.resolve(_src_color, args.source_color)
+        _resolved_color = _color.resolve(_src_color, args.source_color, args.source_range)
         color_props = _color.av_color_properties(_resolved_color)
         cv_color = _color.cv_triple(_resolved_color)
         output_full_range = _resolved_color[3]
@@ -585,6 +585,14 @@ def run(args: argparse.Namespace) -> None:
         if args.source_color != "auto":
             print(f"  (forcing the source to be DECODED as {args.source_color}, "
                   "overriding VideoToolbox's resolution guess)")
+        if args.source_range != "auto":
+            _container_range = "full" if _src_color["full_range"] else "video"
+            if args.source_range == _container_range:
+                print(f"  (--source-range {args.source_range} matches the container "
+                      "flag; no reinterpretation needed)")
+            else:
+                print(f"  (reinterpreting the source's code values as {args.source_range} "
+                      f"range, overriding the container's {_container_range}-range flag)")
 
         # ---- Bar crop + border sampling (before any dims are consumed) -----
         src_w, src_h = in_w, in_h
@@ -750,13 +758,25 @@ def run(args: argparse.Namespace) -> None:
             total_frames = (win_end if win_end is not None else total_frames) - win_start
             print(f"[setup] input trim: frames [{win_start}, "
                   f"{win_end if win_end is not None else 'end'}) -> {total_frames} frames")
-        if args.source_color != "auto" and vsr_src_fmt == _pb.PIX_RGBAHALF:
-            # Force the READ: decode raw YUV and re-interpret it with the chosen
-            # matrix, overriding VideoToolbox's resolution-based guess. (NV12 'fast'
-            # keeps the default decode; the LowLatency scaler consumes YUV directly.)
+        _force_read = args.source_color != "auto" or args.source_range != "auto"
+        if args.source_range != "auto" and vsr_src_fmt != _pb.PIX_RGBAHALF:
+            # The NV12 fast path feeds container-range-typed YUV straight into
+            # VSR and the encoder; retyping it would make the encode session
+            # rescale the values. No reinterpretation is possible there.
+            raise SystemExit(
+                "--source-range is not supported with --spatial-mode fast (the "
+                "NV12 path passes YUV through without a range conversion point). "
+                "Use --spatial-mode none/balanced/image or an MLX upscaler.")
+        if _force_read and vsr_src_fmt == _pb.PIX_RGBAHALF:
+            # Force the READ: decode raw YUV in the CONTAINER's range format
+            # (pass-through code values), re-interpret with the chosen matrix
+            # and range, overriding the container tag / VideoToolbox's
+            # resolution-based guess. (NV12 'fast' keeps the default decode;
+            # the LowLatency scaler consumes YUV directly.)
             chunks = _vr.iter_forced_color_chunks(
-                Path(args.video), vsr_src_fmt, cv_color[2], output_full_range,
+                Path(args.video), vsr_src_fmt, cv_color[2], _src_color["full_range"],
                 chunk_size=buf_chunk, start_frame=win_start, end_frame=win_end,
+                reinterpret_full_range=output_full_range,
             )
         else:
             chunks = _vr.iter_video_buffer_chunks(
@@ -1569,6 +1589,21 @@ def main() -> None:
             "guesses wrong. For balanced/image it decodes raw YUV and re-interprets "
             "it (not just an output tag); fast/NV12 keeps VideoToolbox's decode and "
             "only re-tags. The output is tagged to match."
+        ),
+    )
+    parser.add_argument(
+        "--source-range", choices=["auto", "video", "full"], default="auto",
+        help=(
+            "How the source's YUV code values map to RGB. auto (default) trusts "
+            "the container's range flag (untagged = video/limited range, the "
+            "standard assumption -- Y 16-235). video/full FORCE the interpretation "
+            "for mis-flagged sources, e.g. full-range screen recordings or "
+            "phone/webcam MP4s an encoder left untagged: read as limited they get "
+            "shadows crushed to black and highlights clipped BEFORE any model runs "
+            "(and the learned upscalers respond badly to the clipped regions). The "
+            "reinterpretation is exact -- same decoded code values, different "
+            "YUV->RGB scaling -- and the output is tagged to match. Not available "
+            "with --spatial-mode fast (its YUV passes through untouched)."
         ),
     )
     parser.add_argument(

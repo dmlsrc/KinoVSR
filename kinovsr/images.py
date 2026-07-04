@@ -69,10 +69,16 @@ def _mx_to_cgimage(img: Any) -> Any:
     a = mx.array(img)
     if a.ndim != 3 or a.shape[2] not in (3, 4):
         raise ValueError(f"expected (H, W, 3|4) image, got shape {tuple(a.shape)}")
+    if a.dtype != mx.uint8:
+        # Hard error, not a convenience cast: the scale of a non-uint8 image is
+        # ambiguous ([0,1] float? [0,255] float?), and an astype here truncates
+        # [0,1] floats to 0/1 -- a silently black image.
+        raise TypeError(
+            f"expected a uint8 image, got {a.dtype}; convert first, e.g. "
+            "(mx.clip(x, 0, 1) * 255 + 0.5).astype(mx.uint8)")
     h, w = int(a.shape[0]), int(a.shape[1])
     if a.shape[2] == 3:
         a = mx.concatenate([a, mx.full((h, w, 1), 255, dtype=mx.uint8)], axis=2)
-    a = a.astype(mx.uint8)
     mx.eval(a)
     # Independent mutable backing for the CGBitmapContext (CG renders into it
     # and retains the pointer); cast("B") fills it in one copy. Do not pass a

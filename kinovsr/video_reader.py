@@ -159,9 +159,47 @@ _YUV10_VIDEO = Quartz.kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
 _YUV10_FULL = Quartz.kCVPixelFormatType_422YpCbCr10BiPlanarFullRange
 
 
+def _retype_range_copy(yuv: Any, dst_fmt: int) -> Any:
+    """Byte-identical copy of a planar YUV buffer into a buffer typed `dst_fmt`.
+
+    The video/full-range variants of a YUV pixel format share one plane layout;
+    only the format code (the range *interpretation*) differs. Copying the
+    planes unchanged into a buffer of the other range type is what makes
+    --source-range a REINTERPRETATION: asking the decoder for the other range
+    format instead would RESCALE the code values -- exactly wrong when the
+    container's flag is the thing that's mistaken.
+    """
+    w = Quartz.CVPixelBufferGetWidth(yuv)
+    h = Quartz.CVPixelBufferGetHeight(yuv)
+    dst = _pb.make_pixel_buffer_from_attrs(w, h, {
+        Quartz.kCVPixelBufferPixelFormatTypeKey: dst_fmt,
+        Quartz.kCVPixelBufferWidthKey: w, Quartz.kCVPixelBufferHeightKey: h,
+        Quartz.kCVPixelBufferIOSurfacePropertiesKey: {}})
+    Quartz.CVPixelBufferLockBaseAddress(yuv, 1)  # 1 = read-only lock
+    Quartz.CVPixelBufferLockBaseAddress(dst, 0)
+    try:
+        for p in range(Quartz.CVPixelBufferGetPlaneCount(yuv)):
+            rows = Quartz.CVPixelBufferGetHeightOfPlane(yuv, p)
+            sbpr = Quartz.CVPixelBufferGetBytesPerRowOfPlane(yuv, p)
+            dbpr = Quartz.CVPixelBufferGetBytesPerRowOfPlane(dst, p)
+            smv = Quartz.CVPixelBufferGetBaseAddressOfPlane(yuv, p).as_buffer(rows * sbpr)
+            dmv = Quartz.CVPixelBufferGetBaseAddressOfPlane(dst, p).as_buffer(rows * dbpr)
+            if sbpr == dbpr:
+                dmv[:] = smv
+            else:
+                row = min(sbpr, dbpr)
+                for r in range(rows):
+                    dmv[r * dbpr:r * dbpr + row] = smv[r * sbpr:r * sbpr + row]
+    finally:
+        Quartz.CVPixelBufferUnlockBaseAddress(dst, 0)
+        Quartz.CVPixelBufferUnlockBaseAddress(yuv, 1)
+    return dst
+
+
 def iter_forced_color_chunks(
     path: Path, out_format: int, matrix_cv: Any, full_range: bool,
     chunk_size: int = 8, *, start_frame: int = 0, end_frame: int | None = None,
+    reinterpret_full_range: bool | None = None,
 ) -> Iterator[list]:
     """Decode the source as raw 10-bit YUV, FORCE the YCbCr matrix (overriding the
     container tag / VideoToolbox's resolution-based guess), then convert to
@@ -169,11 +207,19 @@ def iter_forced_color_chunks(
 
     This makes --source-color control how the source is READ -- the fix for the
     untagged SD clips VideoToolbox mis-guesses as BT.601. The 4:2:2/10-bit YUV is a
-    precision-preserving superset of any SDR source; range follows the detected
-    full/video flag (the YUV->RGB scaling the requested format implies).
+    precision-preserving superset of any SDR source.
+
+    `full_range` must be the CONTAINER's flag: the YUV decode requests the
+    matching range format so the code values pass through unrescaled.
+    `reinterpret_full_range` (--source-range) then presents those same values
+    to the YUV->RGB conversion under a different range identity via a
+    byte-identical retype copy; None or equal-to-container means no override.
     """
     require_pyobjc()
     yuv_fmt = _YUV10_FULL if full_range else _YUV10_VIDEO
+    retype_fmt = None
+    if reinterpret_full_range is not None and reinterpret_full_range != full_range:
+        retype_fmt = _YUV10_FULL if reinterpret_full_range else _YUV10_VIDEO
     err, xfer = vt.VTPixelTransferSessionCreate(None, None)
     if err != 0 or xfer is None:
         raise RuntimeError(f"VTPixelTransferSessionCreate failed: {err}")
@@ -181,6 +227,8 @@ def iter_forced_color_chunks(
                                           start_frame=start_frame, end_frame=end_frame):
         out: list = []
         for yuv in chunk:
+            if retype_fmt is not None:
+                yuv = _retype_range_copy(yuv, retype_fmt)
             Quartz.CVBufferSetAttachment(
                 yuv, Quartz.kCVImageBufferYCbCrMatrixKey, matrix_cv,
                 Quartz.kCVAttachmentMode_ShouldPropagate)

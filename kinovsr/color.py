@@ -52,23 +52,30 @@ def read_source_color(format_desc: Any) -> dict:
     }
 
 
-def resolve(src: dict, override: str = "auto") -> tuple:
+def resolve(src: dict, override: str = "auto", range_override: str = "auto") -> tuple:
     """(primaries, transfer, matrix, full_range) as CV constants.
 
     override 'auto' = the source's actual color: explicit container tags, or (for
     untagged sources) VideoToolbox's decode-time guess, which probe_color reads
     from a decoded frame -- so the output tag matches how the source was actually
     read, not a fixed BT.709. Falls back to BT.709 only if even the guess is
-    absent. Any other override forces that colorimetry; the range flag is honored.
+    absent. Any other override forces that colorimetry.
+
+    range_override 'auto' = the container's full-range flag (absent = video
+    range, the universal default for H.264/HEVC). 'video'/'full' force the
+    interpretation for mis-flagged sources -- e.g. full-range screen recordings
+    an encoder left untagged, which would otherwise be read as limited range
+    (crushed shadows / blown highlights once expanded).
     """
+    fr = src["full_range"] if range_override == "auto" else range_override == "full"
     if override != "auto":
         prim, trans, mat = _OVERRIDES[override]
-        return prim, trans, mat, src["full_range"]
+        return prim, trans, mat, fr
     return (
         src.get("primaries") or _709[0],
         src.get("transfer") or _709[1],
         src.get("matrix") or _709[2],
-        src["full_range"],
+        fr,
     )
 
 
