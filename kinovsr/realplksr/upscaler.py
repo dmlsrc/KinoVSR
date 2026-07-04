@@ -23,9 +23,10 @@ class RealPlksrUpscaler:
 
     dtype defaults to fp16. The LayerNorm+DySample checkpoints (public2x) are
     fp16-safe; the GroupNorm+PixelShuffle checkpoints (nomos4x) are not fully
-    fp16-stable per the community, so this driver runs the measured precision
-    islands (fp32 norm reductions + stable Mish) inside net.py regardless of the
-    storage dtype -- pass dtype=mx.float32 to force a full fp32 run.
+    fp16-stable per the community, so net.py keeps a single measured precision
+    island -- the GroupNorm/LayerNorm reductions run in fp32 (the activations
+    overflow an fp16 variance) -- regardless of the storage dtype. Pass
+    dtype=mx.float32 to force a full fp32 run.
     """
 
     def __init__(self, weights: Any = None, dtype: Any = mx.float16, compile: bool = True):

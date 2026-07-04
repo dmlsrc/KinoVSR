@@ -73,7 +73,28 @@ channel-norm (small C = 32-512, many N*H*W rows) the threadgroup underfills
 than a hand-rolled `mx.mean`/`mx.rsqrt` reduction. The penalty is shape-bound,
 not dtype-bound (the kernel accumulates in fp32 regardless). Reserve
 `mx.fast.*norm` for transformer-width axes; keep manual reductions for NHWC
-channel norms (see `videotoolbox/nafnet/net.py:_layernorm`).
+channel norms (see `videotoolbox/nafnet/net.py:_layernorm`). Re-verified on
+RealPLKSR (C=64): manual is 1.89x faster than `mx.fast.layer_norm`.
+
+### GroupNorm: reduce the contiguous spatial axes first
+
+A channel-first NHWC GroupNorm (reshape to `(N,H,W,g,cg)`, normalize over
+`(H,W,cg)` per group) is tempting to write as one `mx.mean` over the strided
+axes `(1,2,4)`. That strided reduction is **4.5x slower** than reducing the
+contiguous spatial axes `(1,2)` first (keeping `(g,cg)`) and then the small
+channel-group axis -- and on RealPLKSR's 4x GroupNorm variant the strided form
+was the whole net's #1 op (173 ms/28-blocks at 288x352, more than the 17x17
+partial-large-kernel conv). Fixing it took the whole 4x forward 597 -> 434
+ms/frame (1.38x). The reduction stays fp32 (load-bearing: refine-out activations
+reach ~370, so both `mean(x)` and `mean(x^2)` overflow an fp16 accumulator);
+use the two-pass form (mu, then `(x-mu)^2`) rather than `E[x^2]-E[x]^2` so the
+variance cannot go negative from cancellation. See
+`videotoolbox/realplksr/net.py:_groupnorm`.
+
+Corollary from the same audit: a numerically stable softplus Mish
+(`max(x,0)+log1p(exp(-|x|))`, `exp(-|x|)` <= 1 so no fp16 overflow) needs no
+fp32 island -- it is speed-neutral in the compiled/fused graph and within
+~4e-3 of fp32. Only the norm reductions genuinely need fp32.
 
 ### Winograd collapses at large spatial extents
 

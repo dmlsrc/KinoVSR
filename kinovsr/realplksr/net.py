@@ -111,12 +111,14 @@ def _conv(x: Any, p: dict, key: str, pad: int = 0) -> Any:
 
 
 def _mish(x: Any) -> Any:
-    """x * tanh(softplus(x)), numerically stable softplus (no fp16 exp overflow):
-    softplus(x) = max(x,0) + log1p(exp(-|x|)). The gate runs in fp32; the product
-    stays in x's dtype (tanh(softplus)>=0 and ~1 for large x, so out ~ x)."""
-    xf = x.astype(mx.float32)
-    sp = mx.maximum(xf, 0.0) + mx.log1p(mx.exp(-mx.abs(xf)))
-    return (x.astype(mx.float32) * mx.tanh(sp)).astype(x.dtype)
+    """x * tanh(softplus(x)) in x's own dtype. The softplus is the numerically
+    stable form softplus(x) = max(x,0) + log1p(exp(-|x|)): exp(-|x|) is in (0,1]
+    so it never overflows fp16, and tanh(softplus) in (0,1) keeps the product ~x.
+    Running this in fp16 (rather than a fp32 island) is 2x faster for a ~4e-3
+    difference vs fp32 -- measured negligible through the trunk (see the perf
+    audit); no overflow because DCCM-mid activations stay ~10-30."""
+    sp = mx.maximum(x, 0) + mx.log1p(mx.exp(-mx.abs(x)))
+    return x * mx.tanh(sp)
 
 
 def _layernorm(x: Any, w: Any, b: Any, eps: float = 1e-6) -> Any:
@@ -131,13 +133,22 @@ def _layernorm(x: Any, w: Any, b: Any, eps: float = 1e-6) -> Any:
 
 def _groupnorm(x: Any, w: Any, b: Any, groups: int = 4, eps: float = 1e-5) -> Any:
     """torch GroupNorm(groups, C): per sample, per group, normalize over (H,W,C/g).
-    fp32 reduction; weight/bias are per-channel."""
+
+    fp32 reduction is load-bearing, not a nicety: refine-out activations reach
+    ~370, so both mean(x) and mean(x^2) overflow fp16 (sum of ~1e5 elements, and
+    x^2 ~ 1.4e5 > 65504). This reduces the CONTIGUOUS spatial axes (1,2) first,
+    then the small channel-group axis -- 4.5x faster than a single strided reduce
+    over (H,W,cg), which is the port's #1 hot op on the 4x GroupNorm variant (perf
+    audit). Two-pass (mu, then (x-mu)^2) rather than E[x^2]-E[x]^2 so the variance
+    can never go negative from cancellation."""
     n, h, wd, c = x.shape
     cg = c // groups
+    cnt = h * wd * cg
     xf = x.astype(mx.float32).reshape(n, h, wd, groups, cg)
-    mu = mx.mean(xf, axis=(1, 2, 4), keepdims=True)
-    var = mx.mean((xf - mu) ** 2, axis=(1, 2, 4), keepdims=True)
-    y = ((xf - mu) * mx.rsqrt(var + eps)).reshape(n, h, wd, c)
+    mu = mx.sum(mx.sum(xf, axis=(1, 2), keepdims=True), axis=4, keepdims=True) / cnt
+    d = xf - mu
+    var = mx.sum(mx.sum(d * d, axis=(1, 2), keepdims=True), axis=4, keepdims=True) / cnt
+    y = (d * mx.rsqrt(var + eps)).reshape(n, h, wd, c)
     return (y * w.astype(mx.float32) + b.astype(mx.float32)).astype(x.dtype)
 
 

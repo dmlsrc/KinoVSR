@@ -39,10 +39,10 @@ The `public2x` LayerNorm checkpoints are fp16-safe. The `nomos4x` GroupNorm
 checkpoint is flagged fp16-unsafe upstream (spandrel `supports_half=False`): the
 partial-large-kernel activations reach ~1150, so a naive fp16 GroupNorm variance
 (`mean(x^2)` ~ 1.3e6) overflows fp16 and silently zeros the hot channels. The MLX
-port runs the norm reductions and Mish softplus in fp32 (the `--realplksr-dtype
+port runs just the GroupNorm/LayerNorm reductions in fp32 (the `--realplksr-dtype
 float16` default), which fixes exactly that -- measured visually lossless (~72 dB
-vs fp32) while keeping the convs in fp16. Use `--realplksr-dtype float32` to force
-a full single-precision run.
+vs fp32) while keeping the convs and activations in fp16. Use `--realplksr-dtype
+float32` to force a full single-precision run.
 
 ## Architecture
 
