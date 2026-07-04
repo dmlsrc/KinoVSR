@@ -19,6 +19,18 @@ this port). The forward here runs it fine, but it is deliberately not a token.
   max-pool level, 3x3 depthwise, bilinear upsample, GELU gate) + CCM. Fidelity-
   trained on compressed content; ~45x fewer parameters.
 
+- "purescale" / "purescale2x" / "purescale2x-sharp" (PureScale 2.0 by limitlesslab,
+  https://github.com/limitlesslab/AI-upscaling-models): SAFMN-L retrained from
+  scratch on the author's own curated real-world dataset with a FIXED SAFM branch --
+  adaptive AVG pool (not max) and BICUBIC upsample (not nearest). The stock max+
+  nearest combination broadcasts a hot activation as a constant block into the
+  modulation gate, the known upstream lattice/blotch artifact; the fix requires
+  retraining, which these checkpoints are. GAN models, JPEG-robust; "sharp" adds a
+  deblurring component. The SAFM mode is inferred from the weights filename
+  ("purescale" in the stem); checkpoint keys are identical to SAFMN-L. NOTE: these
+  weights are licensed CC BY-NC-SA 4.0 (NON-COMMERCIAL use only) -- see
+  ATTRIBUTION.md and weights/README.md; they are not distributed with this repo.
+
 Layout: MLX-native NHWC; conv weights -> (O,kH,kW,I) at load; the depthwise convs
 run as the 9-tap shift-add (their channel counts of 24/16 fail MLX's depthwise-gate
 C%16 check -- see docs/VSR_PERFORMANCE_NOTES.md). Input is replicate-padded to a
@@ -42,9 +54,15 @@ _VARIANTS = {
     "light": "light_safmnpp.safetensors",             # light_SAFMN++, fidelity 4x (AIS 2024)
     "real": "safmn_l_real_lsdir_x4.safetensors",      # SAFMN_L_Real_LSDIR, real-world 4x
     "real2x": "safmn_l_real_lsdir_x2.safetensors",    # same family, 2x (HD -> 4K class)
+    # PureScale 2.0 (limitlesslab) -- fixed-SAFM retrains, CC BY-NC-SA 4.0
+    # (non-commercial only); see ATTRIBUTION.md / weights/README.md.
+    "purescale": "safmn_purescale_x4.safetensors",            # real-world 4x
+    "purescale2x": "safmn_purescale_x2.safetensors",          # real-world 2x
+    "purescale2x-sharp": "safmn_purescale_sharper_x2.safetensors",  # 2x + deblur
 }
 _DEFAULT_VARIANT = "light"
 _REPO = "https://github.com/sunny2109/SAFMN"
+_PURESCALE_REPO = "https://github.com/limitlesslab/AI-upscaling-models"
 
 
 def default_weights_path(variant: str = _DEFAULT_VARIANT) -> Path:
@@ -65,10 +83,22 @@ def resolve_weights(spec: Any = None) -> Path:
         ) from None
 
 
+def _safm_mode_for(path: str | Path) -> str:
+    """SAFM branch mode from the weights filename: PureScale checkpoints were
+    TRAINED with avg pool + bicubic upsample ("fixed") and are key-identical to
+    SAFMN-L, so the mode cannot be inferred from the tensors."""
+    return "fixed" if "purescale" in Path(path).stem.lower() else "stock"
+
+
 def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict:
     """Load + lay out the checkpoint: conv weights -> NHWC (O,kH,kW,I); the depthwise
-    weights (C,1,3,3) -> (C,3,3,1) for the shift-add; LayerNorm weight/bias stay 1-D."""
-    w = mx.load(str(resolve_weights(path)))
+    weights (C,1,3,3) -> (C,3,3,1) for the shift-add; LayerNorm weight/bias stay 1-D.
+
+    The SAFM branch mode is stamped into the dict as the plain string
+    "__safm_mode__" (see _safm_mode_for) -- running a checkpoint with the wrong
+    branch mode produces garbage."""
+    resolved = resolve_weights(path)
+    w = mx.load(str(resolved))
     p: dict = {}
     for k, v in w.items():
         if v.ndim == 4:
@@ -78,18 +108,26 @@ def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict
         p[k] = a.astype(dtype)
     if "to_feat.weight" not in p:
         raise ValueError("not a SAFMN checkpoint (missing to_feat.weight)")
+    p["__safm_mode__"] = _safm_mode_for(resolved)
     return p
 
 
 def _config(p: dict) -> tuple:
-    """(variant, dim, n_blocks, scale) inferred from the weights."""
+    """(variant, dim, n_blocks, scale, safm_mode, safm_up, pool_clamp) inferred from
+    the weights. safm_mode is the trained pooling statistic ("stock" = max, "fixed" =
+    avg -- NOT swappable, the gate calibrates to it); safm_up is the SAFM upsampler
+    and defaults to the trained one (nearest for stock, bicubic for fixed) but is a
+    mild shape-only choice that callers may override; pool_clamp (default 0 = off)
+    winsorizes pooled SAFM features to mean +/- k*sigma per channel."""
     variant = "real" if "feats.0.norm1.weight" in p else "light"
     dim = int(p["to_feat.weight"].shape[0])
     i = 0
     while f"feats.{i}.conv1.proj.weight" in p or f"feats.{i}.norm1.weight" in p:
         i += 1
     scale = int(round((p["to_img.0.weight"].shape[0] / 3) ** 0.5))
-    return variant, dim, i, scale
+    mode = p.get("__safm_mode__", "stock")
+    up = "bicubic" if mode == "fixed" else "nearest"
+    return variant, dim, i, scale, mode, up, 0.0
 
 
 def _gelu(x: Any) -> Any:
@@ -137,10 +175,69 @@ def _maxpool(x: Any, k: int) -> Any:
     return mx.max(x.reshape(n, h // k, k, w // k, k, c), axis=(2, 4))
 
 
+def _avgpool(x: Any, k: int) -> Any:
+    """k x k average pool, stride k; matches torch adaptive_avg_pool2d under
+    divisibility (the PureScale fixed-SAFM branch)."""
+    n, h, w, c = x.shape
+    return mx.mean(x.reshape(n, h // k, k, w // k, k, c), axis=(2, 4))
+
+
 def _nearest_up(x: Any, r: int) -> Any:
     n, h, w, c = x.shape
     x = mx.broadcast_to(x[:, :, None, :, None, :], (n, h, r, w, r, c))
     return x.reshape(n, h * r, w * r, c)
+
+
+def _cubic_phases(r: int) -> list:
+    """Per-phase (floor offset, 4 tap weights) for torch bicubic interpolation
+    (Keys kernel, A=-0.75, align_corners=False) at integer upscale r. Output
+    pixel j of each block maps to source coordinate (j + 0.5)/r - 0.5; the four
+    taps sit at floor-1..floor+2."""
+    a = -0.75
+    phases = []
+    for j in range(r):
+        src = (j + 0.5) / r - 0.5
+        f = -1 if src < 0 else 0                        # floor(src) for src in (-0.5, 0.5)
+        t = src - f
+        w_m1 = a * (1 + t) ** 3 - 5 * a * (1 + t) ** 2 + 8 * a * (1 + t) - 4 * a
+        w_0 = (a + 2) * t ** 3 - (a + 3) * t ** 2 + 1
+        w_1 = (a + 2) * (1 - t) ** 3 - (a + 3) * (1 - t) ** 2 + 1
+        w_2 = a * (2 - t) ** 3 - 5 * a * (2 - t) ** 2 + 8 * a * (2 - t) - 4 * a
+        phases.append((f, (w_m1, w_0, w_1, w_2)))
+    return phases
+
+
+def _bicubic_axis_up(x: Any, r: int, axis: int) -> Any:
+    """Bicubic upsample by integer r along axis 1 (H) or 2 (W), matching torch
+    F.interpolate(mode="bicubic", align_corners=False). Edge-replicate padding by 2
+    reproduces torch's tap-index clamping at the borders exactly (taps reach at most
+    2 outside). Each of the r phases is a fixed 4-tap blend of shifted slices."""
+    n = x.shape[1] if axis == 1 else x.shape[2]
+    if axis == 1:
+        edge0, edge1 = x[:, :1], x[:, -1:]
+        xp = mx.concatenate([edge0, edge0, x, edge1, edge1], axis=1)
+    else:
+        edge0, edge1 = x[:, :, :1], x[:, :, -1:]
+        xp = mx.concatenate([edge0, edge0, x, edge1, edge1], axis=2)
+
+    def sl(o):
+        return xp[:, o:o + n] if axis == 1 else xp[:, :, o:o + n]
+
+    phases = []
+    for f, wt in _cubic_phases(r):
+        base = 2 + f - 1                                # first tap of block i is i + f - 1
+        s = (wt[0] * sl(base) + wt[1] * sl(base + 1)
+             + wt[2] * sl(base + 2) + wt[3] * sl(base + 3))
+        phases.append(s)
+    y = mx.stack(phases, axis=axis + 1)                 # (n, N, r, ...) on the chosen axis
+    shape = list(x.shape)
+    shape[axis] = shape[axis] * r
+    return y.reshape(shape)
+
+
+def _bicubic_up(x: Any, r: int) -> Any:
+    """r x r bicubic upsample (torch semantics), separable rows-then-columns."""
+    return _bicubic_axis_up(_bicubic_axis_up(x, r, 1), r, 2)
 
 
 def _pixel_shuffle(x: Any, r: int) -> Any:
@@ -163,10 +260,29 @@ def _replicate_pad(x: Any, m: int) -> Any:
 
 
 # ---- "real" variant blocks (SAFMN-L) ----------------------------------------
-def _safm(x: Any, p: dict, pre: str) -> Any:
+def _pool_clamp(s: Any, k: float) -> Any:
+    """Winsorize pooled SAFM features to mean +/- k*sigma per channel (spatial
+    statistics). A hot activation that wins its max-pool cell is broadcast as a
+    constant block into the modulation gate (the stock models' transient lattice);
+    clamping only the outliers bounds that block's amplitude while leaving frames
+    with no outliers numerically untouched -- unlike swapping the pooling, which
+    shifts every value's statistics and breaks the trained gate."""
+    sf = s.astype(mx.float32)
+    mu = mx.mean(sf, axis=(1, 2), keepdims=True)
+    sd = mx.sqrt(mx.mean((sf - mu) ** 2, axis=(1, 2), keepdims=True))
+    return mx.clip(sf, mu - k * sd, mu + k * sd).astype(s.dtype)
+
+
+def _safm(x: Any, p: dict, pre: str, mode: str = "stock", up: str = "nearest",
+          clamp: float = 0.0) -> Any:
     """4-level spatially-adaptive feature modulation: chunk channels into 4, level i
-    max-pools by 2^i, runs a per-level depthwise 3x3, nearest-upsamples back; the
-    concatenated levels pass a 1x1 aggregate and gate x via GELU."""
+    pools by 2^i, runs a per-level depthwise 3x3, upsamples back; the concatenated
+    levels pass a 1x1 aggregate and gate x via GELU. mode="stock" pools with max
+    (SAFMN paper, trained with nearest up); mode="fixed" pools with avg (PureScale
+    retrains, trained with bicubic up -- kills the hot-pixel block-broadcast
+    lattice). The POOLING is trained in and not swappable; the UPSAMPLER is a mild
+    shape-only choice and may be overridden. clamp > 0 winsorizes the pooled
+    features (see _pool_clamp)."""
     c4 = x.shape[-1] // 4
     outs = []
     for i in range(4):
@@ -174,9 +290,11 @@ def _safm(x: Any, p: dict, pre: str) -> Any:
         if i == 0:
             s = _dw3x3(xc, p, f"{pre}.mfr.0")
         else:
-            s = _maxpool(xc, 2 ** i)
+            s = _avgpool(xc, 2 ** i) if mode == "fixed" else _maxpool(xc, 2 ** i)
+            if clamp > 0.0:
+                s = _pool_clamp(s, clamp)
             s = _dw3x3(s, p, f"{pre}.mfr.{i}")
-            s = _nearest_up(s, 2 ** i)
+            s = _bicubic_up(s, 2 ** i) if up == "bicubic" else _nearest_up(s, 2 ** i)
         outs.append(s)
     out = _conv(mx.concatenate(outs, axis=-1), p, f"{pre}.aggr")
     return _gelu(out) * x
@@ -186,9 +304,10 @@ def _ccm(x: Any, p: dict, pre: str) -> Any:
     return _conv(_gelu(_conv(x, p, f"{pre}.ccm.0", pad=1)), p, f"{pre}.ccm.2")
 
 
-def _att_block_real(x: Any, p: dict, i: int) -> Any:
+def _att_block_real(x: Any, p: dict, i: int, mode: str = "stock",
+                    up: str = "nearest", clamp: float = 0.0) -> Any:
     x = _safm(_layernorm(x, p[f"feats.{i}.norm1.weight"], p[f"feats.{i}.norm1.bias"]),
-              p, f"feats.{i}.safm") + x
+              p, f"feats.{i}.safm", mode, up, clamp) + x
     x = _ccm(_layernorm(x, p[f"feats.{i}.norm2.weight"], p[f"feats.{i}.norm2.bias"]),
              p, f"feats.{i}.ccm") + x
     return x
@@ -221,14 +340,15 @@ def safmn(x: Any, p: dict, cfg: tuple | None = None) -> Any:
     """Upscale one batch. x: (N,H,W,3) in [0,1] -> (N, scale*H, scale*W, 3)."""
     if cfg is None:
         cfg = _config(p)
-    variant, _dim, n_blocks, scale = cfg
+    variant, _dim, n_blocks, scale, safm_mode, safm_up, pool_clamp = cfg
     dt = p["to_feat.weight"].dtype
     n, h, w, _ = x.shape
     xp = _replicate_pad(x.astype(dt), 8)
     feat = _conv(xp, p, "to_feat", pad=1)
     y = feat
     for i in range(n_blocks):
-        y = _att_block_real(y, p, i) if variant == "real" else _att_block_light(y, p, i)
+        y = (_att_block_real(y, p, i, safm_mode, safm_up, pool_clamp)
+             if variant == "real" else _att_block_light(y, p, i))
     y = y + feat
     out = _pixel_shuffle(_conv(y, p, "to_img.0", pad=1), scale)
     return mx.clip(out[:, :h * scale, :w * scale, :], 0.0, 1.0)

@@ -823,7 +823,8 @@ def run(args: argparse.Namespace) -> None:
             )
         elif args.spatial_mode == "safmn":
             from LTX_2_MLX.videotoolbox.safmn import SafmnUpscaler
-            up = SafmnUpscaler(args.safmn_weights)
+            up = SafmnUpscaler(args.safmn_weights, safm_up=args.safmn_safm_up,
+                               pool_clamp=args.safmn_pool_clamp)
         elif args.spatial_mode == "esc":
             from LTX_2_MLX.videotoolbox.esc import EscUpscaler
             up = EscUpscaler(args.esc_weights)
@@ -1847,7 +1848,41 @@ def main() -> None:
             "fidelity 4x trained on compressed content), real (SAFMN_L_Real_LSDIR, "
             "real-world perceptual 4x trained with the Real-ESRGAN degradation -- "
             "video-appropriate, ~3x faster than the RRDBNet class), real2x (same family, "
-            "2x output). None are bundled; see videotoolbox/safmn/weights/README.md."
+            "2x output); purescale / purescale2x / purescale2x-sharp (PureScale 2.0, "
+            "SAFMN-L retrained with a fixed SAFM branch that eliminates the known "
+            "transient block-lattice artifact of the stock models; sharp adds deblur. "
+            "CAUTION: PureScale weights are CC BY-NC-SA 4.0 -- NON-COMMERCIAL use "
+            "only). None are bundled; see videotoolbox/safmn/weights/README.md."
+        ),
+    )
+    parser.add_argument(
+        "--safmn-safm-up", choices=["auto", "nearest", "bicubic"], default="auto",
+        help=(
+            "SAFM upsampler inside the SAFMN blocks. auto (default) = the mode each "
+            "checkpoint was trained with (nearest for the stock models, bicubic for "
+            "the purescale retrains, verified against the reference). Forcing the "
+            "other mode is a mild shape-only override (measured ~0.005 mean shift): "
+            "bicubic on the stock models rounds the lattice blocks into soft blobs "
+            "without fixing the underlying hot-pixel winner. The POOLING statistic "
+            "is trained in and always follows the checkpoint -- swapping it "
+            "corrupts the output."
+        ),
+    )
+    parser.add_argument(
+        "--safmn-pool-clamp", type=float, default=0.0, metavar="K",
+        help=(
+            "Winsorize SAFM pooled features to mean +/- K sigma per channel; a "
+            "stock-weights (real/real2x) mitigation for the transient "
+            "block-lattice artifact (default 0 = off). DIRECTION: K is the "
+            "allowed width in sigmas, so LOWER K = STRONGER suppression -- "
+            "raising K weakens it. Calibrated levels: 4 = visually free on "
+            "normal content, lattice greatly reduced but findable frame by "
+            "frame; 3 = lattice imperceptible, cost still negligible (the "
+            "recommended setting); 2.5 = boundary, specular-rich content "
+            "starts dulling; 2 = visibly muted highlights and flattened "
+            "texture sparkle. Failure is graceful at any K (it can only "
+            "under-modulate, never corrupt). The purescale variants fix the "
+            "artifact at the root and do not need this."
         ),
     )
     parser.add_argument(

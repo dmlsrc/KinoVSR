@@ -307,6 +307,7 @@ model A/Bs.
 | 148 | realesrgan general (SRVGG) | light perceptual |
 | ~754 | safmn real2x (2x output) | real-world perceptual, the HD -> 4K class tool |
 | 756 | safmn real (SAFMN_L_Real_LSDIR) | real-world perceptual, per-frame |
+| 872 | safmn purescale / purescale2x / -sharp | SAFMN-L retrained, lattice-free (see below) |
 | 817 | realviformer (streaming) | real-world perceptual + TEMPORAL consistency |
 | 976 | realbasicvsr | temporal GAN (cleaning + BasicVSR) |
 | 1391 | basicvsrpp | temporal fidelity; 70% propagation / 20% tail |
@@ -317,6 +318,45 @@ RealViformer streams (causal recurrence, per-frame state, reset at cuts) --
 temporal consistency at barely more than a per-frame net's cost. ESC's numbers
 are attention-bound (section 2); its value is output quality plus the only
 fidelity/perceptual twin pair above the SRVGG class.
+
+The stock SAFMN-L models can flash a small transient block lattice on video:
+SAFM's multi-scale branch max-pools by up to 8x8 and nearest-upsamples back, so
+one hot activation is broadcast as a constant block into the modulation gate,
+and the winner flips frame to frame. This is trained-in (swapping the pooling
+at inference on the stock weights corrupts the output -- the gate expects
+max-pool peak statistics). The `purescale*` variants are third-party SAFMN-L
+retrains with the fixed branch (avg pool + bicubic upsample, both trained in;
+the SAFM mode follows the weights filename) that eliminate the artifact; the
+bicubic phases cost ~20% over stock SAFMN-L (872 vs 729 ms measured same-run). They also degrade far more
+gracefully on hard out-of-distribution frame edges (a junk half-dark border
+row becomes a near-scale thin line rather than a thick smeared band with
+blotches above it). CAUTION: unlike every other checkpoint in this table, the
+PureScale weights are CC BY-NC-SA 4.0 -- NON-COMMERCIAL use only (see
+`videotoolbox/safmn/ATTRIBUTION.md`).
+
+Two SAFM dials expose what is and is not swappable at inference.
+`--safmn-safm-up auto|nearest|bicubic`: the upsampler is a mild shape-only
+choice (forcing the untrained mode shifts the output by only ~0.005 mean);
+auto runs each checkpoint's trained mode (verified against the reference:
+the stock real models use max pool + nearest), and bicubic on a stock model
+merely rounds lattice blocks into soft blobs. The POOLING statistic is not a
+dial: the gate calibrates to it during training and swapping it corrupts the
+output (0.2-0.37 mean shift) -- it always follows the checkpoint.
+`--safmn-pool-clamp K` winsorizes each SAFM level's pooled features to
+mean +/- K sigma per channel, bounding the hot-activation block broadcast on
+the stock models. K is the allowed width, so LOWER K = stronger suppression.
+Validated against a real mid-frame lattice occurrence and cost-swept on four
+healthy clips: K=4 is visually free (mean shift 0.0004-0.0007) and greatly
+reduces the lattice but a residue remains findable frame by frame; K=3 makes
+the lattice imperceptible at still-negligible cost (0.001-0.002 mean) -- the
+recommended setting; K=2.5 is the boundary where specular-rich content starts
+dulling; K=2 visibly mutes highlights and flattens texture sparkle. Failure
+is graceful at any K: the clamp pulls outliers toward each frame's own
+statistics, so it can only under-modulate, never corrupt. The artifact and
+legitimate speculars overlap in feature distribution, so no K reaches exactly
+zero lattice at zero cost -- the purescale retrains remain the root fix; this
+dial is for when the stock models' rendering (or the PureScale license) rules
+them out.
 
 ### Case study: the "river" artifact was a merge-normalization port bug
 

@@ -19,11 +19,31 @@ except ImportError:   # running directly as a script
 
 
 class SafmnUpscaler:
-    """feed()/flush() driver for the per-frame SAFMN upscaler."""
+    """feed()/flush() driver for the per-frame SAFMN upscaler.
 
-    def __init__(self, weights: Any = None, dtype: Any = mx.float16, compile: bool = True):
+    safm_up: "auto" (default) runs the SAFM upsampler each checkpoint was trained
+    with (nearest for the stock SAFMN models, bicubic for the PureScale retrains);
+    "nearest"/"bicubic" force one -- a mild shape-only override, unlike the pooling
+    statistic, which is trained in and follows the checkpoint unconditionally.
+    pool_clamp > 0 winsorizes pooled SAFM features to mean +/- k*sigma per channel,
+    a stock-weights mitigation for the transient hot-pixel block lattice (0 = off;
+    frames with no outliers pass numerically untouched)."""
+
+    def __init__(self, weights: Any = None, safm_up: str = "auto",
+                 pool_clamp: float = 0.0,
+                 dtype: Any = mx.float16, compile: bool = True):
+        if safm_up not in {"auto", "nearest", "bicubic"}:
+            raise ValueError(f"SAFMN safm_up must be auto/nearest/bicubic, got {safm_up!r}")
+        pool_clamp = float(pool_clamp)
+        if pool_clamp < 0.0:
+            raise ValueError("SAFMN pool_clamp must be >= 0 (sigmas; 0 = off)")
         self._p = net.load_params(weights, dtype=dtype)
-        self._cfg = net._config(self._p)
+        cfg = net._config(self._p)
+        if safm_up != "auto":
+            cfg = cfg[:5] + (safm_up, cfg[6])
+        if pool_clamp > 0.0:
+            cfg = cfg[:6] + (pool_clamp,)
+        self._cfg = cfg
         self.scale = self._cfg[3]
         self._fwd = net.make_forward(self._p, self._cfg, compile=compile)
 
