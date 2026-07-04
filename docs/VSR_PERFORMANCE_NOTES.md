@@ -338,8 +338,16 @@ Two SAFM dials expose what is and is not swappable at inference.
 `--safmn-safm-up auto|nearest|bicubic`: the upsampler is a mild shape-only
 choice (forcing the untrained mode shifts the output by only ~0.005 mean);
 auto runs each checkpoint's trained mode (verified against the reference:
-the stock real models use max pool + nearest), and bicubic on a stock model
-merely rounds lattice blocks into soft blobs. The POOLING statistic is not a
+the stock real models use max pool + nearest). On the stock real models,
+forcing bicubic is a creative dial: the blocky nearest-up gate flattens
+micro-texture within its blocks, and a smooth gate frees the GAN's texture
+synthesis (~30% more output high-frequency energy, visibly grainier/sharper
+surfaces; hallucinated micro-texture can shimmer temporally, so judge on
+video). Lanczos-3 was tested as a third upsampler and measures within 1% of
+bicubic here -- the effect is smooth-vs-blocky, not the kernel -- and on the
+purescale retrains all kernels are visually identical (the trained-smooth
+gate field has no high frequencies for a sharper kernel to act on). The
+POOLING statistic is not a
 dial: the gate calibrates to it during training and swapping it corrupts the
 output (0.2-0.37 mean shift) -- it always follows the checkpoint.
 `--safmn-pool-clamp K` winsorizes each SAFM level's pooled features to
@@ -393,10 +401,17 @@ keeps the fill for those who want the junk gone and accept the shimmer;
 `trim` crops the junk lines off entirely, folded into the crop BEFORE the
 aspect window is computed (bottom/right bumped 1 px when needed to keep
 even dimensions) -- the right mode when reframing anyway. `--square-pixels`
-resamples anamorphic sources to a 1:1 pixel aspect (horizontal-only bilinear
-at SOURCE resolution, where the upscaler re-synthesizes the mild softness;
-output tagged square) for PAR-ignorant toolchains; the default passes the
-source pixel aspect through losslessly.
+resamples anamorphic sources to a 1:1 pixel aspect (horizontal-only
+Lanczos-3 at SOURCE resolution, where the upscaler re-synthesizes the mild
+softness; output tagged square) for PAR-ignorant toolchains; the default
+passes the source pixel aspect through losslessly. Measured in the DISPLAY
+domain (PAR output stretched as a player must), square-pixels is also a ~7%
+sharpness win: the stretch happens pre-SR where the net re-synthesizes
+detail, instead of post-SR in the player where it dilutes it -- and real
+players often stretch with cheaper kernels than the Lanczos used for this
+measurement. Comparison hygiene: storage-pixel crops of PAR output display
+squished in untagged viewers; display-correct before judging sharpness
+across geometries.
 Dimensions and pixel-aspect are untouched in every mode. `--sanitize-edges
 T,B,L,R` forces explicit counts. Old test captures routinely carry junk on
 multiple edges (a classic CIF clip: one junk bottom row plus a 3-px

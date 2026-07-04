@@ -1839,9 +1839,12 @@ def main() -> None:
             "resolution (Lanczos-3, GPU-resident precomputed plan) -- the "
             "cheapest point, and the upscaler re-synthesizes the mild resample "
             "softness -- with the output tagged 1:1 for "
-            "PAR-ignorant players and toolchains. Default behavior (off) "
-            "passes the source pixel aspect through losslessly instead. "
-            "No-op on square-pixel sources."
+            "PAR-ignorant players and toolchains. Also a mild DISPLAY-domain "
+            "sharpness win (~7 percent measured): the anamorphic stretch must "
+            "happen somewhere, and pre-SR (here, then re-synthesized by the "
+            "net) beats post-SR in the player, which dilutes rendered detail. "
+            "Default behavior (off) passes the source pixel aspect through "
+            "losslessly instead. No-op on square-pixel sources."
         ),
     )
     parser.add_argument(
@@ -2212,9 +2215,14 @@ def main() -> None:
             "SAFM upsampler inside the SAFMN blocks. auto (default) = the mode each "
             "checkpoint was trained with (nearest for the stock models, bicubic for "
             "the purescale retrains, verified against the reference). Forcing the "
-            "other mode is a mild shape-only override (measured ~0.005 mean shift): "
-            "bicubic on the stock models rounds the lattice blocks into soft blobs "
-            "without fixing the underlying hot-pixel winner. The POOLING statistic "
+            "other mode is a safe shape-only override. On the stock real models, "
+            "bicubic is a CREATIVE dial: the trained nearest-up gate is blocky and "
+            "flattens micro-texture within its blocks, and a smooth gate frees the "
+            "GAN's texture synthesis -- measured ~30 percent more output "
+            "high-frequency energy, visibly grainier/sharper surfaces (judge on "
+            "video: hallucinated micro-texture can shimmer temporally). It also "
+            "rounds lattice blocks into soft blobs without fixing the underlying "
+            "hot-pixel winner. The POOLING statistic "
             "is trained in and always follows the checkpoint -- swapping it "
             "corrupts the output."
         ),
