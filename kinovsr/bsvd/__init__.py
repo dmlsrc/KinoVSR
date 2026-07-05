@@ -59,6 +59,33 @@ def _cv(x: Any, conv: tuple[Any, Any, int]) -> Any:
     return y if bias is None else y + bias
 
 
+def _pad_inc_gate(
+    inc0: tuple[Any, Any, int], inc3: tuple[Any, Any, int]
+) -> tuple[tuple[Any, Any, int], tuple[Any, Any, int]]:
+    """Zero-pad the inc block's intermediate channels up to a multiple of 16.
+
+    The c32 checkpoint uses interm_ch=30, which misses MLX's fast conv gate and
+    makes the full-resolution inc block ~2.4x slower than an aligned width. Zero-
+    padding inc0's output channels and inc3's input channels preserves the output
+    exactly -- the extra out-channels are zero after bias + ReLU6, and the extra
+    in-channels meet zero weights -- while letting inc run on an aligned width.
+    A no-op when interm is already a multiple of 16 (e.g. c64's 64).
+    """
+    w0, b0, s0 = inc0
+    interm = int(w0.shape[0])
+    if interm % 16 == 0:
+        return inc0, inc3
+    pad = (-interm) % 16
+    zeros0 = mx.zeros((pad,) + tuple(w0.shape[1:]), dtype=w0.dtype)
+    w0 = mx.concatenate([w0, zeros0], axis=0)
+    if b0 is not None:
+        b0 = mx.concatenate([b0, mx.zeros((pad,), dtype=b0.dtype)], axis=0)
+    w1, b1, s1 = inc3
+    zeros1 = mx.zeros(tuple(w1.shape[:3]) + (pad,), dtype=w1.dtype)
+    w1 = mx.concatenate([w1, zeros1], axis=3)
+    return (w0, b0, s0), (w1, b1, s1)
+
+
 def _relu6(x: Any) -> Any:
     return mx.clip(x, 0.0, 6.0)
 
@@ -303,6 +330,7 @@ def _load_block(w: dict[str, Any], index: int, dtype: Any) -> dict[str, Any]:
         "out0": _conv(w, prefix, "outc.convblock.0", dtype),
         "out3": _conv(w, prefix, "outc.convblock.3", dtype),
     }
+    p["inc0"], p["inc3"] = _pad_inc_gate(p["inc0"], p["inc3"])
     return p
 
 
