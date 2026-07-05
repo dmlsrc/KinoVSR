@@ -99,6 +99,7 @@ from LTX_2_MLX.videotoolbox import color as _color
 from LTX_2_MLX.videotoolbox import pixel_buffers as _pb
 from LTX_2_MLX.videotoolbox import video_reader as _vr
 from LTX_2_MLX.videotoolbox import yuv as _yuv
+from LTX_2_MLX.videotoolbox.bsvd import BsvdDenoiser
 from LTX_2_MLX.videotoolbox.comparison import render_comparison
 from LTX_2_MLX.videotoolbox.denoise import LumaChromaDenoiser, McTemporalDenoiser, SpatialDenoiser
 from LTX_2_MLX.videotoolbox.edge_sanitize import (
@@ -958,7 +959,7 @@ def run(args: argparse.Namespace) -> None:
     vtfrc: VtfrcSession | None = None
     post_writer: AVWriter | None = None
     comparison_writer: AVWriter | None = None
-    denoiser: Any = None  # SpatialDenoiser / McTemporalDenoiser / FastDvd when --denoise set
+    denoiser: Any = None  # SpatialDenoiser / McTemporalDenoiser / learned denoiser when --denoise set
     upscaler: Any = None  # learned MLX upscaler when --spatial-mode basicvsrpp/realbasicvsr
     # deblocker/nafnet pre-set (like denoiser/upscaler) so a _build_post_pipeline failure
     # -- e.g. a missing weight -- cannot UnboundLocalError in the cleanup finally.
@@ -1053,6 +1054,15 @@ def run(args: argparse.Namespace) -> None:
                 args.fastdvd_weights or os.environ.get("FASTDVD_WEIGHTS"),
                 variant=args.fastdvd_variant,
                 strength=args.denoise_strength,
+            )
+        elif args.denoise == "bsvd":
+            # BSVD weights are not bundled; --bsvd-variant picks a local token,
+            # or --bsvd-weights / $BSVD_WEIGHTS overrides the path entirely.
+            den = BsvdDenoiser(
+                args.bsvd_weights or os.environ.get("BSVD_WEIGHTS"),
+                variant=args.bsvd_variant,
+                strength=args.denoise_strength,
+                dtype=parse_mlx_dtype_name(args.bsvd_dtype),
             )
 
         if den is not None and (args.denoise_luma_strength != 1.0
@@ -2157,7 +2167,7 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--denoise", choices=["off", "spatial", "mc", "fastdvd"], default="off",
+        "--denoise", choices=["off", "spatial", "mc", "fastdvd", "bsvd"], default="off",
         help=(
             "Pre-upscale denoise, applied at native resolution before VSR (the "
             "correct order - SR amplifies noise). off (default); spatial = "
@@ -2166,7 +2176,8 @@ def main() -> None:
             "flow (Quality tier plus startup self-test; recursive, GPU; averages "
             "static regions over time without ghosting moving edges); fastdvd = "
             "FastDVDnet CNN denoiser (MLX, learned; causal 5-frame window, "
-            "strongest denoise, weights bundled). "
+            "strongest denoise, weights bundled); bsvd = BSVD bidirectional-buffer "
+            "streaming denoiser (MLX, learned; 16-frame delay, weights local). "
             "Enabling denoise routes frames through the MLX upload path instead of "
             "the zero-copy direct feed."
         ),
@@ -2176,7 +2187,7 @@ def main() -> None:
         help=(
             "Denoise strength 0..1 (default 0.5). For mc, the max temporal blend "
             "toward motion-compensated history; for spatial, the noise level; for "
-            "fastdvd, the noise sigma (mapped onto sigma_255 in [5, 55])."
+            "fastdvd/bsvd, the noise sigma (mapped onto sigma_255 in [5, 55])."
         ),
     )
     parser.add_argument(
@@ -2215,6 +2226,26 @@ def main() -> None:
             "shows a faint pixel-shuffle grid above ~0.1 strength on clean content. "
             "Ignored when --fastdvd-weights is given."
         ),
+    )
+    parser.add_argument(
+        "--bsvd-weights", default=None, metavar="PATH",
+        help=(
+            "Override BSVD weights (.safetensors) for --denoise bsvd. Optional - "
+            "defaults to the local --bsvd-variant weights (or $BSVD_WEIGHTS). "
+            "Convert a .pth with scripts/pth_to_safetensors.py --param-key params."
+        ),
+    )
+    parser.add_argument(
+        "--bsvd-variant", choices=["c64", "c32"], default="c64",
+        help=(
+            "Which local BSVD model token for --denoise bsvd. c64 matches the "
+            "public unblind test config; c32 is a smaller mirror checkpoint with "
+            "weaker provenance. Ignored when --bsvd-weights is given."
+        ),
+    )
+    parser.add_argument(
+        "--bsvd-dtype", choices=["float16", "float32"], default="float16",
+        help="MLX dtype for --denoise bsvd (default float16; use float32 for parity probes).",
     )
     parser.add_argument(
         "--basicvsrpp-variant",
