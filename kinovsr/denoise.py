@@ -150,7 +150,7 @@ class McTemporalDenoiser:
     def __init__(
         self, width: int, height: int, strength: float = 0.5,
         window: int = 0, clamp: bool = False, occlusion: bool = False,
-        confidence: bool = False, self_test: bool = True,
+        confidence: bool = False, sigma: float = 0.06, self_test: bool = True,
     ):
         require_pyobjc()
         self.w, self.h = int(width), int(height)
@@ -160,7 +160,11 @@ class McTemporalDenoiser:
         self.occlusion = bool(occlusion)
         self.confidence = bool(confidence)
         # Tunables (sensible fixed defaults; strength is the user knob).
-        self.sigma = 0.06        # residual rejection scale (luma, [0,1])
+        # sigma is the residual-rejection scale of the photometric match gate
+        # exp(-(resid/sigma)^2): larger = tolerate a bigger current-vs-history
+        # difference before throttling the blend, so noise (which inflates that
+        # residual) stops gating its own removal -> stronger denoise, more ghosting.
+        self.sigma = float(sigma)   # residual rejection scale (luma, [0,1])
         self.clamp_k = 5         # neighborhood window for color clamping
         self.clamp_gamma = 1.25  # box half-width in std units
         self.occ_tau = 1.5       # FB-consistency tolerance (pixels)

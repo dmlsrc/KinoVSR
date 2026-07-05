@@ -1044,6 +1044,7 @@ def run(args: argparse.Namespace) -> None:
                 in_w, in_h, strength=args.denoise_strength,
                 window=args.mc_window, clamp=args.mc_clamp,
                 occlusion=args.mc_occlusion, confidence=args.mc_confidence,
+                sigma=args.mc_sigma,
             )
         elif args.denoise == "fastdvd":
             # Weights ship with the package; --fastdvd-variant picks one, or
@@ -2585,6 +2586,18 @@ def main() -> None:
             "IIR (blends the previous output; strongest denoise, longest ghosts). "
             "N>=1 = causal FIR over the last N input frames (bounded ghost "
             "lifetime, ~N optical-flow computes per frame)."
+        ),
+    )
+    parser.add_argument(
+        "--mc-sigma", type=float, default=0.06, metavar="S",
+        help=(
+            "mc residual-rejection scale (luma, 0..1; default 0.06 ~= 15/255). The "
+            "blend gate is exp(-(current-vs-history residual / sigma)^2); noise "
+            "inflates that residual, so at the default it throttles its own removal "
+            "even at --denoise-strength 1. RAISE it (e.g. 0.10-0.15) to denoise "
+            "harder when strength alone plateaus -- the real 'make it stronger' knob "
+            "for noisy footage. Cost: it also tolerates motion mismatch, so higher = "
+            "more ghosting/smearing on fast motion."
         ),
     )
     parser.add_argument(
