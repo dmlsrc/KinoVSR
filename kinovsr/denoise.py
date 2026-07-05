@@ -486,6 +486,10 @@ class LumaChromaDenoiser:
         if hasattr(self._base, "close"):
             self._base.close()
 
+    def set_schedule(self, schedule: Any) -> None:
+        if hasattr(self._base, "set_schedule"):
+            self._base.set_schedule(schedule)
+
     def _blend(self, orig: Any, den: Any) -> Any:
         return luma_chroma_blend(orig, den, self._al, self._ac, self._kr, self._kb)
 

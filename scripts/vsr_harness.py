@@ -1455,12 +1455,12 @@ def run(args: argparse.Namespace) -> None:
                     bars.write(msg)
                 if nafnet is not None and hasattr(nafnet, "set_progress_message"):
                     nafnet.set_progress_message(bars.write)
-                # Drive every recurrent stage from the one GOP-aligned schedule
-                # (restore chain + a windowed upscaler). Per-frame stages lack the
-                # method and are skipped.
+                # Drive every recurrent stage from the one GOP-aligned schedule.
+                # Per-frame stages lack the method and are skipped.
                 if gop_schedule is not None:
                     for _st in [*(restorer or []),
-                                *( [upscaler] if upscaler is not None else [] )]:
+                                *([denoiser] if denoiser is not None else []),
+                                *([upscaler] if upscaler is not None else [])]:
                         if hasattr(_st, "set_schedule"):
                             _st.set_schedule(gop_schedule)
             for i in range(chunk_len):

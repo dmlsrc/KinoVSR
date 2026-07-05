@@ -325,18 +325,34 @@ class BsvdDenoiser:
             )
         self.net = BSVD(wp, dtype=dtype)
         self.sigma = _strength_to_sigma(strength)
+        self._schedule: list | None = None
         self._reset_state()
 
     def _reset_state(self) -> None:
         self.net.reset()
         self._hw: tuple[int, int] | None = None
         self._tokens: list[Any] = []
+        self._frames: list[Any] = []
+        self._frame_tokens: list[Any] = []
+        self._base = 0
+        self._sched_i = 0
         self._received = 0
         self._emitted = 0
         self._steps = 0
 
     def reset(self) -> None:
         self._reset_state()
+
+    def set_schedule(self, schedule: list | None) -> None:
+        """Use GOP-aligned windows instead of one continuous stream.
+
+        The schedule is a list of (proc_start, proc_end, emit_start, emit_end)
+        specs whose emit ranges tile the stream. Default BSVD remains the
+        reference-like continuous stream; schedule mode resets BSVD per proc
+        window and emits only that window's requested output range.
+        """
+        self._schedule = list(schedule) if schedule else None
+        self._sched_i = 0
 
     def close(self) -> None:
         pass
@@ -376,9 +392,18 @@ class BsvdDenoiser:
         return [self._emit(out, tok)]
 
     def feed(self, frame: Any, token: Any = None) -> list:
-        return self._step(self._prepare(frame), token=token, real=True)
+        x = self._prepare(frame)
+        if self._schedule is not None:
+            self._frames.append(x)
+            self._frame_tokens.append(token)
+            return self._feed_scheduled(final=False)
+        return self._step(x, token=token, real=True)
 
     def flush(self) -> list:
+        if self._schedule is not None:
+            out = self._feed_scheduled(final=True)
+            self._reset_state()
+            return out
         out = []
         guard = self.net.SHIFT_NUM + self._received + 2
         while self._emitted < self._received:
@@ -388,6 +413,44 @@ class BsvdDenoiser:
             if guard <= 0 and self._emitted == before:
                 raise RuntimeError("BSVD flush did not produce enough delayed frames")
         self._reset_state()
+        return out
+
+    def _feed_scheduled(self, final: bool) -> list:
+        out: list = []
+        total = self._base + len(self._frames)
+        while self._sched_i < len(self._schedule):
+            p0, p1, e0, e1 = self._schedule[self._sched_i]
+            if not final and total < p1:
+                break
+            pe, ee = (min(p1, total), min(e1, total)) if final else (p1, e1)
+            if p0 < pe and e0 < ee:
+                rel_p0 = p0 - self._base
+                rel_pe = pe - self._base
+                local_frames = self._frames[rel_p0:rel_pe]
+                local_tokens = self._frame_tokens[rel_p0:rel_pe]
+                out.extend(self._run_window(local_frames, local_tokens, e0 - p0, ee - p0))
+            self._sched_i += 1
+        keep_from = (self._schedule[self._sched_i][0] if self._sched_i < len(self._schedule)
+                     else self._base + len(self._frames))
+        drop = keep_from - self._base
+        if drop > 0:
+            self._frames = self._frames[drop:]
+            self._frame_tokens = self._frame_tokens[drop:]
+            self._base += drop
+        return out
+
+    def _run_window(self, frames: list, tokens: list, emit_start: int, emit_end: int) -> list:
+        self.net.reset()
+        out_seq = [self.net.step(x) for x in frames]
+        for _ in range(self.net.SHIFT_NUM):
+            out_seq.append(self.net.step(None))
+        clipped = out_seq[self.net.SHIFT_NUM:self.net.SHIFT_NUM + len(frames)]
+        out = []
+        for y, tok in zip(clipped[emit_start:emit_end], tokens[emit_start:emit_end], strict=True):
+            if y is None:
+                raise RuntimeError("BSVD scheduled window emitted an empty frame")
+            out.append(self._emit(y, tok))
+        self.net.reset()
         return out
 
 
