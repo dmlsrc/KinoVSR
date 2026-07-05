@@ -1064,6 +1064,23 @@ def run(args: argparse.Namespace) -> None:
                 strength=args.denoise_strength,
                 dtype=parse_mlx_dtype_name(args.bsvd_dtype),
             )
+        elif args.denoise == "pvdd":
+            # PVDD weights are not bundled; --pvdd-variant picks a local token, or
+            # --pvdd-weights / $PVDD_WEIGHTS overrides the path. The `level`
+            # variants take a noise-variance dial (--pvdd-noise-preset/-variance);
+            # blind variants ignore it. --denoise-strength does not apply.
+            from LTX_2_MLX.videotoolbox.pvdd.upscaler import PvddDenoiser
+            from LTX_2_MLX.videotoolbox.pvdd import LEVEL_PRESETS
+            nv = args.pvdd_noise_variance
+            if nv is None and args.pvdd_noise_preset != "off":
+                nv = LEVEL_PRESETS[args.pvdd_noise_preset]
+            den = PvddDenoiser(
+                args.pvdd_weights or os.environ.get("PVDD_WEIGHTS"),
+                variant=args.pvdd_variant,
+                window=args.pvdd_window, trim=args.pvdd_trim,
+                noise_variance=nv,
+                dtype=parse_mlx_dtype_name(args.pvdd_dtype),
+            )
 
         if den is not None and (args.denoise_luma_strength != 1.0
                                 or args.denoise_chroma_strength != 1.0):
@@ -2167,7 +2184,7 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--denoise", choices=["off", "spatial", "mc", "fastdvd", "bsvd"], default="off",
+        "--denoise", choices=["off", "spatial", "mc", "fastdvd", "bsvd", "pvdd"], default="off",
         help=(
             "Pre-upscale denoise, applied at native resolution before VSR (the "
             "correct order - SR amplifies noise). off (default); spatial = "
@@ -2177,7 +2194,10 @@ def main() -> None:
             "static regions over time without ghosting moving edges); fastdvd = "
             "FastDVDnet CNN denoiser (MLX, learned; causal 5-frame window, "
             "strongest denoise, weights bundled); bsvd = BSVD bidirectional-buffer "
-            "streaming denoiser (MLX, learned; 16-frame delay, weights local). "
+            "streaming denoiser (MLX, learned; 16-frame delay, weights local); "
+            "pvdd = PVDD real-world denoiser (MLX, learned; bidirectional window "
+            "attention, real-noise-trained -- unlike the AWGN-trained fastdvd/bsvd; "
+            "--pvdd-variant picks pvdd/crvd/davis, weights local). "
             "Enabling denoise routes frames through the MLX upload path instead of "
             "the zero-copy direct feed."
         ),
@@ -2246,6 +2266,64 @@ def main() -> None:
     parser.add_argument(
         "--bsvd-dtype", choices=["float16", "float32"], default="float16",
         help="MLX dtype for --denoise bsvd (default float16; use float32 for parity probes).",
+    )
+    parser.add_argument(
+        "--pvdd-variant",
+        choices=["pvdd", "crvd", "davis", "pvdd_level", "pvdd_raw", "pvdd_raw_level"],
+        default="pvdd",
+        help=(
+            "Which local PVDD model for --denoise pvdd. pvdd (default) = real-world "
+            "sRGB blind; crvd = real high-ISO sensor noise; davis = synthetic-AWGN "
+            "sibling (baseline, behaves like fastdvd); pvdd_level = noise-level dial "
+            "(non-blind, see --pvdd-noise-*); pvdd_raw / pvdd_raw_level = packed "
+            "Bayer (need a raw pipeline, not sRGB video). Ignored when --pvdd-weights "
+            "is given."
+        ),
+    )
+    parser.add_argument(
+        "--pvdd-weights", default=None, metavar="PATH",
+        help=(
+            "Override PVDD weights (.safetensors) for --denoise pvdd. Optional - "
+            "defaults to the local --pvdd-variant weights (or $PVDD_WEIGHTS). Not "
+            "bundled; convert a .pth with scripts/pth_to_safetensors.py (see "
+            "videotoolbox/pvdd/weights/README.md)."
+        ),
+    )
+    parser.add_argument(
+        "--pvdd-window", type=int, default=10, metavar="N",
+        help=(
+            "Sliding-window length (frames) for --denoise pvdd's bidirectional "
+            "recurrence (default 10). Larger windows give more temporal context at "
+            "higher cost; use --pvdd-trim to overlap windows."
+        ),
+    )
+    parser.add_argument(
+        "--pvdd-trim", type=int, default=0, metavar="N",
+        help=(
+            "Overlap frames trimmed from each --denoise pvdd window edge (default 0 = "
+            "reference-like non-overlapping chunks). Must be < window/2."
+        ),
+    )
+    parser.add_argument(
+        "--pvdd-noise-preset", choices=["off", "S", "M", "L"], default="M",
+        help=(
+            "Noise-level preset for the pvdd_level variants (non-blind). S/M/L map to "
+            "the reference noise-variance levels (0.00069 / 0.0022 / 0.0055); M is "
+            "default. off disables (needs --pvdd-noise-variance). Ignored by blind "
+            "variants."
+        ),
+    )
+    parser.add_argument(
+        "--pvdd-noise-variance", type=float, default=None, metavar="V",
+        help=(
+            "Explicit noise-variance value for the pvdd_level variants, overriding "
+            "--pvdd-noise-preset. This is variance (sigma^2), not sigma. Ignored by "
+            "blind variants."
+        ),
+    )
+    parser.add_argument(
+        "--pvdd-dtype", choices=["float16", "float32"], default="float16",
+        help="MLX dtype for --denoise pvdd (default float16; use float32 for parity probes).",
     )
     parser.add_argument(
         "--basicvsrpp-variant",
