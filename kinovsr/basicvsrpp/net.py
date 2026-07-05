@@ -61,6 +61,21 @@ _VARIANTS = {
 }
 
 
+# 1x restoration checkpoints (is_low_res_input=False: the net downsamples the
+# input 4x, propagates cheap at 1/4 res, upsamples back to the SAME size). Same
+# architecture as the SR variants apart from the feature-extractor stem and the
+# terminal residual; auto-detected at load. Not bundled (large; download +
+# convert -- see weights/README.md).
+_RESTORE_VARIANTS = {
+    "decompress_track1": "basicvsrpp_decompress_track1.safetensors",  # NTIRE'21 compressed-video, fixed-QP fidelity
+    "decompress_track2": "basicvsrpp_decompress_track2.safetensors",  # heavier compression
+    "decompress_track3": "basicvsrpp_decompress_track3.safetensors",  # fixed bit-rate
+    "denoise": "basicvsrpp_denoise.safetensors",                      # temporal video denoise
+    "deblur_dvd": "basicvsrpp_deblur_dvd.safetensors",                # real handheld-video deblur
+    "deblur_gopro": "basicvsrpp_deblur_gopro.safetensors",           # synthetic GoPro deblur
+}
+
+
 def default_weights_path(variant: str = "reds4") -> Path:
     if variant not in _VARIANTS:
         raise ValueError(f"unknown basicvsrpp variant {variant!r}; choose from {list(_VARIANTS)}")
@@ -70,6 +85,18 @@ def default_weights_path(variant: str = "reds4") -> Path:
 def resolve_weights(spec: Any = None) -> Path:
     """Bundled variant token (reds4/vimeo90k_bi/vimeo90k_bd/ntire_vsr) or a path."""
     return _resolve_weights(spec, _VARIANTS, _WEIGHTS_DIR, "reds4")
+
+
+def resolve_restore_weights(spec: Any = None) -> Path:
+    """1x-restoration variant token (decompress_track*/denoise/deblur_*) or a path."""
+    return _resolve_weights(spec, _RESTORE_VARIANTS, _WEIGHTS_DIR, "decompress_track1")
+
+
+def is_low_res_input(p: dict) -> bool:
+    """True for the 4x-SR checkpoints (feat_extract is a bare ResidualBlocksWithInputConv),
+    False for the 1x-restoration checkpoints (feat_extract is a strided downsampling stem
+    feat_extract.0/.2/.4). The two differ only in this stem and the terminal residual."""
+    return "feat_extract.main.0.weight" in p
 
 
 def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict:
@@ -265,6 +292,140 @@ def upscale(frames: list, p: dict, flow_mode: str = "spynet",
             # _propagate already mx.eval's each step internally (see net.py:176), so every
             # element of feats[mod] is materialized here -- no extra sync barrier needed.
     return _upsample(frames, feats, p)
+
+
+# ---- 1x restoration path (is_low_res_input=False) --------------------------
+# torch F.interpolate(scale_factor=0.25, mode='bicubic', align_corners=False):
+# because the factor is an exact 4, every output pixel maps to input coord 4j+1.5
+# with the SAME fractional offset 0.5, so the cubic (A=-0.75) weights are constant
+# -- a fixed 4-tap [w(-1),w(0),w(1),w(2)] over input taps [4j,4j+1,4j+2,4j+3].
+_BICUBIC_DOWN4 = (-0.09375, 0.59375, 0.59375, -0.09375)
+
+
+def _bicubic_down4(x: Any) -> Any:
+    """Separable bicubic 1/4 downsample, exact for H,W multiples of 4 (taps never
+    leave the image so no edge clamp is needed). Matches torch's flow-input downsample."""
+    w0, w1, w2, w3 = _BICUBIC_DOWN4
+    n, h, wd, c = x.shape
+    r = x.reshape(n, h // 4, 4, wd, c)
+    y = w0 * r[:, :, 0] + w1 * r[:, :, 1] + w2 * r[:, :, 2] + w3 * r[:, :, 3]
+    cc = y.reshape(n, h // 4, wd // 4, 4, c)
+    return w0 * cc[:, :, :, 0] + w1 * cc[:, :, :, 1] + w2 * cc[:, :, :, 2] + w3 * cc[:, :, :, 3]
+
+
+def _feat_extract_1x(f: Any, p: dict) -> Any:
+    """Downsampling feature-extractor stem (is_low_res_input=False): two stride-2
+    convs (4x down) then the ResidualBlocksWithInputConv at feat_extract.4."""
+    x = lrelu(conv(f, p, "feat_extract.0", stride=2, pad=1))
+    x = lrelu(conv(x, p, "feat_extract.2", stride=2, pad=1))
+    return compiled_resblocks(x, p, "feat_extract.4")
+
+
+def _pad_mult4(f: Any) -> Any:
+    """Replicate-pad bottom/right so H, W are multiples of 4 (the downsample factor)."""
+    _, h, w, _ = f.shape
+    ph, pw = (-h) % 4, (-w) % 4
+    if ph:
+        f = mx.concatenate([f, mx.broadcast_to(f[:, h - 1:h], (f.shape[0], ph, f.shape[2], f.shape[3]))], axis=1)
+    if pw:
+        f = mx.concatenate([f, mx.broadcast_to(f[:, :, w - 1:w], (f.shape[0], f.shape[1], pw, f.shape[3]))], axis=2)
+    return f
+
+
+def restore(frames: list, p: dict, flow_mode: str = "spynet") -> list:
+    """1x recurrent restoration (decompress / denoise / deblur checkpoints). frames:
+    list of (N,H,W,3) f32 [0,1]; out: same length and SAME size, restored. The net
+    downsamples the input 4x, runs bidirectional second-order propagation at 1/4 res,
+    upsamples back, and adds the original frame as the global residual (no bicubic
+    upscale, unlike the SR path). Input is padded to a multiple of 4 and cropped back."""
+    dt = p["conv_last.weight"].dtype
+    orig = [(f.shape[1], f.shape[2]) for f in frames]
+    padded = [_pad_mult4(mx.clip(f, 0.0, 1.0).astype(dt)) for f in frames]
+    # Optical flow is computed on a bicubic-1/4 downsample of the input (reference).
+    down = [_bicubic_down4(f) for f in padded]
+    spatial = []
+    for f in padded:
+        s = _feat_extract_1x(f, p)
+        mx.eval(s)                       # materialize per frame, not all at once
+        spatial.append(s)
+    feats: dict = {"spatial": spatial}
+    ff, fb = _compute_flows(down, p, flow_mode=flow_mode)
+    for it in (1, 2):
+        for direction in ("backward", "forward"):
+            mod = f"{direction}_{it}"
+            feats = _propagate(feats, fb if direction == "backward" else ff, mod, p)
+    outs = []
+    for i in range(len(spatial)):
+        hr = [feats["spatial"][i]] + [feats[k][i] for k in feats if k != "spatial"]
+        residual = _compiled_upsample(p)(mx.concatenate(hr, axis=-1))
+        oh, ow = orig[i]
+        out = mx.clip(residual + padded[i], 0.0, 1.0)[:, :oh, :ow, :]
+        mx.eval(out)
+        outs.append(out)
+    return outs
+
+
+# ---- spatial self-ensemble (the reference's inference-time trick) -----------
+# The NTIRE decompress + ntire-vsr configs run BasicVSR++ through an 8-way
+# geometric self-ensemble (SpatialTemporalEnsemble, is_temporal_ensemble=False)
+# and average -- how the challenge leaderboard numbers were reached. The original
+# repo applies it in forward_test; mmagic's re-port left it as dead config. It is
+# a genuine artifact-reducer: averaging 8 orientations cancels orientation-specific
+# hallucinated texture (the aggressive checkpoints' flat-region "alligator skin")
+# while keeping the orientation-consistent real signal -- measured ~2.5x less
+# hallucination + ~1.7x less temporal crawl on track2, at 8x the compute.
+def _flip(f: Any, ax: int) -> Any:
+    return mx.take(f, (f.shape[ax] - 1) - mx.arange(f.shape[ax]), axis=ax)
+
+
+def _geo_tf(f: Any, mode: str) -> Any:
+    if mode == "v":
+        return _flip(f, 1)              # flip H
+    if mode == "h":
+        return _flip(f, 2)              # flip W
+    if mode == "t":
+        return mx.transpose(f, (0, 2, 1, 3))   # swap H,W
+    return f
+
+
+def _spatial_ensemble(frames: list, run_fn) -> list:
+    """8-way geometric self-ensemble, exact scheme from the reference
+    mmedit/models/common/ensemble.py: build the 8 variants by successively applying
+    vertical/horizontal/transpose, run_fn each, invert the transforms, average.
+    run_fn(list_of_frames) -> list_of_outputs (same length). Works for the 1x
+    restore and the 4x upscale paths alike (transforms are resolution-agnostic)."""
+    lists = [frames]
+    for mode in ("v", "h", "t"):
+        lists = lists + [[_geo_tf(f, mode) for f in fl] for fl in lists]
+    acc: list | None = None
+    for i, fl in enumerate(lists):
+        o = run_fn(fl)
+        if i > 3:
+            o = [_geo_tf(f, "t") for f in o]
+        if i % 4 > 1:
+            o = [_geo_tf(f, "h") for f in o]
+        if (i % 4) % 2 == 1:
+            o = [_geo_tf(f, "v") for f in o]
+        acc = o if acc is None else [a + b for a, b in zip(acc, o, strict=True)]
+        for a in acc:
+            mx.eval(a)                  # free each variant's graph before the next
+    return [mx.clip(a * 0.125, 0.0, 1.0) for a in acc]
+
+
+def restore_ensemble(frames: list, p: dict, flow_mode: str = "spynet") -> list:
+    """1x restoration under the reference's 8-way spatial self-ensemble (8x the
+    cost of restore()). See _spatial_ensemble."""
+    return _spatial_ensemble(frames, lambda fl: restore(fl, p, flow_mode=flow_mode))
+
+
+def upscale_ensemble(frames: list, p: dict, flow_mode: str = "spynet",
+                     history_strength: float = 1.0, history_gate: str = "off") -> list:
+    """4x SR under the reference's 8-way spatial self-ensemble -- the NTIRE
+    ntire_vsr config declares it (the small reds4/vimeo SR configs do not). 8x the
+    cost of upscale(). See _spatial_ensemble."""
+    return _spatial_ensemble(frames, lambda fl: upscale(
+        fl, p, flow_mode=flow_mode, history_strength=history_strength,
+        history_gate=history_gate))
 
 
 if __name__ == "__main__":

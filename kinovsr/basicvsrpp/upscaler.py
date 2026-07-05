@@ -33,7 +33,7 @@ class BasicVsrUpscaler(WindowedUpscaler):
 
     def __init__(self, weights: Any = None, window: int = 14, trim: int = 2,
                  flow_mode: str = "spynet", history_strength: float = 1.0,
-                 history_gate: str = "off"):
+                 history_gate: str = "off", ensemble: bool = False):
         if flow_mode not in ("spynet", "zero", "vt"):
             raise ValueError(
                 f"BasicVSR++ flow_mode must be 'spynet', 'zero', or 'vt'; got {flow_mode!r}")
@@ -47,13 +47,15 @@ class BasicVsrUpscaler(WindowedUpscaler):
         self._flow_mode = flow_mode
         self._history_strength = float(history_strength)
         self._history_gate = history_gate
+        self._ensemble = bool(ensemble)
         # Window must span both trim edges plus >=1 interior frame to emit.
         super().__init__(window=max(int(window), 2 * int(trim) + 1), trim=trim)
 
     def _upscale_window(self, frames: list) -> list:
-        return net.upscale(frames, self._p, flow_mode=self._flow_mode,
-                           history_strength=self._history_strength,
-                           history_gate=self._history_gate)
+        fn = net.upscale_ensemble if self._ensemble else net.upscale
+        return fn(frames, self._p, flow_mode=self._flow_mode,
+                  history_strength=self._history_strength,
+                  history_gate=self._history_gate)
 
 
 if __name__ == "__main__":

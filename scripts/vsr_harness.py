@@ -441,12 +441,12 @@ def _pick_hevc_profile(spatial_mode: str, encode_chroma: str) -> str:
             else HEVC_PROFILE_MAIN10)
 
 
-_PP_STAGE_NAMES = ("deblock", "denoise", "nafnet")
+_PP_STAGE_NAMES = ("restore", "deblock", "denoise", "nafnet")
 
 
 def _pp_order(spec: str) -> list:
     """argparse type for --preprocess-order: a comma-separated permutation/subset of the
-    preprocess stage names (deblock, denoise, nafnet)."""
+    preprocess stage names (restore, deblock, denoise, nafnet)."""
     names = [x.strip() for x in spec.split(",") if x.strip()]
     bad = [n for n in names if n not in _PP_STAGE_NAMES]
     if bad:
@@ -877,6 +877,7 @@ def run(args: argparse.Namespace) -> None:
     # -- e.g. a missing weight -- cannot UnboundLocalError in the cleanup finally.
     deblocker: Any = None  # STDF / FBCNN when --deblock set
     nafnet: Any = None     # NAFNet restorer when --nafnet set
+    restorer: Any = None   # BasicVSR++ 1x recurrent restoration when --restore set
 
     def _build_post_pipeline() -> tuple[
         VsrSession, VtfrcSession | None, AVWriter | None, AVWriter | None, Any, Any, Any, Any
@@ -994,6 +995,7 @@ def run(args: argparse.Namespace) -> None:
                 flow_mode=args.basicvsrpp_flow_mode,
                 history_strength=args.basicvsrpp_history_strength,
                 history_gate=args.basicvsrpp_history_gate,
+                ensemble=args.basicvsrpp_ensemble,
             )
         elif args.spatial_mode == "realbasicvsr":
             from LTX_2_MLX.videotoolbox.realbasicvsr.upscaler import RealBasicVsrUpscaler
@@ -1056,7 +1058,37 @@ def run(args: argparse.Namespace) -> None:
                 guard_fall_frames=args.nafnet_guard_fall,
             )
 
-        return s, v, pw, cw, deb, den, up, naf
+        res: Any = None
+        if args.restore != "off":
+            from LTX_2_MLX.videotoolbox.basicvsrpp.restorer import BasicVsrRestorer
+            # --restore accepts a comma-separated list that CHAINS restorers in one
+            # pass (e.g. decompress_track1,denoise = temporal deblock then temporal
+            # denoise). --restore-weights (a single path) only applies when one
+            # variant is given; multi-variant chains use the bundled token files.
+            variants = [v.strip() for v in args.restore.split(",") if v.strip()]
+            try:
+                strengths = [float(s) for s in str(args.restore_strength).split(",")]
+            except ValueError:
+                raise SystemExit(
+                    f"--restore-strength must be float(s); got {args.restore_strength!r}") from None
+            if len(strengths) == 1:
+                strengths = strengths * len(variants)
+            elif len(strengths) != len(variants):
+                raise SystemExit(
+                    f"--restore-strength: give 1 value or one per --restore stage "
+                    f"({len(variants)}), got {len(strengths)}")
+            wenv = os.environ.get("BASICVSRPP_RESTORE_WEIGHTS")
+            res = []
+            for variant, strength in zip(variants, strengths, strict=True):
+                spec = variant
+                if len(variants) == 1:
+                    spec = args.restore_weights or wenv or variant
+                res.append(BasicVsrRestorer(
+                    spec, window=args.restore_window, trim=args.restore_trim,
+                    strength=strength, flow_mode=args.restore_flow_mode,
+                    ensemble=args.restore_ensemble))
+
+        return s, v, pw, cw, deb, den, up, naf, res
 
     # ---- Synthetic-border sanitizer ----------------------------------------
     # Detect junk edge rows/cols (letterbox lines, capture garbage) and
@@ -1233,15 +1265,25 @@ def run(args: argparse.Namespace) -> None:
         (analog) then a NAFNet detail/deblur pass; --denoise-first swaps the first two;
         --preprocess-order sets the full explicit order (any enabled stage omitted from it
         is appended in the default order). Only enabled (non-None) stages run."""
-        by_name = {"deblock": deblocker, "denoise": denoiser, "nafnet": nafnet}
+        by_name = {"restore": restorer, "deblock": deblocker, "denoise": denoiser, "nafnet": nafnet}
         if args.preprocess_order:
             order = list(args.preprocess_order)
         else:
             order = ["denoise", "deblock"] if args.denoise_first else ["deblock", "denoise"]
+            # BasicVSR++ restoration is temporal; run it FIRST by default so it
+            # establishes frame-to-frame consistency (killing GOP-periodic
+            # compression flicker + sensor noise) before any per-frame stage.
+            order = ["restore", *order]
         for name in _PP_STAGE_NAMES:                  # append any enabled stage not listed
             if name not in order:
                 order.append(name)
-        return [by_name[n] for n in order if by_name[n] is not None]
+        stages: list = []
+        for n in order:
+            s = by_name[n]
+            if s is None:
+                continue
+            stages.extend(s if isinstance(s, list) else [s])   # "restore" may be a chain
+        return stages
 
     def _stage_feed(stage: Any, rgb: Any, tok: Any) -> list:
         """Push one frame through a preprocessor -> [(rgb, tok), ...]. feed/flush delay
@@ -1303,7 +1345,7 @@ def run(args: argparse.Namespace) -> None:
                 import io as _io
                 _buf = _io.StringIO()
                 with contextlib.redirect_stdout(_buf):
-                    session, vtfrc, post_writer, comparison_writer, deblocker, denoiser, upscaler, nafnet = _build_post_pipeline()
+                    session, vtfrc, post_writer, comparison_writer, deblocker, denoiser, upscaler, nafnet, restorer = _build_post_pipeline()
                 msg = _buf.getvalue().rstrip("\n")
                 if msg:
                     bars.write(msg)
@@ -1385,7 +1427,8 @@ def run(args: argparse.Namespace) -> None:
                     # their two future neighbours have arrived (feed() may return
                     # nothing now; the tail drains after the loop). f32 RGB [0,1].
                     if (deblocker is not None or denoiser is not None
-                            or nafnet is not None or sanitize_edges is not None
+                            or nafnet is not None or restorer is not None
+                            or sanitize_edges is not None
                             or crop_box is not None or square_apply is not None):
                         # fp16-preserving for RGBAHalf (balanced/image/none); 8-bit
                         # CoreImage fallback for NV12 (fast). Deblock (compression)
@@ -1429,7 +1472,8 @@ def run(args: argparse.Namespace) -> None:
             gc.collect()
         # Drain any frames a lookahead denoiser still holds (the centered-window
         # tail, with the standard reflected window at the clip's end).
-        if (deblocker is not None or (denoiser is not None and hasattr(denoiser, "flush"))) and session is not None:
+        if (deblocker is not None or restorer is not None
+                or (denoiser is not None and hasattr(denoiser, "flush"))) and session is not None:
             for d_rgb, (d_sf, d_sa) in _preprocess_flush():
                 if max_frames is not None and appended >= max_frames:
                     break
@@ -1643,6 +1687,68 @@ def main() -> None:
     parser.add_argument(
         "--save-audio-sidecar", action="store_true",
         help="Also write the muxed audio as <stem>_audio.wav next to the MP4s.",
+    )
+    parser.add_argument(
+        "--restore", default="off", metavar="off|VARIANT",
+        help=(
+            "Pre-upscale TEMPORAL restoration (BasicVSR++, recurrent). Unlike the "
+            "per-frame deblock/denoise stages, this is bidirectional + second-order "
+            "over a frame window, so it enforces frame-to-frame consistency -- the fix "
+            "for GOP-periodic compression flicker (artifacts that appear/disappear "
+            "between keyframes) and temporally-varying sensor noise that per-frame "
+            "models pulse on. Runs FIRST by default (before deblock/denoise/nafnet) so "
+            "it stabilizes the sequence before any per-frame stage. Accepts a "
+            "COMMA-SEPARATED list to chain restorers in one pass, in order -- e.g. "
+            "'decompress_track1,denoise' runs temporal deblock then temporal denoise. "
+            "Variants: off "
+            "(default); decompress_track1 (NTIRE'21 compressed-video enhancement, the "
+            "H.264/HEVC deblock choice) / decompress_track2 / decompress_track3; "
+            "denoise (temporal video denoise -- softens far less than a per-frame "
+            "denoiser); deblur_dvd / deblur_gopro (real / synthetic motion deblur). "
+            "Weights downloaded, not bundled -- see basicvsrpp/weights/README.md. "
+            "Domain note: trained on HEVC/synthetic degradations, so temporal-right "
+            "but domain-approximate for 2010-era H.264."
+        ),
+    )
+    parser.add_argument(
+        "--restore-weights", default=None, metavar="VARIANT|PATH",
+        help="Weights for --restore: a restoration variant token or a .safetensors path "
+             "(or $BASICVSRPP_RESTORE_WEIGHTS). Overrides the --restore token's default file.",
+    )
+    parser.add_argument(
+        "--restore-strength", type=str, default="1.0", metavar="S[,S...]",
+        help="Blend each restored frame with the original (1.0 = full restore, default; "
+             "0.0 = passthrough). A single value applies to every chained --restore stage; "
+             "a comma-separated list sets per-stage strengths in order and must match the "
+             "number of --restore variants -- e.g. --restore decompress_track1,denoise "
+             "--restore-strength 1.0,0.5 = full deblock then a gentle denoise.",
+    )
+    parser.add_argument(
+        "--restore-window", type=int, default=14, metavar="N",
+        help="Sliding-window length (frames) for --restore recurrence (default 14). "
+             "Longer = more temporal context (better consistency) but more memory/compute.",
+    )
+    parser.add_argument(
+        "--restore-trim", type=int, default=2, metavar="N",
+        help="Warm-up frames trimmed at each --restore window join (default 2); the "
+             "propagation's transient edge. Interior frames match the full-clip result.",
+    )
+    parser.add_argument(
+        "--restore-flow-mode", choices=["spynet", "zero", "vt"], default="spynet",
+        help="Optical-flow source for --restore alignment: spynet (default, the trained "
+             "flow net), zero (no motion), or vt (VideoToolbox flow).",
+    )
+    parser.add_argument(
+        "--restore-ensemble", action="store_true",
+        help="Run --restore through the reference's 8-way geometric self-ensemble "
+             "(the SpatialTemporalEnsemble the NTIRE decompress/ntire-vsr configs apply "
+             "at inference, dropped as dead config in the mmagic re-port): restore under "
+             "8 flip/rotate variants and average. Cancels orientation-specific "
+             "hallucinated texture -- measured ~2.5x less flat-region 'alligator skin' "
+             "and ~1.7x less temporal crawl on the aggressive decompress_track2 -- at 8x "
+             "the compute. Off by default; worth it when a variant hallucinates on smooth "
+             "surfaces and you still want its aggression. Applies to every chained "
+             "--restore stage.",
     )
     parser.add_argument(
         "--deblock", choices=["off", "stdf", "fbcnn"], default="off",
@@ -2007,6 +2113,17 @@ def main() -> None:
             "Warm-up frames trimmed at each window join for --spatial-mode "
             "basicvsrpp (default 2). Trimmed frames are re-emitted by the "
             "neighbouring window with fuller propagation context."
+        ),
+    )
+    parser.add_argument(
+        "--basicvsrpp-ensemble", action="store_true",
+        help=(
+            "Run --spatial-mode basicvsrpp through the reference's 8-way geometric "
+            "self-ensemble (average the 8 flip/rotate variants). The ntire_vsr "
+            "checkpoint's config declares this SpatialTemporalEnsemble at inference "
+            "(the reds4/vimeo SR models do not); the mmagic re-port dropped it as dead "
+            "config. Reference-faithful for ntire_vsr and a mild artifact-reducer, at "
+            "8x the compute. Off by default."
         ),
     )
     parser.add_argument(
