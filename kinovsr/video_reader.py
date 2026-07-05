@@ -123,6 +123,58 @@ def probe_video(path: Path) -> tuple[int, int, float, int, Any, tuple[int, int] 
     return w, h, fps, n, transform, pixel_aspect
 
 
+def keyframe_display_indices(path: Path) -> list[int]:
+    """Display-order frame indices of the source's keyframes (sync samples).
+
+    A compressed-passthrough pass (AVAssetReaderTrackOutput with no output
+    settings) yields the coded samples in DECODE order; a sample is a keyframe iff
+    its ``kCMSampleAttachmentKey_NotSync`` attachment is absent/false. Each keyframe
+    is mapped to its DISPLAY index via its presentation timestamp
+    (``round(pts * fps)``), because the decoded frames the pipeline processes arrive
+    in display order (B-frame reordered) -- decode-order indices would not line up.
+    DecodeTimeStamp is a fallback for the rare sample whose PTS is invalid.
+
+    No decode and no ffprobe: this reads only sample metadata, so it is cheap even
+    on long clips. Used to align sliding restoration/upscaler windows to GOP
+    boundaries (see the harness --gop-align path). Returns a sorted list; a clip
+    with a single keyframe (open-ended GOP) returns ``[0]``.
+    """
+    import math
+    require_pyobjc()
+    url = Foundation.NSURL.fileURLWithPath_(str(path))
+    asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
+    track = _first_video_track(asset)
+    fps = float(track.nominalFrameRate())
+    if fps <= 0:
+        return [0]
+    reader, err = av.AVAssetReader.alloc().initWithAsset_error_(asset, None)
+    if reader is None:
+        raise RuntimeError(f"AVAssetReader init failed: {err}")
+    out = av.AVAssetReaderTrackOutput.alloc().initWithTrack_outputSettings_(track, None)
+    if not reader.canAddOutput_(out):
+        return [0]
+    reader.addOutput_(out)
+    if not reader.startReading():
+        raise RuntimeError(f"AVAssetReader.startReading failed: {reader.error()}")
+    kf: set[int] = set()
+    while True:
+        sb = out.copyNextSampleBuffer()
+        if sb is None:
+            break
+        arr = CoreMedia.CMSampleBufferGetSampleAttachmentsArray(sb, False)
+        is_key = True
+        if arr and len(arr) > 0:
+            is_key = not bool(arr[0].get(CoreMedia.kCMSampleAttachmentKey_NotSync))
+        if is_key:
+            pts = CoreMedia.CMTimeGetSeconds(CoreMedia.CMSampleBufferGetPresentationTimeStamp(sb))
+            if math.isnan(pts):
+                pts = CoreMedia.CMTimeGetSeconds(CoreMedia.CMSampleBufferGetDecodeTimeStamp(sb))
+            if not math.isnan(pts):
+                kf.add(int(round(pts * fps)))
+        del sb
+    return sorted(kf) if kf else [0]
+
+
 def probe_color(path: Path) -> dict:
     """Source color tags from the container, for output color propagation.
 

@@ -475,6 +475,8 @@ def run(args: argparse.Namespace) -> None:
     print(f"[setup] output stem: {stem}")
 
     audio_track: AudioTrack | None = None
+    gop_schedule: Any = None   # GOP-aligned window plan for recurrent stages (--gop-align)
+    _gop_head_skip = 0         # gop-align context frames whose outputs are dropped
     src_transform: Any = None  # source rotation/flip (set on the --video path)
     src_pixel_aspect: tuple[int, int] | None = None
     # Input frame window [loop_win_start, loop_win_end). The --video reader
@@ -537,15 +539,22 @@ def run(args: argparse.Namespace) -> None:
         if args.crop_bars or args.crop_aspect:
             print("[crop] --crop-bars/--crop-aspect need --video; disabled")
 
+        if args.snap_start or args.gop_align:
+            print("[warn] --snap-start/--gop-align apply to --video only; ignored for --latent")
         # --start/--end trim the decoded frames. The VAE still decodes the whole
         # latent (it is temporally tiled, not seekable), so the window is
         # enforced in the main loop rather than at the reader.
         win_start, win_end = resolve_trim(args.start, args.end, source_fps, total_frames)
+        _win_end_abs = win_end if win_end is not None else total_frames
         if win_start or win_end is not None:
             loop_win_start, loop_win_end = win_start, win_end
-            total_frames = (win_end if win_end is not None else total_frames) - win_start
-            print(f"[setup] input trim: frames [{win_start}, "
-                  f"{win_end if win_end is not None else 'end'}) -> {total_frames} frames")
+            total_frames = _win_end_abs - win_start
+        if source_fps > 0:
+            print(f"[setup] range: start {win_start} ({win_start / source_fps:.3f}s) -> "
+                  f"end {_win_end_abs} ({_win_end_abs / source_fps:.3f}s), "
+                  f"{total_frames} frames @ {source_fps:.3f} fps")
+        else:
+            print(f"[setup] range: frames [{win_start}, {_win_end_abs}), {total_frames} frames")
 
         if args.vae_tiling == "single":
             vae_cfg, n_vae_chunks, vae_tiling_desc = None, 1, "single (one decode)"
@@ -754,10 +763,88 @@ def run(args: argparse.Namespace) -> None:
         # --start/--end trim the input. The reader seeks to the window so the
         # head of a long clip is never decoded (frame-exact, see video_reader).
         win_start, win_end = resolve_trim(args.start, args.end, source_fps, total_frames)
-        if win_start or win_end is not None:
-            total_frames = (win_end if win_end is not None else total_frames) - win_start
-            print(f"[setup] input trim: frames [{win_start}, "
-                  f"{win_end if win_end is not None else 'end'}) -> {total_frames} frames")
+        _orig_total = total_frames       # full-clip frame count (before trim)
+
+        def _tc(fr: int) -> str:         # frame index -> "N (S.SSSs)"
+            return f"{fr} ({fr / source_fps:.3f}s)" if source_fps > 0 else f"{fr}"
+
+        # Keyframes are needed by --snap-start and/or --gop-align; detect once.
+        _kf_all = (_vr.keyframe_display_indices(Path(args.video))
+                   if (args.snap_start or args.gop_align) else None)
+        if args.snap_start and _kf_all:
+            _snap = min(_kf_all, key=lambda k: abs(k - win_start))
+            if _snap != win_start:
+                print(f"[snap] --start {_tc(win_start)} snapped to nearest keyframe "
+                      f"{_tc(_snap)} (output begins there, not at the requested frame)")
+                win_start = _snap
+        _win_end_abs = win_end if win_end is not None else _orig_total
+        total_frames = _win_end_abs - win_start
+        # Always echo the effective range (frames + timecodes, ms precision).
+        print(f"[setup] range: start {_tc(win_start)} -> end {_tc(_win_end_abs)}, "
+              f"{total_frames} frames @ {source_fps:.3f} fps")
+
+        # GOP-aligned windowing: plan windows whose boundaries land on keyframes
+        # (both recurrence directions cold-start on a clean frame -> no trim needed).
+        # One schedule drives every recurrent stage (they preserve frame positions).
+        _read_start = win_start          # gop-align may extend the read back to a keyframe
+        _gop_head_skip = 0               # context frames read before --start, output-dropped
+        if args.gop_align:
+            from LTX_2_MLX.videotoolbox.upscaler_base import plan_gop_windows
+            _win_e = _win_end_abs
+            # Anchor the first window on the keyframe enclosing --start: read from
+            # it and feed [kf, start) as recurrence context (processed, not output),
+            # so the forward pass cold-starts on a clean I-frame even on an
+            # arbitrary start.
+            _encl = [k for k in _kf_all if k <= win_start]
+            _read_start = max(_encl) if _encl else win_start
+            _gop_head_skip = win_start - _read_start
+            _n_sched = _win_e - _read_start
+            _kf = sorted({k - _read_start for k in _kf_all if _read_start <= k < _win_e})
+            gop_schedule = plan_gop_windows(_kf, _n_sched, args.gop_min_window, args.gop_max_window)
+            # ---- diagnostics: everything the scheduler saw + computed ----
+            _kf_abs = [k for k in _kf_all if _read_start <= k < _win_e]
+            # Anchor the first window on the keyframe enclosing --start: read from
+            # it and feed [kf, start) as recurrence context (processed, not output),
+            # so the forward pass cold-starts on a clean I-frame even on an
+            # arbitrary start.
+            _encl = [k for k in _kf_all if k <= win_start]
+            _read_start = max(_encl) if _encl else win_start
+            _gop_head_skip = win_start - _read_start
+            _n_sched = _win_e - _read_start
+            _kf = sorted({k - _read_start for k in _kf_all if _read_start <= k < _win_e})
+            gop_schedule = plan_gop_windows(_kf, _n_sched, args.gop_min_window, args.gop_max_window)
+            # ---- diagnostics: everything the scheduler saw + computed ----
+            _kf_abs = [k for k in _kf_all if _read_start <= k < _win_e]
+            _gaps = [_kf[i] - _kf[i - 1] for i in range(1, len(_kf))]
+            _uniq = sorted(set(_gaps))
+            _cadence = ("single-keyframe (no cadence -> fixed max-window tiling)" if not _gaps
+                        else f"constant {_uniq[0]} frames" if len(_uniq) == 1
+                        else f"variable: min {min(_gaps)} / median {sorted(_gaps)[len(_gaps) // 2]} / max {max(_gaps)}")
+            _proc = sum(p1 - p0 for p0, p1, *_ in gop_schedule)
+            _emit_n = sum(e1 - e0 for *_, e0, e1 in gop_schedule)
+            print(f"[gop-align] source: {len(_kf_abs)} keyframes in frames "
+                  f"[{_read_start}, {_win_e}); GOP cadence {_cadence}")
+            print("[gop-align]   keyframe frames: "
+                  + (str(_kf_abs) if len(_kf_abs) <= 24
+                     else f"{_kf_abs[:8]} ... {_kf_abs[-3:]}  ({len(_kf_abs)} total)"))
+            if _gop_head_skip:
+                print(f"[gop-align]   WARNING: --start {win_start} is mid-GOP; reading from "
+                      f"keyframe {_read_start} and feeding [{_read_start}, {win_start}) "
+                      f"({_gop_head_skip} frames) as recurrence context (processed, NOT output)")
+            print(f"[gop-align] planned {len(gop_schedule)} windows (min {args.gop_min_window} "
+                  f"/ max {args.gop_max_window} frames), keyframe-anchored both ends, trim 0:")
+            _show = (gop_schedule if len(gop_schedule) <= 12
+                     else [*gop_schedule[:6], None, *gop_schedule[-3:]])
+            for _w in _show:
+                if _w is None:
+                    print(f"[gop-align]   ... ({len(gop_schedule) - 9} more) ...")
+                    continue
+                _p0, _p1, _e0, _e1 = _w
+                print(f"[gop-align]   proc[{_p0}:{_p1}] emit[{_e0}:{_e1}]  "
+                      f"({_p1 - _p0} processed -> {_e1 - _e0} output)")
+            _ovh = (_proc / _emit_n - 1.0) * 100 if _emit_n else 0.0
+            print(f"[gop-align] {_proc} frames processed for {_emit_n} output "
+                  f"({_ovh:.1f}% re-processing overhead vs trim's ~2x)")
         _force_read = args.source_color != "auto" or args.source_range != "auto"
         if args.source_range != "auto" and vsr_src_fmt != _pb.PIX_RGBAHALF:
             # The NV12 fast path feeds container-range-typed YUV straight into
@@ -775,13 +862,13 @@ def run(args: argparse.Namespace) -> None:
             # the LowLatency scaler consumes YUV directly.)
             chunks = _vr.iter_forced_color_chunks(
                 Path(args.video), vsr_src_fmt, cv_color[2], _src_color["full_range"],
-                chunk_size=buf_chunk, start_frame=win_start, end_frame=win_end,
+                chunk_size=buf_chunk, start_frame=_read_start, end_frame=win_end,
                 reinterpret_full_range=output_full_range,
             )
         else:
             chunks = _vr.iter_video_buffer_chunks(
                 Path(args.video), vsr_src_fmt, chunk_size=buf_chunk,
-                start_frame=win_start, end_frame=win_end,
+                start_frame=_read_start, end_frame=win_end,
             )
         n_vae_chunks = None  # no VAE on --video path
 
@@ -1199,7 +1286,13 @@ def run(args: argparse.Namespace) -> None:
         Advances the processed and appended counters. Used for every output frame
         so the no-denoise, per-frame (spatial/mc), and lookahead (fastdvd) paths
         share one emit path."""
-        nonlocal processed, appended
+        nonlocal processed, appended, _gop_head_skip
+        # gop-align enclosing-keyframe anchor: the frames read before --start were
+        # fed to the recurrent stages as context only; drop their outputs here,
+        # after every stage has consumed them.
+        if _gop_head_skip > 0:
+            _gop_head_skip -= 1
+            return
         if den_rgb is not None:
             if sanitize_restore is not None and src_arr is not None:
                 den_rgb = _restore_borders(den_rgb, src_arr, sanitize_restore,
@@ -1351,6 +1444,14 @@ def run(args: argparse.Namespace) -> None:
                     bars.write(msg)
                 if nafnet is not None and hasattr(nafnet, "set_progress_message"):
                     nafnet.set_progress_message(bars.write)
+                # Drive every recurrent stage from the one GOP-aligned schedule
+                # (restore chain + a windowed upscaler). Per-frame stages lack the
+                # method and are skipped.
+                if gop_schedule is not None:
+                    for _st in [*(restorer or []),
+                                *( [upscaler] if upscaler is not None else [] )]:
+                        if hasattr(_st, "set_schedule"):
+                            _st.set_schedule(gop_schedule)
             for i in range(chunk_len):
                 if max_frames is not None and appended >= max_frames:
                     break
@@ -1737,6 +1838,42 @@ def main() -> None:
         "--restore-flow-mode", choices=["spynet", "zero", "vt"], default="spynet",
         help="Optical-flow source for --restore alignment: spynet (default, the trained "
              "flow net), zero (no motion), or vt (VideoToolbox flow).",
+    )
+    parser.add_argument(
+        "--snap-start", action="store_true",
+        help=(
+            "Snap --start to the nearest source keyframe, so the output actually "
+            "BEGINS on a clean I-frame (a clean editorial cut, a pristine first frame, "
+            "and no context-decode overhead). This MOVES the start -- you get a "
+            "slightly different range than requested -- so it is warned and the "
+            "effective range is echoed. Contrast --gop-align's anchor, which keeps "
+            "your exact --start and reads the pre-start frames as context. --video only."
+        ),
+    )
+    parser.add_argument(
+        "--gop-align", action="store_true",
+        help=(
+            "Align recurrent windows (--restore and the basicvsrpp/realbasicvsr/"
+            "realviformer upscalers) to the source's GOP: detect keyframes natively "
+            "(no ffprobe) and window keyframe-to-keyframe so BOTH recurrence "
+            "directions cold-start on a clean I-frame -- no warm-up trim needed. "
+            "Overhead is ~1 re-processed frame per GOP (a few percent) instead of "
+            "trim's ~2x, and it removes window-boundary flicker on GOP-structured "
+            "video. Falls back to fixed max-window tiling when the source has no "
+            "keyframe cadence. --video only. Overrides the per-stage --*-window/-trim."
+        ),
+    )
+    parser.add_argument(
+        "--gop-min-window", type=int, default=16, metavar="N",
+        help="Minimum recurrent window (frames) under --gop-align (default 16). A "
+             "window spans whole GOPs until it reaches this, so short GOPs are merged "
+             "for enough temporal context.",
+    )
+    parser.add_argument(
+        "--gop-max-window", type=int, default=96, metavar="N",
+        help="Maximum recurrent window (frames) under --gop-align (default 96). A GOP "
+             "longer than this is split into sub-windows (with a small trim at the "
+             "internal splits) to bound memory.",
     )
     parser.add_argument(
         "--restore-ensemble", action="store_true",
