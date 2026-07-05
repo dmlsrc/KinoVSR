@@ -63,6 +63,36 @@ def _relu6(x: Any) -> Any:
     return mx.clip(x, 0.0, 6.0)
 
 
+def _cv_relu6_s1_kernel(x: Any, weight: Any, bias: Any) -> Any:
+    return mx.clip(mx.conv2d(x, weight, stride=1, padding=1) + bias, 0.0, 6.0)
+
+
+def _inc_kernel(x: Any, w0: Any, b0: Any, w1: Any, b1: Any) -> Any:
+    x = mx.clip(mx.conv2d(x, w0, stride=1, padding=1) + b0, 0.0, 6.0)
+    return mx.clip(mx.conv2d(x, w1, stride=1, padding=1) + b1, 0.0, 6.0)
+
+
+def _out_kernel(x: Any, w0: Any, b0: Any, w1: Any, b1: Any) -> Any:
+    x = mx.clip(mx.conv2d(x, w0, stride=1, padding=1) + b0, 0.0, 6.0)
+    return mx.conv2d(x, w1, stride=1, padding=1) + b1
+
+
+_cv_relu6_s1_compiled = mx.compile(_cv_relu6_s1_kernel)
+_inc_compiled = mx.compile(_inc_kernel)
+_out_compiled = mx.compile(_out_kernel)
+
+
+def _cv_relu6_s1(x: Any, conv: tuple[Any, Any, int]) -> Any:
+    weight, bias, stride = conv
+    if stride == 1 and bias is not None:
+        return _cv_relu6_s1_compiled(x, weight, bias)
+    return _relu6(_cv(x, conv))
+
+
+def _two_conv_ready(a: tuple[Any, Any, int], b: tuple[Any, Any, int]) -> bool:
+    return a[1] is not None and b[1] is not None and a[2] == 1 and b[2] == 1
+
+
 def _pixelshuffle2(x: Any) -> Any:
     """(N,H,W,4C) -> (N,2H,2W,C), matching torch PixelShuffle(2)."""
     n, h, w, c4 = x.shape
@@ -92,14 +122,16 @@ class _BiBufferConv:
     right side with zeros, exactly like the upstream streaming end stage.
     """
 
-    def __init__(self, conv: tuple[Any, Any, int]):
+    def __init__(self, conv: tuple[Any, Any, int], relu: bool = False):
         self._conv = conv
+        self._relu = relu
         self.reset()
 
     def reset(self) -> None:
         self._left_fold_2fold: Any = None
         self._center: Any = None
         self._shape: tuple[int, int, int, int] | None = None
+        self._zero_right: Any = None
         self._fold = 0
 
     def __call__(self, input_right: Any | None) -> Any | None:
@@ -119,14 +151,20 @@ class _BiBufferConv:
             if self._shape is None:
                 return None
             n, h, w, _c = self._shape
-            right = mx.zeros((n, h, w, self._fold), dtype=self._center.dtype)
+            if (
+                self._zero_right is None
+                or self._zero_right.shape != (n, h, w, self._fold)
+                or self._zero_right.dtype != self._center.dtype
+            ):
+                self._zero_right = mx.zeros((n, h, w, self._fold), dtype=self._center.dtype)
+            right = self._zero_right
         else:
             right = input_right[..., : self._fold]
 
         x = mx.concatenate(
             [right, self._left_fold_2fold, self._center[..., 2 * self._fold:]], axis=-1
         )
-        out = _cv(x, self._conv)
+        out = _cv_relu6_s1(x, self._conv) if self._relu else _cv(x, self._conv)
         self._left_fold_2fold = self._center[..., self._fold: 2 * self._fold]
         self._center = input_right
         return out
@@ -134,8 +172,8 @@ class _BiBufferConv:
 
 class _MemCvBlock:
     def __init__(self, c1: tuple[Any, Any, int], c2: tuple[Any, Any, int]):
-        self.c1 = _BiBufferConv(c1)
-        self.c2 = _BiBufferConv(c2)
+        self.c1 = _BiBufferConv(c1, relu=True)
+        self.c2 = _BiBufferConv(c2, relu=True)
 
     def reset(self) -> None:
         self.c1.reset()
@@ -143,12 +181,7 @@ class _MemCvBlock:
 
     def __call__(self, x: Any | None) -> Any | None:
         x = self.c1(x)
-        if x is not None:
-            x = _relu6(x)
-        x = self.c2(x)
-        if x is not None:
-            x = _relu6(x)
-        return x
+        return self.c2(x)
 
 
 class _MemSkip:
@@ -204,6 +237,10 @@ class _DenBlock:
     def _inc(self, x: Any | None) -> Any | None:
         if x is None:
             return None
+        if _two_conv_ready(self.p["inc0"], self.p["inc3"]):
+            w0, b0, _ = self.p["inc0"]
+            w1, b1, _ = self.p["inc3"]
+            return _inc_compiled(x, w0, b0, w1, b1)
         return _relu6(_cv(_relu6(_cv(x, self.p["inc0"])), self.p["inc3"]))
 
     def _down(self, x: Any | None, conv0: tuple[Any, Any, int], mem: _MemCvBlock) -> Any | None:
@@ -220,6 +257,10 @@ class _DenBlock:
     def _out(self, x: Any | None) -> Any | None:
         if x is None:
             return None
+        if _two_conv_ready(self.p["out0"], self.p["out3"]):
+            w0, b0, _ = self.p["out0"]
+            w1, b1, _ = self.p["out3"]
+            return _out_compiled(x, w0, b0, w1, b1)
         return _cv(_relu6(_cv(x, self.p["out0"])), self.p["out3"])
 
     def __call__(self, x: Any | None) -> Any | None:
@@ -331,6 +372,8 @@ class BsvdDenoiser:
     def _reset_state(self) -> None:
         self.net.reset()
         self._hw: tuple[int, int] | None = None
+        self._nm: Any = None
+        self._padded_hw: tuple[int, int] | None = None
         self._tokens: list[Any] = []
         self._frames: list[Any] = []
         self._frame_tokens: list[Any] = []
@@ -367,8 +410,10 @@ class BsvdDenoiser:
         x = _reflect_pad_to4(frame[None].astype(self.net.dtype))[0]
         if self.net.input_channels == 4:
             _, hp, wp, _ = x.shape
-            nm = mx.full((1, hp, wp, 1), float(self.sigma), dtype=self.net.dtype)
-            x = mx.concatenate([x, nm], axis=-1)
+            if self._nm is None or self._padded_hw != (int(hp), int(wp)):
+                self._nm = mx.full((1, hp, wp, 1), float(self.sigma), dtype=self.net.dtype)
+                self._padded_hw = (int(hp), int(wp))
+            x = mx.concatenate([x, self._nm], axis=-1)
         return x
 
     def _emit(self, out: Any, token: Any) -> tuple[Any, Any]:
@@ -441,15 +486,21 @@ class BsvdDenoiser:
 
     def _run_window(self, frames: list, tokens: list, emit_start: int, emit_end: int) -> list:
         self.net.reset()
-        out_seq = [self.net.step(x) for x in frames]
-        for _ in range(self.net.SHIFT_NUM):
-            out_seq.append(self.net.step(None))
-        clipped = out_seq[self.net.SHIFT_NUM:self.net.SHIFT_NUM + len(frames)]
         out = []
-        for y, tok in zip(clipped[emit_start:emit_end], tokens[emit_start:emit_end], strict=True):
-            if y is None:
-                raise RuntimeError("BSVD scheduled window emitted an empty frame")
-            out.append(self._emit(y, tok))
+        for i, x in enumerate(frames):
+            y = self.net.step(x)
+            idx = i - self.net.SHIFT_NUM
+            if emit_start <= idx < emit_end:
+                if y is None:
+                    raise RuntimeError("BSVD scheduled window emitted an empty frame")
+                out.append(self._emit(y, tokens[idx]))
+        for i in range(self.net.SHIFT_NUM):
+            y = self.net.step(None)
+            idx = len(frames) + i - self.net.SHIFT_NUM
+            if emit_start <= idx < emit_end:
+                if y is None:
+                    raise RuntimeError("BSVD scheduled window emitted an empty frame")
+                out.append(self._emit(y, tokens[idx]))
         self.net.reset()
         return out
 
