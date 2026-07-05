@@ -251,9 +251,12 @@ class FastDvdDenoiser:
     """
 
     LOOKAHEAD = 2   # (5 - 1) // 2: frames of future context the center needs
+    MAP_WARMUP = 9  # frames buffered before estimating a spatial noise map
 
     def __init__(self, weights_path: str | Path | None = None, strength: float = 0.5,
-                 variant: str = "clipped", dtype: Any = mx.float16):
+                 variant: str = "clipped", dtype: Any = mx.float16,
+                 noise_map: Any | None = None, map_refresh: int = 64,
+                 pulse: Any | None = None):
         wp = Path(weights_path) if weights_path else default_weights_path(variant)
         if not wp.is_file():
             raise FileNotFoundError(
@@ -262,6 +265,17 @@ class FastDvdDenoiser:
             )
         self.net = FastDVDnet(wp, dtype=dtype)
         self.sigma = _strength_to_sigma(strength)
+        # optional NoiseMapTracker: replaces the constant sigma plane with a
+        # per-pixel estimate (sigma units, same scale as the constant).
+        self._tracker = noise_map
+        # streaming map refresh cadence (frames); 0 disables.
+        self._map_refresh = max(0, int(map_refresh))
+        # optional PulseGain: per-frame scalar on the sigma plane tracking
+        # GOP-phase noise pulsing (I-frame grain refresh).
+        self._pulse = pulse
+        self.last_noise_map: Any = None   # fp32 (H,W,1) actually used (debug)
+        # diagnostics: gains across the whole run (survives the end-of-stream reset)
+        self._pulse_log: list[float] = []
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -270,6 +284,12 @@ class FastDvdDenoiser:
         self._g: dict = {}      # abs index -> g(i) = temp1 estimate (cached)
         self._nm: Any = None    # padded noise map (set on first frame)
         self._hw: Any = None    # original (h, w) for unpad
+        self._warm: list = []   # (padded_frame, token) held until the map exists
+        self._recent: list = [] # rolling last frames for the streaming map refresh
+        self._since_refresh = 0
+        self._gains: dict = {}  # abs index -> per-frame pulse gain
+        if self._pulse is not None:
+            self._pulse.reset()
         self._received = 0
         self._emitted = 0
 
@@ -291,12 +311,18 @@ class FastDvdDenoiser:
     def _frame(self, i: int, last: int) -> Any:
         return self._buf[self._reflect(i, last) - self._base][0]
 
+    def _nm_at(self, i: int, last: int) -> Any:
+        """Noise plane for center frame i: the map scaled by i's pulse gain."""
+        g = self._gains.get(self._reflect(i, last), 1.0)
+        return self._nm if g == 1.0 else self._nm * g
+
     def _g_at(self, i: int, last: int) -> Any:
         """temp1 estimate g(i), computed once and cached."""
         g = self._g.get(i)
         if g is None:
             g = self.net.temp1_step(
-                self._frame(i - 1, last), self._frame(i, last), self._frame(i + 1, last), self._nm)
+                self._frame(i - 1, last), self._frame(i, last), self._frame(i + 1, last),
+                self._nm_at(i, last))
             mx.eval(g)   # materialize once: each g feeds 3 temp2 calls, don't recompute
             self._g[i] = g
         return g
@@ -304,7 +330,8 @@ class FastDvdDenoiser:
     def _emit_one(self, last: int) -> tuple:
         t = self._emitted
         out = self.net.temp2_step(
-            self._g_at(t - 1, last), self._g_at(t, last), self._g_at(t + 1, last), self._nm)
+            self._g_at(t - 1, last), self._g_at(t, last), self._g_at(t + 1, last),
+            self._nm_at(t, last))
         h, w = self._hw
         out = mx.clip(out, 0.0, 1.0)[0, :h, :w, :].astype(mx.float32)
         tok = self._buf[t - self._base][1]
@@ -315,16 +342,28 @@ class FastDvdDenoiser:
             self._base += 1
         for k in [k for k in self._g if k < keep]:
             del self._g[k]
+        for k in [k for k in self._gains if k < keep]:
+            del self._gains[k]
         return out, tok
 
-    def feed(self, frame: Any, token: Any = None) -> list:
-        """Buffer one input frame; return [(denoised, token), ...] now ready."""
-        frame = mx.clip(frame[..., :3].astype(mx.float32), 0.0, 1.0)
-        padded = _reflect_pad_to4(frame[None].astype(self.net.dtype))[0]
-        if self._nm is None:
-            _, hp, wp, _ = padded.shape
-            self._nm = mx.full((1, hp, wp, 1), float(self.sigma), dtype=self.net.dtype)
-            self._hw = (int(frame.shape[0]), int(frame.shape[1]))
+    def _estimate_map(self, frames: list) -> None:
+        """Build self._nm from padded frames via the tracker (falls back to the
+        constant sigma when the tracker cannot estimate)."""
+        h, w = self._hw
+        sig = self._tracker.update([f[:, :h, :w, :] for f in frames])
+        if sig is None:
+            sig = mx.full((h, w, 1), float(self.sigma), dtype=mx.float32)
+        self.last_noise_map = sig.astype(mx.float32)
+        self._nm = _reflect_pad_to4(sig[None].astype(self.net.dtype))[0]
+
+    def _accept(self, padded: Any, token: Any) -> list:
+        if self._pulse is not None:
+            # frames reach _accept in stream order for both the normal and the
+            # warm-replay path, so the diff chain stays temporally adjacent.
+            h, w = self._hw
+            g = self._pulse.update(padded[:, :h, :w, :])
+            self._gains[self._received] = g
+            self._pulse_log.append(g)
         self._buf.append((padded, token))
         self._received += 1
         last = self._received - 1
@@ -333,10 +372,50 @@ class FastDvdDenoiser:
             ready.append(self._emit_one(last))
         return ready
 
+    def feed(self, frame: Any, token: Any = None) -> list:
+        """Buffer one input frame; return [(denoised, token), ...] now ready."""
+        frame = mx.clip(frame[..., :3].astype(mx.float32), 0.0, 1.0)
+        padded = _reflect_pad_to4(frame[None].astype(self.net.dtype))[0]
+        if self._hw is None:
+            self._hw = (int(frame.shape[0]), int(frame.shape[1]))
+        if self._nm is None and self._tracker is not None:
+            # hold the first frames, estimate the spatial map from them, then
+            # replay them through the normal delay line with that map.
+            self._warm.append((padded, token))
+            if len(self._warm) < self.MAP_WARMUP:
+                return []
+            self._estimate_map([f for f, _ in self._warm])
+            self._recent = [f for f, _ in self._warm]
+            ready = []
+            for f, tok in self._warm:
+                ready += self._accept(f, tok)
+            self._warm = []
+            return ready
+        if self._nm is None:
+            _, hp, wp, _ = padded.shape
+            self._nm = mx.full((1, hp, wp, 1), float(self.sigma), dtype=self.net.dtype)
+        if self._tracker is not None and self._map_refresh > 0:
+            # periodic streaming refresh from a rolling buffer; EMA in the
+            # tracker keeps the conditioning change gradual.
+            self._recent.append(padded)
+            if len(self._recent) > self.MAP_WARMUP:
+                self._recent.pop(0)
+            self._since_refresh += 1
+            if self._since_refresh >= self._map_refresh and len(self._recent) >= 2:
+                self._estimate_map(self._recent)
+                self._since_refresh = 0
+        return self._accept(padded, token)
+
     def flush(self) -> list:
         """Drain remaining frames (end-reflected) at end of stream / cut."""
-        last = self._received - 1
         out = []
+        if self._warm:
+            # stream ended inside the map warmup: estimate from what arrived
+            self._estimate_map([f for f, _ in self._warm])
+            for f, tok in self._warm:
+                out += self._accept(f, tok)
+            self._warm = []
+        last = self._received - 1
         while self._emitted <= last:
             out.append(self._emit_one(last))
         self._reset_state()

@@ -98,20 +98,36 @@ class PVDD:
     def is_level(self) -> bool:
         return self.cfg.level
 
-    def denoise_clip(self, frames_nhwc: list, noise_variance: float | None = None) -> list:
+    def denoise_clip(self, frames_nhwc: list, noise_variance: float | None = None,
+                     noise_map: Any | None = None,
+                     frame_gains: list | None = None) -> list:
         """frames: list of (1,H,W,C) mx arrays in [0,1]. Returns denoised list.
 
         Inputs are edge-padded to a multiple of 4 so the x4 down/up feature path
-        round-trips, then cropped back to the original size.
+        round-trips, then cropped back to the original size. For level variants
+        the conditioning is `noise_map` -- an (H,W,1) per-pixel noise-VARIANCE
+        plane (sigma^2, not sigma) -- or, when absent, a constant plane from the
+        scalar `noise_variance` (default: the M preset). `frame_gains` are
+        per-frame SIGMA gains (e.g. GOP pulse); the variance plane scales by
+        gain^2.
         """
         h0, w0 = int(frames_nhwc[0].shape[1]), int(frames_nhwc[0].shape[2])
         frames = [_pad4(f.astype(self.dtype)) for f in frames_nhwc]
         hp, wp = int(frames[0].shape[1]), int(frames[0].shape[2])
-        nm = None
+        nm: Any = None
         if self.cfg.level:
-            if noise_variance is None:
-                noise_variance = LEVEL_PRESETS["M"]
-            nm = mx.full((1, hp, wp, 1), float(noise_variance), dtype=self.dtype)
+            if noise_map is not None:
+                nm = _pad4(noise_map[None].astype(self.dtype))
+            else:
+                if noise_variance is None:
+                    noise_variance = LEVEL_PRESETS["M"]
+                nm = mx.full((1, hp, wp, 1), float(noise_variance), dtype=self.dtype)
+            if frame_gains is not None:
+                if len(frame_gains) != len(frames):
+                    raise ValueError(
+                        f"frame_gains must match the clip length {len(frames)}; "
+                        f"got {len(frame_gains)}")
+                nm = [nm * float(g) ** 2 for g in frame_gains]
         outs = pvdd_forward(frames, self.params, self.cfg, noise_map=nm)
         return [o[:, :h0, :w0, :] for o in outs]
 

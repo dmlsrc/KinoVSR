@@ -379,12 +379,17 @@ class BsvdDenoiser:
     outputs are discarded, then outputs are paired with the oldest input token.
     """
 
+    MAP_WARMUP = 9   # frames buffered before estimating a spatial noise map
+
     def __init__(
         self,
         weights_path: str | Path | None = None,
         strength: float = 0.5,
         variant: str = "c64",
         dtype: Any = mx.float16,
+        noise_map: Any | None = None,
+        map_refresh: int = 64,
+        pulse: Any | None = None,
     ):
         wp = Path(weights_path) if weights_path else default_weights_path(variant)
         if not wp.is_file():
@@ -394,6 +399,24 @@ class BsvdDenoiser:
             )
         self.net = BSVD(wp, dtype=dtype)
         self.sigma = _strength_to_sigma(strength)
+        # optional NoiseMapTracker: replaces the constant sigma plane with a
+        # per-pixel estimate (sigma units, same scale as the constant).
+        self._tracker = noise_map
+        # optional PulseGain: per-frame scalar on the sigma plane tracking
+        # GOP-phase noise pulsing (I-frame grain refresh).
+        self._pulse = pulse
+        if (self._tracker is not None or self._pulse is not None) \
+                and self.net.input_channels != 4:
+            raise ValueError(
+                "--noise-map / --noise-map-pulse need a non-blind (4-channel) "
+                "BSVD checkpoint; this one is blind RGB-only."
+            )
+        # streaming-mode map refresh cadence (frames); 0 disables. Scheduled
+        # (gop-aligned) mode re-estimates per window instead and ignores this.
+        self._map_refresh = max(0, int(map_refresh))
+        self.last_noise_map: Any = None   # fp32 (H,W,1) actually used (debug)
+        # diagnostics: gains across the whole run (survives the end-of-stream reset)
+        self._pulse_log: list[float] = []
         self._schedule: list | None = None
         self._reset_state()
 
@@ -405,6 +428,11 @@ class BsvdDenoiser:
         self._tokens: list[Any] = []
         self._frames: list[Any] = []
         self._frame_tokens: list[Any] = []
+        self._warm: list = []    # (frame3ch, token, gain) held until the map is estimated
+        self._recent: list = []  # rolling last frames for the streaming map refresh
+        self._since_refresh = 0
+        if self._pulse is not None:
+            self._pulse.reset()
         self._base = 0
         self._sched_i = 0
         self._received = 0
@@ -429,20 +457,69 @@ class BsvdDenoiser:
         pass
 
     def _prepare(self, frame: Any) -> Any:
+        """Clip + pad one frame to a 3-channel net-dtype tensor (no noise map yet;
+        the map channel is concatenated at step time so a spatial estimate made
+        from the first frames can apply to those same frames)."""
         frame = mx.clip(frame[..., :3].astype(mx.float32), 0.0, 1.0)
         h, w = int(frame.shape[0]), int(frame.shape[1])
         if self._hw is None:
             self._hw = (h, w)
         elif self._hw != (h, w):
             raise ValueError(f"BSVD stream changed resolution from {self._hw} to {(h, w)}")
-        x = _reflect_pad_to4(frame[None].astype(self.net.dtype))[0]
-        if self.net.input_channels == 4:
-            _, hp, wp, _ = x.shape
-            if self._nm is None or self._padded_hw != (int(hp), int(wp)):
-                self._nm = mx.full((1, hp, wp, 1), float(self.sigma), dtype=self.net.dtype)
-                self._padded_hw = (int(hp), int(wp))
-            x = mx.concatenate([x, self._nm], axis=-1)
-        return x
+        return _reflect_pad_to4(frame[None].astype(self.net.dtype))[0]
+
+    def _plane_from_map(self, sig_map: Any) -> Any:
+        """(H,W,1) sigma map -> (1,hp,wp,1) net-dtype plane (reflect-padded)."""
+        self.last_noise_map = sig_map.astype(mx.float32)
+        return _reflect_pad_to4(sig_map[None].astype(self.net.dtype))[0]
+
+    def _ensure_nm(self, x: Any) -> None:
+        """Make sure self._nm exists for this padded size (constant-sigma path)."""
+        _, hp, wp, _ = x.shape
+        if self._nm is None or self._padded_hw != (int(hp), int(wp)):
+            self._nm = mx.full((1, hp, wp, 1), float(self.sigma), dtype=self.net.dtype)
+            self._padded_hw = (int(hp), int(wp))
+
+    def _with_nm(self, x: Any, nm: Any | None = None, gain: float = 1.0) -> Any:
+        if self.net.input_channels != 4:
+            return x
+        if nm is None:
+            if self._nm is None:
+                self._ensure_nm(x)
+            nm = self._nm
+        if gain != 1.0:
+            nm = nm * gain
+        return mx.concatenate([x, nm], axis=-1)
+
+    def _pulse_gain(self, x3: Any, new_segment: bool = False) -> float:
+        """Per-frame pulse gain from the cropped frame (1.0 when pulse is off)."""
+        if self._pulse is None:
+            return 1.0
+        g = self._pulse.update(self._crop(x3), new_segment=new_segment)
+        self._pulse_log.append(g)
+        return g
+
+    def _crop(self, x: Any) -> Any:
+        h, w = self._hw
+        return x[:, :h, :w, :]
+
+    def _estimate_from(self, frames3: list) -> None:
+        """Estimate the map from padded 3ch frames; fall back to the constant
+        sigma when the tracker cannot estimate (too few frames)."""
+        sig = self._tracker.update([self._crop(f) for f in frames3])
+        if sig is None:
+            h, w = self._hw
+            sig = mx.full((h, w, 1), float(self.sigma), dtype=mx.float32)
+        plane = self._plane_from_map(sig)
+        self._nm = plane
+        self._padded_hw = (int(plane.shape[1]), int(plane.shape[2]))
+
+    def _drain_warm(self) -> list:
+        out: list = []
+        for x, tok, gain in self._warm:
+            out += self._step(x, token=tok, real=True, gain=gain)
+        self._warm = []
+        return out
 
     def _emit(self, out: Any, token: Any) -> tuple[Any, Any]:
         if self._hw is None:
@@ -452,11 +529,12 @@ class BsvdDenoiser:
         mx.eval(out)
         return out, token
 
-    def _step(self, x: Any | None, token: Any = None, real: bool = False) -> list:
+    def _step(self, x: Any | None, token: Any = None, real: bool = False,
+              gain: float = 1.0) -> list:
         if real:
             self._tokens.append(token)
             self._received += 1
-        out = self.net.step(x)
+        out = self.net.step(None if x is None else self._with_nm(x, gain=gain))
         self._steps += 1
         if self._steps <= self.net.SHIFT_NUM or out is None or self._emitted >= self._received:
             return []
@@ -470,7 +548,27 @@ class BsvdDenoiser:
             self._frames.append(x)
             self._frame_tokens.append(token)
             return self._feed_scheduled(final=False)
-        return self._step(x, token=token, real=True)
+        gain = self._pulse_gain(x)
+        if self._tracker is not None and self._nm is None:
+            # hold the first frames, estimate the spatial map from them, then
+            # drain them through the net with that map attached.
+            self._warm.append((x, token, gain))
+            if len(self._warm) >= self.MAP_WARMUP:
+                self._estimate_from([f for f, _, _ in self._warm])
+                self._recent = [f for f, _, _ in self._warm]
+                return self._drain_warm()
+            return []
+        if self._tracker is not None and self._map_refresh > 0:
+            # periodic streaming refresh: re-estimate from a rolling buffer of
+            # recent frames; the tracker's EMA keeps the transition gradual.
+            self._recent.append(x)
+            if len(self._recent) > self.MAP_WARMUP:
+                self._recent.pop(0)
+            self._since_refresh += 1
+            if self._since_refresh >= self._map_refresh and len(self._recent) >= 2:
+                self._estimate_from(self._recent)
+                self._since_refresh = 0
+        return self._step(x, token=token, real=True, gain=gain)
 
     def flush(self) -> list:
         if self._schedule is not None:
@@ -478,6 +576,11 @@ class BsvdDenoiser:
             self._reset_state()
             return out
         out = []
+        if self._warm:
+            # short stream ended before the map warmup filled: estimate from
+            # whatever arrived (the tracker falls back to constant below 2 frames)
+            self._estimate_from([f for f, _, _ in self._warm])
+            out += self._drain_warm()
         guard = self.net.SHIFT_NUM + self._received + 2
         while self._emitted < self._received:
             before = self._emitted
@@ -514,9 +617,19 @@ class BsvdDenoiser:
 
     def _run_window(self, frames: list, tokens: list, emit_start: int, emit_end: int) -> list:
         self.net.reset()
+        nm = None
+        if self._tracker is not None:
+            # per-window estimate, EMA-blended across windows by the tracker so
+            # the conditioning does not pump at gop-aligned window boundaries.
+            sig = self._tracker.update([self._crop(f) for f in frames])
+            if sig is not None:
+                nm = self._plane_from_map(sig)
         out = []
         for i, x in enumerate(frames):
-            y = self.net.step(x)
+            # window starts break temporal adjacency (proc ranges overlap), so
+            # the pulse tracker restarts its diff chain at each window.
+            gain = self._pulse_gain(x, new_segment=(i == 0))
+            y = self.net.step(self._with_nm(x, nm, gain=gain))
             idx = i - self.net.SHIFT_NUM
             if emit_start <= idx < emit_end:
                 if y is None:

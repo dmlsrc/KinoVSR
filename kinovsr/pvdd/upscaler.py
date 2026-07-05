@@ -29,6 +29,8 @@ class PvddDenoiser(WindowedUpscaler):
         trim: int = 0,
         noise_variance: float | None = None,
         dtype: Any = mx.float16,
+        noise_map: Any | None = None,
+        pulse: Any | None = None,
     ):
         if variant not in _VARIANTS:
             raise ValueError(f"PVDD variant must be one of {sorted(_VARIANTS)}; got {variant!r}")
@@ -51,6 +53,19 @@ class PvddDenoiser(WindowedUpscaler):
                 "or pass an explicit --pvdd-weights path."
             )
         self.net = PVDD(src, dtype=dtype)
+        # optional NoiseMapTracker (sigma units): squared into the variance plane
+        # the level checkpoints take. Only meaningful for level variants.
+        self._tracker = noise_map
+        # optional PulseGain: per-frame sigma gain, squared into the variance
+        # planes (GOP-phase noise pulsing).
+        self._pulse = pulse
+        if (self._tracker is not None or self._pulse is not None) and not self.net.is_level:
+            raise ValueError(
+                "--noise-map / --noise-map-pulse need a level (non-blind) PVDD "
+                f"variant; {variant!r} is blind. Use pvdd_level / pvdd_raw_level."
+            )
+        self.last_noise_map: Any = None   # fp32 (H,W,1) sigma actually used (debug)
+        self._pulse_log: list[float] = []
         if noise_variance is not None:
             self._nv: float | None = float(noise_variance)
         elif self.net.is_level:
@@ -60,7 +75,20 @@ class PvddDenoiser(WindowedUpscaler):
         super().__init__(window=w, trim=t)
 
     def _upscale_window(self, frames: list) -> list:
-        return self.net.denoise_clip(frames, noise_variance=self._nv)
+        gains = None
+        if self._pulse is not None:
+            # windows are separate segments: restart the diff chain each window
+            gains = [self._pulse.update(f, new_segment=(i == 0))
+                     for i, f in enumerate(frames)]
+            self._pulse_log.extend(gains)
+        if self._tracker is not None:
+            sig = self._tracker.update(frames)
+            if sig is not None:
+                self.last_noise_map = sig
+                return self.net.denoise_clip(frames, noise_map=sig * sig,
+                                             frame_gains=gains)
+        return self.net.denoise_clip(frames, noise_variance=self._nv,
+                                     frame_gains=gains)
 
     def close(self) -> None:
         """Denoiser-protocol no-op (the harness calls close() on denoise stages)."""

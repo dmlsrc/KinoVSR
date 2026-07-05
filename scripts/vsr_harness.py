@@ -1037,6 +1037,34 @@ def run(args: argparse.Namespace) -> None:
                 **audio_kwargs,
             )
 
+        # --noise-map auto: one tracker shared conceptually (one per denoiser in
+        # practice); estimates a per-pixel sigma map from the footage. Only the
+        # map-conditioned denoisers can consume it. --noise-map-pulse adds a
+        # per-frame gain (GOP-phase noise pulsing) on the same conditioning.
+        nm_tracker: Any = None
+        nm_pulse: Any = None
+        _map_capable = (args.denoise == "fastdvd" or args.denoise == "bsvd"
+                        or (args.denoise == "pvdd" and "level" in args.pvdd_variant))
+        if args.noise_map == "auto":
+            if _map_capable:
+                from LTX_2_MLX.videotoolbox.noise_map import NoiseMapTracker
+                nm_tracker = NoiseMapTracker(gain=args.noise_map_gain)
+                print(f"[noise-map] auto: per-pixel sigma estimated from the footage "
+                      f"(gain {args.noise_map_gain:g})")
+            elif args.denoise != "off":
+                why = ("blind PVDD variant (use --pvdd-variant pvdd_level)"
+                       if args.denoise == "pvdd" else f"--denoise {args.denoise} has no map input")
+                print(f"[noise-map] auto ignored: {why}")
+        if args.noise_map_pulse:
+            if _map_capable:
+                from LTX_2_MLX.videotoolbox.noise_map import PulseGain
+                nm_pulse = PulseGain()
+                print("[noise-map] pulse: per-frame gain tracking GOP-phase noise "
+                      "(I-frame grain refresh)")
+            elif args.denoise != "off":
+                print("[noise-map] pulse ignored: needs a map-conditioned denoiser "
+                      "(fastdvd, bsvd, or a pvdd level variant)")
+
         den: Any = None
         if args.denoise == "spatial":
             den = SpatialDenoiser(strength=args.denoise_strength)
@@ -1054,6 +1082,9 @@ def run(args: argparse.Namespace) -> None:
                 args.fastdvd_weights or os.environ.get("FASTDVD_WEIGHTS"),
                 variant=args.fastdvd_variant,
                 strength=args.denoise_strength,
+                noise_map=nm_tracker,
+                map_refresh=args.noise_map_refresh,
+                pulse=nm_pulse,
             )
         elif args.denoise == "bsvd":
             # BSVD weights are not bundled; --bsvd-variant picks a local token,
@@ -1063,6 +1094,9 @@ def run(args: argparse.Namespace) -> None:
                 variant=args.bsvd_variant,
                 strength=args.denoise_strength,
                 dtype=parse_mlx_dtype_name(args.bsvd_dtype),
+                noise_map=nm_tracker,
+                map_refresh=args.noise_map_refresh,
+                pulse=nm_pulse,
             )
         elif args.denoise == "pvdd":
             # PVDD weights are not bundled; --pvdd-variant picks a local token, or
@@ -1080,6 +1114,8 @@ def run(args: argparse.Namespace) -> None:
                 window=args.pvdd_window, trim=args.pvdd_trim,
                 noise_variance=nv,
                 dtype=parse_mlx_dtype_name(args.pvdd_dtype),
+                noise_map=nm_tracker,
+                pulse=nm_pulse,
             )
 
         if den is not None and (args.denoise_luma_strength != 1.0
@@ -1636,6 +1672,33 @@ def run(args: argparse.Namespace) -> None:
             session.close()
         if denoiser is not None:
             denoiser.close()
+        if denoiser is not None and args.noise_map_pulse:
+            _pl = getattr(denoiser, "_pulse_log", None)
+            if _pl is None:
+                _pl = getattr(getattr(denoiser, "_base", None), "_pulse_log", None)
+            if _pl:
+                _ps = sorted(_pl)
+                print(f"[noise-map] pulse gain over {len(_ps)} frames: "
+                      f"min {_ps[0]:.2f}  median {_ps[len(_ps) // 2]:.2f}  "
+                      f"max {_ps[-1]:.2f}  ({sum(1 for g in _ps if g > 1.2)} frames > 1.2)")
+        if denoiser is not None and args.noise_map == "auto":
+            # surface the estimated map (unwrap the luma/chroma splitter if present)
+            _nm_src = getattr(denoiser, "last_noise_map", None)
+            if _nm_src is None:
+                _nm_src = getattr(getattr(denoiser, "_base", None), "last_noise_map", None)
+            if _nm_src is not None:
+                _s = mx.sort(_nm_src.reshape(-1))
+                _n = _s.shape[0]
+                print(f"[noise-map] estimated sigma: min {float(_s[0]):.4f}  "
+                      f"median {float(_s[_n // 2]):.4f}  p95 {float(_s[int(0.95 * (_n - 1))]):.4f}  "
+                      f"max {float(_s[-1]):.4f}")
+                if args.noise_map_debug and post_writer is not None:
+                    from LTX_2_MLX.videotoolbox.images import save_image
+                    _vp = Path(post_writer.path)
+                    _png = _vp.with_name(_vp.stem + "_noisemap.png")
+                    _u8 = (mx.clip(_nm_src[:, :, 0] / 0.15, 0, 1) * 255).astype(mx.uint8)
+                    save_image(mx.stack([_u8, _u8, _u8], axis=-1), _png)
+                    print(f"[noise-map] map written: {_png}")
         if upscaler is not None and hasattr(upscaler, "close"):
             upscaler.close()
         if nafnet is not None:
@@ -2207,7 +2270,10 @@ def main() -> None:
         help=(
             "Denoise strength 0..1 (default 0.5). For mc, the max temporal blend "
             "toward motion-compensated history; for spatial, the noise level; for "
-            "fastdvd/bsvd, the noise sigma (mapped onto sigma_255 in [5, 55])."
+            "fastdvd/bsvd, the noise sigma (mapped onto sigma_255 in [5, 55]). "
+            "With --noise-map auto the estimated map REPLACES this constant "
+            "(strength then only serves as the fallback when estimation is "
+            "impossible); scale the estimate with --noise-map-gain instead."
         ),
     )
     parser.add_argument(
@@ -2324,6 +2390,57 @@ def main() -> None:
     parser.add_argument(
         "--pvdd-dtype", choices=["float16", "float32"], default="float16",
         help="MLX dtype for --denoise pvdd (default float16; use float32 for parity probes).",
+    )
+    parser.add_argument(
+        "--noise-map", choices=["constant", "auto"], default="constant",
+        help=(
+            "Noise conditioning for map-driven denoisers (fastdvd, bsvd, pvdd level "
+            "variants). constant (default) = one sigma everywhere (from "
+            "--denoise-strength / --pvdd-noise-*). auto = estimate a per-pixel sigma "
+            "map from the footage itself (temporal frame-difference statistics: "
+            "texture-safe, motion-capped, smooth), so noisy shadows get denoised "
+            "harder than clean lit areas. Ignored with a warning by denoisers that "
+            "have no map input (spatial, mc, blind pvdd variants)."
+        ),
+    )
+    parser.add_argument(
+        "--noise-map-gain", type=float, default=1.0, metavar="G",
+        help=(
+            "Multiplier on the auto-estimated noise map (default 1.0). >1 denoises "
+            "harder everywhere while keeping the spatial shape; <1 is gentler. Only "
+            "used with --noise-map auto."
+        ),
+    )
+    parser.add_argument(
+        "--noise-map-debug", action="store_true",
+        help=(
+            "With --noise-map auto: after the run, write the estimated sigma map as "
+            "<output>_noisemap.png (grayscale, sigma 0..0.15 -> black..white) and "
+            "print its stats, so the estimate can be eyeballed."
+        ),
+    )
+    parser.add_argument(
+        "--noise-map-refresh", type=int, default=64, metavar="N",
+        help=(
+            "With --noise-map auto in plain streaming mode (fastdvd/bsvd without "
+            "--gop-align): re-estimate the map from the last frames every N input "
+            "frames, EMA-blended so it adapts without pumping (default 64; 0 = "
+            "estimate once from the first frames and hold). Windowed modes "
+            "(--gop-align, pvdd) re-estimate per window and ignore this."
+        ),
+    )
+    parser.add_argument(
+        "--noise-map-pulse", action="store_true",
+        help=(
+            "Per-frame gain on the noise conditioning that tracks GOP-phase noise "
+            "pulsing: old encoders re-code the grain at every I-frame, so temporal "
+            "noise is elevated right after keyframes and suppressed once P/B "
+            "prediction settles. Each frame's global sigma is measured against the "
+            "running settled level and the sigma plane is scaled by the ratio "
+            "(clamped 0.6..1.8), so I-frame grain refreshes get proportionally "
+            "stronger denoising. Works with --noise-map constant or auto; "
+            "map-conditioned denoisers only (fastdvd, bsvd, pvdd level variants)."
+        ),
     )
     parser.add_argument(
         "--basicvsrpp-variant",

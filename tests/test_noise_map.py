@@ -1,0 +1,237 @@
+"""Weight-free tests for the spatial noise-map estimator (noise_map.py).
+
+Pins the estimator's contract: recovery of known sigma fields, immunity to static
+texture (the property that separates a temporal estimator from spatial ones), the
+motion cap, unit conversion, and the tracker's gain/EMA behavior.
+"""
+import math
+
+import mlx.core as mx
+
+from LTX_2_MLX.videotoolbox.noise_map import NoiseMapTracker, PulseGain, estimate_sigma_map
+
+H, W, T = 128, 160, 8
+
+
+def _content():
+    ys = mx.linspace(0, 1, H).reshape(H, 1)
+    xs = mx.linspace(0, 1, W).reshape(1, W)
+    img = 0.35 + 0.3 * ys + 0.15 * mx.sin(4 * math.pi * xs)
+    return mx.clip(mx.broadcast_to(img[..., None], (H, W, 3)), 0, 1)
+
+
+def _noisy_clip(sigma_field):
+    mx.random.seed(0)
+    base = _content()
+    return [mx.clip(base + mx.random.normal(shape=base.shape) * sigma_field[..., None], 0, 1)
+            for _ in range(T)]
+
+
+def test_recovers_constant_sigma():
+    sig = mx.full((H, W), 0.05)
+    est = estimate_sigma_map(_noisy_clip(sig))
+    assert est.shape == (H, W, 1) and est.dtype == mx.float32
+    med = float(mx.sort(est.reshape(-1))[H * W // 2])
+    assert abs(med - 0.05) / 0.05 < 0.15   # within 15%
+
+
+def test_recovers_gradient_and_orientation():
+    xs = mx.linspace(0, 1, W).reshape(1, W)
+    sig = mx.broadcast_to(0.01 + 0.07 * xs, (H, W))
+    est = estimate_sigma_map(_noisy_clip(sig))[:, :, 0]
+    left = float(mx.mean(est[:, : W // 4]))
+    right = float(mx.mean(est[:, -W // 4:]))
+    assert right > 2.0 * left              # ramp direction and spread survive
+
+
+def test_static_texture_does_not_register():
+    # a strong checkerboard is pure signal; frame diffs cancel it. A spatial
+    # estimator would read it as huge noise; this one must stay at the true 0.01.
+    ys = mx.arange(H).reshape(H, 1)
+    xs = mx.arange(W).reshape(1, W)
+    checker = ((ys // 2 + xs // 2) % 2).astype(mx.float32) * 0.5 + 0.25
+    tex = mx.broadcast_to(checker[..., None], (H, W, 3))
+    mx.random.seed(1)
+    clip = [mx.clip(tex + 0.01 * mx.random.normal(shape=tex.shape), 0, 1) for _ in range(T)]
+    est = estimate_sigma_map(clip)
+    p95 = float(mx.sort(est.reshape(-1))[int(0.95 * (H * W - 1))])
+    assert p95 < 0.02                       # NOT the ~0.5 a spatial reading would give
+
+
+def test_motion_is_capped():
+    mx.random.seed(2)
+    base = _content()
+    yy = mx.arange(H).reshape(H, 1)
+    xx = mx.arange(W).reshape(1, W)
+    clip = []
+    for t in range(T):
+        x0 = 10 + 10 * t
+        m = ((yy >= 40) & (yy < 90) & (xx >= x0) & (xx < x0 + 40))[..., None]
+        f = mx.where(m, 0.8 if t % 2 == 0 else 0.2, base)
+        clip.append(mx.clip(f + 0.03 * mx.random.normal(shape=f.shape), 0, 1))
+    est = estimate_sigma_map(clip)
+    # the flashing/moving block would read sigma ~0.3 uncapped; the luma-model cap
+    # must hold the whole map within a few multiples of the true 0.03
+    assert float(mx.max(est)) < 0.10
+
+
+def test_too_few_frames_returns_none():
+    assert estimate_sigma_map([_content()]) is None
+    assert estimate_sigma_map([]) is None
+
+
+def test_tracker_gain_and_ema():
+    sig = mx.full((H, W), 0.04)
+    clip = _noisy_clip(sig)
+    tr = NoiseMapTracker(gain=2.0, ema=0.5)
+    m1 = tr.update(clip)
+    med1 = float(mx.sort(m1.reshape(-1))[H * W // 2])
+    assert abs(med1 - 2.0 * 0.04) / 0.08 < 0.2       # gain applied
+    # feed a much noisier window: EMA must land between the two estimates
+    mx.random.seed(3)
+    base = _content()
+    clip2 = [mx.clip(base + 0.10 * mx.random.normal(shape=base.shape), 0, 1) for _ in range(T)]
+    m2 = tr.update(clip2)
+    med2 = float(mx.sort(m2.reshape(-1))[H * W // 2]) / 2.0   # un-gain
+    assert 0.05 < med2 < 0.09                         # between 0.04 and ~0.10
+    # reset drops state; update with too-few frames returns None
+    tr.reset()
+    assert tr.current() is None
+    assert tr.update([base]) is None
+
+
+def test_tracker_rejects_bad_params():
+    for bad in ({"gain": 0.0}, {"gain": -1.0}, {"ema": 0.0}, {"ema": 1.5}):
+        try:
+            NoiseMapTracker(**bad)
+            raised = False
+        except ValueError:
+            raised = True
+        assert raised, f"NoiseMapTracker accepted {bad}"
+
+
+def test_tracker_holds_map_on_degenerate_window():
+    # a tiny (e.g. 6-frame gop-align tail) window must not crater the map: once
+    # a map exists, windows below min_frames reuse it instead of updating.
+    sig = mx.full((H, W), 0.05)
+    clip = _noisy_clip(sig)
+    tr = NoiseMapTracker(min_frames=8)
+    m1 = tr.update(clip)
+    med1 = float(mx.sort(m1.reshape(-1))[H * W // 2])
+    clean = [_content() for _ in range(4)]          # 4 near-noiseless frames
+    m2 = tr.update(clean)                            # below min_frames: held
+    med2 = float(mx.sort(m2.reshape(-1))[H * W // 2])
+    assert abs(med2 - med1) < 1e-6
+    # but a first estimate from a tiny window is still allowed (better than none)
+    tr2 = NoiseMapTracker(min_frames=8)
+    assert tr2.update(clip[:4]) is not None
+
+
+def test_select_runs_spread_and_adjacent():
+    from LTX_2_MLX.videotoolbox.noise_map import _select_runs
+    # short windows: one consecutive run, unchanged behavior
+    assert _select_runs(8, 12) == [list(range(8))]
+    # long windows: runs of consecutive indices spread across the whole span
+    runs = _select_runs(96, 12)
+    assert all(r == list(range(r[0], r[0] + 3)) for r in runs)   # adjacent within runs
+    assert runs[0][0] == 0 and runs[-1][-1] == 95                # covers both ends
+    assert len(runs) >= 3
+
+
+def test_long_window_sampling_sees_late_noise():
+    # sigma jumps 0.01 -> 0.06 halfway through a 60-frame window. Head-only
+    # sampling would read ~0.01; spread runs must see the noisy second half.
+    mx.random.seed(4)
+    base = _content()
+    clip = [mx.clip(base + (0.01 if t < 30 else 0.06) * mx.random.normal(shape=base.shape), 0, 1)
+            for t in range(60)]
+    est_spread = estimate_sigma_map(clip)
+    est_head = estimate_sigma_map(clip[:12])       # what head-only sampling saw
+    med_s = float(mx.sort(est_spread.reshape(-1))[H * W // 2])
+    med_h = float(mx.sort(est_head.reshape(-1))[H * W // 2])
+    assert med_h < 0.02                            # head-only is blind to the jump
+    assert med_s > med_h * 1.5                     # spread sampling is not
+
+
+def test_pulse_gain_tracks_noise_pulse():
+    # settled sigma 0.03; frames 24-27 carry sigma 0.09 (an I-frame grain
+    # refresh). Settled gains ~1.0; pulse frames must rise and clamp at hi.
+    mx.random.seed(6)
+    base = _content()
+    pg = PulseGain(lo=0.6, hi=1.8, min_history=8)
+    gains = []
+    prev_sig = None
+    for t in range(32):
+        s = 0.09 if 24 <= t < 28 else 0.03
+        f = mx.clip(base + s * mx.random.normal(shape=base.shape), 0, 1)
+        gains.append(pg.update(f))
+    settled = gains[10:23]
+    assert all(abs(g - 1.0) < 0.25 for g in settled)
+    # the diff spanning the sigma jump and the pulse frames read high
+    assert max(gains[24:28]) > 1.5
+    # new_segment restarts the chain neutrally
+    assert pg.update(base, new_segment=True) == 1.0
+
+
+def test_pulse_gain_neutral_until_history():
+    mx.random.seed(7)
+    base = _content()
+    pg = PulseGain(min_history=8)
+    for t in range(7):
+        f = mx.clip(base + 0.05 * mx.random.normal(shape=base.shape), 0, 1)
+        assert pg.update(f) == 1.0     # not enough history yet
+
+
+def test_pulse_gain_rejects_bad_bounds():
+    for bad in ({"lo": 0.0}, {"lo": 1.2}, {"hi": 0.9}):
+        try:
+            PulseGain(**bad)
+            raised = False
+        except ValueError:
+            raised = True
+        assert raised, f"PulseGain accepted {bad}"
+
+
+def test_fastdvd_pulse_emits_all_and_varies():
+    # integration: pulse on, sigma jumps mid-stream; all frames out in order and
+    # the logged gains actually respond.
+    from LTX_2_MLX.videotoolbox.fastdvdnet import FastDvdDenoiser
+    mx.random.seed(8)
+    base = mx.clip(_content()[:48, :80, :], 0, 1)
+    den = FastDvdDenoiser(strength=0.3, pulse=PulseGain(min_history=6))
+    em = []
+    for t in range(40):
+        s = 0.08 if 30 <= t < 34 else 0.02
+        f = mx.clip(base + s * mx.random.normal(shape=base.shape), 0, 1)
+        em += den.feed(f, token=t)
+    gains = list(den._pulse_log)
+    em += den.flush()
+    assert [t for _, t in sorted(em, key=lambda e: e[1])] == list(range(40))
+    assert max(gains[30:34]) > 1.4 and abs(gains[20] - 1.0) < 0.3
+
+
+def test_fastdvd_streaming_refresh_adapts():
+    # noise jumps 0.01 -> 0.08 at frame 20 of a 60-frame stream. With refresh on,
+    # the held map must climb toward the new level; with refresh off it must not.
+    from LTX_2_MLX.videotoolbox.fastdvdnet import FastDvdDenoiser
+    mx.random.seed(5)
+    base = mx.clip(_content()[:48, :80, :], 0, 1)
+    frames = [mx.clip(base + (0.01 if t < 20 else 0.08) * mx.random.normal(shape=base.shape), 0, 1)
+              for t in range(60)]
+
+    def run(refresh):
+        den = FastDvdDenoiser(strength=0.3, noise_map=NoiseMapTracker(ema=0.7),
+                              map_refresh=refresh)
+        em = []
+        for i, f in enumerate(frames):
+            em += den.feed(f, token=i)
+        last = den.last_noise_map
+        em += den.flush()
+        assert [t for _, t in sorted(em, key=lambda e: e[1])] == list(range(60))
+        med = float(mx.sort(last.reshape(-1))[last.shape[0] * last.shape[1] // 2])
+        return med
+
+    med_off = run(0)       # estimate-once: stuck at the quiet start
+    med_on = run(16)       # refreshing: adapts toward 0.08
+    assert med_off < 0.025
+    assert med_on > 2.0 * med_off

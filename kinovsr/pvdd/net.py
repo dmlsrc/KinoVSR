@@ -354,13 +354,19 @@ def _process(frames_nhwc: list, p: dict, cfg: PVDDConfig) -> list:
 
 def pvdd_forward(frames_nhwc: list, p: dict, cfg: PVDDConfig,
                  noise_map: Any | None = None) -> list:
-    """frames: list of T (1,H,W,C) in [0,1]. noise_map: (1,H,W,1) variance for level."""
+    """frames: list of T (1,H,W,C) in [0,1]. noise_map: (1,H,W,1) variance plane,
+    or a list of T such planes for per-frame conditioning (GOP pulse gain)."""
     x = list(frames_nhwc)
+    per_frame = isinstance(noise_map, (list, tuple))
     for _ in range(3):
         cleaned = []
         total = 0.0
-        for f in x:
-            inp = f if noise_map is None else mx.concatenate([f, noise_map], axis=-1)
+        for i, f in enumerate(x):
+            if noise_map is None:
+                inp = f
+            else:
+                nm = noise_map[i] if per_frame else noise_map
+                inp = mx.concatenate([f, nm], axis=-1)
             res = _resunet(inp, p, "clean_model", 2, cfg.num_block_pre)
             cleaned.append(f + res)
             total = total + mx.mean(mx.abs(res))
