@@ -178,13 +178,74 @@ def _map_assessment(probe: dict[str, Any], sigma: dict[str, Any], blockiness: di
     strict = sigma.get("strict")
     if strict is not None and "motion/noise ambiguous" in labels and strict["p95"] > 0.10:
         flags.append("strict sigma map may over-condition dense textured motion")
+    if strict is not None and "source-wide motion contamination" in labels and strict["p95"] > 0.12:
+        flags.append("strict sigma map may still be motion-contaminated")
     if strict is not None and "sparse edge flicker" in labels and strict["p95"] < 0.02:
         flags.append("sigma map likely under-conditions sparse edge flicker")
     if "static/structured grain" in labels:
         flags.append("temporal sigma map is blind to some static structure; floor/manual strength matters")
     if blockiness is not None and blockiness["p95"] > 0.90:
-        flags.append("blockiness map saturates; compare against reencode-only baseline")
+        flags.append("blockiness map saturates; baseline not available yet")
     return {"flags": flags, "risk": "high" if flags else probe.get("risk", "low")}
+
+
+def _apply_reencode_baselines(rows: list[dict[str, Any]]) -> None:
+    baselines = {
+        row["source"]: row
+        for row in rows
+        if row["mode"] == "reencode_only"
+    }
+    for row in rows:
+        base = baselines.get(row["source"])
+        if base is None:
+            continue
+        sig = row["sigma"].get("strict") or {}
+        bsig = base["sigma"].get("strict") or {}
+        block = row["blockiness"] or {}
+        bblock = base["blockiness"] or {}
+        baseline = {
+            "source": base["path"],
+            "sigma_strict_p95": bsig.get("p95"),
+            "sigma_strict_p95_delta": (
+                sig.get("p95") - bsig.get("p95")
+                if sig.get("p95") is not None and bsig.get("p95") is not None else None
+            ),
+            "blockiness_p95": bblock.get("p95"),
+            "blockiness_p95_delta": (
+                block.get("p95") - bblock.get("p95")
+                if block.get("p95") is not None and bblock.get("p95") is not None else None
+            ),
+        }
+        row["baseline"] = baseline
+        if row["mode"] == "reencode_only":
+            flags = [
+                flag for flag in row["assessment"]["flags"]
+                if flag != "blockiness map saturates; baseline not available yet"
+            ]
+            if bblock.get("p95") is not None and bblock["p95"] > 0.90:
+                flags.append("reencode baseline blockiness saturates")
+            row["assessment"]["flags"] = flags
+            if flags:
+                row["assessment"]["risk"] = "high"
+            continue
+
+        flags = [
+            flag for flag in row["assessment"]["flags"]
+            if flag != "blockiness map saturates; baseline not available yet"
+        ]
+        block_p95 = block.get("p95")
+        block_delta = baseline["blockiness_p95_delta"]
+        base_block_p95 = baseline["blockiness_p95"]
+        if block_p95 is not None and block_p95 > 0.90:
+            if base_block_p95 is not None and base_block_p95 > 0.90 and block_delta is not None and block_delta < 0.08:
+                flags.append("blockiness saturation is already present in reencode baseline")
+            elif block_delta is not None and block_delta > 0.15:
+                flags.append("blockiness rises well above reencode baseline")
+            else:
+                flags.append("blockiness map saturates relative to uncertain baseline")
+        row["assessment"]["flags"] = flags
+        if flags:
+            row["assessment"]["risk"] = "high"
 
 
 def _summarize_clip(path: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -262,6 +323,12 @@ def _group_summary(rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
                 for item in items
                 if item["blockiness"] is not None
             ]),
+            "blockiness_p95_delta_median": _median([
+                item.get("baseline", {}).get("blockiness_p95_delta")
+                for item in items
+                if item.get("baseline", {}).get("blockiness_p95_delta") is not None
+                and item["mode"] != "reencode_only"
+            ]),
         }
     return out
 
@@ -269,6 +336,8 @@ def _group_summary(rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
 def _write_csv(rows: list[dict[str, Any]], path: Path) -> None:
     fields = [
         "source", "mode", "risk", "labels", "flags",
+        "baseline_sigma_strict_p95", "delta_sigma_strict_p95",
+        "baseline_block_p95", "delta_block_p95",
         "probe_trace_med", "probe_trace_max",
         "probe_flicker_density_med", "probe_flicker_density_p90",
         "probe_flicker_amp_med", "probe_flicker_amp_p90",
@@ -286,12 +355,17 @@ def _write_csv(rows: list[dict[str, Any]], path: Path) -> None:
             p = row["probe"]
             s = row["sigma"]
             b = row["blockiness"] or {}
+            base = row.get("baseline", {})
             writer.writerow({
                 "source": row["source"],
                 "mode": row["mode"],
                 "risk": row["assessment"]["risk"],
                 "labels": "; ".join(p["labels"]),
                 "flags": "; ".join(row["assessment"]["flags"]),
+                "baseline_sigma_strict_p95": base.get("sigma_strict_p95", ""),
+                "delta_sigma_strict_p95": base.get("sigma_strict_p95_delta", ""),
+                "baseline_block_p95": base.get("blockiness_p95", ""),
+                "delta_block_p95": base.get("blockiness_p95_delta", ""),
                 "probe_trace_med": p["trace_med"],
                 "probe_trace_max": p["trace_max"],
                 "probe_flicker_density_med": p["flicker_density_med"],
@@ -383,6 +457,7 @@ def run_analysis(args: argparse.Namespace) -> dict[str, Any]:
         print(f"[analysis] {idx:02d}/{len(args.videos):02d} {path.name}", flush=True)
         rows.append(_summarize_clip(path, args))
         (args.output_root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    _apply_reencode_baselines(rows)
     summary["by_source"] = _group_summary(rows, "source")
     summary["by_mode"] = _group_summary(rows, "mode")
     (args.output_root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

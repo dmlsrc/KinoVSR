@@ -632,6 +632,10 @@ def classify_noise_analysis(stats: dict) -> dict:
     if lag >= 1.35 and dens_p90 >= 0.25:
         labels.append("motion-like temporal change")
         warnings.append("motion can inflate frame-difference sigma estimates")
+        if static <= 0.15 and dens_med >= 0.55 and tail5_med >= 0.08:
+            labels.append("source-wide motion contamination")
+            warnings.append("few stable pixels are available; temporal sigma may become a motion map")
+            suggestions.append("compare against a reencode-only baseline or manual constant denoise")
     if static <= 0.06 and dens_p90 >= 0.55 and tail5_p90 >= 0.045:
         labels.append("dense temporal change")
         if edge < 1.8 and lag <= 1.30:
