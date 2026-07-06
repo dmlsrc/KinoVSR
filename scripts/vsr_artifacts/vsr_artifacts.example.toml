@@ -1,0 +1,61 @@
+# Copy to scripts/vsr_artifacts/vsr_artifacts.local.toml and adjust paths for
+# your machine. Relative paths are resolved from this config file's directory.
+
+[fixtures]
+sources = [
+  "../../path/to/source-1.y4m",
+  "../../path/to/source-2.mp4",
+]
+output_dir = "../../path/to/generated-fixtures"
+seconds = 5.0
+modes = "all"
+seed = 20260705
+codec = "libx264"
+crf = 34
+gop = 30
+preset = "veryfast"
+overwrite = false
+
+[tests]
+# Defaults to the current interpreter when omitted.
+# python = "/path/to/python"
+
+# Defaults to fixtures.output_dir when omitted.
+# fixture_dir = "../../path/to/generated-fixtures"
+
+# Defaults to $SHARED_TEMP_DIR/vsr_fixture_tests_<timestamp> when omitted.
+# output_root = "../../path/to/test-output"
+
+base_flags = [
+  "--spatial-mode", "none",
+  "--gop-align",
+  "--snap-start",
+  "--start", "0",
+  "--end", "2s",
+]
+manual_flags = [
+  "--denoise", "bsvd",
+  "--denoise-strength", "0.05",
+  "--deblock", "stdf",
+  "--deblock-strength", "0.25",
+]
+auto_flags = [
+  "--denoise", "bsvd",
+  "--noise-map", "auto",
+  "--noise-map-pulse",
+  "--noise-map-motion-cap", "strict",
+  "--noise-map-masking", "1",
+  "--noise-map-debug",
+  "--deblock", "stdf",
+  "--deblock-map", "auto",
+]
+compare_max_frames = 60
+compare_progress = 0
+
+[[tests.cases]]
+label = "block_grid_case"
+video = "generated-block-grid.mp4"
+
+[[tests.cases]]
+label = "scanline_case"
+video = "generated-scanlines.mp4"

@@ -471,16 +471,16 @@ def _pp_order(spec: str) -> list:
 # ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> None:
-    out_root = Path(args.output_dir)
-    out_root.mkdir(parents=True, exist_ok=True)
-
     from LTX_2_MLX.generate import sanitize_output_prefix
     stem = f"{sanitize_output_prefix(args.output_prefix)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    pre_dir = out_root / f"{stem}_pre"
-    post_dir = out_root / f"{stem}_post"
-    if args.save_pre_frames:
+    out_root = Path(args.output_dir) if args.output_dir else None
+    if out_root is not None:
+        out_root.mkdir(parents=True, exist_ok=True)
+    pre_dir = (out_root / f"{stem}_pre") if out_root is not None else None
+    post_dir = (out_root / f"{stem}_post") if out_root is not None else None
+    if args.save_pre_frames and pre_dir is not None:
         pre_dir.mkdir(parents=True, exist_ok=True)
-    if args.save_post_frames:
+    if args.save_post_frames and post_dir is not None:
         post_dir.mkdir(parents=True, exist_ok=True)
     print(f"[setup] output stem: {stem}")
 
@@ -919,6 +919,8 @@ def run(args: argparse.Namespace) -> None:
             f"{'end' if a_end is None else f'{a_end:.3f}s'})"
         )
     if audio_track is not None and args.save_audio_sidecar:
+        if out_root is None:
+            raise SystemExit("--save-audio-sidecar requires --output-dir")
         sidecar = out_root / f"{stem}_audio.wav"
         audio_track.save_wav(sidecar)
         print(f"[setup] audio sidecar: {sidecar}")
@@ -1883,7 +1885,7 @@ def main() -> None:
             "forces one decode; frames past the int32 boundary decode white."
         ),
     )
-    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--output-dir")
     parser.add_argument(
         "--output-prefix", default="vsr",
         help="Filename prefix for the timestamped outputs (matches generate.py).",
@@ -3129,6 +3131,10 @@ def main() -> None:
 
     if args.latent and not args.weights:
         parser.error("--latent requires --weights")
+    if not args.output_dir and not (args.probe_noise and args.video):
+        parser.error("--output-dir is required unless --probe-noise is used with --video")
+    if not args.output_dir and (args.save_pre_frames or args.save_post_frames or args.save_audio_sidecar):
+        parser.error("--save-pre-frames/--save-post-frames/--save-audio-sidecar require --output-dir")
     if args.spatial_mode == "realbasicvsr":
         if args.realbasicvsr_window < 1:
             parser.error("--realbasicvsr-window must be >= 1")
