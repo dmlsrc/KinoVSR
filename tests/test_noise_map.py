@@ -411,6 +411,21 @@ def test_pulse_gain_rejects_bad_bounds():
         assert raised, f"PulseGain accepted {bad}"
 
 
+def test_pulse_robust_map_damps_global_noise_pulse():
+    mx.random.seed(16)
+    base = _content()
+    clip = []
+    for t in range(T):
+        sigma = 0.11 if t == T // 2 else 0.03
+        clip.append(mx.clip(base + sigma * mx.random.normal(shape=base.shape), 0, 1))
+    plain = estimate_sigma_map(clip, motion_cap="off", smooth=False)
+    robust = estimate_sigma_map(clip, motion_cap="off", pulse_robust=True, smooth=False)
+    plain_med = float(mx.sort(plain.reshape(-1))[H * W // 2])
+    robust_med = float(mx.sort(robust.reshape(-1))[H * W // 2])
+    assert plain_med > 1.25 * robust_med
+    assert 0.02 < robust_med < 0.055
+
+
 def test_fastdvd_pulse_emits_all_and_varies():
     # integration: pulse on, sigma jumps mid-stream; all frames out in order and
     # the logged gains actually respond.

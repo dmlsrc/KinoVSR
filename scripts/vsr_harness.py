@@ -1128,7 +1128,8 @@ def run(args: argparse.Namespace) -> None:
                 from LTX_2_MLX.videotoolbox.noise_map import NoiseMapTracker
                 nm_tracker = NoiseMapTracker(gain=args.noise_map_gain,
                                              motion_cap=args.noise_map_motion_cap,
-                                             masking=args.noise_map_masking)
+                                             masking=args.noise_map_masking,
+                                             pulse_robust=args.noise_map_pulse)
                 _floor_note = (f", floor {args.noise_map_floor:g}"
                                if args.noise_map_floor > 0 else "")
                 print(f"[noise-map] auto: per-pixel sigma estimated from the footage "
@@ -2662,7 +2663,9 @@ def main() -> None:
             "prediction settles. Each frame's global sigma is measured against the "
             "running settled level and the sigma plane is scaled by the ratio "
             "(clamped 0.6..1.8), so I-frame grain refreshes get proportionally "
-            "stronger denoising. Works with --noise-map constant or auto; "
+            "stronger denoising. With --noise-map auto, whole-frame pulse spikes "
+            "are damped out of the base map so they are not counted twice. Works "
+            "with --noise-map constant or auto; "
             "map-conditioned denoisers only (fastdvd, bsvd, mc, pvdd level "
             "variants)."
         ),

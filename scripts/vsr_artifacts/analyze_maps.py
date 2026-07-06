@@ -255,7 +255,12 @@ def _summarize_clip(path: Path, args: argparse.Namespace) -> dict[str, Any]:
     sigma: dict[str, Any] = {}
     for cap in args.motion_caps:
         maps = [
-            estimate_sigma_map(win["frames"], motion_cap=cap, masking=args.masking)
+            estimate_sigma_map(
+                win["frames"],
+                motion_cap=cap,
+                masking=args.masking,
+                pulse_robust=args.pulse_robust,
+            )
             for win in windows
         ]
         sigma[cap] = _median_map_stats([_stats_map(m) for m in maps if m is not None])
@@ -420,6 +425,7 @@ def _normalise_config(args: argparse.Namespace) -> argparse.Namespace:
     merged.seconds = float(config_get(analysis, args, "seconds", 2.0))
     merged.window_frames = int(config_get(analysis, args, "window_frames", 12))
     merged.masking = float(config_get(analysis, args, "masking", 1.0))
+    merged.pulse_robust = bool(config_get(analysis, args, "pulse_robust", False))
     merged.windows = _as_float_list(config_get(analysis, args, "windows", DEFAULT_WINDOWS), DEFAULT_WINDOWS)
     merged.motion_caps = _as_str_list(config_get(analysis, args, "motion_caps", DEFAULT_MOTION_CAPS), DEFAULT_MOTION_CAPS)
     bad_caps = sorted(set(merged.motion_caps) - {"strict", "loose", "off"})
@@ -451,6 +457,7 @@ def run_analysis(args: argparse.Namespace) -> dict[str, Any]:
         "windows": args.windows,
         "motion_caps": args.motion_caps,
         "masking": args.masking,
+        "pulse_robust": args.pulse_robust,
         "clips": rows,
     }
     for idx, path in enumerate(args.videos, 1):
@@ -480,6 +487,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--windows", help="comma-separated fractional window starts, e.g. 0.1,0.5,0.9")
     parser.add_argument("--motion-caps", help="comma-separated subset: strict,loose,off")
     parser.add_argument("--masking", type=float, help="noise-map masking value for estimated maps")
+    parser.add_argument("--pulse-robust", action="store_true", default=None,
+                        help="winsorize whole-frame pulse spikes in estimated maps, matching --noise-map-pulse base-map behavior")
     parser.add_argument("--limit", type=int, help="debug: analyze only the first N videos")
     return parser.parse_args()
 

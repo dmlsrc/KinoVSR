@@ -122,6 +122,8 @@ def estimate_sigma_map(
     luma_cap_headroom: float = 2.0,
     motion_cap: str = "strict",
     masking: float = 0.0,
+    pulse_robust: bool = False,
+    pulse_clip_ratio: float = 1.35,
     luma_bins: int = 8,
     sigma_floor: float = 0.002,
     sigma_ceil: float = 0.25,
@@ -134,6 +136,9 @@ def estimate_sigma_map(
     than 2 frames are given. Square it for variance-conditioned nets (PVDD).
     Windows longer than max_frames are sampled as spread runs of consecutive
     frames, so the estimate covers the whole window, not just its head.
+    When pulse_robust is enabled, whole-frame diff spikes are winsorized before
+    the spatial map is estimated; use it together with PulseGain so GOP/noise
+    pulses are represented as per-frame gains instead of baked into the base map.
     """
     if len(frames) < 2:
         return None
@@ -153,6 +158,14 @@ def estimate_sigma_map(
     d2 = mx.concatenate(diffs2, axis=0) if diffs2 else None     # lag-2 diffs
     H, W = int(y.shape[1]), int(y.shape[2])
     K = d.shape[0]
+    if pulse_robust and K >= 4:
+        trace = mx.sqrt(mx.mean(d * d, axis=(1, 2)))
+        ts = mx.sort(trace)
+        med = float(ts[int(0.50 * (K - 1))])
+        if med > 1e-6:
+            limit = med * max(1.0, float(pulse_clip_ratio))
+            scale = mx.minimum(1.0, limit / (trace + 1e-6))
+            d = d * scale[:, None, None]
 
     # block-pool |d| over space and time; low quantile -> sigma per block
     ph, pw = (-H) % block, (-W) % block
