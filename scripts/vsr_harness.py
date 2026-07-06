@@ -413,6 +413,16 @@ def _read_audio_track_from_video(mp4_path: Path) -> AudioTrack | None:
     """
     from LTX_2_MLX.videotoolbox.audio import read_wav
 
+    if hasattr(_vr, "read_audio_track"):
+        # ffmpeg compatibility reader: decode audio via the same backend that
+        # reads the video (the native audio path cannot open these containers).
+        print(f"[setup] reading audio track from {mp4_path} (ffmpeg)")
+        try:
+            return _vr.read_audio_track(mp4_path)
+        except Exception as e:
+            print(f"[setup] audio decode failed ({type(e).__name__}); continuing without audio")
+            return None
+
     print(f"[setup] reading audio track from {mp4_path}")
     try:
         sample_rate, samples = read_wav(mp4_path)
@@ -578,6 +588,23 @@ def run(args: argparse.Namespace) -> None:
         )
     else:
         from LTX_2_MLX.videotoolbox.vsr import source_format_for_mode
+
+        # ---- reader selection: native (AVFoundation) unless forced or refused.
+        # The ffmpeg compatibility reader mirrors the native surface for
+        # containers/codecs AVFoundation cannot open (MKV, VP9, ...).
+        global _vr
+        if args.reader == "ffmpeg":
+            from LTX_2_MLX.videotoolbox import ffmpeg_reader
+            _vr = ffmpeg_reader
+            print("[reader] ffmpeg compatibility reader (forced)")
+        elif args.reader == "auto":
+            try:
+                _vr.probe_video(Path(args.video))
+            except Exception as e:
+                from LTX_2_MLX.videotoolbox import ffmpeg_reader
+                _vr = ffmpeg_reader
+                print(f"[reader] native reader cannot open this file "
+                      f"({type(e).__name__}); using the ffmpeg compatibility reader")
 
         print(f"Reading video: {args.video}")
         in_w, in_h, source_fps, total_frames, src_transform, src_pixel_aspect = _vr.probe_video(
@@ -2464,6 +2491,19 @@ def main() -> None:
             "frames, EMA-blended so it adapts without pumping (default 64; 0 = "
             "estimate once from the first frames and hold). Windowed modes "
             "(--gop-align, pvdd) re-estimate per window and ignore this."
+        ),
+    )
+    parser.add_argument(
+        "--reader", choices=["auto", "native", "ffmpeg"], default="auto",
+        help=(
+            "Video reader backend. auto (default) = the native AVFoundation reader "
+            "(zero-copy, full precision), falling back to the ffmpeg compatibility "
+            "reader when the container/codec is refused (MKV, VP9, AVI-era "
+            "material). ffmpeg = force the compatibility reader (needs PyAV: "
+            "install the 'ffmpeg' extra). native = never fall back. The ffmpeg "
+            "reader mirrors color tags, keyframe windows (--gop-align), trims, and "
+            "audio; its frame indices are self-consistent but may differ from the "
+            "native reader's by an edit-list offset on the same file."
         ),
     )
     parser.add_argument(
