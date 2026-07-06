@@ -134,6 +134,92 @@ def _frame_low_quantile_sigma(d: Any, block: int = 16, q: float = 0.30) -> float
     return float(flat[idx])
 
 
+def _mc_pair_medians(y: Any, ia: list, ib: list, B: int = 32) -> tuple[Any, Any]:
+    """Phase-correlation motion-compensated residual medians per frame pair.
+
+    y: (T,H,W) luma stack; (ia[i], ib[i]) index the frames of pair i.  Each
+    pair is cut into non-overlapping BxB blocks; per block, phase correlation
+    (Hann-windowed, normalized cross power) finds the dominant displacement
+    with parabolic subpixel refinement, block b is aligned to block a by a
+    Fourier phase ramp, and the whitened aligned residual's central-region
+    median is taken.  The unaligned residual median is computed the same way
+    and the per-block MINIMUM of the two is returned: flat blocks (no peak
+    structure) and failed alignments (periodic texture, occlusion, shifts
+    beyond B/4) fall back to the plain diff instead of poisoning the floor.
+
+    Returns (med, lum): (P, nb) whitened residual medians in luma-sigma-like
+    units (scaled so iid per-frame noise of sigma reads 0.6745*sigma as a
+    median, matching the flat floor's convention) and (P, nb) block lumas.
+    """
+    H, W = int(y.shape[1]), int(y.shape[2])
+    S = B // 2                                   # half-overlap: model granularity
+    ny, nx = (H - B) // S + 1, (W - B) // S + 1
+    nb = ny * nx
+    ys = (mx.arange(ny) * S)[:, None, None, None]
+    xs = (mx.arange(nx) * S)[None, :, None, None]
+    idx = ((ys + mx.arange(B)[None, None, :, None]) * W
+           + (xs + mx.arange(B)[None, None, None, :])).reshape(nb * B * B)
+    P = len(ia)
+    ya = mx.take(y, mx.array(ia, dtype=mx.int32), axis=0).reshape(P, H * W)
+    yb = mx.take(y, mx.array(ib, dtype=mx.int32), axis=0).reshape(P, H * W)
+    A = mx.take(ya, idx, axis=1).reshape(P * nb, B, B)
+    Bb = mx.take(yb, idx, axis=1).reshape(P * nb, B, B)
+
+    n1 = mx.arange(B).astype(mx.float32)
+    w1 = 0.5 - 0.5 * mx.cos(2.0 * 3.141592653589793 * n1 / (B - 1))
+    win = (w1[:, None] * w1[None, :])[None]
+    ky = mx.concatenate([mx.arange(B // 2 + 1),
+                         mx.arange(-(B - B // 2 - 1), 0)]).astype(mx.float32)[None, :, None]
+    kx = mx.arange(B // 2 + 1).astype(mx.float32)[None, None, :]
+
+    Fa = mx.fft.rfft2(A * win)
+    Fbw = mx.fft.rfft2(Bb * win)
+    R = Fa * mx.conj(Fbw)
+    R = R / (mx.abs(R) + 1e-9)
+    corr = mx.fft.irfft2(R, s=(B, B)).reshape(P * nb, B * B)
+    peak = mx.argmax(corr, axis=-1)
+    py = (peak // B).astype(mx.int32)
+    px = (peak % B).astype(mx.int32)
+
+    def _at(dy: int, dx: int) -> Any:
+        gi = (((py + dy) % B) * B + (px + dx) % B)[:, None]
+        return mx.take_along_axis(corr, gi.astype(mx.int32), axis=-1)[:, 0]
+
+    c0 = _at(0, 0)
+    sub_y = 0.5 * (_at(-1, 0) - _at(1, 0)) / (_at(-1, 0) - 2 * c0 + _at(1, 0) - 1e-9)
+    sub_x = 0.5 * (_at(0, -1) - _at(0, 1)) / (_at(0, -1) - 2 * c0 + _at(0, 1) - 1e-9)
+    dy = py.astype(mx.float32)
+    dx = px.astype(mx.float32)
+    dy = mx.where(dy > B / 2, dy - B, dy) + mx.clip(sub_y, -0.5, 0.5)
+    dx = mx.where(dx > B / 2, dx - B, dx) + mx.clip(sub_x, -0.5, 0.5)
+    in_range = (mx.abs(dy) <= B / 4) & (mx.abs(dx) <= B / 4)
+
+    ang = (-2.0 * 3.141592653589793 / B) * (ky * dy[:, None, None] + kx * dx[:, None, None])
+    ramp = mx.cos(ang) + 1j * mx.sin(ang)
+    b_al = mx.fft.irfft2(mx.fft.rfft2(Bb) * ramp, s=(B, B))
+
+    box3 = mx.full((1, 3, 3, 1), 1.0 / 9.0)
+
+    def _white_med(res: Any) -> Any:
+        w = res - mx.conv2d(res[..., None], box3, padding=1)[..., 0]
+        lo, hi = B // 4, B - B // 4
+        # /sqrt2 pair convention, /0.9428 whitening attenuation for iid noise
+        v = mx.abs(w[:, lo:hi, lo:hi]) * (1.0 / (1.4142135623730951 * 0.9428))
+        v = v.reshape(v.shape[0], -1)
+        return mx.sort(v, axis=-1)[:, v.shape[-1] // 2]
+
+    med_mc = mx.where(in_range, _white_med(A - b_al), mx.full((P * nb,), 1e9))
+    med_zero = _white_med(A - Bb)
+    # hysteresis: on static noise the correlation peak is the noise's best
+    # self-match and alignment shaves ~5-10% off the residual; real motion
+    # cuts it by 2-5x.  Only trust the aligned reading when it undercuts the
+    # plain diff decisively, so static blocks measure exactly the plain diff.
+    med = mx.where(med_mc < 0.90 * med_zero, med_mc, med_zero).reshape(P, nb)
+    lo, hi = B // 4, B - B // 4
+    lum = mx.mean(A[:, lo:hi, lo:hi], axis=(1, 2)).reshape(P, nb)
+    return med, lum
+
+
 def estimate_sigma_map(
     frames: list,
     block: int = 16,
@@ -143,6 +229,7 @@ def estimate_sigma_map(
     masking: float = 0.0,
     pulse_robust: bool = False,
     pulse_clip_ratio: float = 1.35,
+    floor_mode: str = "mc",
     luma_bins: int = 8,
     sigma_floor: float = 0.002,
     sigma_ceil: float = 0.25,
@@ -158,9 +245,17 @@ def estimate_sigma_map(
     When pulse_robust is enabled, whole-frame diff spikes are winsorized before
     the spatial map is estimated; use it together with PulseGain so GOP/noise
     pulses are represented as per-frame gains instead of baked into the base map.
+    floor_mode picks the motion-immune noise-floor source for the luma model:
+    "mc" (default) aligns 32px blocks by phase correlation first and measures
+    the whitened aligned residual on all pixels; "flat" measures flat pixels
+    only (aperture-gated whitened median). mc is stronger on pans over weak
+    texture (the flat set there is thin or drift-contaminated) and cheaper;
+    they agree wherever the flat floor is healthy.
     """
     if len(frames) < 2:
         return None
+    if floor_mode not in ("flat", "mc"):
+        raise ValueError(f"floor_mode must be 'flat' or 'mc'; got {floor_mode!r}")
     runs = _select_runs(len(frames), max_frames)
     lum_all: list = []
     diffs: list = []
@@ -169,17 +264,26 @@ def estimate_sigma_map(
     pair_means2: list = []
     sdiffs: list = []
     sdiffs2: list = []
+    p1a: list = []
+    p1b: list = []
+    p2a: list = []
+    p2b: list = []
     for run in runs:
+        off = len(lum_all)
         lum = [_to_luma_2d(frames[i]) for i in run]
         lum_all.extend(lum)
         yr = mx.stack(lum, axis=0)
         diffs.append(mx.abs(yr[1:] - yr[:-1]) * (1.0 / 1.4142135623730951))
         sdiffs.append((yr[1:] - yr[:-1]) * (1.0 / 1.4142135623730951))
         pair_means.append((yr[1:] + yr[:-1]) * 0.5)
+        p1a.extend(off + i for i in range(len(run) - 1))
+        p1b.extend(off + i + 1 for i in range(len(run) - 1))
         if yr.shape[0] >= 3:
             diffs2.append(mx.abs(yr[2:] - yr[:-2]) * (1.0 / 1.4142135623730951))
             sdiffs2.append((yr[2:] - yr[:-2]) * (1.0 / 1.4142135623730951))
             pair_means2.append((yr[2:] + yr[:-2]) * 0.5)
+            p2a.extend(off + i for i in range(len(run) - 2))
+            p2b.extend(off + i + 2 for i in range(len(run) - 2))
     y = mx.stack(lum_all, axis=0)                               # sampled lumas
     d = mx.concatenate(diffs, axis=0)                           # (K,H,W) adjacent diffs
     sd = mx.concatenate(sdiffs, axis=0)                         # signed diffs
@@ -265,56 +369,90 @@ def estimate_sigma_map(
         med_ = mx.take_along_axis(msort_, midx_[..., None], axis=-1)[..., 0]
         return med_, cnt_, thr_med_, fl_
 
-    # The floor is measured on the WHITENED diff: d minus its own 3x3 mean.
-    # Clean-encode wobble, sub-pixel drift, and deformable-texture shimmer
-    # (fur, foliage) produce a spatially smooth diff field (lag-1 correlation
-    # 0.92-0.98 measured on clean re-encodes) that the high-pass removes,
-    # while sensor/AWGN noise is spatially white and survives (x0.9428 for
-    # iid, corrected below).  This is what makes the floor read the
-    # DENOISEABLE component rather than any temporal change.
-    def _whiten(sig_diff: Any) -> Any:
-        w = mx.stack([_box_blur_full(sig_diff[i], 3)
-                      for i in range(int(sig_diff.shape[0]))], axis=0)
-        return mx.abs(sig_diff - w) * (1.0 / 0.9428)
-
-    dw = _edge_pad_hw(_whiten(sd), ph, pw)
-    dwb = mx.transpose(dw.reshape(K, bh, block, bw, block),
-                       (1, 3, 0, 2, 4)).reshape(bh, bw, n)
-    # value floor from the WHITENED diff; displacement test from the RAW diff
-    # (whitening is symmetric in lag, so it would erase the lag-2 doubling
-    # signature that separates drift from noise)
-    fmed1, fcnt1, flat_thr_med, _ = _flat_block_median(dwb, pm, K)
-    fmed1r, _, _, _ = _flat_block_median(db, pm, K)
-    flat_trusted = flat_thr_med <= 0.045
-    r_flat_med = 2.0
-    if sd2 is not None and pm2 is not None and flat_trusted:
-        d2pf = _edge_pad_hw(d2, ph, pw)
-        K2f = int(d2pf.shape[0])
-        db2f = mx.transpose(d2pf.reshape(K2f, bh, block, bw, block),
-                            (1, 3, 0, 2, 4)).reshape(bh, bw, -1)
-        fmed2, fcnt2, _, _ = _flat_block_median(db2f, pm2, K2f)
-        r_flat = fmed2 / mx.maximum(fmed1r, 1e-6)
-        flat_static = fmed1r < (2.0 / 255.0)
-        counted = (fcnt1 >= 24) & (fcnt2 >= 24)
-        flat_ok = counted & (flat_static | (r_flat <= 1.30))
-        # global drift signature over ALL counted blocks (not just the passing
-        # ones): source-wide slow drift puts the median well above 1.30 even
-        # when a tail of blocks slips under the per-block gate.
-        rf_l = [float(r) for r, c, st in zip(
-            [float(v) for v in r_flat.reshape(-1).tolist()],
-            [bool(v) for v in counted.reshape(-1).tolist()],
-            [bool(v) for v in flat_static.reshape(-1).tolist()], strict=True)
-            if c and not st]
-        if rf_l:
-            r_flat_med = sorted(rf_l)[len(rf_l) // 2]
+    if floor_mode == "mc":
+        # Motion-compensated floor: per-block phase correlation aligns each
+        # pair before the whitened residual median, so the floor is read on
+        # ALL pixels rather than the gradient-free subset -- pans over weak
+        # texture (the flat floor's residual blind spot) align away instead
+        # of contaminating the estimate.  Validation mirrors the flat floor:
+        # per-block lag-2 consistency plus a global drift median; the floor
+        # blocks live on their own 32px grid and carry their own lumas.
+        med1p, lum1p = _mc_pair_medians(y, p1a, p1b)
+        P1 = int(med1p.shape[0])
+        med1b = mx.sort(mx.transpose(med1p, (1, 0)), axis=-1)[:, P1 // 2]
+        mlum = mx.mean(lum1p, axis=0)
+        r_flat_med = 2.0
+        if p2a:
+            med2p, _ = _mc_pair_medians(y, p2a, p2b)
+            P2 = int(med2p.shape[0])
+            med2b = mx.sort(mx.transpose(med2p, (1, 0)), axis=-1)[:, P2 // 2]
+            mc_static = med1b < (2.0 / 255.0)
+            mc_ok = mc_static | (med2b <= 1.30 * med1b)
+            rr = [m2 / max(m1, 1e-6) for m1, m2, st in zip(
+                [float(v) for v in med1b.tolist()],
+                [float(v) for v in med2b.tolist()],
+                [bool(v) for v in mc_static.tolist()], strict=True) if not st]
+            r_flat_med = sorted(rr)[len(rr) // 2] if rr else 1.0
         else:
-            r_flat_med = 1.0                                     # all-static: noise-like
+            mc_ok = mx.zeros(med1b.shape, dtype=mx.bool_)
+        flat_trusted = True
+        fsig_mc = med1b * (_CHANNEL_FROM_LUMA / 0.6745)
+        flat_sig_l = [float(v) for v in fsig_mc.tolist()]
+        flat_ok_l = [bool(v) for v in mc_ok.tolist()]
+        floor_lum_l = [float(v) for v in mlum.tolist()]
     else:
-        flat_ok = mx.zeros(fmed1.shape, dtype=mx.bool_)
-    # |d| of iid per-frame noise is half-normal with median 0.6745 sigma
-    fsig = fmed1 * (_CHANNEL_FROM_LUMA / 0.6745)
-    flat_sig_l = [float(v) for v in fsig.reshape(-1).tolist()]
-    flat_ok_l = [bool(v) for v in flat_ok.reshape(-1).tolist()]
+        # The floor is measured on the WHITENED diff: d minus its own 3x3
+        # mean.  Clean-encode wobble, sub-pixel drift, and deformable-texture
+        # shimmer (fur, foliage) produce a spatially smooth diff field (lag-1
+        # correlation 0.92-0.98 measured on clean re-encodes) that the
+        # high-pass removes, while sensor/AWGN noise is spatially white and
+        # survives (x0.9428 for iid, corrected below).  This is what makes
+        # the floor read the DENOISEABLE component, not any temporal change.
+        def _whiten(sig_diff: Any) -> Any:
+            w = mx.stack([_box_blur_full(sig_diff[i], 3)
+                          for i in range(int(sig_diff.shape[0]))], axis=0)
+            return mx.abs(sig_diff - w) * (1.0 / 0.9428)
+
+        dw = _edge_pad_hw(_whiten(sd), ph, pw)
+        dwb = mx.transpose(dw.reshape(K, bh, block, bw, block),
+                           (1, 3, 0, 2, 4)).reshape(bh, bw, n)
+        # value floor from the WHITENED diff; displacement test from the RAW
+        # diff (whitening is symmetric in lag, so it would erase the lag-2
+        # doubling signature that separates drift from noise)
+        fmed1, fcnt1, flat_thr_med, _ = _flat_block_median(dwb, pm, K)
+        fmed1r, _, _, _ = _flat_block_median(db, pm, K)
+        flat_trusted = flat_thr_med <= 0.045
+        r_flat_med = 2.0
+        if sd2 is not None and pm2 is not None and flat_trusted:
+            d2pf = _edge_pad_hw(d2, ph, pw)
+            K2f = int(d2pf.shape[0])
+            db2f = mx.transpose(d2pf.reshape(K2f, bh, block, bw, block),
+                                (1, 3, 0, 2, 4)).reshape(bh, bw, -1)
+            fmed2, fcnt2, _, _ = _flat_block_median(db2f, pm2, K2f)
+            r_flat = fmed2 / mx.maximum(fmed1r, 1e-6)
+            flat_static = fmed1r < (2.0 / 255.0)
+            counted = (fcnt1 >= 24) & (fcnt2 >= 24)
+            flat_ok = counted & (flat_static | (r_flat <= 1.30))
+            # global drift signature over ALL counted blocks (not just the
+            # passing ones): source-wide slow drift puts the median well
+            # above 1.30 even when a tail of blocks slips under the per-block
+            # gate.
+            rf_l = [float(r) for r, c, st in zip(
+                [float(v) for v in r_flat.reshape(-1).tolist()],
+                [bool(v) for v in counted.reshape(-1).tolist()],
+                [bool(v) for v in flat_static.reshape(-1).tolist()], strict=True)
+                if c and not st]
+            if rf_l:
+                r_flat_med = sorted(rf_l)[len(rf_l) // 2]
+            else:
+                r_flat_med = 1.0                                 # all-static: noise-like
+        else:
+            flat_ok = mx.zeros(fmed1.shape, dtype=mx.bool_)
+        # |d| of iid per-frame noise is half-normal with median 0.6745 sigma
+        fsig = fmed1 * (_CHANNEL_FROM_LUMA / 0.6745)
+        flat_sig_l = [float(v) for v in fsig.reshape(-1).tolist()]
+        flat_ok_l = [bool(v) for v in flat_ok.reshape(-1).tolist()]
+        floor_lum_l = None
 
     # signal-dependence model: robust sigma-vs-luma from the quiet blocks, used to
     # cap motion-dominated blocks (their pooled quantile is inflated everywhere).
@@ -366,7 +504,8 @@ def estimate_sigma_map(
     #     content) but never raise it.  The legacy guards stay in charge.
     # Static/sparse-flash content keeps the legacy path untouched (the flat
     # median would under-read sparse flashes there).
-    min_flat_blocks = max(8, int(0.10 * len(sig_l)))
+    floor_lum = floor_lum_l if floor_lum_l is not None else lum_l
+    min_flat_blocks = max(8, int(0.10 * len(flat_sig_l)))
     flat_idx = [i for i, ok in enumerate(flat_ok_l) if ok]
     have_flat = len(flat_idx) >= min_flat_blocks
     flat_floor_p30 = _p30([flat_sig_l[i] for i in flat_idx]) if have_flat else None
@@ -385,7 +524,7 @@ def estimate_sigma_map(
     use_flat_min = flat_active and not use_flat_model
     if use_flat_model:
         model_sig_l = [flat_sig_l[i] for i in flat_idx]
-        model_lum_l = [lum_l[i] for i in flat_idx]
+        model_lum_l = [floor_lum[i] for i in flat_idx]
     global_p30 = _p30(model_sig_l)
     dense_texture_ambiguous = (
         motion_cap == "strict"
@@ -428,7 +567,7 @@ def estimate_sigma_map(
         flat_model = [flat_floor_p30] * luma_bins
         for b in range(luma_bins):
             lo, hi = b / luma_bins, (b + 1) / luma_bins
-            vals = [flat_sig_l[i] for i in flat_idx if lo <= lum_l[i] < hi]
+            vals = [flat_sig_l[i] for i in flat_idx if lo <= floor_lum[i] < hi]
             if len(vals) >= 8:
                 flat_model[b] = _p30(vals)
         model = [min(v, fv) for v, fv in zip(model, flat_model, strict=True)]

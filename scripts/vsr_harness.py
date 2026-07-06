@@ -1136,11 +1136,13 @@ def run(args: argparse.Namespace) -> None:
                 nm_tracker = NoiseMapTracker(gain=args.noise_map_gain,
                                              motion_cap=args.noise_map_motion_cap,
                                              masking=args.noise_map_masking,
-                                             pulse_robust=args.noise_map_pulse)
+                                             pulse_robust=args.noise_map_pulse,
+                                             floor_mode=args.noise_map_floor_mode)
                 _floor_note = (f", floor {args.noise_map_floor:g}"
                                if args.noise_map_floor > 0 else "")
                 print(f"[noise-map] auto: per-pixel sigma estimated from the footage "
-                      f"(gain {args.noise_map_gain:g}{_floor_note})")
+                      f"(gain {args.noise_map_gain:g}{_floor_note}, "
+                      f"floor-mode {args.noise_map_floor_mode})")
             elif args.denoise != "off":
                 why = ("blind PVDD variant (use --pvdd-variant pvdd_level)"
                        if args.denoise == "pvdd" else f"--denoise {args.denoise} has no map input")
@@ -2635,6 +2637,19 @@ def main() -> None:
             "motion; loose = static-camera material, persistent flicker also "
             "escapes the cap; off = tripod/archival footage, no cap -- the map "
             "reports exactly what it measured."
+        ),
+    )
+    parser.add_argument(
+        "--noise-map-floor-mode", choices=["mc", "flat"], default="mc",
+        help=(
+            "Source of the motion-immune noise floor that anchors the map's "
+            "luma model on moving content. mc (default): 32px blocks are "
+            "aligned by phase correlation (subpixel) before the whitened "
+            "residual median, so the floor is read on ALL pixels -- stronger "
+            "on pans over weak texture where flat pixels are scarce or "
+            "drift-contaminated, and cheaper. flat: whitened median over "
+            "gradient-free pixels only (motion cannot flicker flat pixels); "
+            "the two agree wherever the flat set is healthy."
         ),
     )
     parser.add_argument(

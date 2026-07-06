@@ -559,8 +559,10 @@ def test_flat_floor_separates_clean_pan_from_noisy_pan():
     # pixels, so a clean pan must read LOW while the same pan with real dense
     # noise reads the noise level. Before the flat floor both read ~0.06
     # (motion-dominated), which made auto denoise soften clean footage.
-    clean = estimate_sigma_map(_panning_clip(0.0), motion_cap="strict")
-    noisy = estimate_sigma_map(_panning_clip(0.05), motion_cap="strict")
+    clean = estimate_sigma_map(_panning_clip(0.0), motion_cap="strict",
+                               floor_mode="flat")
+    noisy = estimate_sigma_map(_panning_clip(0.05), motion_cap="strict",
+                               floor_mode="flat")
     med_c = float(mx.sort(clean.reshape(-1))[H * W // 2])
     med_n = float(mx.sort(noisy.reshape(-1))[H * W // 2])
     assert med_c < 0.035                      # clean pan stays near the wobble
@@ -578,3 +580,50 @@ def test_probe_flat_floor_flags_dense_noise_not_motion():
     assert "dense sensor noise" in noisy_diag["labels"]
     clean_diag = classify_noise_analysis(clean_stats)
     assert "dense sensor noise" not in clean_diag["labels"]
+
+
+def _full_texture_pan_clip(noise_sigma):
+    # texture EVERYWHERE (no flat pixels), panning 2 px/frame: the flat floor
+    # has nothing to measure here, but phase correlation aligns the pan away.
+    mx.random.seed(99)
+    tex = mx.random.uniform(shape=(H, W + 2 * T))
+    k = mx.ones((1, 5, 5, 1)) / 25.0
+    tex = mx.conv2d(tex[None, :, :, None], k, padding=2)[0, :, :, 0]
+    base_sigma = max(noise_sigma, 0.004)
+    clip = []
+    for t in range(T):
+        f = tex[:, t * 2:t * 2 + W]
+        rgb = mx.broadcast_to(f[..., None], (H, W, 3))
+        clip.append(mx.clip(rgb + mx.random.normal(shape=(H, W, 3)) * base_sigma, 0, 1))
+    return clip
+
+
+def test_mc_floor_separates_clean_pan_from_noisy_pan_without_flat_pixels():
+    clean = estimate_sigma_map(_full_texture_pan_clip(0.0),
+                               motion_cap="strict", floor_mode="mc")
+    noisy = estimate_sigma_map(_full_texture_pan_clip(0.05),
+                               motion_cap="strict", floor_mode="mc")
+    med_c = float(mx.sort(clean.reshape(-1))[H * W // 2])
+    med_n = float(mx.sort(noisy.reshape(-1))[H * W // 2])
+    assert med_c < 0.035                      # aligned pan leaves only wobble
+    assert 0.035 < med_n < 0.095              # dense noise survives alignment
+    assert med_n > 1.8 * med_c
+
+
+def test_mc_floor_matches_flat_floor_on_flat_band_pan():
+    # where the flat floor CAN measure (pan + flat band), the two floor modes
+    # must agree on the level; they share every downstream stage.
+    for sigma in (0.0, 0.05):
+        flat = estimate_sigma_map(_panning_clip(sigma), motion_cap="strict",
+                                  floor_mode="flat")
+        mc = estimate_sigma_map(_panning_clip(sigma), motion_cap="strict",
+                                floor_mode="mc")
+        med_f = float(mx.sort(flat.reshape(-1))[H * W // 2])
+        med_m = float(mx.sort(mc.reshape(-1))[H * W // 2])
+        assert abs(med_m - med_f) < max(0.015, 0.6 * med_f)
+
+
+def test_mc_floor_rejects_bad_mode():
+    import pytest
+    with pytest.raises(ValueError):
+        estimate_sigma_map(_panning_clip(0.0), floor_mode="phase")
