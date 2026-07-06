@@ -63,6 +63,14 @@ class StdfDeblocker:
         self._received = 0
         self._emitted = 0
 
+    def _reset_conditioning(self, clear_debug: bool = False) -> None:
+        self._mask = None
+        self._since_refresh = 0
+        if self._tracker is not None and hasattr(self._tracker, "reset"):
+            self._tracker.reset()
+        if clear_debug:
+            self.last_blockiness_map = None
+
     def _update_mask(self) -> None:
         """(Re)estimate the blockiness mask from the buffered lumas."""
         m = self._tracker.update([l for l, _, _ in self._buf])
@@ -73,6 +81,7 @@ class StdfDeblocker:
 
     def reset(self) -> None:
         self._reset()
+        self._reset_conditioning(clear_debug=True)
 
     def close(self) -> None:
         pass
@@ -147,4 +156,5 @@ class StdfDeblocker:
         while self._emitted <= last:
             out.append(self._emit_one(last))
         self._reset()
+        self._reset_conditioning(clear_debug=False)
         return out

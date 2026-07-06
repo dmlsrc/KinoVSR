@@ -281,6 +281,12 @@ class FastDvdDenoiser:
         self._pulse_log: list[float] = []
         self._reset_state()
 
+    def _reset_conditioning(self, clear_debug: bool = False) -> None:
+        if self._tracker is not None and hasattr(self._tracker, "reset"):
+            self._tracker.reset()
+        if clear_debug:
+            self.last_noise_map = None
+
     def _reset_state(self) -> None:
         self._buf: list = []    # (padded_frame, token) for abs indices [_base ..]
         self._base = 0          # absolute index of _buf[0]
@@ -298,6 +304,7 @@ class FastDvdDenoiser:
 
     def reset(self) -> None:
         self._reset_state()
+        self._reset_conditioning(clear_debug=True)
 
     def close(self) -> None:
         pass
@@ -431,4 +438,5 @@ class FastDvdDenoiser:
         while self._emitted <= last:
             out.append(self._emit_one(last))
         self._reset_state()
+        self._reset_conditioning(clear_debug=False)
         return out

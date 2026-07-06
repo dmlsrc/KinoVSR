@@ -427,6 +427,12 @@ class BsvdDenoiser:
         self._schedule: list | None = None
         self._reset_state()
 
+    def _reset_conditioning(self, clear_debug: bool = False) -> None:
+        if self._tracker is not None and hasattr(self._tracker, "reset"):
+            self._tracker.reset()
+        if clear_debug:
+            self.last_noise_map = None
+
     def _reset_state(self) -> None:
         self.net.reset()
         self._hw: tuple[int, int] | None = None
@@ -448,6 +454,7 @@ class BsvdDenoiser:
 
     def reset(self) -> None:
         self._reset_state()
+        self._reset_conditioning(clear_debug=True)
 
     def set_schedule(self, schedule: list | None) -> None:
         """Use GOP-aligned windows instead of one continuous stream.
@@ -591,6 +598,7 @@ class BsvdDenoiser:
         if self._schedule is not None:
             out = self._feed_scheduled(final=True)
             self._reset_state()
+            self._reset_conditioning(clear_debug=False)
             return out
         out = []
         if self._warm:
@@ -606,6 +614,7 @@ class BsvdDenoiser:
             if guard <= 0 and self._emitted == before:
                 raise RuntimeError("BSVD flush did not produce enough delayed frames")
         self._reset_state()
+        self._reset_conditioning(clear_debug=False)
         return out
 
     def _feed_scheduled(self, final: bool) -> list:

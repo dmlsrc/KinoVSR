@@ -50,8 +50,17 @@ class FbcnnDeblocker:
         self._fwd = net.make_forward(self._p, self._qf_input, net_strength, self._nb,
                                      compile=compile)
 
+    def _reset_conditioning(self, clear_debug: bool = False) -> None:
+        self._mask = None
+        self._recent = []
+        self._since_refresh = 0
+        if self._tracker is not None and hasattr(self._tracker, "reset"):
+            self._tracker.reset()
+        if clear_debug:
+            self.last_blockiness_map = None
+
     def reset(self) -> None:
-        pass
+        self._reset_conditioning(clear_debug=True)
 
     def close(self) -> None:
         pass
