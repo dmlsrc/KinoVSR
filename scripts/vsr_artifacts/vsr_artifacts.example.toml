@@ -14,7 +14,49 @@ codec = "libx264"
 crf = 34
 gop = 30
 preset = "veryfast"
+pix_fmt = "yuv420p"
 overwrite = false
+
+# Optional per-mode artifact tuning. The defaults preserve the original
+# compression-heavy stress corpus. For an analog-focused corpus, use lower CRF
+# and stronger/lighter-weight analog settings like these:
+#
+# [fixtures.mode_params.mild_high_iso]
+# sigma = 0.060
+# row_sigma = 0.012
+#
+# [fixtures.mode_params.jumping_scanlines]
+# period = 11
+# line_width = 1
+# amp = 0.030
+# row_jitter = 0.006
+# dropout = 0.25
+#
+# [fixtures.mode_params.mixed_analog_h264]
+# high_iso_sigma = 0.055
+# high_iso_row_sigma = 0.010
+# scanline_period = 13
+# scanline_line_width = 1
+# scanline_amp = 0.024
+# scanline_row_jitter = 0.005
+# scanline_dropout = 0.35
+# pulse_peak_sigma = 0.020
+# pulse_floor_sigma = 0.002
+# mosquito_amp = 0.020
+# mosquito_density = 0.10
+# include_block_grid = false
+#
+# [fixtures.encode.mild_high_iso]
+# crf = 16
+# preset = "slow"
+#
+# [fixtures.encode.jumping_scanlines]
+# crf = 16
+# preset = "slow"
+#
+# [fixtures.encode.mixed_analog_h264]
+# crf = 18
+# preset = "slow"
 
 [tests]
 # Defaults to the current interpreter when omitted.
@@ -51,6 +93,10 @@ auto_flags = [
 ]
 compare_max_frames = 60
 compare_progress = 0
+# When a generated fixture has a matching source__reencode_only__... clip,
+# score each output against that clean/reencoded baseline too. This helps
+# distinguish "auto differs from manual" from "auto is closer to clean".
+clean_compare = true
 
 [[tests.cases]]
 label = "block_grid_case"

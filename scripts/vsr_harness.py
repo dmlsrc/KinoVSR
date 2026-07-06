@@ -995,7 +995,9 @@ def run(args: argparse.Namespace) -> None:
             print(f"  structure: lag2/lag1 {r.get('lag2_over_lag1', 0):.2f}   "
                   f"edge/flat {r['edge_over_flat']:.2f}   luma-corr {r['luma_corr']:+.2f}   "
                   f"static-frac {r['static_fraction']:.2f}   "
-                  f"static-spatial-hf {r['static_spatial_hf']:.4f}")
+                  f"static-spatial-hf {r['static_spatial_hf']:.4f}   "
+                  f"row-period {r.get('row_periodicity', 0.0):.2f}@"
+                  f"{r.get('row_period_px', 0.0):.0f}px")
             print(f"  channels: R {r['sigma_R']:.4f}  G {r['sigma_G']:.4f}  B {r['sigma_B']:.4f}")
             print(f"  verdict: {', '.join(diag['labels'])}  risk={diag['risk']}")
             for _msg in diag["warnings"][:2]:

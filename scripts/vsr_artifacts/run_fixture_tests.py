@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -23,6 +24,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+import av
+import numpy as np
 
 from config import config_get, config_section, default_shared_temp, listify, load_config, resolve_path
 
@@ -141,6 +145,10 @@ def summarize_probe(text: str) -> dict[str, Any]:
                 current["luma_corr"] = float(m.group(3))
                 current["static_fraction"] = float(m.group(4))
                 current["static_spatial_hf"] = float(m.group(5))
+            rm = re.search(r"row-period ([0-9.]+)@([0-9.]+)px", line)
+            if rm:
+                current["row_periodicity"] = float(rm.group(1))
+                current["row_period_px"] = float(rm.group(2))
         elif current is not None and "verdict:" in line:
             m = re.search(r"verdict: (.+?)\s+risk=([a-z]+)", line)
             if m:
@@ -188,6 +196,81 @@ def run(name: str, cmd: list[str], log_path: Path, python: Path) -> dict[str, An
     }
 
 
+def parse_start_frame(text: str) -> int:
+    m = re.search(r"\[setup\] range: start ([0-9]+)", text)
+    return int(m.group(1)) if m else 0
+
+
+def _source_seed_from_fixture(path: Path) -> tuple[str, str | None] | None:
+    parts = path.stem.split("__")
+    if len(parts) < 3:
+        return None
+    seed_match = re.search(r"(?:^|_)s([0-9]+)(?:_|$)", parts[2])
+    return parts[0], seed_match.group(1) if seed_match else None
+
+
+def _infer_clean_reference(video: Path, fixture_dir: Path | None) -> Path | None:
+    parsed = _source_seed_from_fixture(video)
+    base = fixture_dir or video.parent
+    if parsed is None or base is None:
+        return None
+    source, seed = parsed
+    patterns = []
+    if seed:
+        patterns.append(f"{source}__reencode_only__s{seed}_*.mp4")
+    patterns.append(f"{source}__reencode_only__*.mp4")
+    for pattern in patterns:
+        matches = sorted(base.glob(pattern))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _read_luma_frames(path: Path, skip: int = 0, max_frames: int = 60) -> list[np.ndarray]:
+    frames: list[np.ndarray] = []
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        for idx, frame in enumerate(container.decode(stream)):
+            if idx < skip:
+                continue
+            rgb = frame.to_ndarray(format="rgb24").astype(np.float32) * (1.0 / 255.0)
+            frames.append(0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2])
+            if len(frames) >= max_frames:
+                break
+    return frames
+
+
+def compare_to_clean(clean: Path, candidate: Path, clean_skip: int, max_frames: int) -> dict[str, float | int | str]:
+    ref = _read_luma_frames(clean, skip=clean_skip, max_frames=max_frames)
+    cand = _read_luma_frames(candidate, max_frames=max_frames)
+    n = min(len(ref), len(cand))
+    if n == 0:
+        return {"frames": 0, "error": "no overlapping frames"}
+    maes: list[float] = []
+    p95s: list[float] = []
+    mses: list[float] = []
+    for a, b in zip(ref[:n], cand[:n], strict=True):
+        if a.shape != b.shape:
+            return {
+                "frames": n,
+                "error": f"shape mismatch clean {a.shape} vs candidate {b.shape}",
+            }
+        d = np.abs(a - b)
+        maes.append(float(np.mean(d)))
+        p95s.append(float(np.quantile(d, 0.95)))
+        mses.append(float(np.mean((a - b) ** 2)))
+    mse = float(sum(mses) / len(mses))
+    return {
+        "frames": n,
+        "clean_reference": str(clean),
+        "clean_skip_frames": int(clean_skip),
+        "mean_abs_luma": float(sum(maes) / len(maes)),
+        "p95_abs_luma": float(sum(p95s) / len(p95s)),
+        "worst_frame_mean_abs_luma": float(max(maes)),
+        "psnr_luma": 99.0 if mse <= 0 else float(-10.0 * math.log10(mse)),
+    }
+
+
 def _case_video(case: dict[str, Any], fixture_dir: Path | None, config_base: Path | None) -> Path:
     value = case.get("video")
     if value is None:
@@ -223,6 +306,7 @@ def _normalise_config(args: argparse.Namespace) -> argparse.Namespace:
     merged.auto_flags = _as_str_list(tests.get("auto_flags"), DEFAULT_AUTO_FLAGS)
     merged.compare_max_frames = int(tests.get("compare_max_frames", 60))
     merged.progress = str(tests.get("compare_progress", 0))
+    merged.clean_compare = bool(tests.get("clean_compare", True))
     cases = listify(tests.get("cases", []))
     if args.cases:
         selected = {name.strip() for name in args.cases.split(",") if name.strip()}
@@ -277,6 +361,22 @@ def run_cases(args: argparse.Namespace) -> dict[str, Any]:
                 *flags,
             ]
             case["runs"][mode] = run(f"{label}:{mode}", cmd, case_dir / f"{mode}.log", args.python)
+
+        if args.clean_compare:
+            clean_ref = _infer_clean_reference(video, args.fixture_dir)
+            if clean_ref is not None and clean_ref.exists():
+                case["clean_reference"] = str(clean_ref)
+                for mode in ("manual", "auto"):
+                    run_info = case["runs"][mode]
+                    post = run_info.get("post")
+                    if post and Path(post).exists():
+                        log_text = Path(run_info["log"]).read_text(encoding="utf-8")
+                        run_info["quality_vs_clean"] = compare_to_clean(
+                            clean_ref,
+                            Path(post),
+                            parse_start_frame(log_text),
+                            args.compare_max_frames,
+                        )
 
         man = case["runs"]["manual"]["post"]
         aut = case["runs"]["auto"]["post"]

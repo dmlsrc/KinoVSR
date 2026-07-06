@@ -115,6 +115,25 @@ def _select_runs(n: int, max_frames: int, run_len: int = 3) -> list[list[int]]:
     return [list(range(s, s + run_len)) for s in starts]
 
 
+def _frame_low_quantile_sigma(d: Any, block: int = 16, q: float = 0.30) -> float:
+    """Robust global sigma for one luma diff frame.
+
+    Uses the low quantile of block RMS values: global noise pulses lift even
+    quiet blocks, while subject/camera motion usually occupies a smaller set of
+    blocks and should not drive a whole-frame pulse gain.
+    """
+    H, W = int(d.shape[0]), int(d.shape[1])
+    ph, pw = (-H) % block, (-W) % block
+    dp = _edge_pad_hw(d[None, :, :], ph, pw)[0]
+    hp, wp = H + ph, W + pw
+    bh, bw = hp // block, wp // block
+    db = dp.reshape(bh, block, bw, block)
+    br = mx.sqrt(mx.mean(db * db, axis=(1, 3))) * _CHANNEL_FROM_LUMA
+    flat = mx.sort(br.reshape(-1))
+    idx = int(max(0.0, min(1.0, q)) * (int(flat.shape[0]) - 1))
+    return float(flat[idx])
+
+
 def estimate_sigma_map(
     frames: list,
     block: int = 16,
@@ -539,7 +558,7 @@ class PulseGain:
             return self.last
         d = mx.abs(y - self._prev) * (1.0 / 1.4142135623730951)
         self._prev = y
-        sigma_t = float(mx.sqrt(mx.mean(d * d))) * _CHANNEL_FROM_LUMA
+        sigma_t = _frame_low_quantile_sigma(d)
         self._hist.append(sigma_t)
         if len(self._hist) > self.history:
             self._hist.pop(0)
@@ -634,6 +653,40 @@ def analyze_noise(frames: list, thresh: float = 2.0 / 255.0) -> dict:
     out["static_fraction"] = float(mx.mean(static))
     out["static_spatial_hf"] = float(mx.sum(lap * sm2) / mx.maximum(mx.sum(sm2), 1.0)) / 4.4721 * _CHANNEL_FROM_LUMA
 
+    # Row-coherent flicker proxy: thin analog scanlines produce a signed
+    # frame-diff profile that repeats at a row period. Dense sensor noise can
+    # have row drift too, but it should not have strong short-lag periodicity.
+    signed = (y[1:] - y[:-1]) * (1.0 / 1.4142135623730951)
+    row = mx.mean(signed, axis=2)                               # (K,H)
+    frame_rms = mx.sqrt(mx.mean(signed * signed, axis=(1, 2))) + 1e-9
+    row_rms = mx.sqrt(mx.mean(row * row, axis=1))
+    rc = mx.sort(row_rms / frame_rms)
+    out["row_coherence"] = float(rc[int(rc.shape[0]) // 2])
+    if H >= 32:
+        krow = 9
+        rr = krow // 2
+        rp = mx.concatenate([mx.broadcast_to(row[:, :1], (K, rr)), row,
+                             mx.broadcast_to(row[:, -1:], (K, rr))], axis=1)
+        smooth = mx.zeros_like(row)
+        for off in range(krow):
+            smooth = smooth + rp[:, off:off + H]
+        hp = row - smooth / krow
+        energy = mx.mean(hp * hp, axis=1) + 1e-12
+        best = mx.zeros((K,), dtype=mx.float32)
+        best_lag = mx.zeros((K,), dtype=mx.float32)
+        for lag in range(3, min(25, max(4, H // 2))):
+            corr = mx.maximum(mx.mean(hp[:, lag:] * hp[:, :-lag], axis=1) / energy, 0.0)
+            take = corr > best
+            best = mx.where(take, corr, best)
+            best_lag = mx.where(take, float(lag), best_lag)
+        bs = mx.sort(best)
+        bl = mx.sort(best_lag)
+        out["row_periodicity"] = float(bs[int(bs.shape[0]) // 2])
+        out["row_period_px"] = float(bl[int(bl.shape[0]) // 2])
+    else:
+        out["row_periodicity"] = 0.0
+        out["row_period_px"] = 0.0
+
     # per-channel temporal RMS (is the flash chromatic?)
     for i, ch in enumerate("RGB"):
         c = mx.stack([f[0] if f.ndim == 4 else f for f in frames], axis=0).astype(mx.float32)[..., i]
@@ -659,6 +712,9 @@ def classify_noise_analysis(stats: dict) -> dict:
     edge = float(stats.get("edge_over_flat", 1.0))
     static = float(stats.get("static_fraction", 0.0))
     static_hf = float(stats.get("static_spatial_hf", 0.0))
+    row_coherence = float(stats.get("row_coherence", 0.0))
+    row_periodicity = float(stats.get("row_periodicity", 0.0))
+    row_period_px = float(stats.get("row_period_px", 0.0))
     trace = [float(v) for v in stats.get("frame_trace", [])]
     trace_sorted = sorted(trace)
     trace_med = trace_sorted[len(trace_sorted) // 2] if trace_sorted else 0.0
@@ -678,6 +734,10 @@ def classify_noise_analysis(stats: dict) -> dict:
         labels.append("sparse edge flicker")
         warnings.append("edge-local mosquito flicker can be weak in a smooth sigma map")
         suggestions.append("inspect the deblock map and consider edge/compression cleanup before denoise")
+    if row_periodicity >= 0.50 and row_coherence >= 0.05 and dens_p90 >= 0.05 and amp_p90 >= 0.012:
+        labels.append("row-coherent scanline flicker")
+        warnings.append("periodic row flicker can make temporal sigma maps over-condition line artifacts")
+        suggestions.append("compare against the clean/reencode baseline; try --noise-map-gain 0.6-0.8 if it over-softens")
     if trace_med > 0 and trace_max >= max(0.030, 1.55 * trace_med):
         labels.append("pulsed temporal noise")
         suggestions.append("--noise-map-pulse is likely useful")
@@ -720,6 +780,9 @@ def classify_noise_analysis(stats: dict) -> dict:
             "edge_over_flat": edge,
             "static_fraction": static,
             "static_spatial_hf": static_hf,
+            "row_coherence": row_coherence,
+            "row_periodicity": row_periodicity,
+            "row_period_px": row_period_px,
             "trace_median": float(trace_med),
             "trace_max": float(trace_max),
         },

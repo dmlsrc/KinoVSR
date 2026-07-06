@@ -18,6 +18,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import zlib
 from fractions import Fraction
@@ -57,6 +58,52 @@ DEFAULTS = {
     "crf": 34,
     "gop": 30,
     "preset": "veryfast",
+}
+
+DEFAULT_MODE_PARAMS: dict[str, dict] = {
+    "mild_high_iso": {
+        "sigma": 0.026,
+        "row_sigma": 0.004,
+    },
+    "block_grid": {
+        "block": 8,
+        "qstep": 1.0 / 28.0,
+        "bias_sigma": 0.010,
+        "grid_amp": 0.014,
+    },
+    "jumping_scanlines": {
+        "period": 3,
+        "line_width": 1,
+        "amp": 0.038,
+        "row_jitter": 0.010,
+        "dropout": 0.0,
+    },
+    "gop_pulse_noise": {
+        "pulse_len": 5,
+        "peak_sigma": 0.060,
+        "floor_sigma": 0.005,
+    },
+    "mosquito_edges": {
+        "amp": 0.045,
+        "density": 0.22,
+    },
+    "mixed_analog_h264": {
+        "high_iso_sigma": 0.030,
+        "high_iso_row_sigma": 0.004,
+        "scanline_period": 3,
+        "scanline_line_width": 1,
+        "scanline_amp": 0.032,
+        "scanline_row_jitter": 0.008,
+        "scanline_dropout": 0.0,
+        "pulse_peak_sigma": 0.030,
+        "pulse_floor_sigma": 0.002,
+        "mosquito_amp": 0.032,
+        "mosquito_density": 0.16,
+        "include_block_grid": True,
+        "block_qstep": 1.0 / 32.0,
+        "block_bias_sigma": 0.007,
+        "block_grid_amp": 0.010,
+    },
 }
 
 
@@ -134,13 +181,18 @@ def _add_jumping_scanlines(
     frame_index: int,
     rng: np.random.Generator,
     period: int = 3,
+    line_width: int = 1,
     amp: float = 0.038,
     row_jitter: float = 0.010,
+    dropout: float = 0.0,
 ) -> np.ndarray:
     h = frame.shape[0]
     phase = int((frame_index + rng.integers(0, period * 2)) % period)
     rows = np.arange(h)
-    lines = ((rows + phase) % period == 0).astype(np.float32)[:, None, None]
+    lines_1d = ((rows + phase) % max(1, period) < max(1, line_width))
+    if dropout > 0.0:
+        lines_1d &= rng.random(h) >= float(dropout)
+    lines = lines_1d.astype(np.float32)[:, None, None]
     row_noise = rng.normal(0.0, row_jitter, (h, 1, 1)).astype(np.float32)
     strength = amp * (0.75 + 0.5 * rng.random())
     return _clip(frame - lines * strength + lines * row_noise)
@@ -189,25 +241,61 @@ def _apply_mode(
     frame_index: int,
     rng: np.random.Generator,
     gop: int,
+    params: dict | None = None,
 ) -> np.ndarray:
+    params = params or {}
     if mode == "reencode_only":
         return frame
     if mode == "mild_high_iso":
-        return _add_high_iso(frame, rng)
+        return _add_high_iso(frame, rng, **params)
     if mode == "block_grid":
-        return _add_block_grid(frame, rng)
+        return _add_block_grid(frame, rng, **params)
     if mode == "jumping_scanlines":
-        return _add_jumping_scanlines(frame, frame_index, rng)
+        return _add_jumping_scanlines(frame, frame_index, rng, **params)
     if mode == "gop_pulse_noise":
-        return _add_gop_pulse_noise(frame, frame_index, rng, gop=gop)
+        return _add_gop_pulse_noise(frame, frame_index, rng, gop=gop, **params)
     if mode == "mosquito_edges":
-        return _add_mosquito_edges(frame, rng)
+        return _add_mosquito_edges(frame, rng, **params)
     if mode == "mixed_analog_h264":
-        out = _add_high_iso(frame, rng, sigma=0.030, row_sigma=0.004)
-        out = _add_jumping_scanlines(out, frame_index, rng, period=3, amp=0.032, row_jitter=0.008)
-        out = _add_gop_pulse_noise(out, frame_index, rng, gop=gop, peak_sigma=0.030, floor_sigma=0.002)
-        out = _add_mosquito_edges(out, rng, amp=0.032, density=0.16)
-        return _add_block_grid(out, rng, qstep=1.0 / 32.0, bias_sigma=0.007, grid_amp=0.010)
+        out = _add_high_iso(
+            frame,
+            rng,
+            sigma=float(params.get("high_iso_sigma", 0.030)),
+            row_sigma=float(params.get("high_iso_row_sigma", 0.004)),
+        )
+        out = _add_jumping_scanlines(
+            out,
+            frame_index,
+            rng,
+            period=int(params.get("scanline_period", 3)),
+            line_width=int(params.get("scanline_line_width", 1)),
+            amp=float(params.get("scanline_amp", 0.032)),
+            row_jitter=float(params.get("scanline_row_jitter", 0.008)),
+            dropout=float(params.get("scanline_dropout", 0.0)),
+        )
+        out = _add_gop_pulse_noise(
+            out,
+            frame_index,
+            rng,
+            gop=gop,
+            peak_sigma=float(params.get("pulse_peak_sigma", 0.030)),
+            floor_sigma=float(params.get("pulse_floor_sigma", 0.002)),
+        )
+        out = _add_mosquito_edges(
+            out,
+            rng,
+            amp=float(params.get("mosquito_amp", 0.032)),
+            density=float(params.get("mosquito_density", 0.16)),
+        )
+        if bool(params.get("include_block_grid", True)):
+            out = _add_block_grid(
+                out,
+                rng,
+                qstep=float(params.get("block_qstep", 1.0 / 32.0)),
+                bias_sigma=float(params.get("block_bias_sigma", 0.007)),
+                grid_amp=float(params.get("block_grid_amp", 0.010)),
+            )
+        return out
     raise ValueError(f"unknown mode: {mode}")
 
 
@@ -229,12 +317,22 @@ def _read_frames(source: Path, seconds: float) -> tuple[list[np.ndarray], float]
     return frames, fps
 
 
-def _open_output(path: Path, codec: str, fps: float, width: int, height: int, crf: int, gop: int, preset: str):
+def _open_output(
+    path: Path,
+    codec: str,
+    fps: float,
+    width: int,
+    height: int,
+    crf: int,
+    gop: int,
+    preset: str,
+    pix_fmt: str,
+):
     out = av.open(str(path), "w")
     stream = out.add_stream(codec, rate=_rate_fraction(fps))
     stream.width = width
     stream.height = height
-    stream.pix_fmt = "yuv420p"
+    stream.pix_fmt = pix_fmt
     stream.codec_context.gop_size = gop
     stream.options = {
         "crf": str(crf),
@@ -256,13 +354,15 @@ def _write_clip(
     crf: int,
     gop: int,
     preset: str,
+    pix_fmt: str,
+    mode_params: dict,
 ) -> dict:
     h, w = source_frames[0].shape[:2]
     rng = np.random.default_rng(seed)
-    out, stream = _open_output(path, codec, fps, w, h, crf, gop, preset)
+    out, stream = _open_output(path, codec, fps, w, h, crf, gop, preset, pix_fmt)
     try:
         for idx, src in enumerate(source_frames):
-            rgb = _apply_mode(mode, src, idx, rng, gop)
+            rgb = _apply_mode(mode, src, idx, rng, gop, mode_params)
             frame = av.VideoFrame.from_ndarray((rgb * 255.0 + 0.5).astype(np.uint8), format="rgb24")
             for packet in stream.encode(frame):
                 out.mux(packet)
@@ -278,6 +378,8 @@ def _write_clip(
         "codec": codec,
         "crf": crf,
         "gop": gop,
+        "pix_fmt": pix_fmt,
+        "mode_params": mode_params,
         "fps": fps,
         "width": w,
         "height": h,
@@ -311,7 +413,7 @@ def _resolve_sources(sources: list[str | Path], base_dir: Path | None = None) ->
     existing = [p for p in selected if p.exists()]
     missing = [p for p in selected if not p.exists()]
     for path in missing:
-        print(f"[fixtures] missing source, skipped: {path}")
+        print(f"[fixtures] missing source, skipped: {path}", flush=True)
     if not existing:
         raise SystemExit("no input sources found")
     return existing
@@ -339,6 +441,21 @@ def _normalise_config(args: argparse.Namespace) -> argparse.Namespace:
     merged.gop = int(merged.gop)
     merged.codec = str(merged.codec)
     merged.preset = str(merged.preset)
+    merged.pix_fmt = str(config_get(section, args, "pix_fmt", section.get("pix_fmt", "yuv420p")))
+    merged.mode_params = copy.deepcopy(DEFAULT_MODE_PARAMS)
+    for mode, values in config_section(section, "mode_params").items():
+        if mode not in MODE_ORDER:
+            raise SystemExit(f"unknown fixtures.mode_params entry: {mode}")
+        if not isinstance(values, dict):
+            raise SystemExit(f"fixtures.mode_params.{mode} must be a table/object")
+        merged.mode_params.setdefault(mode, {}).update(values)
+    merged.encode_overrides = {}
+    for mode, values in config_section(section, "encode").items():
+        if mode not in MODE_ORDER:
+            raise SystemExit(f"unknown fixtures.encode entry: {mode}")
+        if not isinstance(values, dict):
+            raise SystemExit(f"fixtures.encode.{mode} must be a table/object")
+        merged.encode_overrides[mode] = values
     merged.overwrite = bool(args.overwrite if args.overwrite is not None else section.get("overwrite", False))
     return merged
 
@@ -354,6 +471,7 @@ def _write_readme(output_dir: Path, manifest: dict) -> None:
         f"- codec: {manifest['codec']}",
         f"- crf: {manifest['crf']}",
         f"- gop: {manifest['gop']}",
+        f"- pix_fmt: {manifest['pix_fmt']}",
         f"- seed: {manifest['seed']}",
         "",
         "Modes:",
@@ -376,8 +494,11 @@ def build_fixtures(args: argparse.Namespace) -> dict:
         "crf": args.crf,
         "gop": args.gop,
         "preset": args.preset,
+        "pix_fmt": args.pix_fmt,
         "seed": args.seed,
         "modes": modes,
+        "mode_params": {mode: args.mode_params.get(mode, {}) for mode in modes},
+        "encode_overrides": args.encode_overrides,
         "sources": [],
         "outputs": [],
     }
@@ -393,13 +514,19 @@ def build_fixtures(args: argparse.Namespace) -> dict:
         }
         manifest["sources"].append(source_entry)
         for mode in modes:
+            enc = args.encode_overrides.get(mode, {})
+            codec = str(enc.get("codec", args.codec))
+            crf = int(enc.get("crf", args.crf))
+            gop = int(enc.get("gop", args.gop))
+            preset = str(enc.get("preset", args.preset))
+            pix_fmt = str(enc.get("pix_fmt", args.pix_fmt))
             mode_seed = _mode_seed(args.seed, source, mode)
-            out_name = f"{source.stem}__{mode}__s{args.seed}_crf{args.crf}.mp4"
+            out_name = f"{source.stem}__{mode}__s{args.seed}_crf{crf}.mp4"
             out_path = output_dir / out_name
             if out_path.exists() and not args.overwrite:
-                print(f"[fixtures] exists, skipped: {out_path}")
+                print(f"[fixtures] exists, skipped: {out_path}", flush=True)
                 continue
-            print(f"[fixtures] {source.name} -> {out_path.name}")
+            print(f"[fixtures] {source.name} -> {out_path.name}", flush=True)
             manifest["outputs"].append(
                 {
                     "source": str(source),
@@ -409,10 +536,12 @@ def build_fixtures(args: argparse.Namespace) -> dict:
                         fps,
                         mode,
                         mode_seed,
-                        args.codec,
-                        args.crf,
-                        args.gop,
-                        args.preset,
+                        codec,
+                        crf,
+                        gop,
+                        preset,
+                        pix_fmt,
+                        args.mode_params.get(mode, {}),
                     ),
                 }
             )
@@ -437,13 +566,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crf", type=int, help="H.264 CRF; larger means more compression")
     parser.add_argument("--gop", type=int, help="GOP/keyframe interval used by encoder and pulse mode")
     parser.add_argument("--preset", help="x264 preset")
+    parser.add_argument("--pix-fmt", help="encoder pixel format, e.g. yuv420p or yuv444p")
     parser.add_argument("--overwrite", action="store_true", default=None, help="regenerate clips that already exist")
     return parser.parse_args()
 
 
 def main() -> int:
     manifest = build_fixtures(_normalise_config(parse_args()))
-    print(f"[fixtures] wrote {len(manifest['outputs'])} clips")
+    print(f"[fixtures] wrote {len(manifest['outputs'])} clips", flush=True)
     return 0
 
 

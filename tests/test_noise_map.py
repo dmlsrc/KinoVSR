@@ -11,6 +11,7 @@ import mlx.core as mx
 from LTX_2_MLX.videotoolbox.noise_map import (
     NoiseMapTracker,
     PulseGain,
+    analyze_noise,
     classify_noise_analysis,
     estimate_sigma_map,
 )
@@ -189,8 +190,6 @@ def test_probe_classifier_flags_dense_motion_ambiguity():
 
 
 def test_probe_classifier_flags_source_wide_motion_contamination():
-    from LTX_2_MLX.videotoolbox.noise_map import analyze_noise
-
     mx.random.seed(301)
     x = mx.random.uniform(shape=(H, W, 1))
     p = mx.concatenate([x[:1], x, x[-1:]], axis=0)
@@ -204,6 +203,22 @@ def test_probe_classifier_flags_source_wide_motion_contamination():
     diag = classify_noise_analysis(analyze_noise(clip))
     assert "source-wide motion contamination" in diag["labels"]
     assert any("motion map" in warning for warning in diag["warnings"])
+
+
+def test_probe_classifier_flags_row_coherent_scanlines():
+    base = _content()
+    ys = mx.arange(H).reshape(H, 1)
+    clip = []
+    for t in range(T):
+        phase = (t * 3) % 11
+        lines = (((ys + phase) % 11) == 0).astype(mx.float32)
+        lines = mx.broadcast_to(lines[:, :, None], (H, W, 3))
+        clip.append(mx.clip(base - 0.035 * lines, 0, 1))
+    stats = analyze_noise(clip)
+    diag = classify_noise_analysis(stats)
+    assert stats["row_periodicity"] > 0.5
+    assert "row-coherent scanline flicker" in diag["labels"]
+    assert any("row" in warning for warning in diag["warnings"])
 
 
 def test_too_few_frames_returns_none():
@@ -390,6 +405,22 @@ def test_pulse_gain_tracks_noise_pulse():
     assert max(gains[24:28]) > 1.5
     # new_segment restarts the chain neutrally
     assert pg.update(base, new_segment=True) == 1.0
+
+
+def test_pulse_gain_ignores_localized_motion():
+    # PulseGain should measure a global quiet-block noise pulse, not subject
+    # motion. A moving square covers too few blocks to move the low quantile.
+    base = _content()
+    yy = mx.arange(H).reshape(H, 1)
+    xx = mx.arange(W).reshape(1, W)
+    pg = PulseGain(lo=0.6, hi=1.8, min_history=8)
+    gains = []
+    for t in range(32):
+        x0 = 4 + 3 * t
+        mask = ((yy >= 42) & (yy < 86) & (xx >= x0) & (xx < x0 + 36))[..., None]
+        frame = mx.where(mask, 0.9, base)
+        gains.append(pg.update(frame))
+    assert max(gains[10:]) < 1.2
 
 
 def test_pulse_gain_neutral_until_history():

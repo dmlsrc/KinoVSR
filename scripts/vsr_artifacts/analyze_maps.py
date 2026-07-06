@@ -158,6 +158,9 @@ def _summarize_probe(windows: list[dict[str, Any]]) -> dict[str, Any]:
         "luma_corr",
         "static_fraction",
         "static_spatial_hf",
+        "row_coherence",
+        "row_periodicity",
+        "row_period_px",
         "sigma_R",
         "sigma_G",
         "sigma_B",
@@ -182,6 +185,8 @@ def _map_assessment(probe: dict[str, Any], sigma: dict[str, Any], blockiness: di
         flags.append("strict sigma map may still be motion-contaminated")
     if strict is not None and "sparse edge flicker" in labels and strict["p95"] < 0.02:
         flags.append("sigma map likely under-conditions sparse edge flicker")
+    if strict is not None and "row-coherent scanline flicker" in labels and strict["p95"] > 0.06:
+        flags.append("row-periodic scanlines may need reduced noise-map gain")
     if "static/structured grain" in labels:
         flags.append("temporal sigma map is blind to some static structure; floor/manual strength matters")
     if blockiness is not None and blockiness["p95"] > 0.90:
