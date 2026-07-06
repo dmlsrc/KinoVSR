@@ -32,6 +32,24 @@ overwrite = false
 # row_jitter = 0.006
 # dropout = 0.25
 #
+# [fixtures.mode_params.mosquito_edges]
+# method = "codec_residual"
+# proxy_codec = "libx264"
+# proxy_crf = 44
+# proxy_preset = "ultrafast"
+# proxy_pix_fmt = "yuv420p"
+# residual_gain = 1.45
+# residual_highpass_radius = 2
+# residual_lowpass_reject = 0.85
+# edge_quantile = 0.88
+# halo_radius = 4
+# core_radius = 0
+# texture_quantile = 0.65
+# texture_radius = 4
+# texture_max = 0.55
+# texture_softness = 0.18
+# mask_blur_radius = 1
+#
 # [fixtures.mode_params.mixed_analog_h264]
 # high_iso_sigma = 0.055
 # high_iso_row_sigma = 0.010
@@ -42,8 +60,22 @@ overwrite = false
 # scanline_dropout = 0.35
 # pulse_peak_sigma = 0.020
 # pulse_floor_sigma = 0.002
-# mosquito_amp = 0.020
-# mosquito_density = 0.10
+# mosquito_method = "codec_residual"
+# mosquito_proxy_codec = "libx264"
+# mosquito_proxy_crf = 42
+# mosquito_proxy_preset = "ultrafast"
+# mosquito_proxy_pix_fmt = "yuv420p"
+# mosquito_residual_gain = 1.20
+# mosquito_residual_highpass_radius = 2
+# mosquito_residual_lowpass_reject = 0.85
+# mosquito_edge_quantile = 0.88
+# mosquito_halo_radius = 4
+# mosquito_core_radius = 0
+# mosquito_texture_quantile = 0.65
+# mosquito_texture_radius = 4
+# mosquito_texture_max = 0.55
+# mosquito_texture_softness = 0.18
+# mosquito_mask_blur_radius = 1
 # include_block_grid = false
 #
 # [fixtures.encode.mild_high_iso]

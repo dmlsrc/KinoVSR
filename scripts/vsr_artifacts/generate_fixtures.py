@@ -25,6 +25,7 @@ from fractions import Fraction
 from pathlib import Path
 
 import av
+import cv2
 import numpy as np
 
 from config import config_get, config_section, listify, load_config, resolve_path
@@ -46,8 +47,8 @@ MODE_NOTES = {
     "block_grid": "8x8-ish quantization, block bias, and explicit grid edges",
     "jumping_scanlines": "horizontal line darkening/noise with frame-to-frame phase jumps",
     "gop_pulse_noise": "noise bursts at the start of each GOP-sized interval",
-    "mosquito_edges": "sparse high-frequency flicker near detected edges",
-    "mixed_analog_h264": "high ISO noise, jumping scanlines, GOP pulses, edge flicker, and block structure",
+    "mosquito_edges": "codec-derived compression residuals masked into thin edge halos",
+    "mixed_analog_h264": "high ISO noise, jumping scanlines, GOP pulses, codec mosquito halos, and block structure",
 }
 
 DEFAULTS = {
@@ -84,8 +85,23 @@ DEFAULT_MODE_PARAMS: dict[str, dict] = {
         "floor_sigma": 0.005,
     },
     "mosquito_edges": {
-        "amp": 0.045,
-        "density": 0.22,
+        "method": "codec_residual",
+        "proxy_codec": "libx264",
+        "proxy_crf": 44,
+        "proxy_preset": "ultrafast",
+        "proxy_pix_fmt": "yuv420p",
+        "residual_gain": 1.45,
+        "residual_highpass_radius": 2,
+        "residual_lowpass_reject": 0.85,
+        "edge_quantile": 0.88,
+        "halo_radius": 4,
+        "core_radius": 0,
+        "texture_quantile": 0.65,
+        "texture_radius": 4,
+        "texture_max": 0.55,
+        "texture_softness": 0.18,
+        "mask_blur_radius": 1,
+        "keep_proxy": False,
     },
     "mixed_analog_h264": {
         "high_iso_sigma": 0.030,
@@ -97,8 +113,23 @@ DEFAULT_MODE_PARAMS: dict[str, dict] = {
         "scanline_dropout": 0.0,
         "pulse_peak_sigma": 0.030,
         "pulse_floor_sigma": 0.002,
-        "mosquito_amp": 0.032,
-        "mosquito_density": 0.16,
+        "mosquito_method": "codec_residual",
+        "mosquito_proxy_codec": "libx264",
+        "mosquito_proxy_crf": 42,
+        "mosquito_proxy_preset": "ultrafast",
+        "mosquito_proxy_pix_fmt": "yuv420p",
+        "mosquito_residual_gain": 1.20,
+        "mosquito_residual_highpass_radius": 2,
+        "mosquito_residual_lowpass_reject": 0.85,
+        "mosquito_edge_quantile": 0.88,
+        "mosquito_halo_radius": 4,
+        "mosquito_core_radius": 0,
+        "mosquito_texture_quantile": 0.65,
+        "mosquito_texture_radius": 4,
+        "mosquito_texture_max": 0.55,
+        "mosquito_texture_softness": 0.18,
+        "mosquito_mask_blur_radius": 1,
+        "mosquito_keep_proxy": False,
         "include_block_grid": True,
         "block_qstep": 1.0 / 32.0,
         "block_bias_sigma": 0.007,
@@ -133,12 +164,91 @@ def _repeat_blocks(values: np.ndarray, height: int, width: int, block: int) -> n
     return np.repeat(np.repeat(values, block, axis=0), block, axis=1)[:height, :width]
 
 
-def _dilate_mask(mask: np.ndarray) -> np.ndarray:
-    out = mask.copy()
-    out[:-1, :] |= mask[1:, :]
-    out[1:, :] |= mask[:-1, :]
-    out[:, :-1] |= mask[:, 1:]
-    out[:, 1:] |= mask[:, :-1]
+def _dilate_mask(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
+    iterations = max(0, int(iterations))
+    if iterations == 0:
+        return mask.copy()
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    return cv2.dilate(mask.astype(np.uint8), kernel, iterations=iterations).astype(bool)
+
+
+def _box_blur2d(x: np.ndarray, radius: int) -> np.ndarray:
+    """Small OpenCV box blur for local edge-density estimates."""
+    radius = max(0, int(radius))
+    if radius == 0:
+        return x
+    k = 2 * radius + 1
+    return cv2.blur(x.astype(np.float32, copy=False), (k, k), borderType=cv2.BORDER_REPLICATE)
+
+
+def _box_blur_rgb(x: np.ndarray, radius: int) -> np.ndarray:
+    radius = max(0, int(radius))
+    if radius == 0:
+        return x
+    k = 2 * radius + 1
+    return cv2.blur(x.astype(np.float32, copy=False), (k, k), borderType=cv2.BORDER_REPLICATE)
+
+
+def _edge_magnitude(frame: np.ndarray) -> np.ndarray:
+    y = _luma(frame).astype(np.float32, copy=False)
+    gx = cv2.Sobel(y, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(y, cv2.CV_32F, 0, 1, ksize=3)
+    return np.abs(gx) + np.abs(gy)
+
+
+def _edge_halo_mask(
+    frame: np.ndarray,
+    edge_quantile: float = 0.88,
+    halo_radius: int = 4,
+    core_radius: int = 0,
+    texture_quantile: float = 0.65,
+    texture_radius: int = 4,
+    texture_max: float = 0.55,
+    texture_softness: float = 0.18,
+    mask_blur_radius: int = 1,
+) -> np.ndarray:
+    edge = _edge_magnitude(frame)
+    if not np.any(edge):
+        return np.zeros(edge.shape, dtype=np.float32)
+    edge_threshold = float(np.quantile(edge, float(edge_quantile)))
+    texture_threshold = float(np.quantile(edge, float(texture_quantile)))
+    core = edge >= edge_threshold
+    texture = _box_blur2d((edge >= texture_threshold).astype(np.float32), texture_radius)
+    structural = core & (texture <= float(texture_max))
+    halo = _dilate_mask(structural, halo_radius)
+    if core_radius >= 0:
+        halo &= ~_dilate_mask(structural, core_radius)
+    softness = max(float(texture_softness), 1e-6)
+    texture_gate = np.clip((float(texture_max) + softness - texture) / softness, 0.0, 1.0)
+    edge_strength = _box_blur2d(edge, max(1, min(int(halo_radius), 4)))
+    edge_scale = np.clip(edge_strength / (np.quantile(edge_strength, 0.97) + 1e-6), 0.0, 1.0)
+    mask = halo.astype(np.float32) * texture_gate * (0.50 + 0.75 * edge_scale)
+    if mask_blur_radius > 0:
+        mask = _box_blur2d(mask, mask_blur_radius)
+    return np.clip(mask, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _highpass_residual(
+    residual: np.ndarray,
+    radius: int = 2,
+    lowpass_reject: float = 0.85,
+) -> np.ndarray:
+    if radius <= 0 or lowpass_reject <= 0.0:
+        return residual
+    return residual - _box_blur_rgb(residual, radius) * float(lowpass_reject)
+
+
+def _require_codec_residual_method(params: dict, mode: str) -> None:
+    method = str(params.get("method", "codec_residual")).strip().lower().replace("-", "_")
+    if method != "codec_residual":
+        raise ValueError(f"{mode} only supports method='codec_residual', got {method!r}")
+
+
+def _strip_mosquito_prefix(params: dict) -> dict:
+    out = {}
+    for key, value in params.items():
+        if key.startswith("mosquito_"):
+            out[key.removeprefix("mosquito_")] = value
     return out
 
 
@@ -215,26 +325,6 @@ def _add_gop_pulse_noise(
     return _add_high_iso(frame, rng, sigma=sigma, row_sigma=0.0015)
 
 
-def _add_mosquito_edges(
-    frame: np.ndarray,
-    rng: np.random.Generator,
-    amp: float = 0.045,
-    density: float = 0.22,
-) -> np.ndarray:
-    y = _luma(frame)
-    gx = np.zeros_like(y)
-    gy = np.zeros_like(y)
-    gx[:, 1:] = np.abs(y[:, 1:] - y[:, :-1])
-    gy[1:, :] = np.abs(y[1:, :] - y[:-1, :])
-    edge = gx + gy
-    threshold = float(np.quantile(edge, 0.82)) if np.any(edge) else 1.0
-    mask = _dilate_mask(edge >= threshold)[..., None]
-    sparse = (rng.random(frame.shape[:2] + (1,)) < density).astype(np.float32)
-    sign = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=frame.shape)
-    chroma = np.array([1.0, 0.85, 0.85], dtype=np.float32)
-    return _clip(frame + mask.astype(np.float32) * sparse * sign * amp * chroma)
-
-
 def _apply_mode(
     mode: str,
     frame: np.ndarray,
@@ -254,48 +344,8 @@ def _apply_mode(
         return _add_jumping_scanlines(frame, frame_index, rng, **params)
     if mode == "gop_pulse_noise":
         return _add_gop_pulse_noise(frame, frame_index, rng, gop=gop, **params)
-    if mode == "mosquito_edges":
-        return _add_mosquito_edges(frame, rng, **params)
-    if mode == "mixed_analog_h264":
-        out = _add_high_iso(
-            frame,
-            rng,
-            sigma=float(params.get("high_iso_sigma", 0.030)),
-            row_sigma=float(params.get("high_iso_row_sigma", 0.004)),
-        )
-        out = _add_jumping_scanlines(
-            out,
-            frame_index,
-            rng,
-            period=int(params.get("scanline_period", 3)),
-            line_width=int(params.get("scanline_line_width", 1)),
-            amp=float(params.get("scanline_amp", 0.032)),
-            row_jitter=float(params.get("scanline_row_jitter", 0.008)),
-            dropout=float(params.get("scanline_dropout", 0.0)),
-        )
-        out = _add_gop_pulse_noise(
-            out,
-            frame_index,
-            rng,
-            gop=gop,
-            peak_sigma=float(params.get("pulse_peak_sigma", 0.030)),
-            floor_sigma=float(params.get("pulse_floor_sigma", 0.002)),
-        )
-        out = _add_mosquito_edges(
-            out,
-            rng,
-            amp=float(params.get("mosquito_amp", 0.032)),
-            density=float(params.get("mosquito_density", 0.16)),
-        )
-        if bool(params.get("include_block_grid", True)):
-            out = _add_block_grid(
-                out,
-                rng,
-                qstep=float(params.get("block_qstep", 1.0 / 32.0)),
-                bias_sigma=float(params.get("block_bias_sigma", 0.007)),
-                grid_amp=float(params.get("block_grid_amp", 0.010)),
-            )
-        return out
+    if mode in {"mosquito_edges", "mixed_analog_h264"}:
+        raise RuntimeError(f"{mode} needs the full frame sequence")
     raise ValueError(f"unknown mode: {mode}")
 
 
@@ -344,6 +394,159 @@ def _open_output(
     return out, stream
 
 
+def _encode_frames(
+    path: Path,
+    frames: list[np.ndarray],
+    fps: float,
+    codec: str,
+    crf: int,
+    gop: int,
+    preset: str,
+    pix_fmt: str,
+) -> None:
+    h, w = frames[0].shape[:2]
+    out, stream = _open_output(path, codec, fps, w, h, crf, gop, preset, pix_fmt)
+    try:
+        for rgb in frames:
+            frame = av.VideoFrame.from_ndarray((rgb * 255.0 + 0.5).astype(np.uint8), format="rgb24")
+            for packet in stream.encode(frame):
+                out.mux(packet)
+        for packet in stream.encode():
+            out.mux(packet)
+    finally:
+        out.close()
+
+
+def _decode_clip_frames(path: Path, expected_frames: int) -> list[np.ndarray]:
+    frames: list[np.ndarray] = []
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        for frame in container.decode(stream):
+            frames.append(frame.to_ndarray(format="rgb24").astype(np.float32) * (1.0 / 255.0))
+            if len(frames) >= expected_frames:
+                break
+    if len(frames) < expected_frames:
+        raise RuntimeError(f"decoded {len(frames)} frames from {path}, expected {expected_frames}")
+    return frames[:expected_frames]
+
+
+def _codec_residual_mosquito_frames(
+    base_frames: list[np.ndarray],
+    fps: float,
+    gop: int,
+    seed: int,
+    output_path: Path,
+    params: dict,
+) -> tuple[list[np.ndarray], dict]:
+    proxy_codec = str(params.get("proxy_codec", "libx264"))
+    proxy_crf = int(params.get("proxy_crf", 44))
+    proxy_gop = int(params.get("proxy_gop", gop))
+    proxy_preset = str(params.get("proxy_preset", "ultrafast"))
+    proxy_pix_fmt = str(params.get("proxy_pix_fmt", "yuv420p"))
+    residual_gain = float(params.get("residual_gain", 1.45))
+    highpass_radius = int(params.get("residual_highpass_radius", 2))
+    lowpass_reject = float(params.get("residual_lowpass_reject", 0.85))
+    keep_proxy = bool(params.get("keep_proxy", False))
+    scratch_dir = output_path.parent / ".codec_residual_scratch"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    proxy_path = scratch_dir / f"{output_path.stem}__proxy_s{seed}_crf{proxy_crf}.mp4"
+    info = {
+        "mosquito_method": "codec_residual",
+        "proxy_codec": proxy_codec,
+        "proxy_crf": proxy_crf,
+        "proxy_gop": proxy_gop,
+        "proxy_preset": proxy_preset,
+        "proxy_pix_fmt": proxy_pix_fmt,
+        "residual_gain": residual_gain,
+        "residual_highpass_radius": highpass_radius,
+        "residual_lowpass_reject": lowpass_reject,
+    }
+    try:
+        _encode_frames(proxy_path, base_frames, fps, proxy_codec, proxy_crf, proxy_gop, proxy_preset, proxy_pix_fmt)
+        proxy_frames = _decode_clip_frames(proxy_path, len(base_frames))
+    finally:
+        if keep_proxy:
+            info["proxy_path"] = str(proxy_path)
+        else:
+            proxy_path.unlink(missing_ok=True)
+            try:
+                scratch_dir.rmdir()
+            except OSError:
+                pass
+
+    rendered: list[np.ndarray] = []
+    for base, proxy in zip(base_frames, proxy_frames, strict=True):
+        if proxy.shape != base.shape:
+            proxy = proxy[: base.shape[0], : base.shape[1], :]
+        residual = _highpass_residual(proxy - base, highpass_radius, lowpass_reject)
+        mask = _edge_halo_mask(
+            base,
+            edge_quantile=float(params.get("edge_quantile", 0.88)),
+            halo_radius=int(params.get("halo_radius", 4)),
+            core_radius=int(params.get("core_radius", 0)),
+            texture_quantile=float(params.get("texture_quantile", 0.65)),
+            texture_radius=int(params.get("texture_radius", 4)),
+            texture_max=float(params.get("texture_max", 0.55)),
+            texture_softness=float(params.get("texture_softness", 0.18)),
+            mask_blur_radius=int(params.get("mask_blur_radius", 1)),
+        )
+        rendered.append(_clip(base + residual * residual_gain * mask[..., None]))
+    return rendered, info
+
+
+def _mixed_analog_base_frames(
+    source_frames: list[np.ndarray],
+    rng: np.random.Generator,
+    gop: int,
+    params: dict,
+) -> list[np.ndarray]:
+    rendered: list[np.ndarray] = []
+    for idx, frame in enumerate(source_frames):
+        out = _add_high_iso(
+            frame,
+            rng,
+            sigma=float(params.get("high_iso_sigma", 0.030)),
+            row_sigma=float(params.get("high_iso_row_sigma", 0.004)),
+        )
+        out = _add_jumping_scanlines(
+            out,
+            idx,
+            rng,
+            period=int(params.get("scanline_period", 3)),
+            line_width=int(params.get("scanline_line_width", 1)),
+            amp=float(params.get("scanline_amp", 0.032)),
+            row_jitter=float(params.get("scanline_row_jitter", 0.008)),
+            dropout=float(params.get("scanline_dropout", 0.0)),
+        )
+        out = _add_gop_pulse_noise(
+            out,
+            idx,
+            rng,
+            gop=gop,
+            peak_sigma=float(params.get("pulse_peak_sigma", 0.030)),
+            floor_sigma=float(params.get("pulse_floor_sigma", 0.002)),
+        )
+        rendered.append(out)
+    return rendered
+
+
+def _apply_block_grid_frames(
+    frames: list[np.ndarray],
+    rng: np.random.Generator,
+    params: dict,
+) -> list[np.ndarray]:
+    return [
+        _add_block_grid(
+            frame,
+            rng,
+            qstep=float(params.get("block_qstep", 1.0 / 32.0)),
+            bias_sigma=float(params.get("block_bias_sigma", 0.007)),
+            grid_amp=float(params.get("block_grid_amp", 0.010)),
+        )
+        for frame in frames
+    ]
+
+
 def _write_clip(
     path: Path,
     source_frames: list[np.ndarray],
@@ -359,17 +562,20 @@ def _write_clip(
 ) -> dict:
     h, w = source_frames[0].shape[:2]
     rng = np.random.default_rng(seed)
-    out, stream = _open_output(path, codec, fps, w, h, crf, gop, preset, pix_fmt)
-    try:
-        for idx, src in enumerate(source_frames):
-            rgb = _apply_mode(mode, src, idx, rng, gop, mode_params)
-            frame = av.VideoFrame.from_ndarray((rgb * 255.0 + 0.5).astype(np.uint8), format="rgb24")
-            for packet in stream.encode(frame):
-                out.mux(packet)
-        for packet in stream.encode():
-            out.mux(packet)
-    finally:
-        out.close()
+    extra: dict = {}
+    if mode == "mosquito_edges":
+        _require_codec_residual_method(mode_params, mode)
+        rendered, extra = _codec_residual_mosquito_frames(source_frames, fps, gop, seed, path, mode_params)
+    elif mode == "mixed_analog_h264":
+        rendered = _mixed_analog_base_frames(source_frames, rng, gop, mode_params)
+        mosquito_params = _strip_mosquito_prefix(mode_params)
+        _require_codec_residual_method(mosquito_params, mode)
+        rendered, extra = _codec_residual_mosquito_frames(rendered, fps, gop, seed, path, mosquito_params)
+        if bool(mode_params.get("include_block_grid", True)):
+            rendered = _apply_block_grid_frames(rendered, rng, mode_params)
+    else:
+        rendered = [_apply_mode(mode, src, idx, rng, gop, mode_params) for idx, src in enumerate(source_frames)]
+    _encode_frames(path, rendered, fps, codec, crf, gop, preset, pix_fmt)
     return {
         "path": str(path),
         "mode": mode,
@@ -384,6 +590,7 @@ def _write_clip(
         "width": w,
         "height": h,
         "frames": len(source_frames),
+        **extra,
     }
 
 
