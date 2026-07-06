@@ -376,6 +376,7 @@ def estimate_blockiness_map(
     tile: int = 32,
     max_frames: int = 6,
     severity_scale: float = 0.006,
+    global_floor: float = 0.35,
     smooth: bool = True,
 ) -> Any | None:
     """Estimate a per-pixel blockiness mask in [0, 1] from a window of frames.
@@ -392,6 +393,8 @@ def estimate_blockiness_map(
     excess (luma units) mapped to mask 1.0; the default is calibrated so
     loop-filtered modern H.264 blocking lands mid-scale and old-encoder /
     hard DCT grids saturate.
+    `global_floor` is the maximum wetness kept for frame-wide saturated grids;
+    only local excess above that frame baseline can remain fully wet.
 
     Returns (H,W,1) fp32 in [0,1], or None for an empty frame list.
     """
@@ -456,6 +459,20 @@ def estimate_blockiness_map(
     if smooth:
         full = _box_blur_full(full, tile + 1)
     mask = mx.clip(full / severity_scale, 0.0, 1.0)
+    # If much of the frame already carries grid evidence, an absolute mask can
+    # quietly become "full-strength deblock everywhere" (the auto path's default
+    # strength is 1.0). Keep a moderate global correction, but reserve full wet
+    # values for regions that stand above the frame's own blockiness baseline.
+    flat = mx.sort(mask.reshape(-1))
+    nf = int(flat.shape[0])
+    p25 = float(flat[int(0.25 * (nf - 1))])
+    p50 = float(flat[nf // 2])
+    p95 = float(flat[int(0.95 * (nf - 1))])
+    area = float(mx.mean((mask > 0.5).astype(mx.float32)))
+    if p95 > 0.90 and area > 0.30 and p25 > 0.20:
+        local_excess = mx.clip((mask - p50) / max(1.0 - p50, 1e-6), 0.0, 1.0)
+        tempered = float(global_floor) + (1.0 - float(global_floor)) * local_excess
+        mask = mx.minimum(mask, tempered)
     return mask[:, :, None].astype(mx.float32)
 
 

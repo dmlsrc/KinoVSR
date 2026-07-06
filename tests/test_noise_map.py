@@ -331,6 +331,23 @@ def test_blockiness_grid_phase_offset_detected():
     assert float(mid[mid.shape[0] // 2]) > 0.3
 
 
+def test_blockiness_global_saturation_is_tempered():
+    from LTX_2_MLX.videotoolbox.noise_map import estimate_blockiness_map
+    mx.random.seed(13)
+    base = _bcontent()
+    blocked = _blockify(base)
+    frames = [mx.clip(blocked + 0.004 * mx.random.normal(shape=blocked.shape), 0, 1)
+              for _ in range(3)]
+    m = estimate_blockiness_map(frames)
+    flat = mx.sort(m[:, :, 0].reshape(-1))
+    med = float(flat[flat.shape[0] // 2])
+    p95 = float(flat[int(0.95 * (flat.shape[0] - 1))])
+    # Whole-frame blocking should not become a silent "strength 1 everywhere"
+    # mask; reserve high wetness for local excess above the frame baseline.
+    assert 0.25 < med < 0.75
+    assert p95 < 0.75
+
+
 def test_pulse_gain_tracks_noise_pulse():
     # settled sigma 0.03; frames 24-27 carry sigma 0.09 (an I-frame grain
     # refresh). Settled gains ~1.0; pulse frames must rise and clamp at hi.
