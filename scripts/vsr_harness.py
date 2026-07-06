@@ -1127,16 +1127,34 @@ def run(args: argparse.Namespace) -> None:
             den = LumaChromaDenoiser(den, args.denoise_luma_strength,
                                      args.denoise_chroma_strength, kr=kr, kb=kb)
 
+        # --deblock-map auto: a per-pixel blockiness mask (grid-phase detected,
+        # boundary-vs-interior contrast) gating the deblocker's correction, so
+        # blocked flats get the full correction and detailed/clean areas keep
+        # their texture.
+        blk_tracker: Any = None
+        if args.deblock_map == "auto":
+            if args.deblock in ("stdf", "fbcnn"):
+                from LTX_2_MLX.videotoolbox.noise_map import (
+                    NoiseMapTracker, estimate_blockiness_map)
+                blk_tracker = NoiseMapTracker(gain=args.deblock_map_gain, min_frames=1,
+                                              estimator=estimate_blockiness_map)
+                print(f"[deblock-map] auto: per-pixel blockiness mask on the "
+                      f"correction (gain {args.deblock_map_gain:g})")
+            elif args.deblock != "off":
+                print(f"[deblock-map] auto ignored: --deblock {args.deblock} unsupported")
+
         deb: Any = None
         if args.deblock == "stdf":
             from LTX_2_MLX.videotoolbox.stdf.deblocker import StdfDeblocker
             kr, kb = _yuv.coef_for_matrix(_resolved_color[2])    # match the source color matrix
             deb = StdfDeblocker(args.deblock_weights or os.environ.get("STDF_WEIGHTS"),
-                                strength=args.deblock_strength, kr=kr, kb=kb)
+                                strength=args.deblock_strength, kr=kr, kb=kb,
+                                blockiness_map=blk_tracker)
         elif args.deblock == "fbcnn":
             from LTX_2_MLX.videotoolbox.fbcnn import FbcnnDeblocker
             deb = FbcnnDeblocker(args.deblock_weights or os.environ.get("FBCNN_WEIGHTS"),
-                                 quality=args.fbcnn_quality, strength=args.fbcnn_strength)
+                                 quality=args.fbcnn_quality, strength=args.fbcnn_strength,
+                                 blockiness_map=blk_tracker)
 
         up: Any = None
         if args.spatial_mode == "basicvsrpp":
@@ -1675,6 +1693,21 @@ def run(args: argparse.Namespace) -> None:
             session.close()
         if denoiser is not None:
             denoiser.close()
+        if deblocker is not None and args.deblock_map == "auto":
+            _bm = getattr(deblocker, "last_blockiness_map", None)
+            if _bm is not None:
+                _s = mx.sort(_bm.reshape(-1))
+                _n = _s.shape[0]
+                print(f"[deblock-map] blockiness mask: median {float(_s[_n // 2]):.3f}  "
+                      f"p95 {float(_s[int(0.95 * (_n - 1))]):.3f}  max {float(_s[-1]):.3f}  "
+                      f"({float(mx.mean((_bm > 0.5).astype(mx.float32))) * 100:.0f}% of frame > 0.5)")
+                if args.noise_map_debug and post_writer is not None:
+                    from LTX_2_MLX.videotoolbox.images import save_image
+                    _vp = Path(post_writer.path)
+                    _png = _vp.with_name(_vp.stem + "_blockmap.png")
+                    _u8 = (mx.clip(_bm[:, :, 0], 0, 1) * 255).astype(mx.uint8)
+                    save_image(mx.stack([_u8, _u8, _u8], axis=-1), _png)
+                    print(f"[deblock-map] mask written: {_png}")
         if denoiser is not None and args.noise_map_pulse:
             _pl = getattr(denoiser, "_pulse_log", None)
             if _pl is None:
@@ -2431,6 +2464,25 @@ def main() -> None:
             "frames, EMA-blended so it adapts without pumping (default 64; 0 = "
             "estimate once from the first frames and hold). Windowed modes "
             "(--gop-align, pvdd) re-estimate per window and ignore this."
+        ),
+    )
+    parser.add_argument(
+        "--deblock-map", choices=["constant", "auto"], default="constant",
+        help=(
+            "Spatial gating for --deblock stdf/fbcnn. constant (default) = the "
+            "correction applies everywhere at --deblock-strength. auto = estimate a "
+            "per-pixel blockiness mask from the footage (coding-grid phase detection "
+            "+ boundary-vs-interior gradient contrast; texture and 1D content edges "
+            "reject) and gate the correction by it -- blocked flats get the full "
+            "deblock, detailed/clean areas keep their texture."
+        ),
+    )
+    parser.add_argument(
+        "--deblock-map-gain", type=float, default=1.0, metavar="G",
+        help=(
+            "Multiplier on the auto blockiness mask (default 1.0). >1 saturates the "
+            "mask sooner (more area fully deblocked); <1 is more conservative. Only "
+            "used with --deblock-map auto."
         ),
     )
     parser.add_argument(

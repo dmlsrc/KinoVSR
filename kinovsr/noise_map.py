@@ -183,7 +183,7 @@ class NoiseMapTracker:
     """
 
     def __init__(self, gain: float = 1.0, ema: float = 0.5, min_frames: int = 8,
-                 **est_kwargs):
+                 estimator: Any = None, **est_kwargs):
         if gain <= 0:
             raise ValueError(f"noise-map gain must be > 0; got {gain}")
         if not (0.0 < ema <= 1.0):
@@ -192,8 +192,12 @@ class NoiseMapTracker:
         self.ema = float(ema)
         # windows shorter than this give high-variance estimates (a 6-frame
         # gop-align tail can read near zero); once a map exists, such windows
-        # reuse it instead of updating.
-        self.min_frames = max(2, int(min_frames))
+        # reuse it instead of updating. (For purely spatial estimators like
+        # blockiness, pass min_frames=1.)
+        self.min_frames = max(1, int(min_frames))
+        # the map producer; defaults to the noise-sigma estimator. Pass
+        # estimate_blockiness_map to track a deblocker mask instead.
+        self.estimator = estimator or estimate_sigma_map
         self.est_kwargs = est_kwargs
         self._map: Any | None = None    # pre-gain EMA state
 
@@ -203,7 +207,7 @@ class NoiseMapTracker:
     def update(self, frames: list) -> Any | None:
         if self._map is not None and len(frames) < self.min_frames:
             return self.current()
-        est = estimate_sigma_map(frames, **self.est_kwargs)
+        est = self.estimator(frames, **self.est_kwargs)
         if est is None:
             return self.current()
         if self._map is None or self._map.shape != est.shape:
@@ -216,6 +220,107 @@ class NoiseMapTracker:
         if self._map is None:
             return None
         return self._map * self.gain
+
+
+def _grid_phase(g: Any, period: int = 8) -> tuple[int, bool]:
+    """Detect the coding-grid phase along an axis from gradient energy.
+
+    g: (H, Wg) absolute gradients along the axis (Wg = W-1 for columns). Returns
+    (phase, found). A real coding grid elevates exactly ONE phase; periodic
+    texture whose period divides the grid (e.g. a 2px checker) elevates several
+    phases equally and aliases into any phase test, so the grid counts as found
+    only when the winner's margin over the runner-up is decisive (unimodal).
+    """
+    n = int(g.shape[1]) // period * period
+    if n < period:
+        return 0, False
+    m = mx.mean(g[:, :n].reshape(g.shape[0], n // period, period), axis=(0, 1))  # (period,)
+    vals = [float(v) for v in m.tolist()]
+    order = sorted(range(period), key=lambda i: -vals[i])
+    top1, top2 = vals[order[0]], vals[order[1]]
+    found = top1 > 1e-6 and (top1 - top2) > 0.10 * top1
+    return order[0], found
+
+
+def estimate_blockiness_map(
+    frames: list,
+    period: int = 8,
+    tile: int = 32,
+    max_frames: int = 6,
+    severity_scale: float = 0.03,
+    smooth: bool = True,
+) -> Any | None:
+    """Estimate a per-pixel blockiness mask in [0, 1] from a window of frames.
+
+    Blocking is a purely spatial artifact, so unlike the noise-sigma estimator
+    this needs no adjacent frames -- it samples up to max_frames spread across
+    the window. Per axis, the coding-grid phase is detected globally from
+    gradient energy (period-8 grids; period-16 boundaries are a subset), then
+    each tile scores the mean gradient ON grid boundaries minus the mean OFF
+    them -- content texture raises both and cancels, so only grid-aligned
+    discontinuities register. The two axes combine by geometric mean, so a real
+    vertical or horizontal content edge (one axis only) scores zero; DCT
+    blocking (always a 2D grid) survives. `severity_scale` is the boundary
+    excess (luma units) mapped to mask 1.0.
+
+    Returns (H,W,1) fp32 in [0,1], or None for an empty frame list.
+    """
+    if not frames:
+        return None
+    n = len(frames)
+    take = list(range(n)) if n <= max_frames else \
+        sorted({round(i * (n - 1) / (max_frames - 1)) for i in range(max_frames)})
+    lum = [_to_luma_2d(frames[i]) for i in take]
+    H, W = int(lum[0].shape[0]), int(lum[0].shape[1])
+    y = mx.stack(lum, axis=0)                                   # (K,H,W)
+
+    gv = mx.mean(mx.abs(y[:, :, 1:] - y[:, :, :-1]), axis=0)    # (H, W-1) col grads
+    gh = mx.mean(mx.abs(y[:, 1:, :] - y[:, :-1, :]), axis=0)    # (H-1, W) row grads
+    px, fx = _grid_phase(gv, period)
+    py, fy = _grid_phase(mx.transpose(gh, (1, 0)), period)
+    if not (fx and fy):
+        # no decisive 2D coding grid anywhere -> nothing to deblock
+        return mx.zeros((H, W, 1), dtype=mx.float32)
+
+    def _tile_excess(g: Any, phase: int, transpose: bool) -> Any:
+        """Per-tile min-over-boundary-lines minus interior mean, >= 0.
+
+        Blocking elevates EVERY grid line crossing a tile; a content edge that
+        happens to sit on the grid elevates one. Taking the minimum across the
+        tile's boundary lines keeps the former and rejects the latter.
+        """
+        if transpose:
+            g = mx.transpose(g, (1, 0))
+        h, w = int(g.shape[0]), int(g.shape[1])
+        ph, pw = (-h) % tile, (-w) % tile
+        g = _edge_pad_hw(g, ph, pw)
+        hp, wp = h + ph, w + pw
+        gt = g.reshape(hp // tile, tile, wp // tile, tile)      # (ht,tr,wt,tc)
+        lines = [gt[:, :, :, phase + k * period]
+                 for k in range(max(1, (tile - phase) // period))
+                 if phase + k * period < tile]
+        line_means = mx.stack([mx.mean(l, axis=1) for l in lines], axis=0)  # (L,ht,wt)
+        bmin = mx.min(line_means, axis=0)                       # (ht,wt)
+        idx = mx.arange(tile)
+        imask = ((idx % period) != phase).astype(mx.float32).reshape(1, 1, 1, tile)
+        isum = mx.sum(gt * imask, axis=(1, 3))
+        icnt = mx.sum(mx.broadcast_to(imask, gt.shape), axis=(1, 3))
+        ex = mx.maximum(bmin - isum / mx.maximum(icnt, 1.0), 0.0)
+        return mx.transpose(ex, (1, 0)) if transpose else ex
+
+    bv = _tile_excess(gv, px, transpose=False)                  # (ht, wt-ish)
+    bh = _tile_excess(gh, py, transpose=True)
+    # tile grids can differ by one when (W-1) vs W pad differently; crop to match
+    th = min(int(bv.shape[0]), int(bh.shape[0]))
+    tw = min(int(bv.shape[1]), int(bh.shape[1]))
+    b = mx.sqrt(bv[:th, :tw] * bh[:th, :tw])                    # 2D-grid evidence only
+    if smooth:
+        b = _box_smooth_coarse(b)
+    full = mx.repeat(mx.repeat(b, tile, axis=0), tile, axis=1)[:H, :W]
+    if smooth:
+        full = _box_blur_full(full, tile + 1)
+    mask = mx.clip(full / severity_scale, 0.0, 1.0)
+    return mask[:, :, None].astype(mx.float32)
 
 
 class PulseGain:
@@ -277,4 +382,5 @@ class PulseGain:
         return self.last
 
 
-__all__ = ["estimate_sigma_map", "NoiseMapTracker", "PulseGain"]
+__all__ = ["estimate_sigma_map", "estimate_blockiness_map", "NoiseMapTracker",
+           "PulseGain"]

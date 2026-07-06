@@ -153,6 +153,73 @@ def test_long_window_sampling_sees_late_noise():
     assert med_s > med_h * 1.5                     # spread sampling is not
 
 
+# blockiness tests run at the validated geometry (32px tiles need room; the
+# estimator is meant for real frame sizes, not tiny buffers)
+_BH, _BW = 256, 384
+
+
+def _bcontent():
+    ys = mx.linspace(0, 1, _BH).reshape(_BH, 1)
+    xs = mx.linspace(0, 1, _BW).reshape(1, _BW)
+    img = (0.4 + 0.25 * mx.sin(5 * math.pi * xs) * mx.cos(4 * math.pi * ys)
+           + 0.2 * ys + 0.05 * mx.sin(23 * math.pi * xs))
+    return mx.clip(mx.broadcast_to(img[..., None], (_BH, _BW, 3)), 0, 1)
+
+
+def _blockify(img, size=8):
+    h, w, c = img.shape
+    hb, wb = h // size * size, w // size * size
+    core = img[:hb, :wb].reshape(hb // size, size, wb // size, size, c)
+    m = mx.mean(core, axis=(1, 3), keepdims=True)
+    core = mx.broadcast_to(m, core.shape).reshape(hb, wb, c)
+    return mx.concatenate([mx.concatenate([core, img[:hb, wb:]], axis=1), img[hb:]], axis=0)
+
+
+def test_blockiness_map_localizes_and_rejects():
+    from LTX_2_MLX.videotoolbox.noise_map import estimate_blockiness_map
+    mx.random.seed(10)
+    base = _bcontent()
+    # half blocked, half clean: mask lights the blocked half only
+    half = mx.concatenate([_blockify(base)[:, : _BW // 2], base[:, _BW // 2:]], axis=1)
+    frames = [mx.clip(half + 0.004 * mx.random.normal(shape=half.shape), 0, 1)
+              for _ in range(3)]
+    m = estimate_blockiness_map(frames)
+    assert m.shape == (_BH, _BW, 1)
+    # the mask is deliberately smooth (coarse 3x3 smoothing twice + a tile-wide
+    # blur gives a ~2.5-tile soft skirt), so judge the clean half beyond it
+    blocked = mx.sort(m[:, : _BW // 2 - 16, 0].reshape(-1))
+    clean = mx.sort(m[:, _BW // 2 + 80:, 0].reshape(-1))
+    assert float(blocked[blocked.shape[0] // 2]) > 0.3
+    assert float(clean[int(0.95 * (clean.shape[0] - 1))]) < 0.05
+    # strong periodic texture (aliases into any grid phase): unimodality gate -> 0
+    ys = mx.arange(_BH).reshape(_BH, 1)
+    xs = mx.arange(_BW).reshape(1, _BW)
+    checker = mx.broadcast_to(
+        (((ys // 2 + xs // 2) % 2).astype(mx.float32) * 0.5 + 0.25)[..., None],
+        (_BH, _BW, 3))
+    assert float(mx.max(estimate_blockiness_map([checker] * 2))) < 0.05
+    # 1D content bars (not a 2D grid): min-over-lines + geometric mean -> 0
+    bars = mx.where(mx.broadcast_to(((xs % 40) < 2).reshape(1, _BW, 1), (_BH, _BW, 1)), 0.9, base)
+    bars = mx.where(mx.broadcast_to(((ys % 56) < 2).reshape(_BH, 1, 1), (_BH, _BW, 1)), 0.1, bars)
+    assert float(mx.max(estimate_blockiness_map([bars] * 2))) < 0.05
+
+
+def test_blockiness_grid_phase_offset_detected():
+    from LTX_2_MLX.videotoolbox.noise_map import estimate_blockiness_map
+    mx.random.seed(11)
+    base = _bcontent()
+    # blocking on a grid shifted by 3px must still be found
+    x = mx.concatenate([base[:, 3:], base[:, :3]], axis=1)
+    x = mx.concatenate([x[3:], x[:3]], axis=0)
+    b = _blockify(x)
+    b = mx.concatenate([b[-3:], b[:-3]], axis=0)
+    b = mx.concatenate([b[:, -3:], b[:, :-3]], axis=1)
+    frames = [mx.clip(b + 0.004 * mx.random.normal(shape=b.shape), 0, 1) for _ in range(3)]
+    m = estimate_blockiness_map(frames)
+    mid = mx.sort(m[16:-16, 16:-16, 0].reshape(-1))
+    assert float(mid[mid.shape[0] // 2]) > 0.3
+
+
 def test_pulse_gain_tracks_noise_pulse():
     # settled sigma 0.03; frames 24-27 carry sigma 0.09 (an I-frame grain
     # refresh). Settled gains ~1.0; pulse frames must rise and clamp at hi.

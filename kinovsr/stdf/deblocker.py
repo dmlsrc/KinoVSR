@@ -27,8 +27,11 @@ _KR, _KB = 0.299, 0.114
 class StdfDeblocker:
     """RGB-in / RGB-out streaming compressed-video deblocker (luma-only STDF)."""
 
+    MAP_REFRESH = 64   # emitted frames between blockiness-mask refreshes
+
     def __init__(self, weights: Any = None, strength: float = 1.0, dtype: Any = mx.float16,
-                 compile: bool = True, kr: float = _KR, kb: float = _KB):
+                 compile: bool = True, kr: float = _KR, kb: float = _KB,
+                 blockiness_map: Any = None):
         self._p = net.load_params(weights, dtype=dtype)
         self._strength = float(strength)
         in_nc, self._ilen, nb = net._config(self._p)
@@ -40,9 +43,17 @@ class StdfDeblocker:
         self._kr, self._kb = float(kr), float(kb)
         self._kg = 1.0 - self._kr - self._kb
         self._cb, self._cr = 2.0 * (1.0 - self._kb), 2.0 * (1.0 - self._kr)
+        # optional blockiness tracker: a per-pixel wet/dry mask on the correction.
+        # STDF's strength is an output lerp (centers + s*res), so running the net
+        # at full strength and blending outside with mask*strength is exact.
+        self._tracker = blockiness_map
+        self._mask: Any = None
+        self._since_refresh = 0
+        self.last_blockiness_map: Any = None   # fp32 (H,W,1) (debug)
+        net_strength = 1.0 if self._tracker is not None else self._strength
         # Compile the window -> deblocked-center forward once (cached per checkpoint +
         # strength), rather than tracing the raw op graph on every frame.
-        self._fwd = net.make_forward(self._p, self._strength, cfg=(in_nc, self._ilen, nb),
+        self._fwd = net.make_forward(self._p, net_strength, cfg=(in_nc, self._ilen, nb),
                                      compile=compile)
         self._reset()
 
@@ -51,6 +62,14 @@ class StdfDeblocker:
         self._base = 0
         self._received = 0
         self._emitted = 0
+
+    def _update_mask(self) -> None:
+        """(Re)estimate the blockiness mask from the buffered lumas."""
+        m = self._tracker.update([l for l, _, _ in self._buf])
+        if m is not None:
+            self.last_blockiness_map = m
+            self._mask = m[None]                       # (1,H,W,1) for luma broadcast
+        self._since_refresh = 0
 
     def reset(self) -> None:
         self._reset()
@@ -90,7 +109,16 @@ class StdfDeblocker:
         t = self._emitted
         window = [self._luma(t + d, last) for d in range(-self._radius, self._radius + 1)]
         dy = self._fwd(window)                                  # deblocked center luma
-        _, rgb, tok = self._buf[t - self._base]
+        y_c, rgb, tok = self._buf[t - self._base]
+        if self._tracker is not None:
+            if self._mask is None or self._since_refresh >= self.MAP_REFRESH:
+                self._update_mask()
+            else:
+                self._since_refresh += 1
+            if self._mask is not None:
+                # per-pixel wet/dry: full-strength correction scaled by the
+                # blockiness mask and the user strength (exact strength lerp).
+                dy = y_c + (self._mask * self._strength) * (dy - y_c)
         out = self._recombine(rgb, dy)
         mx.eval(out)
         self._emitted += 1
