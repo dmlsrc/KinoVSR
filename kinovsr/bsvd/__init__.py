@@ -390,6 +390,7 @@ class BsvdDenoiser:
         noise_map: Any | None = None,
         map_refresh: int = 64,
         pulse: Any | None = None,
+        map_floor: float = 0.0,
     ):
         wp = Path(weights_path) if weights_path else default_weights_path(variant)
         if not wp.is_file():
@@ -414,6 +415,12 @@ class BsvdDenoiser:
         # streaming-mode map refresh cadence (frames); 0 disables. Scheduled
         # (gop-aligned) mode re-estimates per window instead and ignores this.
         self._map_refresh = max(0, int(map_refresh))
+        # user sigma floor under the map: the temporal estimator only measures
+        # FLICKERING noise, so static grain / structured junk reads near zero
+        # even though conditioning the net higher visibly cleans it. The floor
+        # guarantees a base denoise level (the manual dial's role) with the
+        # map's spatial and pulse adaptation applying above it.
+        self._map_floor = max(0.0, float(map_floor))
         self.last_noise_map: Any = None   # fp32 (H,W,1) actually used (debug)
         # diagnostics: gains across the whole run (survives the end-of-stream reset)
         self._pulse_log: list[float] = []
@@ -480,6 +487,14 @@ class BsvdDenoiser:
             self._nm = mx.full((1, hp, wp, 1), float(self.sigma), dtype=self.net.dtype)
             self._padded_hw = (int(hp), int(wp))
 
+    # the unblind checkpoints were trained with noise_ival [5, 55]: sigma
+    # conditioning outside that dial is out of distribution (below the floor the
+    # net no-ops, above the ceiling it over-smooths), so the plane is clamped
+    # into it after the map gain and pulse gain -- the same range the manual
+    # --denoise-strength dial spans.
+    SIGMA_MIN = 5.0 / 255.0
+    SIGMA_MAX = 55.0 / 255.0
+
     def _with_nm(self, x: Any, nm: Any | None = None, gain: float = 1.0) -> Any:
         if self.net.input_channels != 4:
             return x
@@ -489,6 +504,8 @@ class BsvdDenoiser:
             nm = self._nm
         if gain != 1.0:
             nm = nm * gain
+        if self._tracker is not None or self._pulse is not None:
+            nm = mx.clip(nm, max(self.SIGMA_MIN, self._map_floor), self.SIGMA_MAX)
         return mx.concatenate([x, nm], axis=-1)
 
     def _pulse_gain(self, x3: Any, new_segment: bool = False) -> float:

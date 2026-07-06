@@ -30,8 +30,13 @@ from typing import Any
 import mlx.core as mx
 
 # Half-normal quantile factor: for d ~ N(0, sigma), quantile_p(|d|) = sigma *
-# sqrt(2) * erfinv(p). At p = 0.25: sqrt(2) * erfinv(0.25) = 0.3186394.
-_HALF_NORMAL_Q25 = 0.3186393639643751
+# sqrt(2) * erfinv(p). Pooling uses p = 0.75 (factor sqrt(2)*erfinv(0.75)):
+# compression leaves many pixels temporally IDENTICAL (skip blocks), so the
+# pooled |diff| distribution is a spike at zero plus a sparse flicker tail --
+# any low quantile lands on the zeros and reads sigma 0 on exactly the clips
+# that need conditioning. A high quantile reads the tail; motion robustness is
+# the luma-cap's job, not the quantile's.
+_HALF_NORMAL_Q75 = 1.1503493803760079
 # Rec.601 luma; the map conditions nets on broadcast-ish content.
 _LUMA = (0.299, 0.587, 0.114)
 # Map-conditioned nets are trained with per-CHANNEL AWGN sigma in the map plane,
@@ -58,10 +63,10 @@ def _edge_pad_hw(x: Any, ph: int, pw: int) -> Any:
     return x
 
 
-def _box_smooth_coarse(g: Any) -> Any:
-    """3x3 edge-padded box mean on a coarse (bh,bw) grid, applied twice."""
+def _box_smooth_coarse(g: Any, passes: int = 2) -> Any:
+    """3x3 edge-padded box mean on a coarse (bh,bw) grid."""
     bh, bw = g.shape
-    for _ in range(2):
+    for _ in range(passes):
         p = mx.concatenate([g[:1], g, g[-1:]], axis=0)          # (bh+2, bw)
         p = mx.concatenate([p[:, :1], p, p[:, -1:]], axis=1)    # (bh+2, bw+2)
         acc = mx.zeros_like(g)
@@ -144,9 +149,9 @@ def estimate_sigma_map(
     db = d.reshape(K, bh, block, bw, block)
     db = mx.transpose(db, (1, 3, 0, 2, 4)).reshape(bh, bw, K * block * block)
     n = db.shape[-1]
-    q_idx = int(round(0.25 * (n - 1)))
+    q_idx = int(round(0.75 * (n - 1)))
     q = mx.sort(db, axis=-1)[..., q_idx]                        # (bh,bw)
-    sig = q * (_CHANNEL_FROM_LUMA / _HALF_NORMAL_Q25)
+    sig = q * (_CHANNEL_FROM_LUMA / _HALF_NORMAL_Q75)
     blum = mx.mean(ylum.reshape(bh, block, bw, block), axis=(1, 3))   # (bh,bw)
 
     # signal-dependence model: robust sigma-vs-luma from the quiet blocks, used to
@@ -163,7 +168,10 @@ def estimate_sigma_map(
         vals = [s for s, l in zip(sig_l, lum_l) if lo <= l < hi]
         if len(vals) >= 8:
             model[b] = _p30(vals)
-    cap = [luma_cap_headroom * model[min(luma_bins - 1, max(0, int(l * luma_bins)))]
+    # absolute slack keeps the cap from crushing genuine local noise on clips
+    # whose baseline sits near the floor (heavy compression): the cap's job is
+    # rejecting motion blowups (0.1-0.3+), not flattening the map to 2x floor.
+    cap = [luma_cap_headroom * model[min(luma_bins - 1, max(0, int(l * luma_bins)))] + 0.01
            for l in lum_l]
     sig = mx.minimum(sig, mx.array(cap, dtype=mx.float32).reshape(bh, bw))
 
@@ -222,24 +230,14 @@ class NoiseMapTracker:
         return self._map * self.gain
 
 
-def _grid_phase(g: Any, period: int = 8) -> tuple[int, bool]:
-    """Detect the coding-grid phase along an axis from gradient energy.
-
-    g: (H, Wg) absolute gradients along the axis (Wg = W-1 for columns). Returns
-    (phase, found). A real coding grid elevates exactly ONE phase; periodic
-    texture whose period divides the grid (e.g. a 2px checker) elevates several
-    phases equally and aliases into any phase test, so the grid counts as found
-    only when the winner's margin over the runner-up is decisive (unimodal).
-    """
+def _grid_phase(g: Any, period: int = 8) -> int:
+    """Most-elevated gradient phase along an axis (the coding grid's offset)."""
     n = int(g.shape[1]) // period * period
     if n < period:
-        return 0, False
+        return 0
     m = mx.mean(g[:, :n].reshape(g.shape[0], n // period, period), axis=(0, 1))  # (period,)
     vals = [float(v) for v in m.tolist()]
-    order = sorted(range(period), key=lambda i: -vals[i])
-    top1, top2 = vals[order[0]], vals[order[1]]
-    found = top1 > 1e-6 and (top1 - top2) > 0.10 * top1
-    return order[0], found
+    return max(range(period), key=lambda i: vals[i])
 
 
 def estimate_blockiness_map(
@@ -247,7 +245,7 @@ def estimate_blockiness_map(
     period: int = 8,
     tile: int = 32,
     max_frames: int = 6,
-    severity_scale: float = 0.03,
+    severity_scale: float = 0.006,
     smooth: bool = True,
 ) -> Any | None:
     """Estimate a per-pixel blockiness mask in [0, 1] from a window of frames.
@@ -261,7 +259,9 @@ def estimate_blockiness_map(
     discontinuities register. The two axes combine by geometric mean, so a real
     vertical or horizontal content edge (one axis only) scores zero; DCT
     blocking (always a 2D grid) survives. `severity_scale` is the boundary
-    excess (luma units) mapped to mask 1.0.
+    excess (luma units) mapped to mask 1.0; the default is calibrated so
+    loop-filtered modern H.264 blocking lands mid-scale and old-encoder /
+    hard DCT grids saturate.
 
     Returns (H,W,1) fp32 in [0,1], or None for an empty frame list.
     """
@@ -276,18 +276,29 @@ def estimate_blockiness_map(
 
     gv = mx.mean(mx.abs(y[:, :, 1:] - y[:, :, :-1]), axis=0)    # (H, W-1) col grads
     gh = mx.mean(mx.abs(y[:, 1:, :] - y[:, :-1, :]), axis=0)    # (H-1, W) row grads
-    px, fx = _grid_phase(gv, period)
-    py, fy = _grid_phase(mx.transpose(gh, (1, 0)), period)
-    if not (fx and fy):
-        # no decisive 2D coding grid anywhere -> nothing to deblock
-        return mx.zeros((H, W, 1), dtype=mx.float32)
+    px = _grid_phase(gv, period)
+    py = _grid_phase(mx.transpose(gh, (1, 0)), period)
+
+    def _line_min(gt: Any, phase: int) -> Any:
+        """Per-tile min over the grid lines of `phase`: blocking elevates EVERY
+        line crossing a tile; a content edge elevates one, so the min rejects it."""
+        lines = [gt[:, :, :, phase + k * period]
+                 for k in range(max(1, (tile - phase) // period))
+                 if phase + k * period < tile]
+        line_means = mx.stack([mx.mean(l, axis=1) for l in lines], axis=0)  # (L,ht,wt)
+        return mx.min(line_means, axis=0)                       # (ht,wt)
 
     def _tile_excess(g: Any, phase: int, transpose: bool) -> Any:
-        """Per-tile min-over-boundary-lines minus interior mean, >= 0.
+        """Per-tile grid evidence: line-min at the detected phase MINUS the same
+        statistic at a null phase (offset by period/2), >= 0.
 
-        Blocking elevates EVERY grid line crossing a tile; a content edge that
-        happens to sit on the grid elevates one. Taking the minimum across the
-        tile's boundary lines keeps the former and rejects the latter.
+        The null phase is the matched control: content texture -- including
+        periodic texture whose period divides the grid (a 2px checker elevates
+        every other column, hence both phases equally) -- raises both and
+        cancels; only a discontinuity locked to the detected phase survives.
+        This replaces a global phase-unimodality gate, which real loop-filtered
+        H.264 fails (its residual grid is weak) while still being visibly
+        blocked.
         """
         if transpose:
             g = mx.transpose(g, (1, 0))
@@ -296,16 +307,8 @@ def estimate_blockiness_map(
         g = _edge_pad_hw(g, ph, pw)
         hp, wp = h + ph, w + pw
         gt = g.reshape(hp // tile, tile, wp // tile, tile)      # (ht,tr,wt,tc)
-        lines = [gt[:, :, :, phase + k * period]
-                 for k in range(max(1, (tile - phase) // period))
-                 if phase + k * period < tile]
-        line_means = mx.stack([mx.mean(l, axis=1) for l in lines], axis=0)  # (L,ht,wt)
-        bmin = mx.min(line_means, axis=0)                       # (ht,wt)
-        idx = mx.arange(tile)
-        imask = ((idx % period) != phase).astype(mx.float32).reshape(1, 1, 1, tile)
-        isum = mx.sum(gt * imask, axis=(1, 3))
-        icnt = mx.sum(mx.broadcast_to(imask, gt.shape), axis=(1, 3))
-        ex = mx.maximum(bmin - isum / mx.maximum(icnt, 1.0), 0.0)
+        null = (phase + period // 2) % period
+        ex = mx.maximum(_line_min(gt, phase) - _line_min(gt, null), 0.0)
         return mx.transpose(ex, (1, 0)) if transpose else ex
 
     bv = _tile_excess(gv, px, transpose=False)                  # (ht, wt-ish)
@@ -315,7 +318,10 @@ def estimate_blockiness_map(
     tw = min(int(bv.shape[1]), int(bh.shape[1]))
     b = mx.sqrt(bv[:th, :tw] * bh[:th, :tw])                    # 2D-grid evidence only
     if smooth:
-        b = _box_smooth_coarse(b)
+        # single pass: a wet/dry mask wants peak fidelity (double smoothing
+        # diluted mild real-world blocking ~1.5-1.8x); the full-res blur below
+        # still removes tile edges.
+        b = _box_smooth_coarse(b, passes=1)
     full = mx.repeat(mx.repeat(b, tile, axis=0), tile, axis=1)[:H, :W]
     if smooth:
         full = _box_blur_full(full, tile + 1)
@@ -366,8 +372,8 @@ class PulseGain:
         d = mx.abs(y - self._prev) * (1.0 / 1.4142135623730951)
         self._prev = y
         flat = mx.sort(d.reshape(-1))
-        q = float(flat[int(0.25 * (flat.shape[0] - 1))])
-        sigma_t = q * (_CHANNEL_FROM_LUMA / _HALF_NORMAL_Q25)
+        q = float(flat[int(0.75 * (flat.shape[0] - 1))])
+        sigma_t = q * (_CHANNEL_FROM_LUMA / _HALF_NORMAL_Q75)
         self._hist.append(sigma_t)
         if len(self._hist) > self.history:
             self._hist.pop(0)

@@ -118,7 +118,10 @@ class StdfDeblocker:
             if self._mask is not None:
                 # per-pixel wet/dry: full-strength correction scaled by the
                 # blockiness mask and the user strength (exact strength lerp).
-                dy = y_c + (self._mask * self._strength) * (dy - y_c)
+                # The mask clamps at 1.0 AFTER the tracker gain: a blend factor
+                # above 1 would extrapolate past the deblocked frame (mush).
+                m = mx.minimum(self._mask, 1.0)
+                dy = y_c + (m * self._strength) * (dy - y_c)
         out = self._recombine(rgb, dy)
         mx.eval(out)
         self._emitted += 1

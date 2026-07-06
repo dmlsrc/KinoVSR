@@ -256,7 +256,7 @@ class FastDvdDenoiser:
     def __init__(self, weights_path: str | Path | None = None, strength: float = 0.5,
                  variant: str = "clipped", dtype: Any = mx.float16,
                  noise_map: Any | None = None, map_refresh: int = 64,
-                 pulse: Any | None = None):
+                 pulse: Any | None = None, map_floor: float = 0.0):
         wp = Path(weights_path) if weights_path else default_weights_path(variant)
         if not wp.is_file():
             raise FileNotFoundError(
@@ -273,6 +273,9 @@ class FastDvdDenoiser:
         # optional PulseGain: per-frame scalar on the sigma plane tracking
         # GOP-phase noise pulsing (I-frame grain refresh).
         self._pulse = pulse
+        # user sigma floor under the map (static, non-flickering noise is
+        # invisible to the temporal estimator; see the bsvd note).
+        self._map_floor = max(0.0, float(map_floor))
         self.last_noise_map: Any = None   # fp32 (H,W,1) actually used (debug)
         # diagnostics: gains across the whole run (survives the end-of-stream reset)
         self._pulse_log: list[float] = []
@@ -311,10 +314,19 @@ class FastDvdDenoiser:
     def _frame(self, i: int, last: int) -> Any:
         return self._buf[self._reflect(i, last) - self._base][0]
 
+    # trained AWGN range (sigma_255 in [5, 55]); conditioning outside it is out
+    # of distribution, so map/pulse-driven planes are clamped into it.
+    SIGMA_MIN = 5.0 / 255.0
+    SIGMA_MAX = 55.0 / 255.0
+
     def _nm_at(self, i: int, last: int) -> Any:
-        """Noise plane for center frame i: the map scaled by i's pulse gain."""
+        """Noise plane for center frame i: the map scaled by i's pulse gain,
+        clamped into the net's trained sigma dial."""
         g = self._gains.get(self._reflect(i, last), 1.0)
-        return self._nm if g == 1.0 else self._nm * g
+        nm = self._nm if g == 1.0 else self._nm * g
+        if self._tracker is not None or self._pulse is not None:
+            nm = mx.clip(nm, max(self.SIGMA_MIN, self._map_floor), self.SIGMA_MAX)
+        return nm
 
     def _g_at(self, i: int, last: int) -> Any:
         """temp1 estimate g(i), computed once and cached."""

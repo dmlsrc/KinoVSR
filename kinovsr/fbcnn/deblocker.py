@@ -74,6 +74,7 @@ class FbcnnDeblocker:
             else:
                 self._since_refresh += 1
             if self._mask is not None:
-                out = inp + (self._mask * self._strength) * (out - inp)
+                # clamp at 1.0 post-gain: blend factors above 1 extrapolate
+                out = inp + (mx.minimum(self._mask, 1.0) * self._strength) * (out - inp)
         mx.eval(out)
         return out[0]

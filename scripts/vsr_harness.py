@@ -1076,8 +1076,10 @@ def run(args: argparse.Namespace) -> None:
             if _map_capable:
                 from LTX_2_MLX.videotoolbox.noise_map import NoiseMapTracker
                 nm_tracker = NoiseMapTracker(gain=args.noise_map_gain)
+                _floor_note = (f", floor {args.noise_map_floor:g}"
+                               if args.noise_map_floor > 0 else "")
                 print(f"[noise-map] auto: per-pixel sigma estimated from the footage "
-                      f"(gain {args.noise_map_gain:g})")
+                      f"(gain {args.noise_map_gain:g}{_floor_note})")
             elif args.denoise != "off":
                 why = ("blind PVDD variant (use --pvdd-variant pvdd_level)"
                        if args.denoise == "pvdd" else f"--denoise {args.denoise} has no map input")
@@ -1104,6 +1106,7 @@ def run(args: argparse.Namespace) -> None:
                 noise_map=nm_tracker,
                 map_refresh=args.noise_map_refresh,
                 pulse=nm_pulse,
+                map_floor=args.noise_map_floor,
             )
         elif args.denoise == "fastdvd":
             # Weights ship with the package; --fastdvd-variant picks one, or
@@ -1115,6 +1118,7 @@ def run(args: argparse.Namespace) -> None:
                 noise_map=nm_tracker,
                 map_refresh=args.noise_map_refresh,
                 pulse=nm_pulse,
+                map_floor=args.noise_map_floor,
             )
         elif args.denoise == "bsvd":
             # BSVD weights are not bundled; --bsvd-variant picks a local token,
@@ -1127,6 +1131,7 @@ def run(args: argparse.Namespace) -> None:
                 noise_map=nm_tracker,
                 map_refresh=args.noise_map_refresh,
                 pulse=nm_pulse,
+                map_floor=args.noise_map_floor,
             )
         elif args.denoise == "pvdd":
             # PVDD weights are not bundled; --pvdd-variant picks a local token, or
@@ -1722,7 +1727,9 @@ def run(args: argparse.Namespace) -> None:
             denoiser.close()
         if deblocker is not None and args.deblock_map == "auto":
             _bm = getattr(deblocker, "last_blockiness_map", None)
-            if _bm is not None:
+            if _bm is None:
+                print("[deblock-map] no mask was estimated (no frames deblocked?)")
+            else:
                 _s = mx.sort(_bm.reshape(-1))
                 _n = _s.shape[0]
                 print(f"[deblock-map] blockiness mask: median {float(_s[_n // 2]):.3f}  "
@@ -1755,6 +1762,17 @@ def run(args: argparse.Namespace) -> None:
                 print(f"[noise-map] estimated sigma: min {float(_s[0]):.4f}  "
                       f"median {float(_s[_n // 2]):.4f}  p95 {float(_s[int(0.95 * (_n - 1))]):.4f}  "
                       f"max {float(_s[-1]):.4f}")
+                # what the net actually receives: the estimate clamped into the
+                # consumer's conditioning bounds (trained range and/or user floor)
+                _dsrc = denoiser if hasattr(denoiser, "_map_floor") else getattr(denoiser, "_base", None)
+                _lo = max(float(getattr(_dsrc, "SIGMA_MIN", 0.0) or 0.0),
+                          float(getattr(_dsrc, "_map_floor", 0.0) or 0.0))
+                _hi = float(getattr(_dsrc, "SIGMA_MAX", 0.0) or 0.0)
+                if _lo > 0.0 or _hi > 0.0:
+                    _e = mx.sort(mx.clip(_nm_src, _lo, _hi if _hi > 0 else 1.0).reshape(-1))
+                    print(f"[noise-map] effective conditioning: min {float(_e[0]):.4f}  "
+                          f"median {float(_e[_n // 2]):.4f}  max {float(_e[-1]):.4f}  "
+                          f"(floor {_lo:.4f}{f', ceil {_hi:.4f}' if _hi > 0 else ''})")
                 if args.noise_map_debug and post_writer is not None:
                     from LTX_2_MLX.videotoolbox.images import save_image
                     _vp = Path(post_writer.path)
@@ -2471,8 +2489,12 @@ def main() -> None:
         "--noise-map-gain", type=float, default=1.0, metavar="G",
         help=(
             "Multiplier on the auto-estimated noise map (default 1.0). >1 denoises "
-            "harder everywhere while keeping the spatial shape; <1 is gentler. Only "
-            "used with --noise-map auto."
+            "harder everywhere while keeping the spatial shape; <1 is gentler. For "
+            "fastdvd/bsvd the gained map is clamped into the nets' trained sigma "
+            "range [5/255, 55/255] -- the same span the manual --denoise-strength "
+            "dial has -- so heavily compressed clips whose measured temporal noise "
+            "sits below the dial floor get the floor (a mild denoise) instead of a "
+            "no-op. Only used with --noise-map auto."
         ),
     )
     parser.add_argument(
@@ -2521,8 +2543,22 @@ def main() -> None:
         "--deblock-map-gain", type=float, default=1.0, metavar="G",
         help=(
             "Multiplier on the auto blockiness mask (default 1.0). >1 saturates the "
-            "mask sooner (more area fully deblocked); <1 is more conservative. Only "
-            "used with --deblock-map auto."
+            "mask sooner (more area fully deblocked); <1 is more conservative. The "
+            "mask clamps at 1.0 after the gain, so the blend never extrapolates "
+            "past the deblocked frame. Only used with --deblock-map auto."
+        ),
+    )
+    parser.add_argument(
+        "--noise-map-floor", type=float, default=0.0, metavar="S",
+        help=(
+            "Minimum sigma under the auto noise map (0..1 scale; default 0 = the "
+            "net's own trained floor, 5/255 for fastdvd/bsvd). The temporal "
+            "estimator measures FLICKERING noise only; static grain, dirt, and "
+            "structured junk do not flicker and read near zero even though "
+            "conditioning the denoiser higher visibly cleans them. The floor "
+            "guarantees a base denoise level -- the role of the manual strength "
+            "dial -- with the map's spatial and pulse adaptation applying above "
+            "it. E.g. 0.02 ~= --denoise-strength 0.005, 0.03 ~= 0.1."
         ),
     )
     parser.add_argument(

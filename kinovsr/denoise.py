@@ -159,6 +159,7 @@ class McTemporalDenoiser:
         window: int = 0, clamp: bool = False, occlusion: bool = False,
         confidence: bool = False, sigma: float = 0.06, self_test: bool = True,
         noise_map: Any = None, map_refresh: int = 64, pulse: Any = None,
+        map_floor: float = 0.0,
     ):
         require_pyobjc()
         self.w, self.h = int(width), int(height)
@@ -181,6 +182,9 @@ class McTemporalDenoiser:
         self._tracker = noise_map
         self._pulse = pulse
         self._map_refresh = max(0, int(map_refresh))
+        # user sigma floor under the map (static grain does not flicker, so the
+        # temporal estimate reads low on it; the floor keeps a base gate width)
+        self._map_floor = max(0.0, float(map_floor))
         self._sigma_plane: Any = None    # (H,W,1) residual-units plane, or None
         self._recent: list[Any] = []     # rolling frames for estimate/refresh
         self._since_refresh = 0
@@ -338,6 +342,8 @@ class McTemporalDenoiser:
         if due:
             sig = self._tracker.update(self._recent)
             if sig is not None:
+                if self._map_floor > 0.0:
+                    sig = mx.maximum(sig, self._map_floor)
                 self.last_noise_map = sig
                 self._sigma_plane = sig.astype(mx.float32) * self.RESID_FROM_SIGMA
             self._since_refresh = 0

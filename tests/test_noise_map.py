@@ -186,22 +186,26 @@ def test_blockiness_map_localizes_and_rejects():
     m = estimate_blockiness_map(frames)
     assert m.shape == (_BH, _BW, 1)
     # the mask is deliberately smooth (coarse 3x3 smoothing twice + a tile-wide
-    # blur gives a ~2.5-tile soft skirt), so judge the clean half beyond it
+    # blur gives a ~2.5-tile soft skirt), so judge the clean half beyond it.
+    # Safety cases assert in RAW excess units (severity_scale=1.0) so the
+    # default severity calibration can move without weakening the guarantees.
     blocked = mx.sort(m[:, : _BW // 2 - 16, 0].reshape(-1))
-    clean = mx.sort(m[:, _BW // 2 + 80:, 0].reshape(-1))
-    assert float(blocked[blocked.shape[0] // 2]) > 0.3
-    assert float(clean[int(0.95 * (clean.shape[0] - 1))]) < 0.05
-    # strong periodic texture (aliases into any grid phase): unimodality gate -> 0
+    assert float(blocked[blocked.shape[0] // 2]) > 0.5      # hard blocking saturates
+    raw = estimate_blockiness_map(frames, severity_scale=1.0)
+    clean = mx.sort(raw[:, _BW // 2 + 80:, 0].reshape(-1))
+    assert float(clean[int(0.95 * (clean.shape[0] - 1))]) < 1.5e-3
+    # strong periodic texture (elevates BOTH the detected and the null phase,
+    # so the per-tile null-phase subtraction cancels it) -> ~0 raw excess
     ys = mx.arange(_BH).reshape(_BH, 1)
     xs = mx.arange(_BW).reshape(1, _BW)
     checker = mx.broadcast_to(
         (((ys // 2 + xs // 2) % 2).astype(mx.float32) * 0.5 + 0.25)[..., None],
         (_BH, _BW, 3))
-    assert float(mx.max(estimate_blockiness_map([checker] * 2))) < 0.05
-    # 1D content bars (not a 2D grid): min-over-lines + geometric mean -> 0
+    assert float(mx.max(estimate_blockiness_map([checker] * 2, severity_scale=1.0))) < 1e-3
+    # 1D content bars (not a 2D grid): min-over-lines + geometric mean -> ~0
     bars = mx.where(mx.broadcast_to(((xs % 40) < 2).reshape(1, _BW, 1), (_BH, _BW, 1)), 0.9, base)
     bars = mx.where(mx.broadcast_to(((ys % 56) < 2).reshape(_BH, 1, 1), (_BH, _BW, 1)), 0.1, bars)
-    assert float(mx.max(estimate_blockiness_map([bars] * 2))) < 0.05
+    assert float(mx.max(estimate_blockiness_map([bars] * 2, severity_scale=1.0))) < 3e-3
 
 
 def test_blockiness_grid_phase_offset_detected():
