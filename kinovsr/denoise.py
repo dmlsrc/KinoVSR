@@ -147,10 +147,18 @@ class McTemporalDenoiser:
     Interface: (H,W,3) float32 RGB in [0,1] in/out. Apply reset() at scene cuts.
     """
 
+    # Converts a per-channel AWGN sigma (the noise-map estimator's units) to the
+    # expected scale of mc's residual statistic: resid = mean_c |curr - warped|,
+    # and for two noise-carrying frames E[|N(0, sqrt(2) sigma)|] = sqrt(4/pi) sigma.
+    RESID_FROM_SIGMA = 1.1283791670955126
+
+    MAP_WARMUP = 9   # frames observed before estimating a spatial noise map
+
     def __init__(
         self, width: int, height: int, strength: float = 0.5,
         window: int = 0, clamp: bool = False, occlusion: bool = False,
         confidence: bool = False, sigma: float = 0.06, self_test: bool = True,
+        noise_map: Any = None, map_refresh: int = 64, pulse: Any = None,
     ):
         require_pyobjc()
         self.w, self.h = int(width), int(height)
@@ -165,6 +173,20 @@ class McTemporalDenoiser:
         # difference before throttling the blend, so noise (which inflates that
         # residual) stops gating its own removal -> stronger denoise, more ghosting.
         self.sigma = float(sigma)   # residual rejection scale (luma, [0,1])
+        # optional NoiseMapTracker / PulseGain: replace the scalar sigma with a
+        # per-pixel plane (estimated from the footage, scaled to residual units)
+        # and scale it per frame for GOP-phase noise pulsing. mc's sigma has an
+        # exact analytic role, so unlike the learned nets there is no training
+        # distribution to respect -- the gate simply gets the measured scale.
+        self._tracker = noise_map
+        self._pulse = pulse
+        self._map_refresh = max(0, int(map_refresh))
+        self._sigma_plane: Any = None    # (H,W,1) residual-units plane, or None
+        self._recent: list[Any] = []     # rolling frames for estimate/refresh
+        self._since_refresh = 0
+        self._gain = 1.0                 # current per-frame pulse gain
+        self.last_noise_map: Any = None  # fp32 (H,W,1) sigma actually used (debug)
+        self._pulse_log: list[float] = []
         self.clamp_k = 5         # neighborhood window for color clamping
         self.clamp_gamma = 1.25  # box half-width in std units
         self.occ_tau = 1.5       # FB-consistency tolerance (pixels)
@@ -290,9 +312,35 @@ class McTemporalDenoiser:
             )
 
     def reset(self) -> None:
-        """Drop temporal history (call at scene cuts)."""
+        """Drop temporal history (call at scene cuts). The estimated noise map is
+        kept (the encoder's noise character persists across cuts); the pulse diff
+        chain restarts."""
         self._prev = None
         self._hist = []
+        if self._pulse is not None:
+            self._pulse.reset()
+
+    def _condition(self, rgb_f32: Any) -> None:
+        """Per-frame conditioning upkeep: estimate/refresh the sigma plane from
+        recent frames and update the pulse gain."""
+        if self._pulse is not None:
+            self._gain = self._pulse.update(rgb_f32)
+            self._pulse_log.append(self._gain)
+        if self._tracker is None:
+            return
+        self._recent.append(rgb_f32)
+        if len(self._recent) > self.MAP_WARMUP:
+            self._recent.pop(0)
+        due = (self._sigma_plane is None and len(self._recent) >= self.MAP_WARMUP)
+        if not due and self._sigma_plane is not None and self._map_refresh > 0:
+            self._since_refresh += 1
+            due = self._since_refresh >= self._map_refresh and len(self._recent) >= 2
+        if due:
+            sig = self._tracker.update(self._recent)
+            if sig is not None:
+                self.last_noise_map = sig
+                self._sigma_plane = sig.astype(mx.float32) * self.RESID_FROM_SIGMA
+            self._since_refresh = 0
 
     def close(self) -> None:
         if self._pool is not None:
@@ -380,7 +428,10 @@ class McTemporalDenoiser:
         """Per-pixel blend weight (H,W,1) toward `warped`, combining the enabled
         gates: residual match, FB-consistency occlusion, motion confidence."""
         resid = mx.mean(mx.abs(curr - warped), axis=-1, keepdims=True)
-        w = self.strength * mx.exp(-((resid / self.sigma) ** 2))
+        sigma = self.sigma if self._sigma_plane is None else self._sigma_plane
+        if self._gain != 1.0:
+            sigma = sigma * self._gain
+        w = self.strength * mx.exp(-((resid / sigma) ** 2))
         if self.occlusion:
             # Round-trip: curr pixel p -> ref at p+bwd[p], then fwd should return
             # it; |bwd + fwd(at p+bwd)| ~ 0 when consistent, large at occlusion.
@@ -394,6 +445,8 @@ class McTemporalDenoiser:
 
     def denoise(self, rgb_f32: Any) -> Any:
         rgb_f32 = mx.clip(rgb_f32[..., :3].astype(mx.float32), 0.0, 1.0)
+        if self._tracker is not None or self._pulse is not None:
+            self._condition(rgb_f32)
         refs = ([self._prev] if self._prev is not None else []) if self.window == 0 \
             else list(self._hist)
         if not refs:

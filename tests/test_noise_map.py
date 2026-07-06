@@ -210,6 +210,39 @@ def test_fastdvd_pulse_emits_all_and_varies():
     assert max(gains[30:34]) > 1.4 and abs(gains[20] - 1.0) < 0.3
 
 
+def test_mc_sigma_plane_and_pulse():
+    # mc's residual gate takes the map as a per-pixel sigma plane (in residual
+    # units) and the pulse as a per-frame scale. Needs VTOpticalFlow; skip where
+    # the flow self-test refuses (unsupported device / too-small buffers).
+    import pytest
+    from LTX_2_MLX.videotoolbox.denoise import McTemporalDenoiser
+    mx.random.seed(9)
+    h, w = 240, 320
+    base = mx.clip(mx.full((h, w, 3), 0.45) + 0.15 * mx.random.uniform(shape=(h, w, 3)), 0, 1)
+    xs = mx.linspace(0, 1, w).reshape(1, w, 1)
+    try:
+        den = McTemporalDenoiser(w, h, strength=0.8, sigma=0.06,
+                                 noise_map=NoiseMapTracker(),
+                                 pulse=PulseGain(min_history=6))
+    except (RuntimeError, SystemExit) as e:
+        pytest.skip(f"VTOpticalFlow unavailable: {e}")
+    try:
+        for t in range(20):
+            s = (0.01 + 0.07 * xs) * (2.2 if 14 <= t < 17 else 1.0)
+            f = mx.clip(base + s * mx.random.normal(shape=(h, w, 3)), 0, 1)
+            out = den.denoise(f)
+            assert bool(mx.all(mx.isfinite(out)))
+        nm = den.last_noise_map
+        assert nm is not None and nm.shape == (h, w, 1)
+        # spatial: the sigma plane follows the gradient noise field
+        assert float(mx.mean(nm[:, -40:, 0])) > 2.0 * float(mx.mean(nm[:, :40, 0]))
+        # temporal: the pulse burst registers, settled frames stay neutral
+        log = den._pulse_log
+        assert max(log[14:17]) > 1.4 and abs(log[11] - 1.0) < 0.3
+    finally:
+        den.close()
+
+
 def test_fastdvd_streaming_refresh_adapts():
     # noise jumps 0.01 -> 0.08 at frame 20 of a 60-frame stream. With refresh on,
     # the held map must climb toward the new level; with refresh off it must not.

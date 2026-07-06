@@ -1043,7 +1043,7 @@ def run(args: argparse.Namespace) -> None:
         # per-frame gain (GOP-phase noise pulsing) on the same conditioning.
         nm_tracker: Any = None
         nm_pulse: Any = None
-        _map_capable = (args.denoise == "fastdvd" or args.denoise == "bsvd"
+        _map_capable = (args.denoise in ("fastdvd", "bsvd", "mc")
                         or (args.denoise == "pvdd" and "level" in args.pvdd_variant))
         if args.noise_map == "auto":
             if _map_capable:
@@ -1063,7 +1063,7 @@ def run(args: argparse.Namespace) -> None:
                       "(I-frame grain refresh)")
             elif args.denoise != "off":
                 print("[noise-map] pulse ignored: needs a map-conditioned denoiser "
-                      "(fastdvd, bsvd, or a pvdd level variant)")
+                      "(fastdvd, bsvd, mc, or a pvdd level variant)")
 
         den: Any = None
         if args.denoise == "spatial":
@@ -1074,6 +1074,9 @@ def run(args: argparse.Namespace) -> None:
                 window=args.mc_window, clamp=args.mc_clamp,
                 occlusion=args.mc_occlusion, confidence=args.mc_confidence,
                 sigma=args.mc_sigma,
+                noise_map=nm_tracker,
+                map_refresh=args.noise_map_refresh,
+                pulse=nm_pulse,
             )
         elif args.denoise == "fastdvd":
             # Weights ship with the package; --fastdvd-variant picks one, or
@@ -2399,8 +2402,9 @@ def main() -> None:
             "--denoise-strength / --pvdd-noise-*). auto = estimate a per-pixel sigma "
             "map from the footage itself (temporal frame-difference statistics: "
             "texture-safe, motion-capped, smooth), so noisy shadows get denoised "
-            "harder than clean lit areas. Ignored with a warning by denoisers that "
-            "have no map input (spatial, mc, blind pvdd variants)."
+            "harder than clean lit areas. For mc, the map replaces --mc-sigma as "
+            "the per-pixel residual-rejection scale. Ignored with a warning by "
+            "denoisers that have no map input (spatial, blind pvdd variants)."
         ),
     )
     parser.add_argument(
@@ -2439,7 +2443,8 @@ def main() -> None:
             "running settled level and the sigma plane is scaled by the ratio "
             "(clamped 0.6..1.8), so I-frame grain refreshes get proportionally "
             "stronger denoising. Works with --noise-map constant or auto; "
-            "map-conditioned denoisers only (fastdvd, bsvd, pvdd level variants)."
+            "map-conditioned denoisers only (fastdvd, bsvd, mc, pvdd level "
+            "variants)."
         ),
     )
     parser.add_argument(
@@ -2823,7 +2828,9 @@ def main() -> None:
             "even at --denoise-strength 1. RAISE it (e.g. 0.10-0.15) to denoise "
             "harder when strength alone plateaus -- the real 'make it stronger' knob "
             "for noisy footage. Cost: it also tolerates motion mismatch, so higher = "
-            "more ghosting/smearing on fast motion."
+            "more ghosting/smearing on fast motion. With --noise-map auto this "
+            "scalar is REPLACED by the estimated per-pixel map (in residual units); "
+            "scale that with --noise-map-gain instead."
         ),
     )
     parser.add_argument(
