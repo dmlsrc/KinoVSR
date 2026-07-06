@@ -59,3 +59,21 @@ video = "generated-block-grid.mp4"
 [[tests.cases]]
 label = "scanline_case"
 video = "generated-scanlines.mp4"
+
+[analysis]
+# Defaults to tests.fixture_dir, then fixtures.output_dir.
+# fixture_dir = "../../path/to/generated-fixtures"
+
+# Defaults to fixture_dir/manifest.json. When videos is omitted, all manifest
+# outputs are analyzed.
+# manifest = "../../path/to/generated-fixtures/manifest.json"
+# videos = ["generated-block-grid.mp4", "generated-scanlines.mp4"]
+
+# Defaults to $SHARED_TEMP_DIR/vsr_artifact_map_sweep_<timestamp>.
+# output_root = "../../path/to/analysis-output"
+
+seconds = 2.0
+window_frames = 12
+windows = [0.1, 0.5, 0.9]
+motion_caps = ["strict", "loose", "off"]
+masking = 1.0

@@ -960,7 +960,7 @@ def run(args: argparse.Namespace) -> None:
         raise SystemExit(f"bad --max-frames value: {e}") from None
 
     if getattr(args, "probe_noise", False) and args.video:
-        from LTX_2_MLX.videotoolbox.noise_map import analyze_noise
+        from LTX_2_MLX.videotoolbox.noise_map import analyze_noise, classify_noise_analysis
         _pw_end = win_end if win_end is not None else total_frames
         _span = max(1, _pw_end - win_start)
         _starts = sorted({win_start + int(f * max(0, _span - 12)) for f in (0.1, 0.5, 0.9)})
@@ -979,6 +979,7 @@ def run(args: argparse.Namespace) -> None:
             if len(_fr) < 3:
                 continue
             r = analyze_noise(_fr)
+            diag = classify_noise_analysis(r)
             tr = r.pop("frame_trace")
 
             def _kfd(i, _ws=ws):
@@ -996,6 +997,11 @@ def run(args: argparse.Namespace) -> None:
                   f"static-frac {r['static_fraction']:.2f}   "
                   f"static-spatial-hf {r['static_spatial_hf']:.4f}")
             print(f"  channels: R {r['sigma_R']:.4f}  G {r['sigma_G']:.4f}  B {r['sigma_B']:.4f}")
+            print(f"  verdict: {', '.join(diag['labels'])}  risk={diag['risk']}")
+            for _msg in diag["warnings"][:2]:
+                print(f"    warning: {_msg}")
+            for _msg in diag["suggestions"][:2]:
+                print(f"    try: {_msg}")
             _pk = sorted(range(len(tr)), key=lambda i: -tr[i])[:3]
             print(f"  frame trace: med {sorted(tr)[len(tr) // 2]:.4f}  max {max(tr):.4f}"
                   "   top flashes: " + ", ".join(

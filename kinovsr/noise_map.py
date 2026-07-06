@@ -168,20 +168,74 @@ def estimate_sigma_map(
     sig = mx.sqrt(mx.mean(tail * tail, axis=-1))         * (_CHANNEL_FROM_LUMA / _TAIL_RMS_NORM)                 # (bh,bw)
     blum = mx.mean(ylum.reshape(bh, block, bw, block), axis=(1, 3))   # (bh,bw)
 
+    gx = mx.concatenate([mx.abs(ylum[:, 1:] - ylum[:, :-1]),
+                         mx.zeros((hp, 1), dtype=mx.float32)], axis=1)
+    gy = mx.concatenate([mx.abs(ylum[1:, :] - ylum[:-1, :]),
+                         mx.zeros((1, wp), dtype=mx.float32)], axis=0)
+    gsum = gx + gy
+    dblk = mx.mean(gsum.reshape(bh, block, bw, block), axis=(1, 3))
+
+    ratio = None
+    if d2 is not None:
+        d2p = _edge_pad_hw(d2, ph, pw)
+        K2 = d2p.shape[0]
+        db2 = d2p.reshape(K2, bh, block, bw, block)
+        db2 = mx.transpose(db2, (1, 3, 0, 2, 4)).reshape(bh, bw, -1)
+        r1 = mx.sqrt(mx.mean(db * db, axis=-1))
+        r2 = mx.sqrt(mx.mean(db2 * db2, axis=-1))
+        ratio = r2 / (r1 + 1e-6)
+
     # signal-dependence model: robust sigma-vs-luma from the quiet blocks, used to
     # cap motion-dominated blocks (their pooled quantile is inflated everywhere).
     sig_l = [float(v) for v in sig.reshape(-1).tolist()]
     lum_l = [float(v) for v in blum.reshape(-1).tolist()]
+    det_l = [float(v) for v in dblk.reshape(-1).tolist()]
     def _p30(vals: list) -> float:
         s = sorted(vals)
         return s[int(0.30 * (len(s) - 1))]
-    global_p30 = _p30(sig_l)
+    nd = len(det_l)
+    det_s = sorted(det_l)
+    # The luma cap needs a quiet spatial baseline. On clips where every block is
+    # detailed and changing (textured subject/camera motion), the old all-block
+    # p30 baseline was itself motion-contaminated, so strict mode could still
+    # emit a huge map. Use genuinely low-detail blocks when available; if there
+    # are none, fall back to a conservative strict-mode baseline and close the
+    # flicker bypass below.
+    detail_gate = max(0.006, min(det_s[int(0.40 * (nd - 1))], 0.035))
+    quiet_idx = [i for i, dv in enumerate(det_l) if dv <= detail_gate]
+    min_quiet = max(8, int(0.15 * len(sig_l)))
+    have_quiet_detail = len(quiet_idx) >= min_quiet
+    model_sig_l = [sig_l[i] for i in quiet_idx] if have_quiet_detail else sig_l
+    model_lum_l = [lum_l[i] for i in quiet_idx] if have_quiet_detail else lum_l
+    global_p30 = _p30(model_sig_l)
+    sig_s = sorted(sig_l)
+    den = mx.mean((db > (2.0 / 255.0)).astype(mx.float32), axis=-1)
+    den_l = [float(v) for v in den.reshape(-1).tolist()]
+    den_s = sorted(den_l)
+    static_fraction = float(mx.mean((mx.max(d, axis=0) < (2.0 / 255.0)).astype(mx.float32)))
+    ratio_med = 2.0
+    if ratio is not None:
+        ratio_l = [float(v) for v in ratio.reshape(-1).tolist()]
+        ratio_s = sorted(ratio_l)
+        ratio_med = ratio_s[len(ratio_s) // 2]
+    dense_texture_ambiguous = (
+        motion_cap == "strict"
+        and ratio is not None
+        and sig_s[len(sig_s) // 2] > 0.08
+        and den_s[len(den_s) // 2] >= 0.55
+        and static_fraction <= 0.06
+        and ratio_med <= 1.35
+    )
+    if dense_texture_ambiguous:
+        global_p30 = min(global_p30, 0.035)
     model = [global_p30] * luma_bins
     for b in range(luma_bins):
         lo, hi = b / luma_bins, (b + 1) / luma_bins
-        vals = [s for s, lv in zip(sig_l, lum_l, strict=True) if lo <= lv < hi]
+        vals = [s for s, lv in zip(model_sig_l, model_lum_l, strict=True) if lo <= lv < hi]
         if len(vals) >= 8:
             model[b] = _p30(vals)
+    if dense_texture_ambiguous:
+        model = [min(v, 0.035) for v in model]
     # absolute slack keeps the cap from crushing genuine local noise on clips
     # whose baseline sits near the floor (heavy compression): the cap's job is
     # rejecting motion blowups (0.1-0.3+), not flattening the map to 2x floor.
@@ -209,18 +263,17 @@ def estimate_sigma_map(
     #     exactly what it measured.
     if motion_cap == "off":
         pass
-    elif d2 is not None:
-        d2p = _edge_pad_hw(d2, ph, pw)
-        K2 = d2p.shape[0]
-        db2 = d2p.reshape(K2, bh, block, bw, block)
-        db2 = mx.transpose(db2, (1, 3, 0, 2, 4)).reshape(bh, bw, -1)
-        r1 = mx.sqrt(mx.mean(db * db, axis=-1))
-        r2 = mx.sqrt(mx.mean(db2 * db2, axis=-1))
-        ratio = r2 / (r1 + 1e-6)
+    elif ratio is not None:
         if motion_cap == "loose":
             flick = mx.clip((2.0 - ratio) * (1.0 / 0.3), 0.0, 1.0)   # open <=1.7
         else:
             flick = mx.clip((1.35 - ratio) * (1.0 / 0.35), 0.0, 1.0)  # open <=1.0
+            if dense_texture_ambiguous:
+                # Dense textured motion can have ratio ~= 1, the same as
+                # temporal noise. If the frame offers no low-detail baseline,
+                # strict mode should prefer a conservative cap over a giant
+                # map that denoises real detail as if it were noise.
+                flick = flick * 0.0
         sig = flick * sig + (1.0 - flick) * capped
     else:
         sig = capped
@@ -232,12 +285,6 @@ def estimate_sigma_map(
         # local detail: flat blocks get a suppression margin (up to ~1.75x at
         # masking=1, matching the visual-kill margin over measured amplitude),
         # detailed blocks are tempered toward ~0.5x. masking=0 disables.
-        gx = mx.concatenate([mx.abs(ylum[:, 1:] - ylum[:, :-1]),
-                             mx.zeros((hp, 1), dtype=mx.float32)], axis=1)
-        gy = mx.concatenate([mx.abs(ylum[1:, :] - ylum[:-1, :]),
-                             mx.zeros((1, wp), dtype=mx.float32)], axis=0)
-        gsum = gx + gy
-        dblk = mx.mean(gsum.reshape(bh, block, bw, block), axis=(1, 3))
         df = mx.sort(dblk.reshape(-1))
         nb = df.shape[0]
         lo_d, hi_d = float(df[int(0.2 * (nb - 1))]), float(df[int(0.9 * (nb - 1))])
@@ -543,5 +590,85 @@ def analyze_noise(frames: list, thresh: float = 2.0 / 255.0) -> dict:
     return out
 
 
+def classify_noise_analysis(stats: dict) -> dict:
+    """Interpret `analyze_noise` output for map/probe decisions.
+
+    The classifier is intentionally heuristic. Its job is not to prove the
+    artifact source; it calls out when the temporal estimator has enough signal
+    to trust, when it is blind, and when motion/noise are statistically
+    ambiguous. Values are in the same [0, 1] per-channel sigma-ish units printed
+    by --probe-noise.
+    """
+    dens_med, dens_p90 = stats.get("flicker_density", (0.0, 0.0))
+    amp_med, amp_p90 = stats.get("flicker_amplitude", (0.0, 0.0))
+    tail5_med, tail5_p90 = stats.get("tail5", (0.0, 0.0))
+    rms_med, rms_p90 = stats.get("rms", (0.0, 0.0))
+    lag = float(stats.get("lag2_over_lag1", 0.0))
+    edge = float(stats.get("edge_over_flat", 1.0))
+    static = float(stats.get("static_fraction", 0.0))
+    static_hf = float(stats.get("static_spatial_hf", 0.0))
+    trace = [float(v) for v in stats.get("frame_trace", [])]
+    trace_sorted = sorted(trace)
+    trace_med = trace_sorted[len(trace_sorted) // 2] if trace_sorted else 0.0
+    trace_max = max(trace, default=0.0)
+
+    labels: list[str] = []
+    warnings: list[str] = []
+    suggestions: list[str] = []
+
+    if tail5_p90 < 0.012 and dens_p90 < 0.10:
+        labels.append("low temporal noise")
+    if static >= 0.15 and static_hf >= 0.006 and dens_p90 < 0.25:
+        labels.append("static/structured grain")
+        warnings.append("temporal sigma map will under-report static grain or fixed pattern structure")
+        suggestions.append("use a small --noise-map-floor or a manual denoise strength for static junk")
+    if edge >= 2.5 and dens_p90 < 0.45 and amp_p90 >= 0.012:
+        labels.append("sparse edge flicker")
+        warnings.append("edge-local mosquito flicker can be weak in a smooth sigma map")
+        suggestions.append("inspect the deblock map and consider edge/compression cleanup before denoise")
+    if trace_med > 0 and trace_max >= max(0.030, 1.55 * trace_med):
+        labels.append("pulsed temporal noise")
+        suggestions.append("--noise-map-pulse is likely useful")
+    if lag >= 1.35 and dens_p90 >= 0.25:
+        labels.append("motion-like temporal change")
+        warnings.append("motion can inflate frame-difference sigma estimates")
+    if static <= 0.06 and dens_p90 >= 0.55 and tail5_p90 >= 0.045:
+        labels.append("dense temporal change")
+        if edge < 1.8 and lag <= 1.30:
+            labels.append("motion/noise ambiguous")
+            warnings.append("dense texture motion can look like dense noise; strict auto maps may over-condition")
+            suggestions.append("compare the debug noise map against a constant/manual denoise run")
+        elif lag <= 1.35:
+            warnings.append("little static baseline is available for the motion cap")
+    if amp_p90 > max(0.080, 2.5 * max(rms_p90, 1e-6)) and dens_p90 < 0.35:
+        labels.append("sparse flashes")
+
+    if not labels:
+        labels.append("mixed/low-confidence")
+    risk = "low"
+    if any("ambiguous" in label for label in labels) or any("under-report" in w for w in warnings):
+        risk = "high"
+    elif warnings:
+        risk = "medium"
+    return {
+        "labels": labels,
+        "risk": risk,
+        "warnings": warnings,
+        "suggestions": suggestions,
+        "metrics": {
+            "density_p90": float(dens_p90),
+            "amplitude_p90": float(amp_p90),
+            "tail5_p90": float(tail5_p90),
+            "tail5_median": float(tail5_med),
+            "lag2_over_lag1": lag,
+            "edge_over_flat": edge,
+            "static_fraction": static,
+            "static_spatial_hf": static_hf,
+            "trace_median": float(trace_med),
+            "trace_max": float(trace_max),
+        },
+    }
+
+
 __all__ = ["analyze_noise", "estimate_sigma_map", "estimate_blockiness_map",
-           "NoiseMapTracker", "PulseGain"]
+           "classify_noise_analysis", "NoiseMapTracker", "PulseGain"]

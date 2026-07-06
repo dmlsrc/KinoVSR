@@ -8,7 +8,12 @@ import math
 
 import mlx.core as mx
 
-from LTX_2_MLX.videotoolbox.noise_map import NoiseMapTracker, PulseGain, estimate_sigma_map
+from LTX_2_MLX.videotoolbox.noise_map import (
+    NoiseMapTracker,
+    PulseGain,
+    classify_noise_analysis,
+    estimate_sigma_map,
+)
 
 H, W, T = 128, 160, 8
 
@@ -76,6 +81,22 @@ def test_motion_is_capped():
     est = estimate_sigma_map(clip)
     assert float(mx.max(est)) < 0.12
 
+
+def test_dense_textured_motion_is_conservative_in_strict_mode():
+    # Full-frame textured translation has dense frame differences but no
+    # injected noise. Its lag ratio is ~1, so a ratio-only flicker bypass used
+    # to let it through as a huge sigma map.
+    mx.random.seed(42)
+    base = mx.clip(mx.random.uniform(shape=(H, W, 3)) * 0.6 + 0.2, 0, 1)
+    clip = [mx.roll(base, shift=t * 3, axis=1) for t in range(T)]
+    strict = estimate_sigma_map(clip, motion_cap="strict", masking=1.0)
+    off = estimate_sigma_map(clip, motion_cap="off", masking=1.0)
+    p95_strict = float(mx.sort(strict.reshape(-1))[int(0.95 * (H * W - 1))])
+    p95_off = float(mx.sort(off.reshape(-1))[int(0.95 * (H * W - 1))])
+    assert p95_strict < 0.12
+    assert p95_off > 1.7 * p95_strict
+
+
 def test_strobe_reads_as_noise():
     # a photometrically strobing region (no displacement) IS temporal noise for
     # a denoiser: the lag-ratio bypass must let it through the motion cap
@@ -108,6 +129,18 @@ def test_sparse_flicker_registers():
     # cover to suppress it), well above the plain energy amp*sqrt(density)
     assert med > 0.35 * amp                   # amplitude scale (quantiles read ~0)
     assert med < 0.95 * amp                   # bounded below the raw amplitude
+
+
+def test_probe_classifier_flags_dense_motion_ambiguity():
+    from LTX_2_MLX.videotoolbox.noise_map import analyze_noise
+
+    mx.random.seed(43)
+    base = mx.clip(mx.random.uniform(shape=(H, W, 3)) * 0.6 + 0.2, 0, 1)
+    clip = [mx.roll(base, shift=t * 3, axis=1) for t in range(T)]
+    diag = classify_noise_analysis(analyze_noise(clip))
+    assert "motion/noise ambiguous" in diag["labels"]
+    assert diag["risk"] == "high"
+    assert diag["warnings"]
 
 
 def test_too_few_frames_returns_none():

@@ -30,6 +30,7 @@ from config import config_get, config_section, listify, load_config, resolve_pat
 
 
 MODE_ORDER = [
+    "reencode_only",
     "mild_high_iso",
     "block_grid",
     "jumping_scanlines",
@@ -39,6 +40,7 @@ MODE_ORDER = [
 ]
 
 MODE_NOTES = {
+    "reencode_only": "source clip re-encoded with the configured codec/CRF/GOP and no synthetic artifact",
     "mild_high_iso": "luma-dependent gaussian sensor noise plus weak row drift",
     "block_grid": "8x8-ish quantization, block bias, and explicit grid edges",
     "jumping_scanlines": "horizontal line darkening/noise with frame-to-frame phase jumps",
@@ -188,6 +190,8 @@ def _apply_mode(
     rng: np.random.Generator,
     gop: int,
 ) -> np.ndarray:
+    if mode == "reencode_only":
+        return frame
     if mode == "mild_high_iso":
         return _add_high_iso(frame, rng)
     if mode == "block_grid":

@@ -141,6 +141,15 @@ def summarize_probe(text: str) -> dict[str, Any]:
                 current["luma_corr"] = float(m.group(3))
                 current["static_fraction"] = float(m.group(4))
                 current["static_spatial_hf"] = float(m.group(5))
+        elif current is not None and "verdict:" in line:
+            m = re.search(r"verdict: (.+?)\s+risk=([a-z]+)", line)
+            if m:
+                current["labels"] = [part.strip() for part in m.group(1).split(",") if part.strip()]
+                current["risk"] = m.group(2)
+        elif current is not None and "warning:" in line:
+            current.setdefault("warnings", []).append(line.split("warning:", 1)[1].strip())
+        elif current is not None and "try:" in line:
+            current.setdefault("suggestions", []).append(line.split("try:", 1)[1].strip())
         elif current is not None and "frame trace:" in line:
             m = re.search(r"med ([0-9.]+)\s+max ([0-9.]+)", line)
             if m:
