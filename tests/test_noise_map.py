@@ -97,6 +97,27 @@ def test_dense_textured_motion_is_conservative_in_strict_mode():
     assert p95_off > 1.7 * p95_strict
 
 
+def test_source_wide_motion_contamination_is_conservative_in_strict_mode():
+    # A lightly blurred texture drifting one pixel per frame has lag2/lag1 > 1
+    # and no stable pixels. It is source-wide motion, not denoiseable noise.
+    mx.random.seed(301)
+    x = mx.random.uniform(shape=(H, W, 1))
+    p = mx.concatenate([x[:1], x, x[-1:]], axis=0)
+    p = mx.concatenate([p[:, :1], p, p[:, -1:]], axis=1)
+    acc = mx.zeros_like(x)
+    for i in range(3):
+        for j in range(3):
+            acc = acc + p[i:i + H, j:j + W]
+    base = mx.broadcast_to(acc / 9.0, (H, W, 3))
+    clip = [mx.roll(base, shift=t, axis=1) for t in range(T)]
+    strict = estimate_sigma_map(clip, motion_cap="strict", masking=1.0)
+    off = estimate_sigma_map(clip, motion_cap="off", masking=1.0)
+    p95_strict = float(mx.sort(strict.reshape(-1))[int(0.95 * (H * W - 1))])
+    p95_off = float(mx.sort(off.reshape(-1))[int(0.95 * (H * W - 1))])
+    assert p95_strict < 0.08
+    assert p95_off > 1.5 * p95_strict
+
+
 def test_strobe_reads_as_noise():
     # a photometrically strobing region (no displacement) IS temporal noise for
     # a denoiser: the lag-ratio bypass must let it through the motion cap
@@ -141,6 +162,24 @@ def test_probe_classifier_flags_dense_motion_ambiguity():
     assert "motion/noise ambiguous" in diag["labels"]
     assert diag["risk"] == "high"
     assert diag["warnings"]
+
+
+def test_probe_classifier_flags_source_wide_motion_contamination():
+    from LTX_2_MLX.videotoolbox.noise_map import analyze_noise
+
+    mx.random.seed(301)
+    x = mx.random.uniform(shape=(H, W, 1))
+    p = mx.concatenate([x[:1], x, x[-1:]], axis=0)
+    p = mx.concatenate([p[:, :1], p, p[:, -1:]], axis=1)
+    acc = mx.zeros_like(x)
+    for i in range(3):
+        for j in range(3):
+            acc = acc + p[i:i + H, j:j + W]
+    base = mx.broadcast_to(acc / 9.0, (H, W, 3))
+    clip = [mx.roll(base, shift=t, axis=1) for t in range(T)]
+    diag = classify_noise_analysis(analyze_noise(clip))
+    assert "source-wide motion contamination" in diag["labels"]
+    assert any("motion map" in warning for warning in diag["warnings"])
 
 
 def test_too_few_frames_returns_none():

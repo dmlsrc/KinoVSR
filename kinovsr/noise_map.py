@@ -213,6 +213,7 @@ def estimate_sigma_map(
     den_l = [float(v) for v in den.reshape(-1).tolist()]
     den_s = sorted(den_l)
     static_fraction = float(mx.mean((mx.max(d, axis=0) < (2.0 / 255.0)).astype(mx.float32)))
+    den_med = den_s[len(den_s) // 2]
     ratio_med = 2.0
     if ratio is not None:
         ratio_l = [float(v) for v in ratio.reshape(-1).tolist()]
@@ -226,8 +227,18 @@ def estimate_sigma_map(
         and static_fraction <= 0.06
         and ratio_med <= 1.35
     )
+    source_wide_motion_contaminated = (
+        motion_cap == "strict"
+        and ratio is not None
+        and sig_s[len(sig_s) // 2] > 0.06
+        and den_med >= 0.55
+        and static_fraction <= 0.15
+        and ratio_med >= 1.35
+    )
     if dense_texture_ambiguous:
         global_p30 = min(global_p30, 0.035)
+    if source_wide_motion_contaminated:
+        global_p30 = min(global_p30, 0.020)
     model = [global_p30] * luma_bins
     for b in range(luma_bins):
         lo, hi = b / luma_bins, (b + 1) / luma_bins
@@ -236,6 +247,8 @@ def estimate_sigma_map(
             model[b] = _p30(vals)
     if dense_texture_ambiguous:
         model = [min(v, 0.035) for v in model]
+    if source_wide_motion_contaminated:
+        model = [min(v, 0.020) for v in model]
     # absolute slack keeps the cap from crushing genuine local noise on clips
     # whose baseline sits near the floor (heavy compression): the cap's job is
     # rejecting motion blowups (0.1-0.3+), not flattening the map to 2x floor.
@@ -268,11 +281,12 @@ def estimate_sigma_map(
             flick = mx.clip((2.0 - ratio) * (1.0 / 0.3), 0.0, 1.0)   # open <=1.7
         else:
             flick = mx.clip((1.35 - ratio) * (1.0 / 0.35), 0.0, 1.0)  # open <=1.0
-            if dense_texture_ambiguous:
+            if dense_texture_ambiguous or source_wide_motion_contaminated:
                 # Dense textured motion can have ratio ~= 1, the same as
-                # temporal noise. If the frame offers no low-detail baseline,
-                # strict mode should prefer a conservative cap over a giant
-                # map that denoises real detail as if it were noise.
+                # temporal noise; broad, source-wide motion can also occupy the
+                # whole frame with no stable baseline. In either case strict
+                # mode should prefer a conservative cap over a giant map that
+                # denoises real detail as if it were noise.
                 flick = flick * 0.0
         sig = flick * sig + (1.0 - flick) * capped
     else:
