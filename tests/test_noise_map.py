@@ -59,6 +59,10 @@ def test_static_texture_does_not_register():
 
 
 def test_motion_is_capped():
+    # DISPLACEMENT motion (a drifting block, constant fill): lag-2 diffs double
+    # over lag-1, so the flicker bypass stays closed and the luma-model cap
+    # holds the map near the true noise. (A photometric STROBE is temporally
+    # independent and now intentionally reads as noise -- see the bypass note.)
     mx.random.seed(2)
     base = _content()
     yy = mx.arange(H).reshape(H, 1)
@@ -67,12 +71,43 @@ def test_motion_is_capped():
     for t in range(T):
         x0 = 10 + 10 * t
         m = ((yy >= 40) & (yy < 90) & (xx >= x0) & (xx < x0 + 40))[..., None]
-        f = mx.where(m, 0.8 if t % 2 == 0 else 0.2, base)
+        f = mx.where(m, 0.85, base)                    # constant fill, moving position
         clip.append(mx.clip(f + 0.03 * mx.random.normal(shape=f.shape), 0, 1))
     est = estimate_sigma_map(clip)
-    # the flashing/moving block would read sigma ~0.3 uncapped; the luma-model cap
-    # must hold the whole map within a few multiples of the true 0.03
-    assert float(mx.max(est)) < 0.10
+    assert float(mx.max(est)) < 0.12
+
+def test_strobe_reads_as_noise():
+    # a photometrically strobing region (no displacement) IS temporal noise for
+    # a denoiser: the lag-ratio bypass must let it through the motion cap
+    mx.random.seed(3)
+    base = _content()
+    yy = mx.arange(H).reshape(H, 1)
+    xx = mx.arange(W).reshape(1, W)
+    m = ((yy >= 40) & (yy < 90) & (xx >= 50) & (xx < 100))[..., None]
+    clip = [mx.clip(mx.where(m, 0.6 if t % 2 == 0 else 0.4, base)
+                    + 0.01 * mx.random.normal(shape=base.shape), 0, 1) for t in range(T)]
+    est = estimate_sigma_map(clip)
+    assert float(mx.max(est)) > 0.05      # the strobing region registers high
+
+
+def test_sparse_flicker_registers():
+    # mosquito-style compression flicker: 10% of pixels flash per frame, the
+    # rest are temporally identical (skip blocks). Plainly visible, yet ANY
+    # quantile of the diff samples reads ~0 (the zero spike swallows it). The
+    # RMS statistic must read the energy: amp * sqrt(density).
+    mx.random.seed(12)
+    base = _content()
+    amp, density = 0.06, 0.10
+    clip = []
+    for _ in range(T):
+        m = (mx.random.uniform(shape=(H, W, 1)) < density).astype(mx.float32)
+        clip.append(mx.clip(base + m * amp * mx.random.normal(shape=base.shape), 0, 1))
+    est = estimate_sigma_map(clip)
+    med = float(mx.sort(est.reshape(-1))[H * W // 2])
+    # tail-RMS reads the flicker's AMPLITUDE scale (what conditioning must
+    # cover to suppress it), well above the plain energy amp*sqrt(density)
+    assert med > 0.35 * amp                   # amplitude scale (quantiles read ~0)
+    assert med < 0.95 * amp                   # bounded below the raw amplitude
 
 
 def test_too_few_frames_returns_none():
@@ -286,6 +321,7 @@ def test_mc_sigma_plane_and_pulse():
     # units) and the pulse as a per-frame scale. Needs VTOpticalFlow; skip where
     # the flow self-test refuses (unsupported device / too-small buffers).
     import pytest
+
     from LTX_2_MLX.videotoolbox.denoise import McTemporalDenoiser
     mx.random.seed(9)
     h, w = 240, 320

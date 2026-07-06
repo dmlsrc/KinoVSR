@@ -118,7 +118,6 @@ from LTX_2_MLX.videotoolbox.edge_sanitize import (
     sanitize_rgb as _sanitize_rgb,
 )
 from LTX_2_MLX.videotoolbox.fastdvdnet import FastDvdDenoiser
-from LTX_2_MLX.videotoolbox.images import save_image
 from LTX_2_MLX.videotoolbox.vsr import NativePassthrough
 from LTX_2_MLX.videotoolbox.vsr_blocks import make_lanczos_plan, resample_width
 from LTX_2_MLX.videotoolbox.writer import (
@@ -958,6 +957,50 @@ def run(args: argparse.Namespace) -> None:
     except ValueError as e:
         raise SystemExit(f"bad --max-frames value: {e}") from None
 
+    if getattr(args, "probe_noise", False) and args.video:
+        from LTX_2_MLX.videotoolbox.noise_map import analyze_noise
+        _pw_end = win_end if win_end is not None else total_frames
+        _span = max(1, _pw_end - win_start)
+        _starts = sorted({win_start + int(f * max(0, _span - 12)) for f in (0.1, 0.5, 0.9)})
+        print(f"[probe] noise analysis: {len(_starts)} windows of 12 frames in "
+              f"[{win_start}, {_pw_end})")
+        try:
+            _kfl = _vr.keyframe_display_indices(Path(args.video)) or [0]
+        except Exception:
+            _kfl = [0]
+        for ws in _starts:
+            _fr = []
+            for _chk in _vr.iter_video_buffer_chunks(
+                    Path(args.video), _pb.PIX_RGBAHALF, chunk_size=6,
+                    start_frame=ws, end_frame=min(ws + 12, _pw_end)):
+                _fr += [mx.clip(_pb.read_buffer_rgb_f32(b), 0, 1) for b in _chk]
+            if len(_fr) < 3:
+                continue
+            r = analyze_noise(_fr)
+            tr = r.pop("frame_trace")
+
+            def _kfd(i, _ws=ws):
+                pri = [k for k in _kfl if k <= _ws + i + 1]
+                return _ws + i + 1 - (max(pri) if pri else 0)
+            print(f"[probe] window @ frame {ws}:")
+            print("  sigma (med/p90 per block): " + "  ".join(
+                f"{k} {r[k][0]:.4f}/{r[k][1]:.4f}"
+                for k in ("q50", "q75", "q90", "q95", "rms", "tail5", "tail1", "max")))
+            print(f"  flicker: density {r['flicker_density'][0]:.3f}/{r['flicker_density'][1]:.3f}"
+                  f"   amplitude {r['flicker_amplitude'][0]:.4f}/{r['flicker_amplitude'][1]:.4f}"
+                  f"   (fraction of pixels moving; how hard those move)")
+            print(f"  structure: lag2/lag1 {r.get('lag2_over_lag1', 0):.2f}   "
+                  f"edge/flat {r['edge_over_flat']:.2f}   luma-corr {r['luma_corr']:+.2f}   "
+                  f"static-frac {r['static_fraction']:.2f}   "
+                  f"static-spatial-hf {r['static_spatial_hf']:.4f}")
+            print(f"  channels: R {r['sigma_R']:.4f}  G {r['sigma_G']:.4f}  B {r['sigma_B']:.4f}")
+            _pk = sorted(range(len(tr)), key=lambda i: -tr[i])[:3]
+            print(f"  frame trace: med {sorted(tr)[len(tr) // 2]:.4f}  max {max(tr):.4f}"
+                  "   top flashes: " + ", ".join(
+                      f"diff{i + 1} {tr[i]:.4f} (kf+{_kfd(i)})" for i in _pk))
+        print("[probe] done -- no processing performed")
+        return
+
     print(
         f"Source: {in_w}x{in_h}, "
         f"total frames: {total_frames or 'unknown'}, "
@@ -1075,7 +1118,9 @@ def run(args: argparse.Namespace) -> None:
         if args.noise_map == "auto":
             if _map_capable:
                 from LTX_2_MLX.videotoolbox.noise_map import NoiseMapTracker
-                nm_tracker = NoiseMapTracker(gain=args.noise_map_gain)
+                nm_tracker = NoiseMapTracker(gain=args.noise_map_gain,
+                                             motion_cap=args.noise_map_motion_cap,
+                                             masking=args.noise_map_masking)
                 _floor_note = (f", floor {args.noise_map_floor:g}"
                                if args.noise_map_floor > 0 else "")
                 print(f"[noise-map] auto: per-pixel sigma estimated from the footage "
@@ -1138,8 +1183,8 @@ def run(args: argparse.Namespace) -> None:
             # --pvdd-weights / $PVDD_WEIGHTS overrides the path. The `level`
             # variants take a noise-variance dial (--pvdd-noise-preset/-variance);
             # blind variants ignore it. --denoise-strength does not apply.
-            from LTX_2_MLX.videotoolbox.pvdd.upscaler import PvddDenoiser
             from LTX_2_MLX.videotoolbox.pvdd import LEVEL_PRESETS
+            from LTX_2_MLX.videotoolbox.pvdd.upscaler import PvddDenoiser
             nv = args.pvdd_noise_variance
             if nv is None and args.pvdd_noise_preset != "off":
                 nv = LEVEL_PRESETS[args.pvdd_noise_preset]
@@ -1167,7 +1212,9 @@ def run(args: argparse.Namespace) -> None:
         if args.deblock_map == "auto":
             if args.deblock in ("stdf", "fbcnn"):
                 from LTX_2_MLX.videotoolbox.noise_map import (
-                    NoiseMapTracker, estimate_blockiness_map)
+                    NoiseMapTracker,
+                    estimate_blockiness_map,
+                )
                 blk_tracker = NoiseMapTracker(gain=args.deblock_map_gain, min_frames=1,
                                               estimator=estimate_blockiness_map)
                 print(f"[deblock-map] auto: per-pixel blockiness mask on the "
@@ -2546,6 +2593,43 @@ def main() -> None:
             "mask sooner (more area fully deblocked); <1 is more conservative. The "
             "mask clamps at 1.0 after the gain, so the blend never extrapolates "
             "past the deblocked frame. Only used with --deblock-map auto."
+        ),
+    )
+    parser.add_argument(
+        "--noise-map-masking", type=float, default=0.0, metavar="S",
+        help=(
+            "Perceptual masking weight for the noise map (default 0 = off; 1 = "
+            "full). Noise visibility is highest in flat regions and lowest near "
+            "edges/texture, while over-conditioning near detail reads as "
+            "softness -- so at 1.0 flat blocks get a ~1.75x suppression margin "
+            "over the measured amplitude (the visual-kill margin) and detailed "
+            "blocks are tempered to ~0.5x. Fixes the constant-beats-map case "
+            "where the map smooths hardest exactly where the eye punishes "
+            "softness most."
+        ),
+    )
+    parser.add_argument(
+        "--noise-map-motion-cap", choices=["strict", "loose", "off"], default="strict",
+        help=(
+            "How aggressively the noise map's motion cap suppresses blocks that "
+            "look motion-like. Temporal statistics cannot separate compression "
+            "flicker that persists a couple of frames (lag ratio ~1.5) from "
+            "occlusion edges (~1.41), so this is a material decision: strict "
+            "(default) = displacement-safe, right for real subject/camera "
+            "motion; loose = static-camera material, persistent flicker also "
+            "escapes the cap; off = tripod/archival footage, no cap -- the map "
+            "reports exactly what it measured."
+        ),
+    )
+    parser.add_argument(
+        "--probe-noise", action="store_true",
+        help=(
+            "Analyze the clip's noise instead of processing it: per-block "
+            "quantile/energy/amplitude sigma statistics, flicker density and "
+            "amplitude, temporal persistence, edge/luma correlation, a "
+            "static-grain proxy, per-channel split, and the per-frame flash "
+            "trace with keyframe distances. Three sample windows across the "
+            "trim range; prints and exits."
         ),
     )
     parser.add_argument(

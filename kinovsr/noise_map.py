@@ -6,10 +6,13 @@ noise **variance**, so square this map for them) from a short window of frames.
 
 Method: temporal, not spatial. Consecutive-frame differences on luma cancel static
 content (including fine texture, which spatial estimators misread as noise) and
-leave motion plus temporally-varying noise. Per coarse block, a low quantile of
-the pooled |diff| samples is scaled to sigma via the half-normal quantile factor
--- the low quantile makes the estimate robust to a minority of motion-contaminated
-samples. Blocks that are motion-dominated anyway (all samples inflated) are capped
+leave motion plus temporally-varying noise. Per coarse block, the pooled diff
+samples reduce by tail RMS (top-5%, AWGN-normalized): conditioning must cover
+the AMPLITUDE of what flickers -- sparse mosquito flicker reads zero at any
+quantile and only sqrt(density) of its amplitude in plain energy, yet a net
+conditioned below the amplitude preserves the flash as signal. Tail RMS reads
+the flicker amplitude scale and stays exact on dense AWGN.
+Motion-contaminated blocks are capped
 by a signal-dependence model (sigma as a function of block luma, fitted from the
 quiet blocks), which also encodes the shadows-are-noisier structure of real
 footage. The coarse map is smoothed and bilinearly-ish upsampled so the
@@ -29,14 +32,19 @@ from typing import Any
 
 import mlx.core as mx
 
-# Half-normal quantile factor: for d ~ N(0, sigma), quantile_p(|d|) = sigma *
-# sqrt(2) * erfinv(p). Pooling uses p = 0.75 (factor sqrt(2)*erfinv(0.75)):
-# compression leaves many pixels temporally IDENTICAL (skip blocks), so the
-# pooled |diff| distribution is a spike at zero plus a sparse flicker tail --
-# any low quantile lands on the zeros and reads sigma 0 on exactly the clips
-# that need conditioning. A high quantile reads the tail; motion robustness is
-# the luma-cap's job, not the quantile's.
-_HALF_NORMAL_Q75 = 1.1503493803760079
+# Pooling statistic: tail RMS -- the RMS of the top 5% of |diff| samples per
+# block, normalized so dense AWGN reads exactly sigma. The conditioning
+# question is not "how much temporal energy is there" but "how large a sigma
+# must the denoiser be told so it SUPPRESSES what flickers": a pixel flashing
+# at amplitude A in a mostly-static block contributes only A*sqrt(density) to
+# the block energy, yet a net conditioned below A treats the flash as signal
+# and preserves it. The tail statistic reads the flicker's amplitude scale
+# (sparse flash -> the tail IS the flicker); for dense AWGN the top-5% tail of
+# |N(0,sigma)| has E[d^2 | tail] = 5.577 sigma^2, so dividing by sqrt(5.577)
+# keeps it exact there. Quantiles fail both ways (a 10%-density flash reads 0
+# at q75). Motion robustness is the luma-cap's job, not the statistic's.
+_TAIL_FRACTION = 0.05
+_TAIL_RMS_NORM = 2.3616  # sqrt(E[Z^2 | |Z| > z95]) for standard normal Z
 # Rec.601 luma; the map conditions nets on broadcast-ish content.
 _LUMA = (0.299, 0.587, 0.114)
 # Map-conditioned nets are trained with per-CHANNEL AWGN sigma in the map plane,
@@ -112,6 +120,8 @@ def estimate_sigma_map(
     block: int = 16,
     max_frames: int = 12,
     luma_cap_headroom: float = 2.0,
+    motion_cap: str = "strict",
+    masking: float = 0.0,
     luma_bins: int = 8,
     sigma_floor: float = 0.002,
     sigma_ceil: float = 0.25,
@@ -130,13 +140,17 @@ def estimate_sigma_map(
     runs = _select_runs(len(frames), max_frames)
     lum_all: list = []
     diffs: list = []
+    diffs2: list = []
     for run in runs:
         lum = [_to_luma_2d(frames[i]) for i in run]
         lum_all.extend(lum)
         yr = mx.stack(lum, axis=0)
         diffs.append(mx.abs(yr[1:] - yr[:-1]) * (1.0 / 1.4142135623730951))
+        if yr.shape[0] >= 3:
+            diffs2.append(mx.abs(yr[2:] - yr[:-2]) * (1.0 / 1.4142135623730951))
     y = mx.stack(lum_all, axis=0)                               # sampled lumas
     d = mx.concatenate(diffs, axis=0)                           # (K,H,W) adjacent diffs
+    d2 = mx.concatenate(diffs2, axis=0) if diffs2 else None     # lag-2 diffs
     H, W = int(y.shape[1]), int(y.shape[2])
     K = d.shape[0]
 
@@ -149,9 +163,9 @@ def estimate_sigma_map(
     db = d.reshape(K, bh, block, bw, block)
     db = mx.transpose(db, (1, 3, 0, 2, 4)).reshape(bh, bw, K * block * block)
     n = db.shape[-1]
-    q_idx = int(round(0.75 * (n - 1)))
-    q = mx.sort(db, axis=-1)[..., q_idx]                        # (bh,bw)
-    sig = q * (_CHANNEL_FROM_LUMA / _HALF_NORMAL_Q75)
+    k = max(1, int(round(_TAIL_FRACTION * n)))
+    tail = mx.sort(db, axis=-1)[..., n - k:]                    # top-5% |d| per block
+    sig = mx.sqrt(mx.mean(tail * tail, axis=-1))         * (_CHANNEL_FROM_LUMA / _TAIL_RMS_NORM)                 # (bh,bw)
     blum = mx.mean(ylum.reshape(bh, block, bw, block), axis=(1, 3))   # (bh,bw)
 
     # signal-dependence model: robust sigma-vs-luma from the quiet blocks, used to
@@ -165,16 +179,71 @@ def estimate_sigma_map(
     model = [global_p30] * luma_bins
     for b in range(luma_bins):
         lo, hi = b / luma_bins, (b + 1) / luma_bins
-        vals = [s for s, l in zip(sig_l, lum_l) if lo <= l < hi]
+        vals = [s for s, lv in zip(sig_l, lum_l, strict=True) if lo <= lv < hi]
         if len(vals) >= 8:
             model[b] = _p30(vals)
     # absolute slack keeps the cap from crushing genuine local noise on clips
     # whose baseline sits near the floor (heavy compression): the cap's job is
     # rejecting motion blowups (0.1-0.3+), not flattening the map to 2x floor.
-    cap = [luma_cap_headroom * model[min(luma_bins - 1, max(0, int(l * luma_bins)))] + 0.01
-           for l in lum_l]
-    sig = mx.minimum(sig, mx.array(cap, dtype=mx.float32).reshape(bh, bw))
+    cap = [luma_cap_headroom * model[min(luma_bins - 1, max(0, int(lv * luma_bins)))] + 0.01
+           for lv in lum_l]
+    capped = mx.minimum(sig, mx.array(cap, dtype=mx.float32).reshape(bh, bw))
+    # flicker bypass: the cap exists for DISPLACEMENT motion, which doubles
+    # over two frames (lag2/lag1 -> 2); per-frame flicker is temporally
+    # independent (ratio -> 1). Spatially CONCENTRATED noise would otherwise be
+    # indistinguishable from motion outliers and get flattened to the quiet
+    # majority's cap -- exactly the blocks a noise map is for. Blend by
+    # per-block flicker-ness so flicker keeps its measured level and
+    # displacement still gets capped.
+    # motion_cap modes: temporal statistics CANNOT cleanly separate flicker
+    # that persists a couple of frames (compression artifacts refresh at coding
+    # cadence -> lag ratio ~1.5) from occlusion edges (~1.41) -- the
+    # distributions overlap, so the cap's aggressiveness is a material
+    # decision the caller makes:
+    #   strict (default) -- displacement-safe: only temporally independent
+    #     flicker (ratio ~1) bypasses the cap; anything edge/motion-like is
+    #     capped. Right for footage with real subject/camera motion.
+    #   loose -- static-camera material: persistent compression flicker
+    #     (ratio up to ~1.7) also bypasses; occlusion edges partially leak.
+    #   off -- tripod/archival material: no motion cap at all; the map reports
+    #     exactly what it measured.
+    if motion_cap == "off":
+        pass
+    elif d2 is not None:
+        d2p = _edge_pad_hw(d2, ph, pw)
+        K2 = d2p.shape[0]
+        db2 = d2p.reshape(K2, bh, block, bw, block)
+        db2 = mx.transpose(db2, (1, 3, 0, 2, 4)).reshape(bh, bw, -1)
+        r1 = mx.sqrt(mx.mean(db * db, axis=-1))
+        r2 = mx.sqrt(mx.mean(db2 * db2, axis=-1))
+        ratio = r2 / (r1 + 1e-6)
+        if motion_cap == "loose":
+            flick = mx.clip((2.0 - ratio) * (1.0 / 0.3), 0.0, 1.0)   # open <=1.7
+        else:
+            flick = mx.clip((1.35 - ratio) * (1.0 / 0.35), 0.0, 1.0)  # open <=1.0
+        sig = flick * sig + (1.0 - flick) * capped
+    else:
+        sig = capped
 
+    if masking > 0.0:
+        # perceptual masking: noise VISIBILITY is highest in flat regions and
+        # lowest near edges/texture (spatial masking), while over-conditioning
+        # near detail is what reads as softness. Weight the measured map by
+        # local detail: flat blocks get a suppression margin (up to ~1.75x at
+        # masking=1, matching the visual-kill margin over measured amplitude),
+        # detailed blocks are tempered toward ~0.5x. masking=0 disables.
+        gx = mx.concatenate([mx.abs(ylum[:, 1:] - ylum[:, :-1]),
+                             mx.zeros((hp, 1), dtype=mx.float32)], axis=1)
+        gy = mx.concatenate([mx.abs(ylum[1:, :] - ylum[:-1, :]),
+                             mx.zeros((1, wp), dtype=mx.float32)], axis=0)
+        gsum = gx + gy
+        dblk = mx.mean(gsum.reshape(bh, block, bw, block), axis=(1, 3))
+        df = mx.sort(dblk.reshape(-1))
+        nb = df.shape[0]
+        lo_d, hi_d = float(df[int(0.2 * (nb - 1))]), float(df[int(0.9 * (nb - 1))])
+        dn = mx.clip((dblk - lo_d) / max(hi_d - lo_d, 1e-6), 0.0, 1.0)
+        margin = 1.0 + masking * (0.75 - 1.25 * dn)   # flat 1.75x .. detail 0.5x
+        sig = sig * margin
     if smooth:
         sig = _box_smooth_coarse(sig)
     full = mx.repeat(mx.repeat(sig, block, axis=0), block, axis=1)[:H, :W]
@@ -285,7 +354,7 @@ def estimate_blockiness_map(
         lines = [gt[:, :, :, phase + k * period]
                  for k in range(max(1, (tile - phase) // period))
                  if phase + k * period < tile]
-        line_means = mx.stack([mx.mean(l, axis=1) for l in lines], axis=0)  # (L,ht,wt)
+        line_means = mx.stack([mx.mean(ln, axis=1) for ln in lines], axis=0)  # (L,ht,wt)
         return mx.min(line_means, axis=0)                       # (ht,wt)
 
     def _tile_excess(g: Any, phase: int, transpose: bool) -> Any:
@@ -371,9 +440,7 @@ class PulseGain:
             return self.last
         d = mx.abs(y - self._prev) * (1.0 / 1.4142135623730951)
         self._prev = y
-        flat = mx.sort(d.reshape(-1))
-        q = float(flat[int(0.75 * (flat.shape[0] - 1))])
-        sigma_t = q * (_CHANNEL_FROM_LUMA / _HALF_NORMAL_Q75)
+        sigma_t = float(mx.sqrt(mx.mean(d * d))) * _CHANNEL_FROM_LUMA
         self._hist.append(sigma_t)
         if len(self._hist) > self.history:
             self._hist.pop(0)
@@ -388,5 +455,93 @@ class PulseGain:
         return self.last
 
 
-__all__ = ["estimate_sigma_map", "estimate_blockiness_map", "NoiseMapTracker",
-           "PulseGain"]
+def analyze_noise(frames: list, thresh: float = 2.0 / 255.0) -> dict:
+    """Diagnostic battery over one window of frames: every statistic family that
+    can characterize temporal noise, for probing clips where the estimator and
+    the eye disagree. Returns a dict of scalars (block statistics are reported
+    as (median, p90) over 16px blocks; sigma-like values in per-channel units).
+    """
+    lum = [_to_luma_2d(f) for f in frames]
+    y = mx.stack(lum, axis=0)
+    d = mx.abs(y[1:] - y[:-1]) * (1.0 / 1.4142135623730951)
+    K, H, W = int(d.shape[0]), int(d.shape[1]), int(d.shape[2])
+    block = 16
+    hb, wb = H // block * block, W // block * block
+    db = d[:, :hb, :wb].reshape(K, hb // block, block, wb // block, block)
+    db = mx.transpose(db, (1, 3, 0, 2, 4)).reshape(hb // block, wb // block, -1)
+    n = int(db.shape[-1])
+    srt = mx.sort(db, axis=-1)
+    out: dict = {}
+
+    def blkstats(v):
+        f = mx.sort(v.reshape(-1))
+        m = int(f.shape[0])
+        return float(f[m // 2]), float(f[int(0.9 * (m - 1))])
+
+    # quantiles, AWGN-normalized (sqrt2*erfinv(p))
+    for pq, fac in ((0.50, 0.6745), (0.75, 1.1503), (0.90, 1.6449), (0.95, 1.9600)):
+        q = srt[..., int(pq * (n - 1))] * (_CHANNEL_FROM_LUMA / fac)
+        out[f"q{int(pq * 100)}"] = blkstats(q)
+    out["rms"] = blkstats(mx.sqrt(mx.mean(db * db, axis=-1)) * _CHANNEL_FROM_LUMA)
+    for frac, norm, name in ((0.05, 2.3616, "tail5"), (0.01, 2.9110, "tail1")):
+        k = max(1, int(round(frac * n)))
+        t = srt[..., n - k:]
+        out[name] = blkstats(mx.sqrt(mx.mean(t * t, axis=-1)) * (_CHANNEL_FROM_LUMA / norm))
+    out["max"] = blkstats(srt[..., -1] * _CHANNEL_FROM_LUMA)
+
+    # sparseness: how many pixels flicker at all, and how hard THOSE flicker
+    fmask = (db > thresh).astype(mx.float32)
+    cnt = mx.sum(fmask, axis=-1)
+    out["flicker_density"] = blkstats(cnt / n)
+    amp = mx.sqrt(mx.sum(db * db * fmask, axis=-1) / mx.maximum(cnt, 1.0)) * _CHANNEL_FROM_LUMA
+    out["flicker_amplitude"] = blkstats(amp)
+
+    # per-frame flash trace (whole-frame RMS sigma per diff)
+    tr = [float(mx.sqrt(mx.mean(d[i] * d[i]))) * _CHANNEL_FROM_LUMA for i in range(K)]
+    out["frame_trace"] = tr
+
+    # persistence: lag-2 vs lag-1 energy (iid per-frame flicker -> ~1.0;
+    # frame-alternating -> <1; slow drift/motion -> >1)
+    if len(lum) >= 3:
+        d2 = mx.abs(y[2:] - y[:-2]) * (1.0 / 1.4142135623730951)
+        out["lag2_over_lag1"] = float(mx.sqrt(mx.mean(d2 * d2)) / (mx.sqrt(mx.mean(d * d)) + 1e-9))
+
+    # edge correlation (mosquito noise rides edges): flicker energy near edges
+    # vs in flat areas
+    my = mx.mean(y, axis=0)
+    gx = mx.abs(my[:, 1:] - my[:, :-1])[:-1, :]
+    gy = mx.abs(my[1:, :] - my[:-1, :])[:, :-1]
+    g = gx + gy
+    gs = mx.sort(g.reshape(-1))
+    ethr = float(gs[int(0.85 * (gs.shape[0] - 1))])
+    em = (g > ethr).astype(mx.float32)
+    de = mx.mean(d[:, :-1, :-1] ** 2, axis=0)
+    e_edge = float(mx.sum(de * em) / mx.maximum(mx.sum(em), 1.0))
+    e_flat = float(mx.sum(de * (1 - em)) / mx.maximum(mx.sum(1 - em), 1.0))
+    out["edge_over_flat"] = (e_edge / (e_flat + 1e-12)) ** 0.5
+
+    # luma correlation of block sigma (shadows-noisier structure)
+    ylb = mx.mean(y[:, :hb, :wb].mean(axis=0).reshape(hb // block, block, wb // block, block),
+                  axis=(1, 3)).reshape(-1)
+    sb = mx.sqrt(mx.mean(db * db, axis=-1)).reshape(-1)
+    ym, sm = mx.mean(ylb), mx.mean(sb)
+    cov = mx.mean((ylb - ym) * (sb - sm))
+    out["luma_corr"] = float(cov / (mx.sqrt(mx.mean((ylb - ym) ** 2) * mx.mean((sb - sm) ** 2)) + 1e-12))
+
+    # static-grain proxy: spatial high-frequency energy where NOTHING flickers
+    static = (mx.max(d, axis=0) < thresh).astype(mx.float32)
+    lap = mx.abs(my[1:-1, 1:-1] * 4 - my[:-2, 1:-1] - my[2:, 1:-1] - my[1:-1, :-2] - my[1:-1, 2:])
+    sm2 = static[1:-1, 1:-1]
+    out["static_fraction"] = float(mx.mean(static))
+    out["static_spatial_hf"] = float(mx.sum(lap * sm2) / mx.maximum(mx.sum(sm2), 1.0)) / 4.4721 * _CHANNEL_FROM_LUMA
+
+    # per-channel temporal RMS (is the flash chromatic?)
+    for i, ch in enumerate("RGB"):
+        c = mx.stack([f[0] if f.ndim == 4 else f for f in frames], axis=0).astype(mx.float32)[..., i]
+        dc = (c[1:] - c[:-1]) * (1.0 / 1.4142135623730951)
+        out[f"sigma_{ch}"] = float(mx.sqrt(mx.mean(dc * dc)))
+    return out
+
+
+__all__ = ["analyze_noise", "estimate_sigma_map", "estimate_blockiness_map",
+           "NoiseMapTracker", "PulseGain"]
