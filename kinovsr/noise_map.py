@@ -209,6 +209,9 @@ def estimate_sigma_map(
     model_lum_l = [lum_l[i] for i in quiet_idx] if have_quiet_detail else lum_l
     global_p30 = _p30(model_sig_l)
     sig_s = sorted(sig_l)
+    sig_p30 = sig_s[int(0.30 * (len(sig_s) - 1))]
+    sig_med = sig_s[len(sig_s) // 2]
+    sig_p95 = sig_s[int(0.95 * (len(sig_s) - 1))]
     den = mx.mean((db > (2.0 / 255.0)).astype(mx.float32), axis=-1)
     den_l = [float(v) for v in den.reshape(-1).tolist()]
     den_s = sorted(den_l)
@@ -222,21 +225,25 @@ def estimate_sigma_map(
     dense_texture_ambiguous = (
         motion_cap == "strict"
         and ratio is not None
-        and sig_s[len(sig_s) // 2] > 0.08
+        and sig_med > 0.08
         and den_s[len(den_s) // 2] >= 0.55
         and static_fraction <= 0.06
         and ratio_med <= 1.35
     )
+    # Uniform dense temporal change can be true sensor/AWGN noise. Real motion
+    # contamination is usually spatially uneven, so only the high-spread case
+    # gets the stricter cap; the uniform case keeps the older softer cap.
+    dense_motion_heterogeneous = sig_p95 > max(0.12, 1.60 * max(sig_p30, 1e-6))
     source_wide_motion_contaminated = (
         motion_cap == "strict"
         and ratio is not None
-        and sig_s[len(sig_s) // 2] > 0.06
+        and sig_med > 0.06
         and den_med >= 0.55
         and static_fraction <= 0.15
         and ratio_med >= 1.35
     )
     if dense_texture_ambiguous:
-        global_p30 = min(global_p30, 0.035)
+        global_p30 = min(global_p30, 0.020 if dense_motion_heterogeneous else 0.035)
     if source_wide_motion_contaminated:
         global_p30 = min(global_p30, 0.020)
     model = [global_p30] * luma_bins
@@ -246,7 +253,8 @@ def estimate_sigma_map(
         if len(vals) >= 8:
             model[b] = _p30(vals)
     if dense_texture_ambiguous:
-        model = [min(v, 0.035) for v in model]
+        dense_cap = 0.020 if dense_motion_heterogeneous else 0.035
+        model = [min(v, dense_cap) for v in model]
     if source_wide_motion_contaminated:
         model = [min(v, 0.020) for v in model]
     # absolute slack keeps the cap from crushing genuine local noise on clips

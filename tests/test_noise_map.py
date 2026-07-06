@@ -97,6 +97,30 @@ def test_dense_textured_motion_is_conservative_in_strict_mode():
     assert p95_off > 1.7 * p95_strict
 
 
+def test_heterogeneous_dense_motion_gets_stricter_cap():
+    # Real motion contamination is usually spatially uneven (some blocks are
+    # texture/occlusion heavy, others are not). That should get a stricter cap
+    # than spatially uniform dense noise.
+    mx.random.seed(44)
+    left = mx.random.uniform(shape=(H, W // 2, 3)) * 0.6 + 0.2
+    right = mx.random.uniform(shape=(H, W - W // 2, 3)) * 0.12 + 0.44
+    base = mx.clip(mx.concatenate([left, right], axis=1), 0, 1)
+    clip = [mx.roll(base, shift=t * 3, axis=1) for t in range(T)]
+    strict = estimate_sigma_map(clip, motion_cap="strict", masking=1.0)
+    off = estimate_sigma_map(clip, motion_cap="off", masking=1.0)
+    p95_strict = float(mx.sort(strict.reshape(-1))[int(0.95 * (H * W - 1))])
+    p95_off = float(mx.sort(off.reshape(-1))[int(0.95 * (H * W - 1))])
+    assert p95_strict < 0.08
+    assert p95_off > 1.7 * p95_strict
+
+
+def test_dense_noise_on_smooth_content_is_not_motion_capped():
+    sig = mx.full((H, W), 0.10)
+    est = estimate_sigma_map(_noisy_clip(sig), motion_cap="strict", masking=1.0)
+    med = float(mx.sort(est.reshape(-1))[H * W // 2])
+    assert med > 0.08
+
+
 def test_source_wide_motion_contamination_is_conservative_in_strict_mode():
     # A lightly blurred texture drifting one pixel per frame has lag2/lag1 > 1
     # and no stable pixels. It is source-wide motion, not denoiseable noise.
