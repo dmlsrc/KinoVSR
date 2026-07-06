@@ -7,7 +7,6 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOL_DIR.parents[1]
 DEFAULT_CONFIG_CANDIDATES = (

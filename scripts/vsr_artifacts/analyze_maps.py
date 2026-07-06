@@ -28,20 +28,25 @@ from typing import Any
 import av
 import mlx.core as mx
 import numpy as np
-
-from config import config_get, config_section, default_shared_temp, listify, load_config, resolve_path
+from config import (
+    config_get,
+    config_section,
+    default_shared_temp,
+    listify,
+    load_config,
+    resolve_path,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from LTX_2_MLX.videotoolbox.noise_map import (
+from LTX_2_MLX.videotoolbox.noise_map import (  # noqa: E402
     analyze_noise,
     classify_noise_analysis,
     estimate_blockiness_map,
     estimate_sigma_map,
 )
-
 
 DEFAULT_WINDOWS = [0.1, 0.5, 0.9]
 DEFAULT_MOTION_CAPS = ["strict", "loose", "off"]

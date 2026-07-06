@@ -33,11 +33,21 @@ overwrite = false
 # dropout = 0.25
 #
 # [fixtures.mode_params.mosquito_edges]
-# method = "codec_residual"
-# proxy_codec = "libx264"
-# proxy_crf = 44
-# proxy_preset = "ultrafast"
-# proxy_pix_fmt = "yuv420p"
+# # Default method: per-frame JPEG re-quantization at a cycling quality with a
+# # small pre-encode dither. Both real-world flicker mechanisms are present
+# # (source noise flipping quantized DCT coefficients, and the quantizer
+# # breathing frame to frame), so the halo flickers even on static shots.
+# method = "jpeg_cycle"
+# jpeg_quality_lo = 28
+# jpeg_quality_hi = 45
+# pre_dither_sigma = 0.012
+# # Alternate method: residual of a low-quality inter-codec proxy encode.
+# # Freezes on static content (deadzone/skip); use only for moving sources.
+# # method = "codec_residual"
+# # proxy_codec = "libx264"
+# # proxy_crf = 44
+# # proxy_preset = "ultrafast"
+# # proxy_pix_fmt = "yuv420p"
 # residual_gain = 1.45
 # residual_highpass_radius = 2
 # residual_lowpass_reject = 0.85
@@ -60,7 +70,11 @@ overwrite = false
 # scanline_dropout = 0.35
 # pulse_peak_sigma = 0.020
 # pulse_floor_sigma = 0.002
-# mosquito_method = "codec_residual"
+# mosquito_method = "jpeg_cycle"
+# mosquito_jpeg_quality_lo = 30
+# mosquito_jpeg_quality_hi = 44
+# mosquito_pre_dither_sigma = 0.0
+# # or: mosquito_method = "codec_residual" with the mosquito_proxy_* keys
 # mosquito_proxy_codec = "libx264"
 # mosquito_proxy_crf = 42
 # mosquito_proxy_preset = "ultrafast"

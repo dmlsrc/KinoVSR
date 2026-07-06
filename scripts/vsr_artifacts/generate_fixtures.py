@@ -27,9 +27,7 @@ from pathlib import Path
 import av
 import cv2
 import numpy as np
-
 from config import config_get, config_section, listify, load_config, resolve_path
-
 
 MODE_ORDER = [
     "reencode_only",
@@ -47,8 +45,8 @@ MODE_NOTES = {
     "block_grid": "8x8-ish quantization, block bias, and explicit grid edges",
     "jumping_scanlines": "horizontal line darkening/noise with frame-to-frame phase jumps",
     "gop_pulse_noise": "noise bursts at the start of each GOP-sized interval",
-    "mosquito_edges": "codec-derived compression residuals masked into thin edge halos",
-    "mixed_analog_h264": "high ISO noise, jumping scanlines, GOP pulses, codec mosquito halos, and block structure",
+    "mosquito_edges": "per-frame DCT re-quantization residuals masked into thin edge halos",
+    "mixed_analog_h264": "high ISO noise, jumping scanlines, GOP pulses, mosquito halos, and block structure",
 }
 
 DEFAULTS = {
@@ -85,7 +83,18 @@ DEFAULT_MODE_PARAMS: dict[str, dict] = {
         "floor_sigma": 0.005,
     },
     "mosquito_edges": {
-        "method": "codec_residual",
+        # jpeg_cycle: per-frame JPEG re-quantization of a lightly dithered
+        # base.  Both real-world flicker mechanisms are present: source noise
+        # flips DCT coefficients across quantization boundaries, and the
+        # quantizer itself breathes frame to frame (cycling quality).  Intra
+        # 8x8 DCT with no in-loop deblocking keeps genuine ringing, unlike an
+        # x264 proxy whose deadzone/skip freeze the residual on static shots.
+        "method": "jpeg_cycle",
+        "jpeg_quality_lo": 28,
+        "jpeg_quality_hi": 45,
+        "pre_dither_sigma": 0.012,
+        # codec_residual (method="codec_residual"): residual of a low-quality
+        # inter-codec proxy encode.  Kept as an alternate flavor.
         "proxy_codec": "libx264",
         "proxy_crf": 44,
         "proxy_preset": "ultrafast",
@@ -113,7 +122,12 @@ DEFAULT_MODE_PARAMS: dict[str, dict] = {
         "scanline_dropout": 0.0,
         "pulse_peak_sigma": 0.030,
         "pulse_floor_sigma": 0.002,
-        "mosquito_method": "codec_residual",
+        "mosquito_method": "jpeg_cycle",
+        "mosquito_jpeg_quality_lo": 30,
+        "mosquito_jpeg_quality_hi": 44,
+        # the analog base is already noisy, which is mechanism one; no extra
+        # dither needed before the proxy re-quantization.
+        "mosquito_pre_dither_sigma": 0.0,
         "mosquito_proxy_codec": "libx264",
         "mosquito_proxy_crf": 42,
         "mosquito_proxy_preset": "ultrafast",
@@ -148,7 +162,7 @@ def _rate_fraction(fps: float) -> Fraction:
 
 
 def _mode_seed(seed: int, source: Path, mode: str) -> int:
-    payload = f"{seed}:{source.name}:{mode}".encode("utf-8")
+    payload = f"{seed}:{source.name}:{mode}".encode()
     return zlib.crc32(payload) & 0xFFFFFFFF
 
 
@@ -238,10 +252,13 @@ def _highpass_residual(
     return residual - _box_blur_rgb(residual, radius) * float(lowpass_reject)
 
 
-def _require_codec_residual_method(params: dict, mode: str) -> None:
-    method = str(params.get("method", "codec_residual")).strip().lower().replace("-", "_")
-    if method != "codec_residual":
-        raise ValueError(f"{mode} only supports method='codec_residual', got {method!r}")
+def _mosquito_method(params: dict, mode: str) -> str:
+    method = str(params.get("method", "jpeg_cycle")).strip().lower().replace("-", "_")
+    if method not in {"jpeg_cycle", "codec_residual"}:
+        raise ValueError(
+            f"{mode} supports method='jpeg_cycle' or 'codec_residual', got {method!r}"
+        )
+    return method
 
 
 def _strip_mosquito_prefix(params: dict) -> dict:
@@ -430,6 +447,90 @@ def _decode_clip_frames(path: Path, expected_frames: int) -> list[np.ndarray]:
     return frames[:expected_frames]
 
 
+def _jpeg_roundtrip(rgb: np.ndarray, quality: int) -> np.ndarray:
+    bgr = cv2.cvtColor((rgb * 255.0 + 0.5).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok:
+        raise RuntimeError("JPEG encode failed")
+    dec = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    return cv2.cvtColor(dec, cv2.COLOR_BGR2RGB).astype(np.float32) * (1.0 / 255.0)
+
+
+def _jpeg_cycle_mosquito_frames(
+    base_frames: list[np.ndarray],
+    rng: np.random.Generator,
+    params: dict,
+) -> tuple[list[np.ndarray], dict]:
+    """Mosquito noise via per-frame JPEG re-quantization.
+
+    Each frame runs through an independent JPEG round trip (MJPEG semantics:
+    intra 8x8 DCT, no skip blocks, no in-loop deblocking) at a per-frame
+    quality drawn from [jpeg_quality_lo, jpeg_quality_hi].  A small gaussian
+    dither is added before the round trip.  Together these reproduce the two
+    mechanisms that make real mosquito noise flicker: source noise flipping
+    quantized coefficients across boundaries, and the quantizer changing frame
+    to frame.  The high-passed residual against the clean base is then masked
+    into edge halos, so flat regions stay clean and the fixture stays
+    mosquito-only.
+    """
+    qlo = int(params.get("jpeg_quality_lo", 28))
+    qhi = int(params.get("jpeg_quality_hi", 45))
+    if qhi < qlo:
+        qlo, qhi = qhi, qlo
+    dither_sigma = float(params.get("pre_dither_sigma", 0.012))
+    residual_gain = float(params.get("residual_gain", 1.45))
+    highpass_radius = int(params.get("residual_highpass_radius", 2))
+    lowpass_reject = float(params.get("residual_lowpass_reject", 0.85))
+    info = {
+        "mosquito_method": "jpeg_cycle",
+        "jpeg_quality_lo": qlo,
+        "jpeg_quality_hi": qhi,
+        "pre_dither_sigma": dither_sigma,
+        "residual_gain": residual_gain,
+        "residual_highpass_radius": highpass_radius,
+        "residual_lowpass_reject": lowpass_reject,
+    }
+    rendered: list[np.ndarray] = []
+    for base in base_frames:
+        x = base
+        if dither_sigma > 0.0:
+            x = _clip(base + rng.normal(0.0, dither_sigma, base.shape).astype(np.float32))
+        q = qlo if qhi == qlo else int(rng.integers(qlo, qhi + 1))
+        proxy = _jpeg_roundtrip(x, q)
+        if proxy.shape != base.shape:
+            proxy = proxy[: base.shape[0], : base.shape[1], :]
+        residual = _highpass_residual(proxy - base, highpass_radius, lowpass_reject)
+        mask = _edge_halo_mask(
+            base,
+            edge_quantile=float(params.get("edge_quantile", 0.88)),
+            halo_radius=int(params.get("halo_radius", 4)),
+            core_radius=int(params.get("core_radius", 0)),
+            texture_quantile=float(params.get("texture_quantile", 0.65)),
+            texture_radius=int(params.get("texture_radius", 4)),
+            texture_max=float(params.get("texture_max", 0.55)),
+            texture_softness=float(params.get("texture_softness", 0.18)),
+            mask_blur_radius=int(params.get("mask_blur_radius", 1)),
+        )
+        rendered.append(_clip(base + residual * residual_gain * mask[..., None]))
+    return rendered, info
+
+
+def _mosquito_frames(
+    base_frames: list[np.ndarray],
+    fps: float,
+    gop: int,
+    seed: int,
+    rng: np.random.Generator,
+    output_path: Path,
+    params: dict,
+    mode: str,
+) -> tuple[list[np.ndarray], dict]:
+    method = _mosquito_method(params, mode)
+    if method == "jpeg_cycle":
+        return _jpeg_cycle_mosquito_frames(base_frames, rng, params)
+    return _codec_residual_mosquito_frames(base_frames, fps, gop, seed, output_path, params)
+
+
 def _codec_residual_mosquito_frames(
     base_frames: list[np.ndarray],
     fps: float,
@@ -564,13 +665,11 @@ def _write_clip(
     rng = np.random.default_rng(seed)
     extra: dict = {}
     if mode == "mosquito_edges":
-        _require_codec_residual_method(mode_params, mode)
-        rendered, extra = _codec_residual_mosquito_frames(source_frames, fps, gop, seed, path, mode_params)
+        rendered, extra = _mosquito_frames(source_frames, fps, gop, seed, rng, path, mode_params, mode)
     elif mode == "mixed_analog_h264":
         rendered = _mixed_analog_base_frames(source_frames, rng, gop, mode_params)
         mosquito_params = _strip_mosquito_prefix(mode_params)
-        _require_codec_residual_method(mosquito_params, mode)
-        rendered, extra = _codec_residual_mosquito_frames(rendered, fps, gop, seed, path, mosquito_params)
+        rendered, extra = _mosquito_frames(rendered, fps, gop, seed, rng, path, mosquito_params, mode)
         if bool(mode_params.get("include_block_grid", True)):
             rendered = _apply_block_grid_frames(rendered, rng, mode_params)
     else:

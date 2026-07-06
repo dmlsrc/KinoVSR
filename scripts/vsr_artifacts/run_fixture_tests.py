@@ -27,9 +27,14 @@ from typing import Any
 
 import av
 import numpy as np
-
-from config import config_get, config_section, default_shared_temp, listify, load_config, resolve_path
-
+from config import (
+    config_get,
+    config_section,
+    default_shared_temp,
+    listify,
+    load_config,
+    resolve_path,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 
