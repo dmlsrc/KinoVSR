@@ -165,16 +165,28 @@ def estimate_sigma_map(
     lum_all: list = []
     diffs: list = []
     diffs2: list = []
+    pair_means: list = []
+    pair_means2: list = []
+    sdiffs: list = []
+    sdiffs2: list = []
     for run in runs:
         lum = [_to_luma_2d(frames[i]) for i in run]
         lum_all.extend(lum)
         yr = mx.stack(lum, axis=0)
         diffs.append(mx.abs(yr[1:] - yr[:-1]) * (1.0 / 1.4142135623730951))
+        sdiffs.append((yr[1:] - yr[:-1]) * (1.0 / 1.4142135623730951))
+        pair_means.append((yr[1:] + yr[:-1]) * 0.5)
         if yr.shape[0] >= 3:
             diffs2.append(mx.abs(yr[2:] - yr[:-2]) * (1.0 / 1.4142135623730951))
+            sdiffs2.append((yr[2:] - yr[:-2]) * (1.0 / 1.4142135623730951))
+            pair_means2.append((yr[2:] + yr[:-2]) * 0.5)
     y = mx.stack(lum_all, axis=0)                               # sampled lumas
     d = mx.concatenate(diffs, axis=0)                           # (K,H,W) adjacent diffs
+    sd = mx.concatenate(sdiffs, axis=0)                         # signed diffs
+    pm = mx.concatenate(pair_means, axis=0)                     # (K,H,W) pair-mean lumas
     d2 = mx.concatenate(diffs2, axis=0) if diffs2 else None     # lag-2 diffs
+    sd2 = mx.concatenate(sdiffs2, axis=0) if sdiffs2 else None
+    pm2 = mx.concatenate(pair_means2, axis=0) if pair_means2 else None
     H, W = int(y.shape[1]), int(y.shape[2])
     K = d.shape[0]
     if pulse_robust and K >= 4:
@@ -217,6 +229,93 @@ def estimate_sigma_map(
         r2 = mx.sqrt(mx.mean(db2 * db2, axis=-1))
         ratio = r2 / (r1 + 1e-6)
 
+    # Aperture-gated flat-pixel noise floor.  A frame difference decomposes as
+    # d ~ v.grad(I) + noise: motion can only create temporal change where
+    # spatial gradient exists, while sensor/AWGN noise flickers everywhere,
+    # including flat pixels.  Median |d| over pixels that are flat in the pair
+    # (gradient of the blurred pair-mean below a per-pair adaptive threshold)
+    # is therefore a per-block sigma that motion cannot lift -- with two escape
+    # hatches for texture masquerading as flatness:
+    #   * a large pan dragging weak texture whose gradient the blur hides is
+    #     caught by the lag-2 signature inside the flat set itself (noise gives
+    #     |d2| ~ |d1|, drifting texture ~ 2|d1|; blocks above 1.30 rejected);
+    #   * a frame that is texture everywhere has no honest flat set at all --
+    #     its adaptive threshold saturates, which marks the whole floor as
+    #     untrustworthy (translated fine texture decorrelates within one shift
+    #     and is then statistically identical to per-frame noise).
+    def _flat_block_median(dd: Any, pmm: Any, kk: int) -> tuple[Any, Any, float, Any]:
+        sm_ = mx.stack([_box_blur_full(pmm[i], 5) for i in range(kk)], axis=0)
+        gx_ = mx.concatenate([mx.abs(sm_[:, :, 1:] - sm_[:, :, :-1]),
+                              mx.zeros((kk, H, 1), dtype=mx.float32)], axis=2)
+        gy_ = mx.concatenate([mx.abs(sm_[:, 1:, :] - sm_[:, :-1, :]),
+                              mx.zeros((kk, 1, W), dtype=mx.float32)], axis=1)
+        gp_ = gx_ + gy_
+        gs_ = mx.sort(gp_.reshape(kk, -1), axis=-1)
+        thr_ = mx.clip(gs_[:, int(0.35 * (H * W - 1))] * 1.5, 0.016, 0.060)[:, None, None]
+        thr_s = sorted(float(v) for v in thr_.reshape(-1).tolist())
+        thr_med_ = thr_s[len(thr_s) // 2]
+        fl_ = (gp_ < thr_).astype(mx.float32)
+        fb_ = _edge_pad_hw(fl_, ph, pw).reshape(kk, bh, block, bw, block)
+        fb_ = mx.transpose(fb_, (1, 3, 0, 2, 4)).reshape(bh, bw, -1)
+        nn = int(fb_.shape[-1])
+        cnt_ = mx.sum(fb_, axis=-1)
+        masked_ = mx.where(fb_ > 0.5, dd, mx.full(dd.shape, 1e9, dtype=mx.float32))
+        msort_ = mx.sort(masked_, axis=-1)
+        midx_ = mx.clip((cnt_ - 1.0) * 0.5, 0.0, float(nn - 1)).astype(mx.int32)
+        med_ = mx.take_along_axis(msort_, midx_[..., None], axis=-1)[..., 0]
+        return med_, cnt_, thr_med_, fl_
+
+    # The floor is measured on the WHITENED diff: d minus its own 3x3 mean.
+    # Clean-encode wobble, sub-pixel drift, and deformable-texture shimmer
+    # (fur, foliage) produce a spatially smooth diff field (lag-1 correlation
+    # 0.92-0.98 measured on clean re-encodes) that the high-pass removes,
+    # while sensor/AWGN noise is spatially white and survives (x0.9428 for
+    # iid, corrected below).  This is what makes the floor read the
+    # DENOISEABLE component rather than any temporal change.
+    def _whiten(sig_diff: Any) -> Any:
+        w = mx.stack([_box_blur_full(sig_diff[i], 3)
+                      for i in range(int(sig_diff.shape[0]))], axis=0)
+        return mx.abs(sig_diff - w) * (1.0 / 0.9428)
+
+    dw = _edge_pad_hw(_whiten(sd), ph, pw)
+    dwb = mx.transpose(dw.reshape(K, bh, block, bw, block),
+                       (1, 3, 0, 2, 4)).reshape(bh, bw, n)
+    # value floor from the WHITENED diff; displacement test from the RAW diff
+    # (whitening is symmetric in lag, so it would erase the lag-2 doubling
+    # signature that separates drift from noise)
+    fmed1, fcnt1, flat_thr_med, _ = _flat_block_median(dwb, pm, K)
+    fmed1r, _, _, _ = _flat_block_median(db, pm, K)
+    flat_trusted = flat_thr_med <= 0.045
+    r_flat_med = 2.0
+    if sd2 is not None and pm2 is not None and flat_trusted:
+        d2pf = _edge_pad_hw(d2, ph, pw)
+        K2f = int(d2pf.shape[0])
+        db2f = mx.transpose(d2pf.reshape(K2f, bh, block, bw, block),
+                            (1, 3, 0, 2, 4)).reshape(bh, bw, -1)
+        fmed2, fcnt2, _, _ = _flat_block_median(db2f, pm2, K2f)
+        r_flat = fmed2 / mx.maximum(fmed1r, 1e-6)
+        flat_static = fmed1r < (2.0 / 255.0)
+        counted = (fcnt1 >= 24) & (fcnt2 >= 24)
+        flat_ok = counted & (flat_static | (r_flat <= 1.30))
+        # global drift signature over ALL counted blocks (not just the passing
+        # ones): source-wide slow drift puts the median well above 1.30 even
+        # when a tail of blocks slips under the per-block gate.
+        rf_l = [float(r) for r, c, st in zip(
+            [float(v) for v in r_flat.reshape(-1).tolist()],
+            [bool(v) for v in counted.reshape(-1).tolist()],
+            [bool(v) for v in flat_static.reshape(-1).tolist()], strict=True)
+            if c and not st]
+        if rf_l:
+            r_flat_med = sorted(rf_l)[len(rf_l) // 2]
+        else:
+            r_flat_med = 1.0                                     # all-static: noise-like
+    else:
+        flat_ok = mx.zeros(fmed1.shape, dtype=mx.bool_)
+    # |d| of iid per-frame noise is half-normal with median 0.6745 sigma
+    fsig = fmed1 * (_CHANNEL_FROM_LUMA / 0.6745)
+    flat_sig_l = [float(v) for v in fsig.reshape(-1).tolist()]
+    flat_ok_l = [bool(v) for v in flat_ok.reshape(-1).tolist()]
+
     # signal-dependence model: robust sigma-vs-luma from the quiet blocks, used to
     # cap motion-dominated blocks (their pooled quantile is inflated everywhere).
     sig_l = [float(v) for v in sig.reshape(-1).tolist()]
@@ -239,7 +338,6 @@ def estimate_sigma_map(
     have_quiet_detail = len(quiet_idx) >= min_quiet
     model_sig_l = [sig_l[i] for i in quiet_idx] if have_quiet_detail else sig_l
     model_lum_l = [lum_l[i] for i in quiet_idx] if have_quiet_detail else lum_l
-    global_p30 = _p30(model_sig_l)
     sig_s = sorted(sig_l)
     sig_p30 = sig_s[int(0.30 * (len(sig_s) - 1))]
     sig_med = sig_s[len(sig_s) // 2]
@@ -254,8 +352,44 @@ def estimate_sigma_map(
         ratio_l = [float(v) for v in ratio.reshape(-1).tolist()]
         ratio_s = sorted(ratio_l)
         ratio_med = ratio_s[len(ratio_s) // 2]
+    # On dense-change content (subject/camera motion or dense noise) every
+    # block's tail statistic is lifted, so the detail-gated model above is
+    # itself contaminated -- measured on clean moving re-encodes it reads the
+    # same ~0.06 as on sigma-0.06 noise.  The flat-pixel floor separates the
+    # two: it stays at the true noise level regardless of motion.  Two regimes:
+    #   * full flat mode -- the flat set is globally noise-like (block-median
+    #     lag ratio <= 1.30) and physically plausible as noise (<= 0.12): the
+    #     floor IS the model and gets a tight ceiling below.
+    #   * floor-min mode -- the flat set carries drift (a pan), so only its
+    #     ratio-validated subset is trusted, and only in the DOWNWARD
+    #     direction: it may lower the legacy model (less denoising of clean
+    #     content) but never raise it.  The legacy guards stay in charge.
+    # Static/sparse-flash content keeps the legacy path untouched (the flat
+    # median would under-read sparse flashes there).
+    min_flat_blocks = max(8, int(0.10 * len(sig_l)))
+    flat_idx = [i for i, ok in enumerate(flat_ok_l) if ok]
+    have_flat = len(flat_idx) >= min_flat_blocks
+    flat_floor_p30 = _p30([flat_sig_l[i] for i in flat_idx]) if have_flat else None
+    flat_active = (
+        motion_cap != "off"
+        and have_flat
+        and den_med >= 0.45
+        and static_fraction <= 0.10
+    )
+    use_flat_model = (
+        flat_active
+        and r_flat_med <= 1.35
+        and flat_floor_p30 is not None
+        and flat_floor_p30 <= 0.12
+    )
+    use_flat_min = flat_active and not use_flat_model
+    if use_flat_model:
+        model_sig_l = [flat_sig_l[i] for i in flat_idx]
+        model_lum_l = [lum_l[i] for i in flat_idx]
+    global_p30 = _p30(model_sig_l)
     dense_texture_ambiguous = (
         motion_cap == "strict"
+        and not use_flat_model
         and ratio is not None
         and sig_med > 0.08
         and den_s[len(den_s) // 2] >= 0.55
@@ -268,6 +402,7 @@ def estimate_sigma_map(
     dense_motion_heterogeneous = sig_p95 > max(0.12, 1.60 * max(sig_p30, 1e-6))
     source_wide_motion_contaminated = (
         motion_cap == "strict"
+        and not use_flat_model
         and ratio is not None
         and sig_med > 0.06
         and den_med >= 0.55
@@ -289,11 +424,26 @@ def estimate_sigma_map(
         model = [min(v, dense_cap) for v in model]
     if source_wide_motion_contaminated:
         model = [min(v, 0.020) for v in model]
+    if use_flat_min and flat_floor_p30 is not None:
+        flat_model = [flat_floor_p30] * luma_bins
+        for b in range(luma_bins):
+            lo, hi = b / luma_bins, (b + 1) / luma_bins
+            vals = [flat_sig_l[i] for i in flat_idx if lo <= lum_l[i] < hi]
+            if len(vals) >= 8:
+                flat_model[b] = _p30(vals)
+        model = [min(v, fv) for v, fv in zip(model, flat_model, strict=True)]
     # absolute slack keeps the cap from crushing genuine local noise on clips
     # whose baseline sits near the floor (heavy compression): the cap's job is
     # rejecting motion blowups (0.1-0.3+), not flattening the map to 2x floor.
-    cap = [luma_cap_headroom * model[min(luma_bins - 1, max(0, int(lv * luma_bins)))] + 0.01
-           for lv in lum_l]
+    if use_flat_model:
+        # The flat floor is a direct sigma estimate, not a contaminated lower
+        # bound, and on dense-change content the tail's elevation above it is
+        # motion.  Keep the ceiling tight so motion cannot inflate the map.
+        cap = [1.25 * model[min(luma_bins - 1, max(0, int(lv * luma_bins)))] + 0.005
+               for lv in lum_l]
+    else:
+        cap = [luma_cap_headroom * model[min(luma_bins - 1, max(0, int(lv * luma_bins)))] + 0.01
+               for lv in lum_l]
     capped = mx.minimum(sig, mx.array(cap, dtype=mx.float32).reshape(bh, bw))
     # flicker bypass: the cap exists for DISPLACEMENT motion, which doubles
     # over two frames (lag2/lag1 -> 2); per-frame flicker is temporally
@@ -316,6 +466,11 @@ def estimate_sigma_map(
     #     exactly what it measured.
     if motion_cap == "off":
         pass
+    elif use_flat_model:
+        # The flat-pixel model already measures the true noise floor under
+        # motion, so the cap is trustworthy here; the bypass would only let
+        # motion peaks (whose lag ratio noise pulls toward 1) leak past it.
+        sig = capped
     elif ratio is not None:
         if motion_cap == "loose":
             flick = mx.clip((2.0 - ratio) * (1.0 / 0.3), 0.0, 1.0)   # open <=1.7
@@ -614,6 +769,54 @@ def analyze_noise(frames: list, thresh: float = 2.0 / 255.0) -> dict:
     amp = mx.sqrt(mx.sum(db * db * fmask, axis=-1) / mx.maximum(cnt, 1.0)) * _CHANNEL_FROM_LUMA
     out["flicker_amplitude"] = blkstats(amp)
 
+    # aperture-gated noise floor: median |d| over pixels flat in the pair mean
+    # (motion needs gradient to change a pixel; noise does not), whole-frame.
+    # flat_lag21 is the lag-2/lag-1 ratio INSIDE the flat set: ~1 for noise,
+    # ~2 when the flat set is contaminated by drifting weak texture, so a
+    # high value marks flat_sigma itself as untrustworthy.
+    def _flat_median(dd, pmm, kk):
+        smw = mx.stack([_box_blur_full(pmm[i], 5) for i in range(kk)], axis=0)
+        gfx = mx.concatenate([mx.abs(smw[:, :, 1:] - smw[:, :, :-1]),
+                              mx.zeros((kk, H, 1), dtype=mx.float32)], axis=2)
+        gfy = mx.concatenate([mx.abs(smw[:, 1:, :] - smw[:, :-1, :]),
+                              mx.zeros((kk, 1, W), dtype=mx.float32)], axis=1)
+        gf = gfx + gfy
+        gfs = mx.sort(gf.reshape(kk, -1), axis=-1)
+        fthr = mx.clip(gfs[:, int(0.35 * (H * W - 1))] * 1.5, 0.016, 0.060)[:, None, None]
+        thr_s = sorted(float(v) for v in fthr.reshape(-1).tolist())
+        fmask = (gf < fthr).astype(mx.float32)
+        fsel = fmask.reshape(-1)
+        dflat = mx.where(fsel > 0.5, dd.reshape(-1),
+                         mx.full((int(dd.reshape(-1).shape[0]),), 1e9, dtype=mx.float32))
+        dfs = mx.sort(dflat)
+        nflat = int(mx.sum(fsel))
+        med = float(dfs[nflat // 2]) if nflat >= 64 else 0.0
+        return med, thr_s[len(thr_s) // 2], fmask
+
+    sdw = (y[1:] - y[:-1]) * (1.0 / 1.4142135623730951)
+    wme = mx.stack([_box_blur_full(sdw[i], 3) for i in range(K)], axis=0)
+    dwhite = mx.abs(sdw - wme) * (1.0 / 0.9428)
+    med1, thr1, fm1 = _flat_median(dwhite, (y[1:] + y[:-1]) * 0.5, K)
+    out["flat_sigma"] = med1 * (_CHANNEL_FROM_LUMA / 0.6745)
+    # a saturated flat threshold means the frame has no honest flat pixels;
+    # flat_sigma is then texture in disguise and must not be trusted
+    out["flat_thr"] = thr1
+    # spatial whiteness of the flat-set signed diff (noise ~0; smooth encode
+    # wobble / deformable-texture shimmer ~1)
+    ca, cb = sdw[:, :, :-1], sdw[:, :, 1:]
+    cm = fm1[:, :, :-1] * fm1[:, :, 1:]
+    out["flat_diff_corr"] = (float(mx.sum(ca * cb * cm)) /
+                             (float(mx.sum(0.5 * (ca * ca + cb * cb) * cm)) + 1e-9))
+    # the lag ratio uses RAW diffs on both lags: whitening is lag-symmetric
+    # and would erase the displacement-doubling signature
+    med1r, _, _ = _flat_median(d, (y[1:] + y[:-1]) * 0.5, K)
+    if K >= 2 and med1r > 1e-6:
+        d2w = mx.abs(y[2:] - y[:-2]) * (1.0 / 1.4142135623730951)
+        med2r, _, _ = _flat_median(d2w, (y[2:] + y[:-2]) * 0.5, K - 1)
+        out["flat_lag21"] = med2r / med1r
+    else:
+        out["flat_lag21"] = 1.0
+
     # per-frame flash trace (whole-frame RMS sigma per diff)
     tr = [float(mx.sqrt(mx.mean(d[i] * d[i]))) * _CHANNEL_FROM_LUMA for i in range(K)]
     out["frame_trace"] = tr
@@ -712,6 +915,11 @@ def classify_noise_analysis(stats: dict) -> dict:
     edge = float(stats.get("edge_over_flat", 1.0))
     static = float(stats.get("static_fraction", 0.0))
     static_hf = float(stats.get("static_spatial_hf", 0.0))
+    flat_sigma = float(stats.get("flat_sigma", 0.0))
+    flat_lag21 = float(stats.get("flat_lag21", 1.0))
+    flat_corr = float(stats.get("flat_diff_corr", 0.0))
+    flat_trusted = (float(stats.get("flat_thr", 1.0)) <= 0.045
+                    and flat_sigma <= 0.120)
     row_coherence = float(stats.get("row_coherence", 0.0))
     row_periodicity = float(stats.get("row_periodicity", 0.0))
     row_period_px = float(stats.get("row_period_px", 0.0))
@@ -750,7 +958,15 @@ def classify_noise_analysis(stats: dict) -> dict:
             suggestions.append("compare against a reencode-only baseline or manual constant denoise")
     if static <= 0.06 and dens_p90 >= 0.55 and tail5_p90 >= 0.045:
         labels.append("dense temporal change")
-        if edge < 1.8 and lag <= 1.30:
+        if flat_trusted and flat_sigma >= 0.030 and flat_lag21 <= 1.30:
+            # motion cannot flicker flat pixels (and the flat set's own lag
+            # ratio confirms it is not drifting weak texture): the dense
+            # change is real noise, not texture motion
+            labels.append("dense sensor noise")
+            suggestions.append("--noise-map auto should track this; the flat-pixel floor anchors the map")
+        elif edge < 1.8 and lag <= 1.30 and (
+            not flat_trusted or flat_sigma < 0.020 or flat_lag21 > 1.30
+        ):
             labels.append("motion/noise ambiguous")
             warnings.append("dense texture motion can look like dense noise; strict auto maps may over-condition")
             suggestions.append("compare the debug noise map against a constant/manual denoise run")
@@ -778,6 +994,9 @@ def classify_noise_analysis(stats: dict) -> dict:
             "tail5_median": float(tail5_med),
             "lag2_over_lag1": lag,
             "edge_over_flat": edge,
+            "flat_sigma": flat_sigma,
+            "flat_lag21": flat_lag21,
+            "flat_diff_corr": flat_corr,
             "static_fraction": static,
             "static_spatial_hf": static_hf,
             "row_coherence": row_coherence,

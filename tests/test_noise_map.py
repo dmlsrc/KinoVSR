@@ -394,7 +394,6 @@ def test_pulse_gain_tracks_noise_pulse():
     base = _content()
     pg = PulseGain(lo=0.6, hi=1.8, min_history=8)
     gains = []
-    prev_sig = None
     for t in range(32):
         s = 0.09 if 24 <= t < 28 else 0.03
         f = mx.clip(base + s * mx.random.normal(shape=base.shape), 0, 1)
@@ -427,7 +426,7 @@ def test_pulse_gain_neutral_until_history():
     mx.random.seed(7)
     base = _content()
     pg = PulseGain(min_history=8)
-    for t in range(7):
+    for _t in range(7):
         f = mx.clip(base + 0.05 * mx.random.normal(shape=base.shape), 0, 1)
         assert pg.update(f) == 1.0     # not enough history yet
 
@@ -534,3 +533,48 @@ def test_fastdvd_streaming_refresh_adapts():
     med_on = run(16)       # refreshing: adapts toward 0.08
     assert med_off < 0.025
     assert med_on > 2.0 * med_off
+
+
+def _panning_clip(noise_sigma):
+    # 65% smoothed texture panning 2 px/frame over a flat lower band; every
+    # frame carries a small encode-like wobble so static_fraction ~ 0 (as in
+    # real footage). Extra width feeds the pan.
+    mx.random.seed(77)
+    tex = mx.random.uniform(shape=(H, W + 2 * T))
+    k = mx.ones((1, 5, 5, 1)) / 25.0
+    tex = mx.conv2d(tex[None, :, :, None], k, padding=2)[0, :, :, 0]
+    split = int(H * 0.65)
+    base_sigma = max(noise_sigma, 0.004)
+    clip = []
+    for t in range(T):
+        f = tex[:, t * 2:t * 2 + W]
+        f = mx.concatenate([f[:split], mx.full((H - split, W), 0.45)], axis=0)
+        rgb = mx.broadcast_to(f[..., None], (H, W, 3))
+        clip.append(mx.clip(rgb + mx.random.normal(shape=(H, W, 3)) * base_sigma, 0, 1))
+    return clip
+
+
+def test_flat_floor_separates_clean_pan_from_noisy_pan():
+    # The aperture-gated flat floor: motion cannot flicker gradient-free
+    # pixels, so a clean pan must read LOW while the same pan with real dense
+    # noise reads the noise level. Before the flat floor both read ~0.06
+    # (motion-dominated), which made auto denoise soften clean footage.
+    clean = estimate_sigma_map(_panning_clip(0.0), motion_cap="strict")
+    noisy = estimate_sigma_map(_panning_clip(0.05), motion_cap="strict")
+    med_c = float(mx.sort(clean.reshape(-1))[H * W // 2])
+    med_n = float(mx.sort(noisy.reshape(-1))[H * W // 2])
+    assert med_c < 0.035                      # clean pan stays near the wobble
+    assert 0.035 < med_n < 0.095              # dense noise is preserved
+    assert med_n > 1.8 * med_c                # and the two separate cleanly
+
+
+def test_probe_flat_floor_flags_dense_noise_not_motion():
+    clean_stats = analyze_noise(_panning_clip(0.0))
+    noisy_stats = analyze_noise(_panning_clip(0.05))
+    # whitened flat floor: near zero on the clean pan, near sigma on the noisy
+    assert clean_stats["flat_sigma"] < 0.02
+    assert noisy_stats["flat_sigma"] > 0.03
+    noisy_diag = classify_noise_analysis(noisy_stats)
+    assert "dense sensor noise" in noisy_diag["labels"]
+    clean_diag = classify_noise_analysis(clean_stats)
+    assert "dense sensor noise" not in clean_diag["labels"]
