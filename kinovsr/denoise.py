@@ -22,9 +22,12 @@ from typing import Any
 
 import mlx.core as mx
 
+import os
+
 from . import pixel_buffers as _pb
 from ._compat import Foundation, Quartz, autorelease_pool, require_pyobjc, vt
 from .vsr import _suppress_native_stderr
+from .vsr_blocks import compiled_spynet_flow
 
 # Max optical-flow calls in flight at once. Each flow is an ANE/IOKit dispatch
 # (fixed ~17 ms, latency-bound) - a couple overlap well, but the kernel-side
@@ -160,9 +163,19 @@ class McTemporalDenoiser:
         confidence: bool = False, sigma: float = 0.06, self_test: bool = True,
         noise_map: Any = None, map_refresh: int = 64, pulse: Any = None,
         map_floor: float = 0.0, gate: str = "smooth",
+        flow: str = "vt", flow_weights: Any = None,
     ):
         require_pyobjc()
         self.w, self.h = int(width), int(height)
+        # flow: the motion engine. "vt" (default) = VTOpticalFlow Quality on
+        # CPU/AMX (~17 ms fixed, zero GPU contention, mediocre accuracy with
+        # smooth errors). "spynet" = the stock BasicSR SpyNet via the shared
+        # MLX implementation: +3-5 dB warp-PSNR in every motion regime
+        # (static/moving/fast 40.7/29.6/20.1 vs VT 36.9/25.0/16.1), so more
+        # pixels pass the photometric gate and get denoised -- at the cost
+        # of MLX GPU time. Flow errors only lower the ceiling either way:
+        # the residual gate audits every warp before it blends.
+        self.flow_source = str(flow)
         self.strength = float(strength)   # max blend weight toward a reference
         self.window = max(0, int(window))
         self.clamp = bool(clamp)
@@ -212,6 +225,25 @@ class McTemporalDenoiser:
         self.clamp_gamma = 1.25  # box half-width in std units
         self.occ_tau = 1.5       # FB-consistency tolerance (pixels)
         self.conf_scale = 10.0   # flow magnitude (px) at which confidence ~1/e
+        # gate-openness run stat: mean realized blend weight / strength =
+        # the fraction of the possible temporal denoise the flow actually
+        # unlocked (flow-limited clips read low)
+        self._w_sum = 0.0
+        self._w_n = 0
+        if self.flow_source == "spynet":
+            path = flow_weights or os.environ.get("SPYNET_WEIGHTS")
+            if not path:
+                # stock weights ship with the package (5.5 MB)
+                from pathlib import Path as _P
+                path = (_P(__file__).parent / "spynet" / "weights"
+                        / "spynet_stock_20210409.safetensors")
+            self._spynet_p = dict(mx.load(str(path)))
+            self._prev = None
+            self._hist = []
+            self._pool = None
+            self._workers = []
+            self._idx = 0
+            return
         cls = vt.VTOpticalFlowConfiguration
         if not cls.isSupported():
             raise SystemExit("VTOpticalFlow is not supported on this device.")
@@ -396,12 +428,24 @@ class McTemporalDenoiser:
         return flow
 
     def _compute_flows(self, curr: Any, refs: list[Any]) -> list[tuple[Any, Any]]:
-        """Optical flow of each reference -> current. The references run on
-        separate sessions concurrently (the GIL is released during the VT call,
-        so they overlap). Uploads/reads are MLX and stay on the main thread;
-        only the processWithParameters calls are threaded. Returns
+        """Optical flow of each reference -> current. VT path: references run
+        on separate sessions concurrently (the GIL is released during the VT
+        call, so they overlap). SpyNet path: the shared MLX implementation;
+        spynet_flow(cur, ref) equals -forward in this convention, so the
+        downstream warp/occlusion/confidence math is untouched. Returns
         [(forwardFlow, backwardFlow_or_None), ...] as (H,W,2) px MLX arrays.
         """
+        if self.flow_source == "spynet":
+            out = []
+            cur_b = curr[None]
+            for ref in refs:
+                fwd = -compiled_spynet_flow(self._spynet_p, cur_b, ref[None])[0]
+                bwd = None
+                if self.occlusion:
+                    bwd = -compiled_spynet_flow(self._spynet_p, ref[None], cur_b)[0]
+                mx.eval(fwd)
+                out.append((fwd, bwd))
+            return out
         self._upload(curr, self._curr_buf)              # once, shared by all flows
         jobs = []
         for j, ref in enumerate(refs):
@@ -467,7 +511,19 @@ class McTemporalDenoiser:
         if self.confidence:
             mag = mx.sqrt(mx.sum(fwd ** 2, axis=-1, keepdims=True) + 1e-8)
             w = w * mx.exp(-((mag / self.conf_scale) ** 2))
+        self._w_sum += float(mx.mean(w))
+        self._w_n += 1
         return w
+
+    @property
+    def gate_openness(self) -> float:
+        """Mean realized blend weight / strength over the run: how much of
+        the possible temporal denoise the flow unlocked (flow-limited
+        footage reads low; raising strength cannot fix a low value, a
+        better flow engine can)."""
+        if not self._w_n or self.strength <= 0:
+            return 0.0
+        return (self._w_sum / self._w_n) / self.strength
 
     def denoise(self, rgb_f32: Any) -> Any:
         rgb_f32 = mx.clip(rgb_f32[..., :3].astype(mx.float32), 0.0, 1.0)

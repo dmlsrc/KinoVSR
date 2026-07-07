@@ -1306,6 +1306,7 @@ def run(args: argparse.Namespace) -> None:
                     window=args.mc_window, clamp=args.mc_clamp,
                     occlusion=args.mc_occlusion, confidence=args.mc_confidence,
                     sigma=args.mc_sigma, gate=args.mc_gate,
+                    flow=args.mc_flow, flow_weights=args.mc_flow_weights,
                     noise_map=tr,
                     map_refresh=args.noise_map_refresh,
                     pulse=pu,
@@ -2033,6 +2034,13 @@ def run(args: argparse.Namespace) -> None:
                     _u8 = (mx.clip(_bm[:, :, 0], 0, 1) * 255).astype(mx.uint8)
                     save_image(mx.stack([_u8, _u8, _u8], axis=-1), _png)
                     print(f"[deblock-map] mask written: {_png}")
+        for _d in _den_members(denoiser):
+            _mc = _d if hasattr(_d, "gate_openness") else getattr(_d, "_base", None)
+            if _mc is not None and hasattr(_mc, "gate_openness") and _mc.gate_openness > 0:
+                print(f"[denoise] mc gate openness: {_mc.gate_openness * 100:.1f}% "
+                      f"of the strength ceiling realized (flow={_mc.flow_source}; "
+                      f"low = flow-limited, the lever is a better flow, not "
+                      f"more strength)")
         _den_dbg = _den_members(denoiser)
         if _den_dbg and args.noise_map_pulse:
             _pl = None
@@ -3223,6 +3231,34 @@ def main() -> None:
             "IIR (blends the previous output; strongest denoise, longest ghosts). "
             "N>=1 = causal FIR over the last N input frames (bounded ghost "
             "lifetime, ~N optical-flow computes per frame)."
+        ),
+    )
+
+    add(
+        "--mc-flow", choices=["vt", "spynet"], default="vt",
+        help=(
+            "mc's motion engine. vt (default): VTOpticalFlow Quality tier on "
+            "CPU/AMX (~17 ms fixed, no GPU contention, mediocre accuracy with "
+            "smooth errors). spynet: stock BasicSR SpyNet on MLX -- measured "
+            "+3-5 dB warp-PSNR in every motion regime, so more pixels pass "
+            "the photometric gate and get denoised (higher ceiling), at the "
+            "cost of GPU time shared with other stages. Flow errors only "
+            "lower the ceiling either way: every warp is audited against the "
+            "current frame before it blends. Watch the end-of-run 'gate "
+            "openness' number: if it is low, mc is flow-limited and spynet "
+            "is the lever (raising strength is not)."
+        ),
+    )
+
+    add(
+        "--mc-flow-weights", default=None, metavar="PATH",
+        help=(
+            "SpyNet weights (.safetensors, spynet.* keys) for --mc-flow "
+            "spynet. Default: the bundled stock checkpoint (override with "
+            "this flag or $SPYNET_WEIGHTS). Use a STOCK checkpoint, not one "
+            "extracted from an SR net: end-to-end training repurposes "
+            "SpyNet into a feature matcher and its flow accuracy collapses "
+            "(measured worse than zero flow on static content)."
         ),
     )
 
