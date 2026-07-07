@@ -1926,8 +1926,12 @@ def run(args: argparse.Namespace) -> None:
         if denoiser is not None:
             denoiser.close()
         if deflicker_stage is not None:
-            print(f"[deflicker] last-frame fix fraction: "
-                  f"{deflicker_stage.last_fix_fraction * 100:.2f}% of pixels")
+            _dst = deflicker_stage.stats()
+            print(f"[deflicker] run avg: static-verified "
+                  f"{_dst['verified'] * 100:.1f}% of pixels, oscillatory "
+                  f"{_dst['oscillatory'] * 100:.1f}%, fired "
+                  f"{_dst['fired'] * 100:.1f}% (verification is the scope "
+                  f"gate: bounded by camera/subject motion, not band/window)")
         if deblocker is not None:
             _qi = getattr(deblocker, "last_qf_info", None)
             if _qi is not None:

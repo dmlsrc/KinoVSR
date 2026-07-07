@@ -15,8 +15,10 @@ Rule, per pixel, over a +/-K frame window:
     take the median of admitted samples; integrate (uniform mean) the
     admitted samples within band h of that median; replace the pixel only
     if >= frac of admitted samples are in-band, both existing temporal
-    sides contribute, and the correction is below max_fix (refused, not
-    clamped).
+    sides contribute, the temporal profile is OSCILLATORY (net change well
+    below total variation -- monotone smooth profiles are lighting ramps or
+    true drift and must pass through), and the correction is below max_fix
+    (refused, not clamped).
 
 Why this shape (measured on ground-truth crushed fixtures; see the v1-v6
 prototype history in the planning evidence):
@@ -91,9 +93,29 @@ class StaticStateDeflicker:
         self._received = 0
         self._emitted = 0
         self._masks: dict = {}           # {(lo, hi): (H,W) static mask}
+        self._stat_frames = 0            # gate attribution (run averages)
+        self._stat_fired = 0.0
+        self._stat_verified = 0.0
+        self._stat_osc = 0.0
 
     def reset(self) -> None:
         self._reset_state()
+
+    def stats(self) -> dict:
+        """Run-average gate attribution: where firing dies on this clip.
+
+        verified = pixels whose 32px tiles phase-correlate static against
+        enough window neighbors (the tool's scope: this is bounded by real
+        camera/subject motion, NOT by band or window -- micro-jitter
+        accumulates with temporal distance, so far pairs fail verification
+        and windows past the jitter horizon add nothing). oscillatory =
+        verified pixels whose temporal profile is non-monotone (the
+        fixable kind). fired = pixels actually corrected.
+        """
+        n = max(self._stat_frames, 1)
+        return {"fired": self._stat_fired / n,
+                "verified": self._stat_verified / n,
+                "oscillatory": self._stat_osc / n}
 
     def close(self) -> None:
         pass
@@ -171,6 +193,24 @@ class StaticStateDeflicker:
                       else self._pair_mask(t, j) for j in idx], axis=0)
         M = len(idx)
         n_valid = mx.sum(V, axis=0)
+        # monotone-profile gate: lighting/exposure ramps and slow true drift
+        # are monotone and smooth, so their net change ~ total variation;
+        # fixable codec flicker is oscillatory (TV >> NET). A trend FIT
+        # cannot make this separation -- a monotone step is a valid trend at
+        # window scale and the fit absorbs the staircase (measured: both LS
+        # and Theil-Sen detrending lose the flicker kill entirely) -- but
+        # the profile shape can. Without this gate the raw mixture flattens
+        # ramps wherever it fires, and since firing follows the 16px
+        # validity cells the damage prints square seams on lighting changes
+        # (user-reported); with it, ramp regions produce no correction at
+        # any band setting.
+        dj = mx.abs(SL[1:] - SL[:-1]) * V[1:] * V[:-1]
+        tv = mx.sum(dj, axis=0)
+        first_i = mx.argmax(V, axis=0).astype(mx.int32)[None]
+        last_i = (M - 1 - mx.argmax(V[::-1], axis=0)).astype(mx.int32)[None]
+        y_first = mx.take_along_axis(SL, first_i, axis=0)[0]
+        y_last = mx.take_along_axis(SL, last_i, axis=0)[0]
+        oscillatory = mx.abs(y_last - y_first) <= 0.6 * tv + 1.5 / 255.0
         # median of admitted samples: invalid sort past the [0,1] range
         SL_m = mx.where(V > 0.5, SL, mx.full(SL.shape, 2.0))
         SL_s = mx.sort(SL_m, axis=0)
@@ -190,6 +230,7 @@ class StaticStateDeflicker:
         fire = ((n_inl >= self._frac * mx.maximum(n_valid, 1.0))
                 & (n_valid >= self._min_valid)
                 & (left >= need_l) & (right >= need_r)
+                & oscillatory
                 & (cur_dev < self._max_fix)).astype(mx.float32)[..., None]
         out = cur + (self._strength * fire) * (mean_w - cur)
         # anomalous-self fallback: a large 1-frame flash invalidates every
@@ -212,8 +253,15 @@ class StaticStateDeflicker:
             out = out + (self._strength * fire2) * (0.5 * (pv + nx_) - out)
             fire = mx.minimum(fire + fire2, 1.0)
         out = mx.clip(out, 0.0, 1.0)
-        mx.eval(out)
-        self.last_fix_fraction = float(mx.mean(fire))
+        verified = (n_valid >= self._min_valid)
+        stat = mx.stack([mx.mean(fire), mx.mean(verified.astype(mx.float32)),
+                         mx.mean((verified & oscillatory).astype(mx.float32))])
+        mx.eval(out, stat)
+        self.last_fix_fraction = float(stat[0])
+        self._stat_frames += 1
+        self._stat_fired += float(stat[0])
+        self._stat_verified += float(stat[1])
+        self._stat_osc += float(stat[2])
         self._emitted += 1
         keep = self._emitted - self._k
         while self._base < keep and self._buf:

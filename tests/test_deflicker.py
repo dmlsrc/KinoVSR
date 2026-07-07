@@ -102,6 +102,37 @@ def test_one_frame_flash_removed():
     assert after < 0.1 * before
 
 
+def test_lighting_ramp_is_passthrough():
+    # multiplicative lighting/exposure ramp on static content: monotone
+    # smooth temporal profile -> the oscillatory gate refuses, at ANY band
+    # (v6 without the gate flattened ramps and printed square seams along
+    # the 16px validity cells)
+    base = _base()
+    tt = mx.arange(T).astype(mx.float32) / (T - 1)
+    clip = [mx.clip(base * (0.88 + 0.20 * float(g)), 0, 1) for g in tt]
+    for band in (0.10, 0.25):
+        outs = _run(clip, band=band)
+        worst = max(float(mx.max(mx.abs(o - c))) for o, c in zip(outs, clip))
+        assert worst < 0.012, f"ramp altered by {worst} at band {band}"
+
+
+def test_flicker_on_lighting_ramp_fixed_ramp_kept():
+    # blocky state flicker riding ON a lighting ramp: the flicker must
+    # collapse toward the ramped truth while the ramp itself is preserved
+    mx.random.seed(23)
+    base = _base()
+    d = 0.02 * (1.0 + _blocky((H, W)))
+    tt = mx.arange(T).astype(mx.float32) / (T - 1)
+    truth = [mx.clip(base * (0.88 + 0.20 * float(g)), 0, 1) for g in tt]
+    clip = [mx.clip(truth[t] + (d if (t // 3) % 2 == 0 else -d), 0, 1)
+            for t in range(T)]
+    outs = _run(clip)
+    lo, hi = 8, T - 8
+    err_in = sum(float(mx.mean(mx.abs(clip[t] - truth[t]))) for t in range(lo, hi))
+    err_out = sum(float(mx.mean(mx.abs(outs[t] - truth[t]))) for t in range(lo, hi))
+    assert err_out < 0.5 * err_in
+
+
 def test_latency_and_flush():
     base = _base()
     s = StaticStateDeflicker()
