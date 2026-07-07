@@ -1249,9 +1249,25 @@ def run(args: argparse.Namespace) -> None:
                                 blockiness_map=blk_tracker)
         elif args.deblock == "fbcnn":
             from LTX_2_MLX.videotoolbox.fbcnn import FbcnnDeblocker
+            _q = args.fbcnn_quality.strip().lower()
+            if _q == "auto":
+                _quality: Any = "auto"
+            elif _q in ("blind", "none"):
+                _quality = None
+            else:
+                try:
+                    _quality = float(_q)
+                except ValueError:
+                    raise SystemExit(
+                        f"bad --fbcnn-quality {args.fbcnn_quality!r}: expected 'auto', "
+                        f"'blind', or a number 1-100") from None
             deb = FbcnnDeblocker(args.deblock_weights or os.environ.get("FBCNN_WEIGHTS"),
-                                 quality=args.fbcnn_quality, strength=args.fbcnn_strength,
-                                 blockiness_map=blk_tracker)
+                                 quality=_quality, strength=args.fbcnn_strength,
+                                 blockiness_map=blk_tracker,
+                                 quality_fallback=args.fbcnn_quality_fallback)
+            if _quality == "auto":
+                print(f"[deblock] fbcnn auto QF: per-tile comb measurement "
+                      f"(128px tiles, fallback {args.fbcnn_quality_fallback:g})")
 
         up: Any = None
         if args.spatial_mode == "basicvsrpp":
@@ -1790,6 +1806,22 @@ def run(args: argparse.Namespace) -> None:
             session.close()
         if denoiser is not None:
             denoiser.close()
+        if deblocker is not None:
+            _qi = getattr(deblocker, "last_qf_info", None)
+            if _qi is not None:
+                _qg = getattr(deblocker, "_qf_grid", None)
+                _qmed = ""
+                if _qg is not None:
+                    _qs = mx.sort(_qg.reshape(-1))
+                    _qmed = f"  tile QF median {float(_qs[int(_qs.shape[0]) // 2]):.0f}"
+                _mode = _qi.get("mode", "measured")
+                _note = {"measured": "per-tile measured",
+                         "gentle": "sparse combs -> mostly gentle",
+                         "fallback": "no JPEG evidence -> fallback QF"}[_mode]
+                print(f"[deblock] fbcnn auto QF: global {_qi['global']['qf']} "
+                      f"(conf {_qi['global']['confidence']:g})  "
+                      f"comb coverage {_qi['coverage'] * 100:.0f}%{_qmed}  "
+                      f"[{_note}]")
         if deblocker is not None and args.deblock_map == "auto":
             _bm = getattr(deblocker, "last_blockiness_map", None)
             if _bm is None:
@@ -2151,15 +2183,27 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--fbcnn-quality", type=float, default=None, metavar="QF",
+        "--fbcnn-quality", type=str, default="auto", metavar="QF",
         help=(
-            "Assumed JPEG quality factor (1-100, lower = more compressed = stronger "
-            "removal) for --deblock fbcnn. Default None = blind per-frame estimate, but "
-            "the JPEG-trained estimator reads loop-filtered H.264/HEVC as near-lossless "
-            "(~QF 96) and barely acts -- on compressed video PIN a value: 25-50, going "
-            "lower for heavier compression. A fixed value also avoids the shot-to-shot "
-            "flicker blind can show (single-image net), and skips the (then-unused) QF "
-            "predictor, ~1.1x faster."
+            "JPEG quality factor for --deblock fbcnn (1-100, lower = more compressed = "
+            "stronger removal). Default 'auto': the DCT-coefficient comb MEASURES the "
+            "quantization per 128px tile over a rolling frame window and the net runs "
+            "with per-tile QF conditioning, so lightly compressed regions get gentle "
+            "treatment while heavy ones get strong removal; tiles with no detectable "
+            "JPEG history fall back to --fbcnn-quality-fallback. A NUMBER pins one "
+            "global QF (temporally stable, compiled, fastest). 'blind' uses the net's "
+            "own per-frame estimator -- it reads loop-filtered H.264/HEVC as "
+            "near-lossless (~QF 96) and barely acts, so prefer auto or a pin on video."
+        ),
+    )
+    parser.add_argument(
+        "--fbcnn-quality-fallback", type=float, default=50.0, metavar="QF",
+        help=(
+            "QF used by --fbcnn-quality auto where the comb declines (no measurable "
+            "JPEG-family quantization): per tile when only some tiles decline, or for "
+            "the whole frame (via the fast compiled path) when nothing in the window "
+            "carries a comb. Default 50 = mild; lower it for footage you know is "
+            "heavily compressed but too re-encoded for the comb to survive."
         ),
     )
     parser.add_argument(
