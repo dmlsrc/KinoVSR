@@ -2588,10 +2588,15 @@ def main() -> None:
         "--deflicker-band", type=float, default=0.10, metavar="H",
         help=(
             "Luma half-width around the window median that counts as the "
-            "same quantization-state cluster (default 0.10; state steps "
-            "in the starved-encode regime read 0.05-0.15). Raise to also "
-            "collapse heavier pulses, lower if legitimate low-contrast "
-            "motion is being stabilized."
+            "same quantization-state cluster (default 0.10). Measured on "
+            "real crushed footage this knob is nearly inert above ~0.08: "
+            "the correction is dominated by the dense state-wobble "
+            "cluster around the median, which any band covering it yields "
+            "identically, and the rare far states barely move the mean. "
+            "Its only active range is downward -- drop toward 0.05 if "
+            "legitimate low-contrast motion is being stabilized. The "
+            "levers that actually scale the effect are --deflicker-window "
+            "and --deflicker-strength."
         ),
     )
 
