@@ -85,6 +85,13 @@ class StaticStateDeflicker:
         self._min_valid = float(min_valid)
         self._strength = float(strength)
         self.last_fix_fraction = 0.0     # fraction of pixels touched (debug)
+        # gate attribution (run averages); lives OUTSIDE _reset_state so it
+        # survives flush() and cut-boundary resets -- it describes the run,
+        # not the buffer
+        self._stat_frames = 0
+        self._stat_fired = 0.0
+        self._stat_verified = 0.0
+        self._stat_osc = 0.0
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -93,10 +100,6 @@ class StaticStateDeflicker:
         self._received = 0
         self._emitted = 0
         self._masks: dict = {}           # {(lo, hi): (H,W) static mask}
-        self._stat_frames = 0            # gate attribution (run averages)
-        self._stat_fired = 0.0
-        self._stat_verified = 0.0
-        self._stat_osc = 0.0
 
     def reset(self) -> None:
         self._reset_state()
