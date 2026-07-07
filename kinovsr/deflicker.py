@@ -17,8 +17,11 @@ Rule, per pixel, over a +/-K frame window:
     if >= frac of admitted samples are in-band, both existing temporal
     sides contribute, the temporal profile is OSCILLATORY (net change well
     below total variation -- monotone smooth profiles are lighting ramps or
-    true drift and must pass through), and the correction is below max_fix
-    (refused, not clamped).
+    true drift and must pass through), the correction field is locally
+    SIGN-MIXED (spatially coherent same-sign corrections are real
+    oscillating illumination -- blinking signage, headlight sweeps, AGC --
+    and are vetoed), and the correction is below max_fix (refused, not
+    clamped).
 
 Why this shape (measured on ground-truth crushed fixtures; see the v1-v6
 prototype history in the planning evidence):
@@ -67,8 +70,7 @@ class StaticStateDeflicker:
                  frac: float = 0.5, max_fix: float = 0.25,
                  tau: float = 0.75, min_valid: int = 6,
                  strength: float = 1.0, jitter: bool = False,
-                 jitter_max: float = 3.0, flow_reclaim: bool = False,
-                 flow_tau: float = 0.5):
+                 jitter_max: float = 3.0, illum_veto: bool = True):
         # window: +/-K frames integrated (latency = K).
         # band: luma half-width around the window median that counts as the
         #   same quantization-state cluster; the reference regime's state
@@ -98,27 +100,11 @@ class StaticStateDeflicker:
         self._strength = float(strength)
         self._jitter = bool(jitter)
         self._jitter_max = float(jitter_max)
-        # flow_reclaim: per-pixel stillness reclaim for the unverified halo
-        # around movers. Tile verification is 32px-coarse: one small mover
-        # invalidates every covering tile, leaving a 16-48px ring of
-        # genuinely still pixels untreated -- exactly where mosquito churn
-        # lives. VT optical flow between ADJACENT buffered frames gives a
-        # per-pixel motion path; its accumulated magnitude bounds the
-        # displacement of any pair, so a pixel whose path between t and j
-        # stays under flow_tau is verified still even inside a failed
-        # tile. Accumulation cannot cancel (magnitudes), so return trips
-        # count as motion -- conservative by construction. Reclaim only
-        # ever ADDS validity; tile verdicts are never overridden downward.
-        # Measured trade on the crushed fixtures (deadzone 0.05, tau 0.5):
-        # most of the halo flicker kill for about -0.15 dB fidelity from
-        # slow sub-deadzone drift being integrated; a fidelity-first run
-        # should leave this off.
-        # The engine self-test raises up front on the silent-zero VT flow
-        # failure (trusting silent zeros would reclaim moving pixels).
-        self._flow_reclaim = bool(flow_reclaim)
-        self._flow_tau = float(flow_tau)
-        self._flow_deadzone = 0.05       # sub-noise-floor flow ignored
-        self._flow_engine: Any = None
+        # illum_veto: refuse spatially sign-coherent corrections (real
+        # oscillating illumination). Disable only on material with no real
+        # light dynamics (e.g. archival scans) where every oscillation is
+        # junk.
+        self._illum_veto = bool(illum_veto)
         self.last_fix_fraction = 0.0     # fraction of pixels touched (debug)
         # gate attribution (run averages); lives OUTSIDE _reset_state so it
         # survives flush() and cut-boundary resets -- it describes the run,
@@ -130,8 +116,7 @@ class StaticStateDeflicker:
         self._stat_applied = 0.0
         self._stat_jit_px = 0.0
         self._stat_jit_pairs = 0
-        self._stat_reclaim = 0.0
-        self._stat_reclaim_pairs = 0
+
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -140,7 +125,6 @@ class StaticStateDeflicker:
         self._received = 0
         self._emitted = 0
         self._masks: dict = {}           # {(lo, hi): (H,W) static mask}
-        self._cums: dict = {}            # {index: (H,W) accumulated |flow| px}
 
     def reset(self) -> None:
         self._reset_state()
@@ -165,14 +149,10 @@ class StaticStateDeflicker:
                 "oscillatory": self._stat_osc / n,
                 "applied": self._stat_applied / n,
                 "jitter_px": (self._stat_jit_px / self._stat_jit_pairs
-                              if self._stat_jit_pairs else 0.0),
-                "reclaimed": (self._stat_reclaim / self._stat_reclaim_pairs
-                              if self._stat_reclaim_pairs else 0.0)}
+                              if self._stat_jit_pairs else 0.0)}
 
     def close(self) -> None:
-        if self._flow_engine is not None:
-            self._flow_engine.close()
-            self._flow_engine = None
+        pass
 
     # ---- static verification ---------------------------------------------
 
@@ -302,12 +282,6 @@ class StaticStateDeflicker:
                 Vs.append(mx.ones(cur_l.shape, dtype=mx.float32))
                 continue
             m, gy, gx = self._pair_mask(t, j)
-            if self._flow_reclaim:
-                path = mx.abs(self._cums[j] - self._cums[t])
-                still = (path < self._flow_tau).astype(mx.float32)
-                self._stat_reclaim += float(mx.mean(mx.maximum(still - m, 0.0)))
-                self._stat_reclaim_pairs += 1
-                m = mx.maximum(m, still)
             if gy or gx:
                 # cached shift aligns the higher-index frame onto the lower
                 sgn = 1.0 if j > t else -1.0
@@ -364,6 +338,29 @@ class StaticStateDeflicker:
                 & (left >= need_l) & (right >= need_r)
                 & oscillatory
                 & (cur_dev < self._max_fix)).astype(mx.float32)[..., None]
+        # illumination veto: real oscillating light (blinking signage,
+        # headlight sweeps, AGC pumping) is per-pixel indistinguishable
+        # from codec pulsing -- both are oscillatory luminance on static
+        # geometry -- but its CORRECTION field is locally same-signed and
+        # smooth (a light pool dims coherently), while codec block
+        # re-rolls are sign-mixed at block scale. Where the local mean
+        # correction keeps most of the local mean magnitude, the tool is
+        # about to flatten real light: refuse. Without this the
+        # flattening follows the 16px verification cells and prints
+        # flickering boxes wherever lighting oscillates (user-reported).
+        # the coherence window must sit BETWEEN the scales it separates:
+        # larger than a codec block (8-16px, sign-constant within), smaller
+        # than an illumination pool (typically 50px+); 17px reads sign
+        # mixture across 2+ blocks while still seeing a light pool as
+        # uniformly signed
+        corr_l = (_to_luma_2d(mean_w) - cur_l)[None, :, :, None] * fire[None]
+        k17 = mx.ones((1, 17, 17, 1), dtype=mx.float32) / 289.0
+        v_num = mx.conv2d(corr_l, k17, padding=8)[0, :, :, 0]
+        v_den = mx.conv2d(mx.abs(corr_l), k17, padding=8)[0, :, :, 0]
+        coher = mx.abs(v_num) / mx.maximum(v_den, 1e-6)
+        veto = ((coher > 0.65) & (v_den > 1.0 / 255.0))
+        if self._illum_veto:
+            fire = fire * (1.0 - veto.astype(mx.float32))[..., None]
         out = cur + (self._strength * fire) * (mean_w - cur)
         # anomalous-self fallback: a large 1-frame flash invalidates every
         # (t, j) verification in its own tiles (n_valid collapses to 1), so
@@ -382,7 +379,14 @@ class StaticStateDeflicker:
             agree = mx.abs(pv_l - nx_l) < self._band
             anom = mx.abs(cur_l - 0.5 * (pv_l + nx_l)) > self._band
             fixable = mx.abs(cur_l - 0.5 * (pv_l + nx_l)) < self._max_fix
-            fire2 = ((fire[..., 0] < 0.5) & (n_valid <= 2.0) & (br_ok > 0.5)
+            # serves two refusal modes of the main path: self-invalidating
+            # large flashes (n_valid collapses) and coherence-vetoed sparse
+            # same-sign flash blocks -- the bracket rule is itself safe
+            # (static bracket pair + in-band agreement), and a genuine
+            # 1-frame light strobe falling to it is the documented 1-frame
+            # despot trade
+            fire2 = ((fire[..., 0] < 0.5) & ((n_valid <= 2.0) | veto)
+                     & (br_ok > 0.5)
                      & agree & anom & fixable).astype(mx.float32)[..., None]
             out = out + (self._strength * fire2) * (0.5 * (pv + nx_) - out)
             fire = mx.minimum(fire + fire2, 1.0)
@@ -405,31 +409,11 @@ class StaticStateDeflicker:
             self._base += 1
         gone = self._base
         self._masks = {k: v for k, v in self._masks.items() if k[0] >= gone}
-        self._cums = {k: v for k, v in self._cums.items() if k >= gone}
         return out, tok
 
     def feed(self, rgb: Any, token: Any = None) -> list:
         a = rgb[0] if rgb.ndim == 4 else rgb
         a = mx.clip(a[..., :3].astype(mx.float32), 0.0, 1.0)
-        if self._flow_reclaim:
-            r = self._received
-            if r == 0:
-                cum = mx.zeros(a.shape[:2], dtype=mx.float32)
-            else:
-                if self._flow_engine is None:
-                    from .flow import VtFlowEngine
-                    self._flow_engine = VtFlowEngine(int(a.shape[1]),
-                                                     int(a.shape[0]))
-                prev = self._buf[-1][0]
-                f = self._flow_engine.flow(prev, a)
-                mag = mx.sqrt(f[..., 0] ** 2 + f[..., 1] ** 2 + 1e-12)
-                # deadzone the sub-0.1px flow noise floor (codec flicker
-                # induces spurious micro-flow that would otherwise
-                # accumulate into long-window paths and starve the
-                # reclaim); real motion clears it every frame
-                cum = self._cums[r - 1] + mx.maximum(mag - self._flow_deadzone, 0.0)
-            mx.eval(cum)
-            self._cums[r] = cum
         self._buf.append((a, _to_luma_2d(a), token))
         self._received += 1
         last = self._received - 1

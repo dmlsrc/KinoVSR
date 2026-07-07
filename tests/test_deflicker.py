@@ -45,12 +45,16 @@ def test_collapses_state_flicker_on_static_content():
     # GOP-pulse model: 8px blocks flip between base+d and base-d with a
     # 3-frame cadence; the truth is base. Integration must both kill the
     # temporal flicker and land closer to the truth than either state.
+    # Integration-machinery test: same-sign field, illumination veto off
+    # (sign-mixed flips at texture-comparable energy decorrelate the
+    # phase-correlation verification itself on this synthetic -- real junk
+    # rides on real texture; the veto has its own dedicated test).
     mx.random.seed(11)
     base = _base()
     d = 0.02 * (1.0 + _blocky((H, W)))    # steps 2d in [0.04, 0.08] < band
     clip = [mx.clip(base + (d if (t // 3) % 2 == 0 else -d), 0, 1)
             for t in range(T)]
-    outs = _run(clip)
+    outs = _run(clip, illum_veto=False)
     lo, hi = 8, T - 8
     err_in = sum(float(mx.mean(mx.abs(clip[t] - base))) for t in range(lo, hi))
     err_out = sum(float(mx.mean(mx.abs(outs[t] - base))) for t in range(lo, hi))
@@ -126,11 +130,26 @@ def test_flicker_on_lighting_ramp_fixed_ramp_kept():
     truth = [mx.clip(base * (0.88 + 0.20 * float(g)), 0, 1) for g in tt]
     clip = [mx.clip(truth[t] + (d if (t // 3) % 2 == 0 else -d), 0, 1)
             for t in range(T)]
-    outs = _run(clip)
+    outs = _run(clip, illum_veto=False)
     lo, hi = 8, T - 8
     err_in = sum(float(mx.mean(mx.abs(clip[t] - truth[t]))) for t in range(lo, hi))
     err_out = sum(float(mx.mean(mx.abs(outs[t] - truth[t]))) for t in range(lo, hi))
     assert err_out < 0.5 * err_in
+
+
+def test_spatially_coherent_flicker_is_vetoed():
+    # oscillating ILLUMINATION (blinking signage, AGC pumping) is per-pixel
+    # indistinguishable from codec pulsing, but its correction field is
+    # locally same-signed -- the coherence veto must refuse it, or the
+    # flattening follows the 16px verification cells and prints flickering
+    # boxes (user-reported failure)
+    base = _base()
+    d = mx.full((H, W, 1), 0.04)
+    clip = [mx.clip(base * (1.0 + (d if (t // 3) % 2 == 0 else -d)), 0, 1)
+            for t in range(T)]
+    outs = _run(clip)
+    worst = max(float(mx.max(mx.abs(o - c))) for o, c in zip(outs, clip))
+    assert worst < 0.012, f"coherent oscillation altered by {worst}"
 
 
 def test_latency_and_flush():
@@ -155,6 +174,10 @@ def test_jitter_compensation_recovers_shaky_static_scene():
     # with it, the median-shift residual verifies and samples align
     mx.random.seed(29)
     base = _base()
+    # same-sign field with the veto disabled: this test isolates the JITTER
+    # machinery. (Sign-mixed flips at texture-comparable energy decorrelate
+    # the displaced-pair phase correlation itself -- a synthetic artifact;
+    # the veto has its own dedicated test below.)
     d = 0.02 * (1.0 + _blocky((H, W)))
     shifts = [(0, 0), (1, 0), (2, 1), (1, 2), (0, 1), (-1, 0), (-2, -1),
               (-1, -2)]
@@ -184,8 +207,8 @@ def test_jitter_compensation_recovers_shaky_static_scene():
 
     floor = flick(truth)
     fl_in = flick(clip) - floor
-    outs_off = _run(clip)
-    outs_on = _run(clip, jitter=True)
+    outs_off = _run(clip, illum_veto=False)
+    outs_on = _run(clip, jitter=True, illum_veto=False)
     assert flick(outs_off) - floor > 0.7 * fl_in   # jitter defeats strict path
     assert flick(outs_on) - floor < 0.35 * fl_in   # compensation restores kill
     assert err(outs_on) < 0.5 * err(clip)          # and lands nearer the truth
@@ -205,57 +228,16 @@ def test_pan_stays_passthrough_with_jitter_on():
         assert float(mx.max(mx.abs(outs[t] - clip[t]))) < 1e-6
 
 
-def test_flow_reclaim_fixes_halo_around_mover():
-    # a mover invalidates every covering 32px tile, leaving a still,
-    # flickering halo untreated; per-pixel flow paths reclaim it. The
-    # mover itself stays bit-identical (its path is huge), and pixels it
-    # occludes are protected: pairs spanning the occlusion accumulate the
-    # mover's own motion.
-    import pytest
-    mx.random.seed(31)
-    base = _base()
-    d = 0.02 * (1.0 + _blocky((H, W)))
-    clip = []
-    boxes = []
-    for t_i in range(T):
-        f = mx.clip(base + (d if (t_i // 3) % 2 == 0 else -d), 0, 1)
-        x0 = 8 + 3 * t_i
-        yy = mx.arange(H).reshape(H, 1, 1)
-        xx = mx.arange(W).reshape(1, W, 1)
-        sq = ((yy >= 84) & (yy < 108) & (xx >= x0) & (xx < x0 + 24)).astype(mx.float32)
-        clip.append(mx.clip(f * (1 - sq) + 0.9 * sq, 0, 1))
-        boxes.append((84, 108, x0, x0 + 24))
-    try:
-        outs_on = _run(clip, flow_reclaim=True)
-    except RuntimeError as e:
-        pytest.skip(f"VT optical flow unavailable: {e}")
-    outs_off = _run(clip)
-    # halo: rows the mover's tiles cover but the mover never occupies
-    halo = (slice(56, 80), slice(8, 128))
-    lo, hi = 8, T - 8
-    err_off = sum(float(mx.mean(mx.abs(outs_off[t][halo] - base[halo])))
-                  for t in range(lo, hi))
-    err_on = sum(float(mx.mean(mx.abs(outs_on[t][halo] - base[halo])))
-                 for t in range(lo, hi))
-    assert err_on < 0.6 * err_off, (err_on, err_off)
-    # the mover itself is never touched
-    for t_i in range(T):
-        y0, y1, x0, x1 = boxes[t_i]
-        d_m = float(mx.max(mx.abs(outs_on[t_i][y0:y1, x0:x1]
-                                  - clip[t_i][y0:y1, x0:x1])))
-        assert d_m < 1e-6, f"mover altered by {d_m} at t={t_i}"
-
-
 def test_nonmultiple16_margin_passes_through():
     # frames not a multiple of 16: the bottom/right remainder margin has no
     # validity grid and must never fire
     mx.random.seed(19)
     h, w = 190, 250
     base = mx.clip(mx.random.uniform(shape=(h, w, 3)) * 0.3 + 0.3, 0, 1)
-    d = mx.full((h, w, 1), 0.04)
+    d = 0.02 * (1.0 + _blocky((192, 256)))[:h, :w]
     clip = [mx.clip(base + (d if (t // 3) % 2 == 0 else -d), 0, 1)
             for t in range(T)]
-    outs = _run(clip)
+    outs = _run(clip, illum_veto=False)
     t = T // 2
     interior_fixed = float(mx.mean(mx.abs(outs[t][:176, :240] - clip[t][:176, :240])))
     margin_dy = float(mx.max(mx.abs(outs[t][176:, :] - clip[t][176:, :])))

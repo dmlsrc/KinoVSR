@@ -1407,14 +1407,12 @@ def run(args: argparse.Namespace) -> None:
                                         strength=args.deflicker_strength,
                                         frac=args.deflicker_frac,
                                         max_fix=args.deflicker_max_fix,
-                                        jitter=(args.deflicker_jitter == "on"),
-                                        flow_reclaim=(args.deflicker_flow == "on"))
+                                        jitter=(args.deflicker_jitter == "on"))
             _jit = ", jitter-compensated" if args.deflicker_jitter == "on" else ""
-            _flw = ", flow-reclaim" if args.deflicker_flow == "on" else ""
             print(f"[deflicker] static-state integration: window +/-"
                   f"{args.deflicker_window}, band {args.deflicker_band:g}, "
                   f"frac {args.deflicker_frac:g}, max-fix "
-                  f"{args.deflicker_max_fix:g}{_jit}{_flw} (verified-static only; "
+                  f"{args.deflicker_max_fix:g}{_jit} (verified-static only; "
                   f"untouched pixels pass through bit-identical)")
 
         deb: Any = None
@@ -1995,8 +1993,6 @@ def run(args: argparse.Namespace) -> None:
             _dst = deflicker_stage.stats()
             _jit = (f", compensated jitter avg {_dst['jitter_px']:.2f}px"
                     if _dst["jitter_px"] else "")
-            _jit += (f", flow-reclaimed {_dst['reclaimed'] * 100:.1f}%"
-                     if _dst.get("reclaimed") else "")
             print(f"[deflicker] run avg: static-verified "
                   f"{_dst['verified'] * 100:.1f}% of pixels, oscillatory "
                   f"{_dst['oscillatory'] * 100:.1f}%, fired "
@@ -2718,25 +2714,6 @@ def main() -> None:
             "misverification or true content changes -- isolated wrong "
             "patches and ghosts. Lower it on precious footage; think "
             "twice before raising."
-        ),
-    )
-
-    add(
-        "--deflicker-flow", choices=["off", "on"], default="off",
-        help=(
-            "Per-pixel stillness reclaim via VideoToolbox optical flow "
-            "(Quality tier, startup self-test). Tile verification is "
-            "32px-coarse, so one small mover invalidates a 16-48px ring of "
-            "genuinely still pixels around it -- exactly where mosquito "
-            "churn lives. Flow between adjacent frames gives each pixel a "
-            "motion path; pixels whose accumulated path stays under 0.5px "
-            "are verified still even inside a failed tile (accumulated "
-            "magnitudes cannot cancel, so return trips count as motion -- "
-            "conservative). Only ADDS validity; tile verdicts are never "
-            "downgraded. Measured trade: most of the halo flicker kill for "
-            "~0.15 dB fidelity (slow sub-noise-floor drift gets "
-            "integrated) -- leave off for fidelity-first runs. One flow "
-            "eval per frame (~17 ms)."
         ),
     )
 
