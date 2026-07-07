@@ -960,7 +960,13 @@ def run(args: argparse.Namespace) -> None:
         raise SystemExit(f"bad --max-frames value: {e}") from None
 
     if getattr(args, "probe_noise", False) and args.video:
-        from LTX_2_MLX.videotoolbox.noise_map import analyze_noise, classify_noise_analysis
+        from LTX_2_MLX.videotoolbox.noise_map import (
+            analyze_noise,
+            classify_noise_analysis,
+            detect_grid_period,
+            estimate_blockiness_map,
+        )
+        from LTX_2_MLX.videotoolbox.quant_comb import estimate_qf
         _pw_end = win_end if win_end is not None else total_frames
         _span = max(1, _pw_end - win_start)
         _starts = sorted({win_start + int(f * max(0, _span - 12)) for f in (0.1, 0.5, 0.9)})
@@ -970,6 +976,10 @@ def run(args: argparse.Namespace) -> None:
             _kfl = _vr.keyframe_display_indices(Path(args.video)) or [0]
         except Exception:
             _kfl = [0]
+        _all_frames: list = []
+        _mid_frames: list = []
+        _all_labels: list = []
+        _mc_sigs: list = []
         for ws in _starts:
             _fr = []
             for _chk in _vr.iter_video_buffer_chunks(
@@ -980,6 +990,11 @@ def run(args: argparse.Namespace) -> None:
                 continue
             r = analyze_noise(_fr)
             diag = classify_noise_analysis(r)
+            _all_frames.extend(_fr)
+            if ws == _starts[len(_starts) // 2]:
+                _mid_frames = list(_fr)
+            _all_labels.extend(diag["labels"])
+            _mc_sigs.append(float(r.get("mc_sigma", 0.0)))
             tr = r.pop("frame_trace")
 
             def _kfd(i, _ws=ws):
@@ -1005,6 +1020,11 @@ def run(args: argparse.Namespace) -> None:
                   f"diff-corr {r.get('flat_diff_corr', 0.0):.2f}   "
                   f"(mc = the map's default floor: aligned-residual noise on "
                   f"all pixels; lag ~1 + sigma >= 0.03 = dense real noise)")
+            print(f"  spatial floor: sigma {r.get('spatial_sigma', 0.0):.4f}   "
+                  f"static grain ~{r.get('static_grain_sigma', 0.0):.4f}   "
+                  f"static-banding {r.get('static_row_periodicity', 0.0):.2f}@"
+                  f"{r.get('static_row_period_px', 0.0):.0f}px   "
+                  f"interlace {r.get('row_interlace', 0.0):.1f}x")
             print(f"  channels: R {r['sigma_R']:.4f}  G {r['sigma_G']:.4f}  B {r['sigma_B']:.4f}")
             print(f"  verdict: {', '.join(diag['labels'])}  risk={diag['risk']}")
             for _msg in diag["warnings"][:2]:
@@ -1015,6 +1035,82 @@ def run(args: argparse.Namespace) -> None:
             print(f"  frame trace: med {sorted(tr)[len(tr) // 2]:.4f}  max {max(tr):.4f}"
                   "   top flashes: " + ", ".join(
                       f"diff{i + 1} {tr[i]:.4f} (kf+{_kfd(i)})" for i in _pk))
+        # ---- tool guidance: name the tool the measurements support --------
+        print("[probe] tool guidance:")
+        _comb = (estimate_qf(_all_frames) if _all_frames
+                 else {"qf": None, "confidence": 0.0})
+        if _comb["qf"] is not None:
+            print(f"  JPEG ancestry: QF ~{_comb['qf']} "
+                  f"(confidence {_comb['confidence']:g}) -> --deblock fbcnn "
+                  f"(auto QF tracks it per tile)")
+        else:
+            print("  no JPEG-family comb (native H.264/HEVC, or combs killed "
+                  "by a later re-encode)")
+        _bp95 = None
+        if _mid_frames:
+            _gp = detect_grid_period(_mid_frames)
+            _pnon8 = [r[0] for r in (_gp.get("px"), _gp.get("py"))
+                      if r is not None and abs(r[0] - 8.0) > 0.3]
+            if _pnon8:
+                _pm = sum(_pnon8) / len(_pnon8)
+                print(f"  grid period ~{_pm:.1f} px (~{_pm / 8.0:.2f}x resize of "
+                      f"an 8-grid): footage was compressed then RESIZED; the "
+                      f"blockiness map tracks it (period=auto)")
+            _blk = estimate_blockiness_map(_mid_frames)
+            if _blk is not None:
+                _bs = mx.sort(_blk.reshape(-1))
+                _bp95 = float(_bs[int(0.95 * (int(_bs.shape[0]) - 1))])
+                # clean modern re-encodes read p95 ~0.3 from their own light
+                # grid; recommending stdf there costs quality (measured on the
+                # corpus controls), so "little" extends past that baseline
+                if _bp95 >= 0.6:
+                    _bmsg = ("strong coding grid -> --deblock stdf "
+                             "--deblock-map auto (strength 0.3-0.4)")
+                elif _bp95 >= 0.4:
+                    _bmsg = ("mild coding grid -> --deblock stdf "
+                             "--deblock-map auto (strength 0.15-0.25)")
+                else:
+                    _bmsg = ("little grid evidence (clean-encode baseline): "
+                             "nothing grid-locked to deblock")
+                print(f"  blockiness p95 {_bp95:.2f}: {_bmsg}")
+        _mc_med = sorted(_mc_sigs)[len(_mc_sigs) // 2] if _mc_sigs else 0.0
+        if "dense sensor noise" in _all_labels:
+            print(f"  dense noise (mc floor ~{_mc_med:.3f}) -> --denoise bsvd "
+                  f"--noise-map auto")
+        elif "sparse edge flicker" in _all_labels:
+            print("  sparse edge flicker -> compression cleanup first "
+                  "(deblock / fbcnn); plain denoise adds little")
+        elif "dense motion, low noise floor" in _all_labels:
+            print(f"  clean motion (mc floor ~{_mc_med:.3f}) -> skip or keep "
+                  f"denoise minimal; heavy denoise eats texture")
+        elif "static/structured grain" in _all_labels:
+            print("  static grain: temporal denoisers cannot remove it -> "
+                  "spatial cleanup or a small --noise-map-floor")
+        if "interlace/field residue" in _all_labels:
+            print("  interlace residue -> deinterlace upstream before any "
+                  "denoise/deblock (temporal nets smear combing)")
+        if "static row banding" in _all_labels:
+            print("  static row banding -> spatial-only artifact; temporal "
+                  "tools will not touch it")
+        _bpp = None
+        try:
+            _sizes = _vr.coded_frame_sizes(Path(args.video))
+        except Exception:
+            _sizes = []
+        if _sizes:
+            _seg = [s for s in _sizes[win_start:_pw_end] if s > 0]
+            if _seg:
+                _bpp = 8.0 * (sum(_seg) / len(_seg)) / float(in_w * in_h)
+                _bnote = ("starved encode, damage certain" if _bpp < 0.08
+                          else "lean encode" if _bpp < 0.2 else "generous encode")
+                print(f"  bpp {_bpp:.3f} over the probed range: {_bnote} "
+                      f"(last generation ONLY: high bpp proves nothing after "
+                      f"a re-encode)")
+        if (_comb["qf"] is None and _bp95 is not None and _bp95 < 0.4
+                and _bpp is not None and _bpp < 0.12):
+            print("  low bpp with no measurable grid or comb (mush): auto "
+                  "dials have no anchor here -> manual call (bsvd for "
+                  "shimmer, nafnet for structure)")
         print("[probe] done -- no processing performed")
         return
 

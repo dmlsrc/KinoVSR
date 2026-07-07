@@ -648,3 +648,115 @@ def test_probe_mc_floor_resolves_full_texture_pan():
     assert any("motion-compensated" in s for s in noisy_diag["suggestions"])
     clean_diag = classify_noise_analysis(clean_stats)
     assert "dense sensor noise" not in clean_diag["labels"]
+
+
+def _bilinear_up(img, s=1.5):
+    h, w = int(img.shape[0]), int(img.shape[1])
+    oh, ow = int(h * s), int(w * s)
+    fy = mx.arange(oh).astype(mx.float32) / s
+    fx = mx.arange(ow).astype(mx.float32) / s
+    y0 = mx.minimum(fy.astype(mx.int32), h - 2)
+    x0 = mx.minimum(fx.astype(mx.int32), w - 2)
+    wy = (fy - y0.astype(mx.float32)).reshape(oh, 1, 1)
+    wx = (fx - x0.astype(mx.float32)).reshape(1, ow, 1)
+    r0 = mx.take(img, y0, axis=0)
+    r1 = mx.take(img, y0 + 1, axis=0)
+    g0 = mx.take(r0, x0, axis=1) * (1 - wx) + mx.take(r0, x0 + 1, axis=1) * wx
+    g1 = mx.take(r1, x0, axis=1) * (1 - wx) + mx.take(r1, x0 + 1, axis=1) * wx
+    return g0 * (1 - wy) + g1 * wy
+
+
+def test_blockiness_auto_detects_resized_grid():
+    # compressed-then-resized: an 8-grid upscaled 1.5x lives at period 12,
+    # invisible to the 8-locked legacy detector but found by period="auto"
+    from LTX_2_MLX.videotoolbox.noise_map import estimate_blockiness_map
+
+    mx.random.seed(21)
+    base = _bcontent()
+    blocked = _bilinear_up(_blockify(base))
+    clean = _bilinear_up(base)
+    bframes = [mx.clip(blocked + 0.003 * mx.random.normal(shape=blocked.shape), 0, 1)
+               for _ in range(3)]
+    cframes = [mx.clip(clean + 0.003 * mx.random.normal(shape=clean.shape), 0, 1)
+               for _ in range(3)]
+    m_auto = estimate_blockiness_map(bframes, period="auto", severity_scale=1.0)
+    m_legacy = estimate_blockiness_map(bframes, period=8, severity_scale=1.0)
+    m_clean = estimate_blockiness_map(cframes, period="auto", severity_scale=1.0)
+    med_auto = float(mx.sort(m_auto.reshape(-1))[int(m_auto.size) // 2])
+    med_legacy = float(mx.sort(m_legacy.reshape(-1))[int(m_legacy.size) // 2])
+    p95_clean = float(mx.sort(m_clean.reshape(-1))[int(0.95 * (int(m_clean.size) - 1))])
+    assert med_auto > 3e-3                    # resized grid registers
+    assert med_auto > 3.0 * max(med_legacy, 1e-6)   # ...where 8-locked missed it
+    assert p95_clean < 1.5e-3                 # resized CLEAN content stays quiet
+
+
+def test_row_spectrum_detects_interlace_residue():
+    # alternating-row flicker (comb at period 2) -- below the old lag-3
+    # autocorrelation floor, squarely in the spectrum's band
+    mx.random.seed(31)
+    base = _content()
+    comb = mx.broadcast_to(((mx.arange(H) % 2).astype(mx.float32) * 2 - 1)
+                           .reshape(H, 1, 1), (H, W, 3))
+    clip = [mx.clip(base + (0.02 if t % 2 == 0 else -0.02) * comb
+                    + 0.004 * mx.random.normal(shape=base.shape), 0, 1)
+            for t in range(T)]
+    stats = analyze_noise(clip)
+    assert stats["row_interlace"] >= 4.0
+    diag = classify_noise_analysis(stats)
+    assert "interlace/field residue" in diag["labels"]
+
+
+def test_row_spectrum_detects_jumping_scanlines():
+    # dark 1px lines every 11 rows, phase jumping per frame, 30% dropout --
+    # the analog-corpus scanline recipe
+    mx.random.seed(33)
+    base = _content()
+    clip = []
+    for t in range(T):
+        phase = int(mx.random.randint(0, 11).item()) if False else (t * 5) % 11
+        rows = ((mx.arange(H) + phase) % 11 < 1).astype(mx.float32)
+        keep = (mx.random.uniform(shape=(H,)) >= 0.3).astype(mx.float32)
+        lines = (rows * keep).reshape(H, 1, 1)
+        clip.append(mx.clip(base - 0.035 * lines
+                            + 0.004 * mx.random.normal(shape=base.shape), 0, 1))
+    stats = analyze_noise(clip)
+    assert abs(stats["row_period_px"] - 11.0) <= 0.6
+    assert stats["row_periodicity"] >= 0.5
+
+
+def test_static_row_banding_detected_without_temporal_signal():
+    # banding BAKED into every frame identically: zero temporal diff, so only
+    # the static row spectrum can see it
+    mx.random.seed(35)
+    base = _content()
+    band = (0.02 * mx.cos(2.0 * 3.141592653589793 * mx.arange(H).astype(mx.float32) / 7.0)
+            ).reshape(H, 1, 1)
+    clip = [mx.clip(base + band + 0.003 * mx.random.normal(shape=base.shape), 0, 1)
+            for _ in range(T)]
+    stats = analyze_noise(clip)
+    assert abs(stats["static_row_period_px"] - 7.0) <= 0.5
+    assert stats["static_row_periodicity"] >= 0.5
+    diag = classify_noise_analysis(stats)
+    assert "static row banding" in diag["labels"]
+
+
+def test_static_grain_floor_separates_from_temporal_noise():
+    # grain field added IDENTICALLY to every frame (static) + small temporal
+    # wobble: the mean-frame spatial floor must read the grain while the
+    # temporal (mc) floor reads only the wobble
+    mx.random.seed(37)
+    base = _content()
+    grain = 0.03 * mx.random.normal(shape=(H, W, 3))
+    clip = [mx.clip(base + grain + 0.004 * mx.random.normal(shape=base.shape), 0, 1)
+            for _ in range(T)]
+    stats = analyze_noise(clip)
+    assert stats["spatial_sigma"] > 0.018
+    assert stats["static_grain_sigma"] > 0.015
+    assert stats["mc_sigma"] < 0.012                  # temporal floor: wobble only
+    diag = classify_noise_analysis(stats)
+    assert "static/structured grain" in diag["labels"]
+    # clean control: no static grain reported on grain-free content
+    clean = [mx.clip(base + 0.004 * mx.random.normal(shape=base.shape), 0, 1)
+             for _ in range(T)]
+    cstats = analyze_noise(clean)
+    assert cstats["static_grain_sigma"] < 0.012

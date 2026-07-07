@@ -199,6 +199,34 @@ def keyframe_display_indices(path: Path) -> list[int]:
         container.close()
 
 
+def coded_frame_sizes(path: Path) -> list[int]:
+    """Per-frame coded sizes in DISPLAY order (bytes), no decode.
+
+    Mirrors the native reader: packet sizes from the same demux walk the
+    keyframe scan uses, placed by (start_time-rebased) presentation
+    timestamp. Coded size is a LAST-GENERATION signal: a generous re-encode
+    of damaged footage reads large. Returns [] when the stream cannot be
+    walked.
+    """
+    container, vs = _open_video(path)
+    try:
+        fps = _fps(vs)
+        if fps <= 0:
+            return []
+        sized: dict[int, int] = {}
+        for pkt in container.demux(vs):
+            if pkt.pts is None or pkt.size <= 0:
+                continue
+            idx = _pts_index(pkt.pts, vs, fps)
+            sized[idx] = sized.get(idx, 0) + int(pkt.size)
+        if not sized:
+            return []
+        hi = max(sized)
+        return [sized.get(i, 0) for i in range(hi + 1)]
+    finally:
+        container.close()
+
+
 # ---------------------------------------------------------------- frames
 def _plane_to_mx(frame: Any, bytes_per_px: int, width_els: int) -> Any:
     """Packed plane 0 -> mx array (h, width_els), stride-cropped, no numpy."""

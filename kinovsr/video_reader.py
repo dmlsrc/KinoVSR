@@ -175,6 +175,54 @@ def keyframe_display_indices(path: Path) -> list[int]:
     return sorted(kf) if kf else [0]
 
 
+def coded_frame_sizes(path: Path) -> list[int]:
+    """Per-frame coded sizes in DISPLAY order (bytes), no decode.
+
+    Same metadata-only pass-through walk as ``keyframe_display_indices``:
+    an AVAssetReaderTrackOutput with nil settings yields compressed samples,
+    and ``CMSampleBufferGetTotalSampleSize`` is their coded size. Sizes come
+    in decode order and are placed by presentation timestamp; zero-size
+    priming/edit samples are skipped. Coded size is a LAST-GENERATION
+    signal: a generous re-encode of damaged footage reads large. Returns []
+    when the track cannot be walked.
+    """
+    import math
+    require_pyobjc()
+    url = Foundation.NSURL.fileURLWithPath_(str(path))
+    asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
+    track = _first_video_track(asset)
+    fps = float(track.nominalFrameRate())
+    if fps <= 0:
+        return []
+    reader, err = av.AVAssetReader.alloc().initWithAsset_error_(asset, None)
+    if reader is None:
+        raise RuntimeError(f"AVAssetReader init failed: {err}")
+    out = av.AVAssetReaderTrackOutput.alloc().initWithTrack_outputSettings_(track, None)
+    if not reader.canAddOutput_(out):
+        return []
+    reader.addOutput_(out)
+    if not reader.startReading():
+        raise RuntimeError(f"AVAssetReader.startReading failed: {reader.error()}")
+    sized: dict[int, int] = {}
+    while True:
+        sb = out.copyNextSampleBuffer()
+        if sb is None:
+            break
+        n = int(CoreMedia.CMSampleBufferGetTotalSampleSize(sb))
+        if n > 0:
+            pts = CoreMedia.CMTimeGetSeconds(CoreMedia.CMSampleBufferGetPresentationTimeStamp(sb))
+            if math.isnan(pts):
+                pts = CoreMedia.CMTimeGetSeconds(CoreMedia.CMSampleBufferGetDecodeTimeStamp(sb))
+            if not math.isnan(pts):
+                idx = int(round(pts * fps))
+                sized[idx] = sized.get(idx, 0) + n
+        del sb
+    if not sized:
+        return []
+    hi = max(sized)
+    return [sized.get(i, 0) for i in range(hi + 1)]
+
+
 def probe_color(path: Path) -> dict:
     """Source color tags from the container, for output color propagation.
 

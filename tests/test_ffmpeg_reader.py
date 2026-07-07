@@ -153,3 +153,21 @@ def test_audio_track_decodes(tmp_path):
     assert at.sample_rate == 48000 and at.channels == 1
     # AAC pads to frame boundaries; length within ~2 AAC frames of the source
     assert abs(at.n_samples - n_samp) < 4096
+
+
+def test_coded_frame_sizes(clip):
+    sizes = fr.coded_frame_sizes(clip)
+    assert len(sizes) == N
+    assert all(s > 0 for s in sizes)
+    # the fixed-GOP fixture makes every keyframe the local maximum
+    kf = fr.keyframe_display_indices(clip)
+    p_sizes = [s for i, s in enumerate(sizes) if i not in kf]
+    assert min(sizes[i] for i in kf) > max(p_sizes)
+    # cross-reader parity: the native reader must account the same bytes
+    try:
+        from LTX_2_MLX.videotoolbox import video_reader as nvr
+        native = nvr.coded_frame_sizes(clip)
+    except Exception:
+        pytest.skip("native reader unavailable for this container")
+    assert sum(native) == sum(sizes)
+    assert len(native) == len(sizes)
