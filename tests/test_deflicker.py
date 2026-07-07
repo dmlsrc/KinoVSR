@@ -149,6 +149,62 @@ def test_latency_and_flush():
     assert st["applied"] < 1e-5
 
 
+def test_jitter_compensation_recovers_shaky_static_scene():
+    # global integer camera jitter (max 2px) on a static flickering scene:
+    # without compensation, far pairs fail verification and the kill dies;
+    # with it, the median-shift residual verifies and samples align
+    mx.random.seed(29)
+    base = _base()
+    d = 0.02 * (1.0 + _blocky((H, W)))
+    shifts = [(0, 0), (1, 0), (2, 1), (1, 2), (0, 1), (-1, 0), (-2, -1),
+              (-1, -2)]
+    clip = []
+    for t_i in range(T):
+        f = mx.clip(base + (d if (t_i // 3) % 2 == 0 else -d), 0, 1)
+        sy, sx = shifts[t_i % len(shifts)]
+        clip.append(mx.roll(mx.roll(f, sy, axis=0), sx, axis=1))
+    # the output is intentionally NOT stabilized (only samples are
+    # aligned), so adjacent-frame diffs keep the content displacement of
+    # the jitter itself; the kill is judged on the flicker component above
+    # the jittered-CLEAN floor, and on error to the jittered truth
+    truth = []
+    for t_i in range(T):
+        sy, sx = shifts[t_i % len(shifts)]
+        truth.append(mx.roll(mx.roll(base, sy, axis=0), sx, axis=1))
+    lo, hi = 8, T - 8
+    c = (slice(16, H - 16), slice(16, W - 16))   # avoid border strips
+
+    def flick(frames):
+        return sum(float(mx.mean(mx.abs(frames[t][c] - frames[t - 1][c])))
+                   for t in range(lo, hi))
+
+    def err(frames):
+        return sum(float(mx.mean(mx.abs(frames[t][c] - truth[t][c])))
+                   for t in range(lo, hi))
+
+    floor = flick(truth)
+    fl_in = flick(clip) - floor
+    outs_off = _run(clip)
+    outs_on = _run(clip, jitter=True)
+    assert flick(outs_off) - floor > 0.7 * fl_in   # jitter defeats strict path
+    assert flick(outs_on) - floor < 0.35 * fl_in   # compensation restores kill
+    assert err(outs_on) < 0.5 * err(clip)          # and lands nearer the truth
+
+
+def test_pan_stays_passthrough_with_jitter_on():
+    # a real 2px/frame pan: pairs beyond distance 1 exceed the jitter cap,
+    # so too few samples verify and nothing fires
+    mx.random.seed(13)
+    tex = mx.random.uniform(shape=(H, W + 2 * T))
+    k = mx.ones((1, 5, 5, 1)) / 25.0
+    tex = mx.conv2d(tex[None, :, :, None], k, padding=2)[0, :, :, 0]
+    clip = [mx.broadcast_to(mx.clip(tex[:, 2 * t:2 * t + W], 0, 1)[..., None],
+                            (H, W, 3)) for t in range(T)]
+    outs = _run(clip, jitter=True)
+    for t in range(T):
+        assert float(mx.max(mx.abs(outs[t] - clip[t]))) < 1e-6
+
+
 def test_nonmultiple16_margin_passes_through():
     # frames not a multiple of 16: the bottom/right remainder margin has no
     # validity grid and must never fire

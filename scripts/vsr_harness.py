@@ -1345,11 +1345,16 @@ def run(args: argparse.Namespace) -> None:
             from LTX_2_MLX.videotoolbox.deflicker import StaticStateDeflicker
             defl = StaticStateDeflicker(window=args.deflicker_window,
                                         band=args.deflicker_band,
-                                        strength=args.deflicker_strength)
+                                        strength=args.deflicker_strength,
+                                        frac=args.deflicker_frac,
+                                        max_fix=args.deflicker_max_fix,
+                                        jitter=(args.deflicker_jitter == "on"))
+            _jit = ", jitter-compensated" if args.deflicker_jitter == "on" else ""
             print(f"[deflicker] static-state integration: window +/-"
-                  f"{args.deflicker_window}, band {args.deflicker_band:g} "
-                  f"(verified-static only; untouched pixels pass through "
-                  f"bit-identical)")
+                  f"{args.deflicker_window}, band {args.deflicker_band:g}, "
+                  f"frac {args.deflicker_frac:g}, max-fix "
+                  f"{args.deflicker_max_fix:g}{_jit} (verified-static only; "
+                  f"untouched pixels pass through bit-identical)")
 
         deb: Any = None
         if args.deblock == "stdf":
@@ -1927,13 +1932,15 @@ def run(args: argparse.Namespace) -> None:
             denoiser.close()
         if deflicker_stage is not None:
             _dst = deflicker_stage.stats()
+            _jit = (f", compensated jitter avg {_dst['jitter_px']:.2f}px"
+                    if _dst["jitter_px"] else "")
             print(f"[deflicker] run avg: static-verified "
                   f"{_dst['verified'] * 100:.1f}% of pixels, oscillatory "
                   f"{_dst['oscillatory'] * 100:.1f}%, fired "
                   f"{_dst['fired'] * 100:.1f}%, applied "
-                  f"{_dst['applied'] * 1000:.2f}e-3 luma (verification is "
-                  f"the scope gate: bounded by camera/subject motion, not "
-                  f"band/window; band/strength move 'applied')")
+                  f"{_dst['applied'] * 1000:.2f}e-3 luma{_jit} "
+                  f"(verification is the scope gate: bounded by "
+                  f"camera/subject motion, not band/window)")
         if deblocker is not None:
             _qi = getattr(deblocker, "last_qf_info", None)
             if _qi is not None:
@@ -2602,7 +2609,58 @@ def main() -> None:
 
     add(
         "--deflicker-strength", type=float, default=1.0, metavar="A",
-        help="Blend of the stabilized value (1.0 = full replacement).",
+        help=(
+            "Blend of the stabilized value. 1.0 (default) = full "
+            "replacement with the dwell-weighted state mixture, which is "
+            "already the maximum meaningful effect; values above 1.0 "
+            "overshoot PAST the estimate and re-inject the artifact in "
+            "antiphase (manufactured inverted flicker). Lower below 1.0 "
+            "to dial the look back."
+        ),
+    )
+
+    add(
+        "--deflicker-frac", type=float, default=0.5, metavar="F",
+        help=(
+            "Fraction of admitted samples that must sit in-band around "
+            "the window median for a pixel to fire (default 0.5). "
+            "Lowering fires on weaker consensus: below ~0.4 the "
+            "protection against real content changes rests on the "
+            "two-sided gate alone, and mixed junk/content pixels start "
+            "averaging real change into the output (ghosting at "
+            "appearance/disappearance edges). Raise toward 0.65 to be "
+            "extra conservative on busy footage."
+        ),
+    )
+
+    add(
+        "--deflicker-max-fix", type=float, default=0.25, metavar="D",
+        help=(
+            "Corrections larger than this luma delta are REFUSED, not "
+            "clamped (default 0.25). This is a safety valve, not a "
+            "strength dial: genuine state flicker sits well below it, so "
+            "raising it mainly admits corrections that come from "
+            "misverification or true content changes -- isolated wrong "
+            "patches and ghosts. Lower it on precious footage; think "
+            "twice before raising."
+        ),
+    )
+
+    add(
+        "--deflicker-jitter", choices=["off", "on"], default="off",
+        help=(
+            "Compensate global camera micro-jitter before static "
+            "verification: the median per-tile displacement of each frame "
+            "pair is treated as camera shift, tiles verify against the "
+            "residual, and admitted samples are aligned by one "
+            "whole-frame Fourier translation (never per-tile warps). Use "
+            "when footage is handheld/tripod-bumped and 'static-verified' "
+            "reads far below the clip's true static fraction -- it widens "
+            "the tool's scope to jitter-masked static content. Pairs "
+            "shifted beyond 3px are real camera motion and stay refused. "
+            "Costs roughly 2x runtime; off (default) is bit-identical to "
+            "the unjittered path."
+        ),
     )
 
     # ---- Deblock -----------------------------------------------------------------

@@ -66,7 +66,8 @@ class StaticStateDeflicker:
     def __init__(self, window: int = 8, band: float = 0.10,
                  frac: float = 0.5, max_fix: float = 0.25,
                  tau: float = 0.75, min_valid: int = 6,
-                 strength: float = 1.0):
+                 strength: float = 1.0, jitter: bool = False,
+                 jitter_max: float = 3.0):
         # window: +/-K frames integrated (latency = K).
         # band: luma half-width around the window median that counts as the
         #   same quantization-state cluster; the reference regime's state
@@ -77,6 +78,16 @@ class StaticStateDeflicker:
         # tau: max phase-correlation displacement (px) for a tile pair to
         #   count as verified static.
         # min_valid: minimum admitted samples (incl. t) before acting.
+        # jitter: compensate GLOBAL camera micro-jitter before verification:
+        #   the median per-tile displacement of a pair is treated as camera
+        #   shift; tiles are verified against the RESIDUAL and admitted
+        #   samples are aligned by ONE whole-frame Fourier shift. This is
+        #   not the per-tile warping that failed (median-of-tiles is robust
+        #   to moving subjects, a single global translation cannot print
+        #   seams, and Fourier translation is all-pass). Pairs whose global
+        #   shift exceeds jitter_max px are real camera motion, not jitter,
+        #   and fall back to the strict static rule; the wrap-contaminated
+        #   border strip is invalidated per pair.
         self._k = max(1, int(window))
         self._band = float(band)
         self._frac = float(frac)
@@ -84,6 +95,8 @@ class StaticStateDeflicker:
         self._tau = float(tau)
         self._min_valid = float(min_valid)
         self._strength = float(strength)
+        self._jitter = bool(jitter)
+        self._jitter_max = float(jitter_max)
         self.last_fix_fraction = 0.0     # fraction of pixels touched (debug)
         # gate attribution (run averages); lives OUTSIDE _reset_state so it
         # survives flush() and cut-boundary resets -- it describes the run,
@@ -93,6 +106,8 @@ class StaticStateDeflicker:
         self._stat_verified = 0.0
         self._stat_osc = 0.0
         self._stat_applied = 0.0
+        self._stat_jit_px = 0.0
+        self._stat_jit_pairs = 0
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -123,20 +138,26 @@ class StaticStateDeflicker:
         return {"fired": self._stat_fired / n,
                 "verified": self._stat_verified / n,
                 "oscillatory": self._stat_osc / n,
-                "applied": self._stat_applied / n}
+                "applied": self._stat_applied / n,
+                "jitter_px": (self._stat_jit_px / self._stat_jit_pairs
+                              if self._stat_jit_pairs else 0.0)}
 
     def close(self) -> None:
         pass
 
     # ---- static verification ---------------------------------------------
 
-    def _static_mask(self, ref_l: Any, src_l: Any) -> Any:
-        """(H,W) 0/1 mask: 1 where every covering 32px tile is static."""
+    def _static_mask(self, ref_l: Any, src_l: Any) -> tuple:
+        """((H,W) 0/1 mask, gy, gx): mask is 1 where every covering 32px
+        tile is static; (gy, gx) is the global (camera) shift of src
+        relative to ref -- the median per-tile displacement -- or (0, 0)
+        when jitter compensation is off or the shift exceeds jitter_max.
+        In jitter mode tiles verify against the RESIDUAL displacement."""
         H, W = int(ref_l.shape[0]), int(ref_l.shape[1])
         B, S = self.BLOCK, self.STRIDE
         Hc, Wc = (H // S) * S, (W // S) * S
         if Hc < B or Wc < B:
-            return mx.zeros((H, W), dtype=mx.float32)
+            return mx.zeros((H, W), dtype=mx.float32), 0.0, 0.0
         ny, nx = Hc // S - 1, Wc // S - 1        # regular tile origins
         rl = ref_l[:Hc, :Wc]
         sl = src_l[:Hc, :Wc]
@@ -161,8 +182,33 @@ class StaticStateDeflicker:
         px = (peak % B).astype(mx.float32)
         dy = mx.where(py > B / 2, py - B, py)
         dx = mx.where(px > B / 2, px - B, px)
-        ok = ((mx.abs(dy) < self._tau)
-              & (mx.abs(dx) < self._tau)).astype(mx.float32).reshape(ny, nx)
+        gy = gx = 0.0
+        if self._jitter:
+            nt = int(dy.shape[0])
+            gy = float(mx.sort(dy)[nt // 2])
+            gx = float(mx.sort(dx)[nt // 2])
+            if max(abs(gy), abs(gx)) > self._jitter_max or \
+                    max(abs(gy), abs(gx)) < 0.2:
+                # beyond the cap it is real camera motion (strict rule);
+                # below 0.2 px compensation is not worth a resample
+                gy = gx = 0.0
+            else:
+                # dominance rule: starved encoders shred camera shake into
+                # piecewise skips and snaps, so the decoded displacement
+                # field is often NOT a global translation -- half the frame
+                # sits at 0 while coded regions snapped. Compensate only
+                # when it verifies MORE tiles than not compensating, so
+                # jitter mode can never do worse than the strict rule.
+                n_g = float(mx.sum(((mx.abs(dy - gy) < self._tau)
+                                    & (mx.abs(dx - gx) < self._tau))
+                                   .astype(mx.float32)))
+                n_0 = float(mx.sum(((mx.abs(dy) < self._tau)
+                                    & (mx.abs(dx) < self._tau))
+                                   .astype(mx.float32)))
+                if n_0 >= n_g:
+                    gy = gx = 0.0
+        ok = ((mx.abs(dy - gy) < self._tau)
+              & (mx.abs(dx - gx) < self._tau)).astype(mx.float32).reshape(ny, nx)
         # cell verdict = AND of covering tiles; cell grid is (ny+1, nx+1),
         # cell (i,j) covered by tile origins {i-1, i} x {j-1, j}
         okp = mx.pad(ok, ((1, 1), (1, 1)), constant_values=1.0)
@@ -172,17 +218,41 @@ class StaticStateDeflicker:
                             (ny + 1, S, nx + 1, S)).reshape(Hc, Wc)
         if Hc < H or Wc < W:
             m = mx.pad(m, ((0, H - Hc), (0, W - Wc)))
-        return m
+        if gy or gx:
+            # the Fourier shift wraps content around the frame edge: kill
+            # validity in the contaminated border strip for this pair
+            s = int(max(abs(gy), abs(gx))) + 1
+            inner = mx.ones((H - 2 * s, W - 2 * s), dtype=mx.float32)
+            m = mx.minimum(m, mx.pad(inner, ((s, s), (s, s))))
+        return m, gy, gx
 
-    def _pair_mask(self, a: int, b: int) -> Any:
+    def _pair_mask(self, a: int, b: int) -> tuple:
+        """Cached (mask, gy, gx) for the unordered pair; (gy, gx) aligns
+        the HIGHER-index frame onto the lower one (negate to go the other
+        way)."""
         key = (a, b) if a < b else (b, a)
-        m = self._masks.get(key)
-        if m is None:
-            m = self._static_mask(self._buf[a - self._base][1],
-                                  self._buf[b - self._base][1])
-            mx.eval(m)
-            self._masks[key] = m
-        return m
+        got = self._masks.get(key)
+        if got is None:
+            got = self._static_mask(self._buf[key[0] - self._base][1],
+                                    self._buf[key[1] - self._base][1])
+            mx.eval(got[0])
+            self._masks[key] = got
+            if got[1] or got[2]:
+                self._stat_jit_px += max(abs(got[1]), abs(got[2]))
+                self._stat_jit_pairs += 1
+        return got
+
+    def _warp_global(self, rgb: Any, dy: float, dx: float) -> Any:
+        """Whole-frame Fourier translation of (H,W,3) by (dy, dx) px."""
+        H, W = int(rgb.shape[0]), int(rgb.shape[1])
+        ky = mx.concatenate([mx.arange(H // 2 + 1),
+                             mx.arange(-(H - H // 2 - 1), 0)]).astype(mx.float32)
+        kx = mx.arange(W // 2 + 1).astype(mx.float32)
+        ang = (-2.0 * _PI) * (ky[:, None] * (dy / H) + kx[None, :] * (dx / W))
+        ramp = (mx.cos(ang) + 1j * mx.sin(ang))[None]
+        chan = mx.transpose(rgb, (2, 0, 1))
+        out = mx.fft.irfft2(mx.fft.rfft2(chan) * ramp, s=(H, W))
+        return mx.transpose(out, (1, 2, 0))
 
     # ---- streaming ---------------------------------------------------------
 
@@ -195,10 +265,29 @@ class StaticStateDeflicker:
             self._emitted += 1
             self.last_fix_fraction = 0.0
             return cur, tok
-        S = mx.stack([self._buf[j - self._base][0] for j in idx], axis=0)
-        SL = mx.stack([self._buf[j - self._base][1] for j in idx], axis=0)
-        V = mx.stack([mx.ones(cur_l.shape, dtype=mx.float32) if j == t
-                      else self._pair_mask(t, j) for j in idx], axis=0)
+        Ss, SLs, Vs = [], [], []
+        for j in idx:
+            if j == t:
+                Ss.append(cur)
+                SLs.append(cur_l)
+                Vs.append(mx.ones(cur_l.shape, dtype=mx.float32))
+                continue
+            m, gy, gx = self._pair_mask(t, j)
+            if gy or gx:
+                # cached shift aligns the higher-index frame onto the lower
+                sgn = 1.0 if j > t else -1.0
+                w = mx.clip(self._warp_global(self._buf[j - self._base][0],
+                                              sgn * gy, sgn * gx), 0.0, 1.0)
+                Ss.append(w)
+                SLs.append(_to_luma_2d(w))
+            else:
+                rgbj, lj, _tok = self._buf[j - self._base]
+                Ss.append(rgbj)
+                SLs.append(lj)
+            Vs.append(m)
+        S = mx.stack(Ss, axis=0)
+        SL = mx.stack(SLs, axis=0)
+        V = mx.stack(Vs, axis=0)
         M = len(idx)
         n_valid = mx.sum(V, axis=0)
         # monotone-profile gate: lighting/exposure ramps and slow true drift
@@ -252,7 +341,9 @@ class StaticStateDeflicker:
         if t - 1 >= self._base and t + 1 <= last:
             pv, pv_l, _ = self._buf[t - 1 - self._base]
             nx_, nx_l, _ = self._buf[t + 1 - self._base]
-            br_ok = self._pair_mask(t - 1, t + 1)
+            # bracket values stay raw: adjacent-pair jitter is sub-tau and
+            # the agree/anom gates refuse where a residual shift matters
+            br_ok, _bgy, _bgx = self._pair_mask(t - 1, t + 1)
             agree = mx.abs(pv_l - nx_l) < self._band
             anom = mx.abs(cur_l - 0.5 * (pv_l + nx_l)) > self._band
             fixable = mx.abs(cur_l - 0.5 * (pv_l + nx_l)) < self._max_fix
