@@ -92,6 +92,7 @@ class StaticStateDeflicker:
         self._stat_fired = 0.0
         self._stat_verified = 0.0
         self._stat_osc = 0.0
+        self._stat_applied = 0.0
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -113,12 +114,16 @@ class StaticStateDeflicker:
         accumulates with temporal distance, so far pairs fail verification
         and windows past the jitter horizon add nothing). oscillatory =
         verified pixels whose temporal profile is non-monotone (the
-        fixable kind). fired = pixels actually corrected.
+        fixable kind). fired = pixels actually corrected. applied = mean
+        absolute luma correction per frame: the needle that moves with
+        band/strength when the gate fractions do not (band changes WHAT
+        the mixture averages far more than WHETHER pixels fire).
         """
         n = max(self._stat_frames, 1)
         return {"fired": self._stat_fired / n,
                 "verified": self._stat_verified / n,
-                "oscillatory": self._stat_osc / n}
+                "oscillatory": self._stat_osc / n,
+                "applied": self._stat_applied / n}
 
     def close(self) -> None:
         pass
@@ -258,13 +263,15 @@ class StaticStateDeflicker:
         out = mx.clip(out, 0.0, 1.0)
         verified = (n_valid >= self._min_valid)
         stat = mx.stack([mx.mean(fire), mx.mean(verified.astype(mx.float32)),
-                         mx.mean((verified & oscillatory).astype(mx.float32))])
+                         mx.mean((verified & oscillatory).astype(mx.float32)),
+                         mx.mean(mx.abs(_to_luma_2d(out) - cur_l))])
         mx.eval(out, stat)
         self.last_fix_fraction = float(stat[0])
         self._stat_frames += 1
         self._stat_fired += float(stat[0])
         self._stat_verified += float(stat[1])
         self._stat_osc += float(stat[2])
+        self._stat_applied += float(stat[3])
         self._emitted += 1
         keep = self._emitted - self._k
         while self._base < keep and self._buf:

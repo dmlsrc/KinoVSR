@@ -143,8 +143,10 @@ def test_latency_and_flush():
     n_out += len(s.flush())
     assert n_out == 12
     # gate stats must survive the flush (the harness reads them after):
-    # identical static frames fully verify
-    assert s.stats()["verified"] > 0.9
+    # identical static frames fully verify, and applied is ~zero
+    st = s.stats()
+    assert st["verified"] > 0.9
+    assert st["applied"] < 1e-5
 
 
 def test_nonmultiple16_margin_passes_through():

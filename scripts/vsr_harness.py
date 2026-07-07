@@ -1930,8 +1930,10 @@ def run(args: argparse.Namespace) -> None:
             print(f"[deflicker] run avg: static-verified "
                   f"{_dst['verified'] * 100:.1f}% of pixels, oscillatory "
                   f"{_dst['oscillatory'] * 100:.1f}%, fired "
-                  f"{_dst['fired'] * 100:.1f}% (verification is the scope "
-                  f"gate: bounded by camera/subject motion, not band/window)")
+                  f"{_dst['fired'] * 100:.1f}%, applied "
+                  f"{_dst['applied'] * 1000:.2f}e-3 luma (verification is "
+                  f"the scope gate: bounded by camera/subject motion, not "
+                  f"band/window; band/strength move 'applied')")
         if deblocker is not None:
             _qi = getattr(deblocker, "last_qf_info", None)
             if _qi is not None:
