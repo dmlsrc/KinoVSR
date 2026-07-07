@@ -1,0 +1,243 @@
+"""Verified-static temporal state integration (codec-junk deflicker).
+
+Starved, loop-filtered encodes carry their damage as temporally UNSTABLE
+quantization states on static content: blocks sit on a wrong-but-stable
+value, then jump when the encoder re-codes them (GOP pulses, coding-cadence
+flicker, 1-frame re-quantization flashes). The states interleave around the
+truth, so along a verified-static trajectory the artifact is separable from
+real content changes, which are one-sided (before differs from after, never
+interleaved).
+
+Rule, per pixel, over a +/-K frame window:
+
+    admit sample j only if the 32px tile around the pixel is VERIFIED
+    STATIC between frames j and t (phase-correlation displacement < tau);
+    take the median of admitted samples; integrate (uniform mean) the
+    admitted samples within band h of that median; replace the pixel only
+    if >= frac of admitted samples are in-band, both existing temporal
+    sides contribute, and the correction is below max_fix (refused, not
+    clamped).
+
+Why this shape (measured on ground-truth crushed fixtures; see the v1-v6
+prototype history in the planning evidence):
+
+- Verification-only alignment: samples are admitted RAW or not at all --
+  nothing is ever warped, so misalignment cannot poison the mixture and
+  panning/deforming content is passthrough BY CONSTRUCTION (a warped-
+  sample variant lost 3 dB on a pan fixture; this one is bit-identical).
+- Band centered on the window median, not the current frame: every frame
+  in the window converges to the same dwell-weighted state mixture, which
+  collapses state STEPS (GOP pulses), not just minority excursions, and
+  recovers sub-quantization detail by integrating the encoder's
+  inadvertent temporal dither.
+- No spatial mixing exists anywhere in the operator: a pixel is only ever
+  replaced by an average of its own trajectory samples, so the stage has
+  no softening budget; pixels that do not fire pass through bit-identical.
+
+Scope (honest, measured): fixes flicker on verified-static content only --
+which is where compressed-junk flicker offends (motion masks the rest).
+Tracked-moving content is left alone; integration under subpixel alignment
+residual measured net-harmful every time.
+
+Streaming: K frames of lookahead (feed returns frame t once t+K arrives;
+flush drains the tail). Frame dimensions are processed on the /16-cropped
+interior for the validity grid; any bottom/right remainder margin simply
+never fires.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import mlx.core as mx
+
+from .noise_map import _to_luma_2d
+
+_PI = 3.141592653589793
+
+
+class StaticStateDeflicker:
+    """RGB-in / RGB-out streaming deflicker; K frames of lookahead."""
+
+    BLOCK = 32          # phase-correlation verification tile
+    STRIDE = 16         # tile stride (half-overlapped grid)
+
+    def __init__(self, window: int = 8, band: float = 0.10,
+                 frac: float = 0.5, max_fix: float = 0.25,
+                 tau: float = 0.75, min_valid: int = 6,
+                 strength: float = 1.0):
+        # window: +/-K frames integrated (latency = K).
+        # band: luma half-width around the window median that counts as the
+        #   same quantization-state cluster; the reference regime's state
+        #   steps read 0.05-0.15.
+        # frac: fraction of admitted samples that must sit in-band.
+        # max_fix: corrections larger than this are refused (safety valve;
+        #   genuine state flicker sits well below it).
+        # tau: max phase-correlation displacement (px) for a tile pair to
+        #   count as verified static.
+        # min_valid: minimum admitted samples (incl. t) before acting.
+        self._k = max(1, int(window))
+        self._band = float(band)
+        self._frac = float(frac)
+        self._max_fix = float(max_fix)
+        self._tau = float(tau)
+        self._min_valid = float(min_valid)
+        self._strength = float(strength)
+        self.last_fix_fraction = 0.0     # fraction of pixels touched (debug)
+        self._reset_state()
+
+    def _reset_state(self) -> None:
+        self._buf: list = []             # [(rgb (H,W,3) fp32, luma, token)]
+        self._base = 0                   # index of _buf[0]
+        self._received = 0
+        self._emitted = 0
+        self._masks: dict = {}           # {(lo, hi): (H,W) static mask}
+
+    def reset(self) -> None:
+        self._reset_state()
+
+    def close(self) -> None:
+        pass
+
+    # ---- static verification ---------------------------------------------
+
+    def _static_mask(self, ref_l: Any, src_l: Any) -> Any:
+        """(H,W) 0/1 mask: 1 where every covering 32px tile is static."""
+        H, W = int(ref_l.shape[0]), int(ref_l.shape[1])
+        B, S = self.BLOCK, self.STRIDE
+        Hc, Wc = (H // S) * S, (W // S) * S
+        if Hc < B or Wc < B:
+            return mx.zeros((H, W), dtype=mx.float32)
+        ny, nx = Hc // S - 1, Wc // S - 1        # regular tile origins
+        rl = ref_l[:Hc, :Wc]
+        sl = src_l[:Hc, :Wc]
+        # (ny*nx, B, B) tile stacks via strided reshape: tile (i,j) spans
+        # rows i*S..i*S+B = cells (i, i+1), cols likewise
+        rc = rl.reshape(ny + 1, S, nx + 1, S).transpose(0, 2, 1, 3)
+        sc = sl.reshape(ny + 1, S, nx + 1, S).transpose(0, 2, 1, 3)
+        rt = mx.concatenate([mx.concatenate(
+            [rc[:ny, :nx], rc[1:, :nx]], axis=2), mx.concatenate(
+            [rc[:ny, 1:], rc[1:, 1:]], axis=2)], axis=3).reshape(ny * nx, B, B)
+        st = mx.concatenate([mx.concatenate(
+            [sc[:ny, :nx], sc[1:, :nx]], axis=2), mx.concatenate(
+            [sc[:ny, 1:], sc[1:, 1:]], axis=2)], axis=3).reshape(ny * nx, B, B)
+        n1 = mx.arange(B).astype(mx.float32)
+        w1 = 0.5 - 0.5 * mx.cos(2.0 * _PI * n1 / (B - 1))
+        win = (w1[:, None] * w1[None, :])[None]
+        R = mx.fft.rfft2(rt * win) * mx.conj(mx.fft.rfft2(st * win))
+        R = R / (mx.abs(R) + 1e-9)
+        corr = mx.fft.irfft2(R, s=(B, B)).reshape(ny * nx, B * B)
+        peak = mx.argmax(corr, axis=-1)
+        py = (peak // B).astype(mx.float32)
+        px = (peak % B).astype(mx.float32)
+        dy = mx.where(py > B / 2, py - B, py)
+        dx = mx.where(px > B / 2, px - B, px)
+        ok = ((mx.abs(dy) < self._tau)
+              & (mx.abs(dx) < self._tau)).astype(mx.float32).reshape(ny, nx)
+        # cell verdict = AND of covering tiles; cell grid is (ny+1, nx+1),
+        # cell (i,j) covered by tile origins {i-1, i} x {j-1, j}
+        okp = mx.pad(ok, ((1, 1), (1, 1)), constant_values=1.0)
+        cells = mx.minimum(okp[:-1, :], okp[1:, :])
+        cells = mx.minimum(cells[:, :-1], cells[:, 1:])     # (ny+1, nx+1)
+        m = mx.broadcast_to(cells[:, None, :, None],
+                            (ny + 1, S, nx + 1, S)).reshape(Hc, Wc)
+        if Hc < H or Wc < W:
+            m = mx.pad(m, ((0, H - Hc), (0, W - Wc)))
+        return m
+
+    def _pair_mask(self, a: int, b: int) -> Any:
+        key = (a, b) if a < b else (b, a)
+        m = self._masks.get(key)
+        if m is None:
+            m = self._static_mask(self._buf[a - self._base][1],
+                                  self._buf[b - self._base][1])
+            mx.eval(m)
+            self._masks[key] = m
+        return m
+
+    # ---- streaming ---------------------------------------------------------
+
+    def _emit_one(self, last: int) -> tuple:
+        t = self._emitted
+        cur, cur_l, tok = self._buf[t - self._base]
+        lo, hi = max(self._base, t - self._k), min(last, t + self._k)
+        idx = list(range(lo, hi + 1))
+        if len(idx) < 2:
+            self._emitted += 1
+            self.last_fix_fraction = 0.0
+            return cur, tok
+        S = mx.stack([self._buf[j - self._base][0] for j in idx], axis=0)
+        SL = mx.stack([self._buf[j - self._base][1] for j in idx], axis=0)
+        V = mx.stack([mx.ones(cur_l.shape, dtype=mx.float32) if j == t
+                      else self._pair_mask(t, j) for j in idx], axis=0)
+        M = len(idx)
+        n_valid = mx.sum(V, axis=0)
+        # median of admitted samples: invalid sort past the [0,1] range
+        SL_m = mx.where(V > 0.5, SL, mx.full(SL.shape, 2.0))
+        SL_s = mx.sort(SL_m, axis=0)
+        mi = mx.maximum((n_valid - 1) // 2, 0).astype(mx.int32)[None]
+        wmed = mx.take_along_axis(SL_s, mi, axis=0)[0]
+        inl = ((mx.abs(SL - wmed[None]) < self._band)
+               & (V > 0.5)).astype(mx.float32)
+        n_inl = mx.sum(inl, axis=0)
+        rel = mx.arange(lo - t, hi - t + 1).astype(mx.float32).reshape(M, 1, 1)
+        left = mx.sum(inl * (rel < 0), axis=0)
+        right = mx.sum(inl * (rel > 0), axis=0)
+        need_l = 1.0 if lo < t else 0.0
+        need_r = 1.0 if hi > t else 0.0
+        wsum = mx.maximum(n_inl, 1e-6)
+        mean_w = mx.sum(inl[..., None] * S, axis=0) / wsum[..., None]
+        cur_dev = mx.abs(_to_luma_2d(mean_w) - cur_l)
+        fire = ((n_inl >= self._frac * mx.maximum(n_valid, 1.0))
+                & (n_valid >= self._min_valid)
+                & (left >= need_l) & (right >= need_r)
+                & (cur_dev < self._max_fix)).astype(mx.float32)[..., None]
+        out = cur + (self._strength * fire) * (mean_w - cur)
+        # anomalous-self fallback: a large 1-frame flash invalidates every
+        # (t, j) verification in its own tiles (n_valid collapses to 1), so
+        # the main path refuses exactly where the flash is. If the BRACKET
+        # pair (t-1, t+1) verifies static against each other and agrees
+        # in-band at this pixel, the current frame is a one-frame anomaly in
+        # a static context: replace with the bracket mean. A 2-frame flash
+        # leaves one bracket frame contaminated (pair fails or disagrees),
+        # so persistent content is safe.
+        if t - 1 >= self._base and t + 1 <= last:
+            pv, pv_l, _ = self._buf[t - 1 - self._base]
+            nx_, nx_l, _ = self._buf[t + 1 - self._base]
+            br_ok = self._pair_mask(t - 1, t + 1)
+            agree = mx.abs(pv_l - nx_l) < self._band
+            anom = mx.abs(cur_l - 0.5 * (pv_l + nx_l)) > self._band
+            fixable = mx.abs(cur_l - 0.5 * (pv_l + nx_l)) < self._max_fix
+            fire2 = ((fire[..., 0] < 0.5) & (n_valid <= 2.0) & (br_ok > 0.5)
+                     & agree & anom & fixable).astype(mx.float32)[..., None]
+            out = out + (self._strength * fire2) * (0.5 * (pv + nx_) - out)
+            fire = mx.minimum(fire + fire2, 1.0)
+        out = mx.clip(out, 0.0, 1.0)
+        mx.eval(out)
+        self.last_fix_fraction = float(mx.mean(fire))
+        self._emitted += 1
+        keep = self._emitted - self._k
+        while self._base < keep and self._buf:
+            self._buf.pop(0)
+            self._base += 1
+        gone = self._base
+        self._masks = {k: v for k, v in self._masks.items() if k[0] >= gone}
+        return out, tok
+
+    def feed(self, rgb: Any, token: Any = None) -> list:
+        a = rgb[0] if rgb.ndim == 4 else rgb
+        a = mx.clip(a[..., :3].astype(mx.float32), 0.0, 1.0)
+        self._buf.append((a, _to_luma_2d(a), token))
+        self._received += 1
+        last = self._received - 1
+        ready = []
+        while last - self._emitted >= self._k:
+            ready.append(self._emit_one(last))
+        return ready
+
+    def flush(self) -> list:
+        last = self._received - 1
+        out = []
+        while self._emitted <= last:
+            out.append(self._emit_one(last))
+        self._reset_state()
+        return out

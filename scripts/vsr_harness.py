@@ -451,7 +451,7 @@ def _pick_hevc_profile(spatial_mode: str, encode_chroma: str) -> str:
             else HEVC_PROFILE_MAIN10)
 
 
-_PP_STAGE_NAMES = ("restore", "deblock", "denoise", "nafnet")
+_PP_STAGE_NAMES = ("restore", "deflicker", "deblock", "denoise", "nafnet")
 
 
 def _pp_order(spec: str) -> list:
@@ -1149,10 +1149,12 @@ def run(args: argparse.Namespace) -> None:
     deblocker: Any = None  # STDF / FBCNN when --deblock set
     nafnet: Any = None     # NAFNet restorer when --nafnet set
     restorer: Any = None   # BasicVSR++ 1x recurrent restoration when --restore set
+    deflicker_stage: Any = None  # static-state deflicker when --deflicker on
 
     def _build_post_pipeline() -> tuple[
-        VsrSession, VtfrcSession | None, AVWriter | None, AVWriter | None, Any, Any, Any, Any
-    ]:  # session, vtfrc, post_writer, comparison_writer, deblocker, denoiser, upscaler, nafnet
+        VsrSession, VtfrcSession | None, AVWriter | None, AVWriter | None,
+        Any, Any, Any, Any, Any, Any
+    ]:  # session, vtfrc, post_writer, comparison_writer, deblocker, denoiser, upscaler, nafnet, restorer, deflicker
         """Materialize VSR + temporal + writer sessions just-in-time.
 
         Called on the first chunk so chunk-1 VAE has the Metal heap to
@@ -1338,6 +1340,17 @@ def run(args: argparse.Namespace) -> None:
             elif args.deblock != "off":
                 print(f"[deblock-map] auto ignored: --deblock {args.deblock} unsupported")
 
+        defl: Any = None
+        if args.deflicker == "on":
+            from LTX_2_MLX.videotoolbox.deflicker import StaticStateDeflicker
+            defl = StaticStateDeflicker(window=args.deflicker_window,
+                                        band=args.deflicker_band,
+                                        strength=args.deflicker_strength)
+            print(f"[deflicker] static-state integration: window +/-"
+                  f"{args.deflicker_window}, band {args.deflicker_band:g} "
+                  f"(verified-static only; untouched pixels pass through "
+                  f"bit-identical)")
+
         deb: Any = None
         if args.deblock == "stdf":
             from LTX_2_MLX.videotoolbox.stdf.deblocker import StdfDeblocker
@@ -1471,7 +1484,7 @@ def run(args: argparse.Namespace) -> None:
                     strength=strength, flow_mode=args.restore_flow_mode,
                     ensemble=args.restore_ensemble))
 
-        return s, v, pw, cw, deb, den, up, naf, res
+        return s, v, pw, cw, deb, den, up, naf, res, defl
 
     # ---- Synthetic-border sanitizer ----------------------------------------
     # Detect junk edge rows/cols (letterbox lines, capture garbage) and
@@ -1654,7 +1667,8 @@ def run(args: argparse.Namespace) -> None:
         (analog) then a NAFNet detail/deblur pass; --denoise-first swaps the first two;
         --preprocess-order sets the full explicit order (any enabled stage omitted from it
         is appended in the default order). Only enabled (non-None) stages run."""
-        by_name = {"restore": restorer, "deblock": deblocker, "denoise": denoiser, "nafnet": nafnet}
+        by_name = {"restore": restorer, "deflicker": deflicker_stage, "deblock": deblocker,
+                   "denoise": denoiser, "nafnet": nafnet}
         if args.preprocess_order:
             order = list(args.preprocess_order)
         else:
@@ -1662,7 +1676,9 @@ def run(args: argparse.Namespace) -> None:
             # BasicVSR++ restoration is temporal; run it FIRST by default so it
             # establishes frame-to-frame consistency (killing GOP-periodic
             # compression flicker + sensor noise) before any per-frame stage.
-            order = ["restore", *order]
+            # deflicker runs before deblock/denoise: stabilizing the codec
+            # state flicker first lets the broadband stages run gentler.
+            order = ["restore", "deflicker", *order]
         for name in _PP_STAGE_NAMES:                  # append any enabled stage not listed
             if name not in order:
                 order.append(name)
@@ -1734,7 +1750,7 @@ def run(args: argparse.Namespace) -> None:
                 import io as _io
                 _buf = _io.StringIO()
                 with contextlib.redirect_stdout(_buf):
-                    session, vtfrc, post_writer, comparison_writer, deblocker, denoiser, upscaler, nafnet, restorer = _build_post_pipeline()
+                    session, vtfrc, post_writer, comparison_writer, deblocker, denoiser, upscaler, nafnet, restorer, deflicker_stage = _build_post_pipeline()
                 msg = _buf.getvalue().rstrip("\n")
                 if msg:
                     bars.write(msg)
@@ -1799,9 +1815,11 @@ def run(args: argparse.Namespace) -> None:
                             src_arr = square_apply(sa)
 
                     if cut_detector is not None and cut_detector.is_cut(src_arr):
-                        # Flush the lookahead deblock + denoiser's buffered (pre-cut)
-                        # frames before resetting so no window bridges the cut.
-                        if deblocker is not None or (denoiser is not None and hasattr(denoiser, "flush")):
+                        # Flush buffered pre-cut frames before resetting so no
+                        # lookahead stage's window bridges the cut.
+                        if (deblocker is not None or deflicker_stage is not None
+                                or restorer is not None
+                                or (denoiser is not None and hasattr(denoiser, "flush"))):
                             for d_rgb, (d_sf, d_sa) in _preprocess_flush():
                                 _emit_scaled(d_rgb, d_sf, d_sa)
                         if upscaler is not None:
@@ -1812,6 +1830,8 @@ def run(args: argparse.Namespace) -> None:
                             deblocker.reset()
                         if denoiser is not None:
                             denoiser.reset()
+                        if deflicker_stage is not None:
+                            deflicker_stage.reset()
                         if nafnet is not None:
                             nafnet.reset()
                         if cut_log is not None:
@@ -1824,6 +1844,7 @@ def run(args: argparse.Namespace) -> None:
                     # their two future neighbours have arrived (feed() may return
                     # nothing now; the tail drains after the loop). f32 RGB [0,1].
                     if (deblocker is not None or denoiser is not None
+                            or deflicker_stage is not None
                             or nafnet is not None or restorer is not None
                             or sanitize_edges is not None
                             or crop_box is not None or square_apply is not None):
@@ -1867,9 +1888,9 @@ def run(args: argparse.Namespace) -> None:
                 break
             del chunk
             gc.collect()
-        # Drain any frames a lookahead denoiser still holds (the centered-window
-        # tail, with the standard reflected window at the clip's end).
+        # Drain any frames a lookahead preprocessor still holds.
         if (deblocker is not None or restorer is not None
+                or deflicker_stage is not None
                 or (denoiser is not None and hasattr(denoiser, "flush"))) and session is not None:
             for d_rgb, (d_sf, d_sa) in _preprocess_flush():
                 if max_frames is not None and appended >= max_frames:
@@ -1904,6 +1925,9 @@ def run(args: argparse.Namespace) -> None:
             session.close()
         if denoiser is not None:
             denoiser.close()
+        if deflicker_stage is not None:
+            print(f"[deflicker] last-frame fix fraction: "
+                  f"{deflicker_stage.last_fix_fraction * 100:.2f}% of pixels")
         if deblocker is not None:
             _qi = getattr(deblocker, "last_qf_info", None)
             if _qi is not None:
@@ -2004,11 +2028,74 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    src = parser.add_mutually_exclusive_group(required=True)
+    source_select = parser.add_argument_group("Source Selection")
+    src = source_select.add_mutually_exclusive_group(required=True)
     src.add_argument("--latent", help="--save-latents NPZ sidecar (VAE-decoded first).")
     src.add_argument("--video", help="Already-decoded video file (mp4/mov/...).")
 
-    parser.add_argument(
+    input_args = parser.add_argument_group("Input Decode")
+    output_args = parser.add_argument_group("Output, Encoding, And Audio")
+    color_args = parser.add_argument_group("Color Interpretation")
+    geometry_args = parser.add_argument_group("Trim, Cropping, And Cuts")
+    preprocess_args = parser.add_argument_group("Preprocess Ordering")
+    restore_args = parser.add_argument_group("Temporal Restore And Deflicker")
+    deblock_args = parser.add_argument_group("Deblock")
+    denoise_args = parser.add_argument_group("Denoise And Noise Maps")
+    nafnet_args = parser.add_argument_group("NAFNet")
+    upscale_args = parser.add_argument_group("Spatial Upscalers")
+    runtime_args = parser.add_argument_group("Runtime And Diagnostics")
+
+    def add(*args: Any, **kwargs: Any) -> Any:
+        option = next((a for a in args if isinstance(a, str) and a.startswith("--")), "")
+        exact = {
+            "--latent-stage": input_args,
+            "--weights": input_args,
+            "--vae-dtype": input_args,
+            "--vae-tiling": input_args,
+            "--source-fps": input_args,
+            "--reader": input_args,
+            "--output-dir": output_args,
+            "--output-prefix": output_args,
+            "--target-fps": output_args,
+            "--temporal-mode": output_args,
+            "--encode-quality": output_args,
+            "--encode-chroma": output_args,
+            "--audio": output_args,
+            "--audio-codec": output_args,
+            "--save-audio-sidecar": output_args,
+            "--save-pre-frames": output_args,
+            "--save-post-frames": output_args,
+            "--skip-post-mp4": output_args,
+            "--comparison": output_args,
+            "--source-color": color_args,
+            "--source-range": color_args,
+            "--preprocess-order": preprocess_args,
+            "--denoise-first": preprocess_args,
+            "--spatial-mode": upscale_args,
+            "--probe-noise": runtime_args,
+            "--video-chunk-size": runtime_args,
+            "--mlx-cache-limit-gb": runtime_args,
+        }
+        if option in exact:
+            return exact[option].add_argument(*args, **kwargs)
+        prefix_groups = (
+            (("--restore", "--deflicker"), restore_args),
+            (("--deblock", "--fbcnn"), deblock_args),
+            (("--denoise", "--fastdvd", "--bsvd", "--pvdd",
+              "--noise-map", "--mc"), denoise_args),
+            (("--nafnet",), nafnet_args),
+            (("--basicvsrpp", "--realbasicvsr", "--realesrgan",
+              "--realviformer", "--esc", "--realplksr", "--safmn"), upscale_args),
+            (("--start", "--end", "--max-frames", "--snap-start", "--gop",
+              "--sanitize", "--crop", "--square-pixels", "--cut"), geometry_args),
+        )
+        for prefixes, group in prefix_groups:
+            if option.startswith(prefixes):
+                return group.add_argument(*args, **kwargs)
+        return parser.add_argument(*args, **kwargs)
+
+    # ---- Input Decode ------------------------------------------------------------
+    add(
         "--latent-stage",
         choices=["final", "stage1", "stage2"],
         default="final",
@@ -2019,11 +2106,14 @@ def main() -> None:
             "'stage2' = explicit stage 2 (same content as 'final' on distilled two-stage)."
         ),
     )
-    parser.add_argument("--weights", help="LTX-2 .safetensors path (required with --latent).")
-    parser.add_argument(
+
+    add("--weights", help="LTX-2 .safetensors path (required with --latent).")
+
+    add(
         "--vae-dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16",
     )
-    parser.add_argument(
+
+    add(
         "--vae-tiling", choices=["auto", "single"], default="auto",
         help=(
             "auto (default) lets TilingConfig.auto_native_conv3d size to RAM + the "
@@ -2031,12 +2121,8 @@ def main() -> None:
             "forces one decode; frames past the int32 boundary decode white."
         ),
     )
-    parser.add_argument("--output-dir")
-    parser.add_argument(
-        "--output-prefix", default="vsr",
-        help="Filename prefix for the timestamped outputs (matches generate.py).",
-    )
-    parser.add_argument(
+
+    add(
         "--source-fps", type=float, default=NATIVE_FPS,
         help=(
             f"Source frame rate for --latent (latents don't carry an fps; "
@@ -2045,7 +2131,30 @@ def main() -> None:
             f"--target-fps to drive temporal frame-rate conversion."
         ),
     )
-    parser.add_argument(
+
+    add(
+        "--reader", choices=["auto", "native", "ffmpeg"], default="auto",
+        help=(
+            "Video reader backend. auto (default) = the native AVFoundation reader "
+            "(zero-copy, full precision), falling back to the ffmpeg compatibility "
+            "reader when the container/codec is refused (MKV, VP9, AVI-era "
+            "material). ffmpeg = force the compatibility reader (needs PyAV: "
+            "install the 'ffmpeg' extra). native = never fall back. The ffmpeg "
+            "reader mirrors color tags, keyframe windows (--gop-align), trims, and "
+            "audio; its frame indices are self-consistent but may differ from the "
+            "native reader's by an edit-list offset on the same file."
+        ),
+    )
+
+    # ---- Output, Encoding, And Audio ---------------------------------------------
+    add("--output-dir")
+
+    add(
+        "--output-prefix", default="vsr",
+        help="Filename prefix for the timestamped outputs (matches generate.py).",
+    )
+
+    add(
         "--target-fps", type=float, default=None,
         help=(
             "Target output fps. Defaults to the source fps (no temporal upscale). "
@@ -2056,7 +2165,8 @@ def main() -> None:
             "land bit-exact."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--temporal-mode", choices=["normal", "high"], default="normal",
         help=(
             "VTFrameRateConversion mode. Only active when --target-fps is set. "
@@ -2064,7 +2174,947 @@ def main() -> None:
             "high = QualityPrioritizationQuality, more compute for cleaner motion."
         ),
     )
-    parser.add_argument(
+
+    add(
+        "--encode-quality", type=float, default=0.65,
+        help="AVVideoQualityKey (0..1) for the HEVC encoder. 0.65 matches the default tier.",
+    )
+
+    add(
+        "--encode-chroma", choices=["auto", "420", "422"], default="auto",
+        help=(
+            "HEVC profile chroma subsampling. auto = 4:2:2 (Main42210) for "
+            "balanced/image modes, 4:2:0 (Main10) for fast. 420 forces Main10 for "
+            "generate.py-tier parity."
+        ),
+    )
+
+    add(
+        "--audio", action="store_true",
+        help=(
+            "Mux audio into both MP4s. For --latent the audio is decoded from "
+            "final_audio_latent (audio VAE + vocoder); for --video the source "
+            "file's audio track is read natively (AVFoundation) and carried "
+            "through. A --video input with no audio track stays silent."
+        ),
+    )
+
+    add(
+        "--audio-codec", choices=["alac", "aac"], default="alac",
+        help="Audio codec for muxed audio (alac=lossless, aac=256kbps).",
+    )
+
+    add(
+        "--save-audio-sidecar", action="store_true",
+        help="Also write the muxed audio as <stem>_audio.wav next to the MP4s.",
+    )
+
+    add("--save-pre-frames", action="store_true")
+
+    add("--save-post-frames", action="store_true")
+
+    add(
+        "--skip-post-mp4", action="store_true",
+        help="Skip writing the upscaled _post.mp4 (e.g. when you only want frame dumps).",
+    )
+
+    add(
+        "--comparison", action="store_true",
+        help="Also write a side-by-side <stem>_comparison.mp4 "
+             "(NEAREST-upscaled pre vs VSR post).",
+    )
+
+    # ---- Color Interpretation ----------------------------------------------------
+    add(
+        "--source-color", choices=["auto", "bt709", "bt601", "bt2020"], default="auto",
+        help=(
+            "How the source is interpreted. auto (default) trusts the container's "
+            "color tags, or VideoToolbox's resolution guess when untagged (SD "
+            "width -> BT.601, HD -> BT.709). bt601/bt709/bt2020 FORCE the source to "
+            "be decoded as that matrix -- the fix for untagged/mistagged clips VT "
+            "guesses wrong. For balanced/image it decodes raw YUV and re-interprets "
+            "it (not just an output tag); fast/NV12 keeps VideoToolbox's decode and "
+            "only re-tags. The output is tagged to match."
+        ),
+    )
+
+    add(
+        "--source-range", choices=["auto", "video", "full"], default="auto",
+        help=(
+            "How the source's YUV code values map to RGB. auto (default) trusts "
+            "the container's range flag (untagged = video/limited range, the "
+            "standard assumption -- Y 16-235). video/full FORCE the interpretation "
+            "for mis-flagged sources, e.g. full-range screen recordings or "
+            "phone/webcam MP4s an encoder left untagged: read as limited they get "
+            "shadows crushed to black and highlights clipped BEFORE any model runs "
+            "(and the learned upscalers respond badly to the clipped regions). The "
+            "reinterpretation is exact -- same decoded code values, different "
+            "YUV->RGB scaling -- and the output is tagged to match. Not available "
+            "with --spatial-mode fast (its YUV passes through untouched)."
+        ),
+    )
+
+    # ---- Trim, Cropping, And Cuts ------------------------------------------------
+    add(
+        "--start", default=None,
+        help=(
+            "Trim the input to start at this position (process the middle of a "
+            "clip). Accepts frames or time: bare integer = frames (e.g. 120), "
+            "Nf = frames (120f), Ns / decimal = seconds (5s, 1.5), or a clock "
+            "string mm:ss / hh:mm:ss (0:05, 1:02:03). --video seeks here "
+            "natively (the head is not decoded); --latent windows the decode."
+        ),
+    )
+
+    add(
+        "--end", default=None,
+        help=(
+            "Trim the input to stop before this position (exclusive), same "
+            "frames-or-time forms as --start. Output is a fresh clip starting "
+            "at PTS 0 spanning [--start, --end)."
+        ),
+    )
+
+    add(
+        "--max-frames", default=None,
+        help=(
+            "Cap the number of OUTPUT frames. Same frames-or-time forms as "
+            "--start (a time here is output duration, measured at the target "
+            "fps). Composes with --start/--end, which trim the input."
+        ),
+    )
+
+    add(
+        "--snap-start", action="store_true",
+        help=(
+            "Snap --start to the nearest source keyframe, so the output actually "
+            "BEGINS on a clean I-frame (a clean editorial cut, a pristine first frame, "
+            "and no context-decode overhead). This MOVES the start -- you get a "
+            "slightly different range than requested -- so it is warned and the "
+            "effective range is echoed. Contrast --gop-align's anchor, which keeps "
+            "your exact --start and reads the pre-start frames as context. --video only."
+        ),
+    )
+
+    add(
+        "--gop-align", action="store_true",
+        help=(
+            "Align recurrent windows (--restore and the basicvsrpp/realbasicvsr/"
+            "realviformer upscalers) to the source's GOP: detect keyframes natively "
+            "(no ffprobe) and window keyframe-to-keyframe so BOTH recurrence "
+            "directions cold-start on a clean I-frame -- no warm-up trim needed. "
+            "Overhead is ~1 re-processed frame per GOP (a few percent) instead of "
+            "trim's ~2x, and it removes window-boundary flicker on GOP-structured "
+            "video. Falls back to fixed max-window tiling when the source has no "
+            "keyframe cadence. --video only. Overrides the per-stage --*-window/-trim."
+        ),
+    )
+
+    add(
+        "--gop-min-window", type=int, default=16, metavar="N",
+        help="Minimum recurrent window (frames) under --gop-align (default 16). A "
+             "window spans whole GOPs until it reaches this, so short GOPs are merged "
+             "for enough temporal context.",
+    )
+
+    add(
+        "--gop-max-window", type=int, default=96, metavar="N",
+        help="Maximum recurrent window (frames) under --gop-align (default 96). A GOP "
+             "longer than this is split into sub-windows (with a small trim at the "
+             "internal splits) to bound memory.",
+    )
+
+    add(
+        "--sanitize-edges", default=None, metavar="auto|T,B,L,R",
+        help=(
+            "Detect and clean synthetic border junk (letterbox lines, capture "
+            "garbage rows) BEFORE any processor sees the frame: the affected "
+            "edge rows/cols are overwritten with the adjacent interior line "
+            "(replicate fill), because learned restorers are trained on "
+            "photographic content and hallucinate texture around synthetic "
+            "edges. Frame dimensions and pixel-aspect are untouched, so the "
+            "output geometry is identical. auto (needs --video) samples early "
+            "frames and only trims edges that are anomalous in every sample, "
+            "capped at 8 px per edge; thick constant bars (letterbox-class) "
+            "are reported but never filled -- crop those instead. T,B,L,R "
+            "forces explicit per-edge pixel counts. Default: off."
+        ),
+    )
+
+    add(
+        "--sanitize-edges-fill", choices=["restore", "extend", "trim"],
+        default="restore",
+        help=(
+            "What happens where junk edges were detected. restore (default) "
+            "= the nets see a replicate-extended frame and the ORIGINAL "
+            "border is composited back over the processed output, feathered "
+            "into the content (--sanitize-edges-feather): the border stays "
+            "exactly as quiet/static/dark as the source. extend = keep the "
+            "replicated content in the output, removing the junk -- but "
+            "replicated content MOVES with the interior, visible shimmer "
+            "where the eye expects a static border. trim = CROP the junk "
+            "lines off entirely (folded into the crop before --crop-aspect "
+            "runs, so the aspect window is computed on the clean picture; "
+            "bottom/right bumped 1 px if needed to keep even dimensions)."
+        ),
+    )
+
+    add(
+        "--sanitize-edges-feather", type=int, default=2, metavar="N",
+        help=(
+            "Crossfade width (source px) from a restored border band into the "
+            "processed content (default 2). Softens the seam between the "
+            "authentic soft border and the crisply processed interior. "
+            "0 = hard splice."
+        ),
+    )
+
+    add(
+        "--crop-bars", default=None, metavar="auto|T,B,L,R",
+        help=(
+            "Crop constant letterbox/pillarbox bars off BEFORE processing and "
+            "output only the active picture (e.g. 16:9 letterboxed in 4:3 "
+            "becomes true 16:9 out; 9:16 pillarboxed in 16:9 becomes true "
+            "9:16). auto detects bars that are constant-extreme in every "
+            "sampled frame, up to 45 percent per edge, and rounds so the "
+            "active area keeps even dimensions; T,B,L,R forces explicit "
+            "counts. The pixel aspect is unchanged -- the display aspect "
+            "becomes the content's true aspect, which is the point. Composes "
+            "with --sanitize-edges (junk detection runs on the cropped "
+            "picture). Needs --video. Default: off."
+        ),
+    )
+
+    add(
+        "--crop-aspect", default=None, metavar="W:H",
+        help=(
+            "Crop the picture to the largest even-dimension window with this "
+            "DISPLAY aspect (e.g. 16:9 on a 4:3 source, 1:1, 9:16 for a "
+            "portrait extract). On anamorphic sources the pixel aspect is "
+            "folded into the target automatically, so 16:9 means 16:9 on "
+            "screen, not in storage pixels. Even-integer windows approximate "
+            "most ratios; the closest fit is chosen. Applies AFTER "
+            "--crop-bars, so a letterboxed source can be bar-cropped and then "
+            "reframed in one run. Place with --crop-anchor, shift with "
+            "--crop-offset. Needs --video."
+        ),
+    )
+
+    add(
+        "--crop-anchor",
+        choices=["top-left", "top", "top-right", "left", "center", "right",
+                 "bottom-left", "bottom", "bottom-right"],
+        default="center",
+        help=(
+            "Where to place the --crop-aspect window (default center). "
+            "E.g. 16:9 from a 4:3 source anchored at 'bottom' keeps the "
+            "lower two-thirds; 'top-right' pins the window to that corner. "
+            "--crop-offset nudges from the anchor."
+        ),
+    )
+
+    add(
+        "--crop-offset", default="0,0", metavar="DX,DY",
+        help=(
+            "Pixel offset of the --crop-aspect window from its anchor "
+            "(right/down positive, clamped so the window stays inside the "
+            "frame). Default 0,0."
+        ),
+    )
+
+    add(
+        "--square-pixels", action="store_true",
+        help=(
+            "Resample anamorphic sources to square pixels (1:1 pixel aspect) "
+            "before processing: a horizontal-only resample at SOURCE "
+            "resolution (Lanczos-3, GPU-resident precomputed plan) -- the "
+            "cheapest point, and the upscaler re-synthesizes the mild resample "
+            "softness -- with the output tagged 1:1 for "
+            "PAR-ignorant players and toolchains. Also a mild DISPLAY-domain "
+            "sharpness win (~7 percent measured): the anamorphic stretch must "
+            "happen somewhere, and pre-SR (here, then re-synthesized by the "
+            "net) beats post-SR in the player, which dilutes rendered detail. "
+            "Default behavior (off) passes the source pixel aspect through "
+            "losslessly instead. No-op on square-pixel sources."
+        ),
+    )
+
+    add(
+        "--cut-detect", choices=["off", "simple", "hist"], default="off",
+        help=(
+            "Reset VSR's prev-frame chain at hard cuts. off = never reset "
+            "(correct for single-shot LTX latents). Only meaningful for "
+            "edited --video input under --spatial-mode balanced (which "
+            "chains prev-frame state); a no-op under fast/image modes."
+        ),
+    )
+
+    add("--cut-threshold", type=float, default=0.25)
+
+    add(
+        "--cut-log", default=None,
+        help="Write detected cut frame indices to this file (one per line).",
+    )
+
+    # ---- Preprocess Ordering -----------------------------------------------------
+    add(
+        "--preprocess-order", type=_pp_order, default=None, metavar="A,B,C",
+        help=(
+            "Explicit order for the preprocess stages, comma-separated from "
+            "{restore, deflicker, deblock, denoise, nafnet}, e.g. "
+            "'deflicker,deblock,denoise'. Only enabled stages run; any enabled "
+            "stage you omit is appended in the default order (restore, deflicker, "
+            "deblock, denoise, nafnet). Overrides --denoise-first when set."
+        ),
+    )
+
+    add(
+        "--denoise-first", action="store_true",
+        help=(
+            "Run --denoise before --deblock (default is deblock then denoise). The "
+            "default suits captured-then-encoded footage: undo the last degradation "
+            "(compression) first, and a denoiser's white-noise assumption is broken by "
+            "structured blocking. Use --denoise-first only when noise was added AFTER "
+            "compression (regrained master, analog/transmission noise)."
+        ),
+    )
+
+    # ---- Temporal Restore And Deflicker ------------------------------------------
+    add(
+        "--restore", default="off", metavar="off|VARIANT",
+        help=(
+            "Pre-upscale TEMPORAL restoration (BasicVSR++, recurrent). Unlike the "
+            "per-frame deblock/denoise stages, this is bidirectional + second-order "
+            "over a frame window, so it enforces frame-to-frame consistency -- the fix "
+            "for GOP-periodic compression flicker (artifacts that appear/disappear "
+            "between keyframes) and temporally-varying sensor noise that per-frame "
+            "models pulse on. Runs FIRST by default (before deblock/denoise/nafnet) so "
+            "it stabilizes the sequence before any per-frame stage. Accepts a "
+            "COMMA-SEPARATED list to chain restorers in one pass, in order -- e.g. "
+            "'decompress_track1,denoise' runs temporal deblock then temporal denoise. "
+            "Variants: off "
+            "(default); decompress_track1 (NTIRE'21 compressed-video enhancement, the "
+            "H.264/HEVC deblock choice) / decompress_track2 / decompress_track3; "
+            "denoise (temporal video denoise -- softens far less than a per-frame "
+            "denoiser); deblur_dvd / deblur_gopro (real / synthetic motion deblur). "
+            "Weights downloaded, not bundled -- see basicvsrpp/weights/README.md. "
+            "Domain note: trained on HEVC/synthetic degradations, so temporal-right "
+            "but domain-approximate for 2010-era H.264."
+        ),
+    )
+
+    add(
+        "--restore-weights", default=None, metavar="VARIANT|PATH",
+        help="Weights for --restore: a restoration variant token or a .safetensors path "
+             "(or $BASICVSRPP_RESTORE_WEIGHTS). Overrides the --restore token's default file.",
+    )
+
+    add(
+        "--restore-strength", type=str, default="1.0", metavar="S[,S...]",
+        help="Blend each restored frame with the original (1.0 = full restore, default; "
+             "0.0 = passthrough). A single value applies to every chained --restore stage; "
+             "a comma-separated list sets per-stage strengths in order and must match the "
+             "number of --restore variants -- e.g. --restore decompress_track1,denoise "
+             "--restore-strength 1.0,0.5 = full deblock then a gentle denoise.",
+    )
+
+    add(
+        "--restore-window", type=int, default=14, metavar="N",
+        help="Sliding-window length (frames) for --restore recurrence (default 14). "
+             "Longer = more temporal context (better consistency) but more memory/compute.",
+    )
+
+    add(
+        "--restore-trim", type=int, default=2, metavar="N",
+        help="Warm-up frames trimmed at each --restore window join (default 2); the "
+             "propagation's transient edge. Interior frames match the full-clip result.",
+    )
+
+    add(
+        "--restore-flow-mode", choices=["spynet", "zero", "vt"], default="spynet",
+        help="Optical-flow source for --restore alignment: spynet (default, the trained "
+             "flow net), zero (no motion), or vt (VideoToolbox flow).",
+    )
+
+    add(
+        "--restore-ensemble", action="store_true",
+        help="Run --restore through the reference's 8-way geometric self-ensemble "
+             "(the SpatialTemporalEnsemble the NTIRE decompress/ntire-vsr configs apply "
+             "at inference, dropped as dead config in the mmagic re-port): restore under "
+             "8 flip/rotate variants and average. Cancels orientation-specific "
+             "hallucinated texture -- measured ~2.5x less flat-region 'alligator skin' "
+             "and ~1.7x less temporal crawl on the aggressive decompress_track2 -- at 8x "
+             "the compute. Off by default; worth it when a variant hallucinates on smooth "
+             "surfaces and you still want its aggression. Applies to every chained "
+             "--restore stage.",
+    )
+
+    add(
+        "--deflicker", choices=["off", "on"], default="off",
+        help=(
+            "Verified-static temporal state integration, run before "
+            "deblock/denoise. For starved, loop-filtered encodes whose "
+            "damage is temporally UNSTABLE quantization states on static "
+            "content (GOP pulses, coding-cadence flicker, re-quantization "
+            "flashes): integrates each pixel over a +/-window trajectory, "
+            "but ONLY where phase correlation verifies the surrounding "
+            "32px tiles as static between the two frames -- moving content "
+            "is passthrough BY CONSTRUCTION, and nothing is ever warped, "
+            "so misalignment cannot smear. A pixel is only ever replaced "
+            "by an average of its own trajectory samples (no spatial "
+            "mixing: no softening budget); real content changes are "
+            "one-sided in time and refuse the two-sided consensus gate. "
+            "Lets --denoise run gentler on compressed junk."
+        ),
+    )
+
+    add(
+        "--deflicker-window", type=int, default=8, metavar="K",
+        help=(
+            "Temporal integration half-window in frames (default 8: "
+            "covers typical GOP-pulse cadences; also the stage latency). "
+            "Larger = stabler + slower; must exceed the flicker period "
+            "to collapse it."
+        ),
+    )
+
+    add(
+        "--deflicker-band", type=float, default=0.10, metavar="H",
+        help=(
+            "Luma half-width around the window median that counts as the "
+            "same quantization-state cluster (default 0.10; state steps "
+            "in the starved-encode regime read 0.05-0.15). Raise to also "
+            "collapse heavier pulses, lower if legitimate low-contrast "
+            "motion is being stabilized."
+        ),
+    )
+
+    add(
+        "--deflicker-strength", type=float, default=1.0, metavar="A",
+        help="Blend of the stabilized value (1.0 = full replacement).",
+    )
+
+    # ---- Deblock -----------------------------------------------------------------
+    add(
+        "--deblock", choices=["off", "stdf", "fbcnn"], default="off",
+        help=(
+            "Pre-upscale compression-artifact deblock, applied before denoise + VSR "
+            "(deblock before SR amplifies the blocking). off (default); stdf = STDF "
+            "deformable spatio-temporal fusion (HEVC-trained, luma-only 7-frame window, "
+            "weights bundled); fbcnn = FBCNN flexible blind JPEG-artifact removal "
+            "(single-image RGB, ~72M params, weights downloaded not bundled -- see "
+            "videotoolbox/fbcnn/weights/README.md). Routes frames through the MLX path."
+        ),
+    )
+
+    add(
+        "--deblock-weights", default=None, metavar="VARIANT|PATH",
+        help=(
+            "Weights for --deblock. stdf: a bundled token (mfqev2 = HEVC multi-QP, the "
+            "default; vimeo90k = All-Intra QP37) or a path (or $STDF_WEIGHTS). fbcnn: a "
+            "fbcnn_color.safetensors path (or $FBCNN_WEIGHTS); not bundled."
+        ),
+    )
+
+    add(
+        "--deblock-strength", type=float, default=1.0, metavar="S",
+        help=(
+            "Scale the STDF deblock residual (1.0 = full, default; lower keeps more "
+            "fine texture at the cost of less deblocking -- try 0.5-0.7 on faces)."
+        ),
+    )
+
+    add(
+        "--deblock-map", choices=["constant", "auto"], default="constant",
+        help=(
+            "Spatial gating for --deblock stdf/fbcnn. constant (default) = the "
+            "correction applies everywhere at --deblock-strength. auto = estimate a "
+            "per-pixel blockiness mask from the footage (coding-grid phase detection "
+            "+ boundary-vs-interior gradient contrast; texture and 1D content edges "
+            "reject) and gate the correction by it -- blocked flats get the full "
+            "deblock, detailed/clean areas keep their texture."
+        ),
+    )
+
+    add(
+        "--deblock-map-gain", type=float, default=1.0, metavar="G",
+        help=(
+            "Multiplier on the auto blockiness mask (default 1.0). >1 saturates the "
+            "mask sooner (more area fully deblocked); <1 is more conservative. The "
+            "mask clamps at 1.0 after the gain, so the blend never extrapolates "
+            "past the deblocked frame. Only used with --deblock-map auto."
+        ),
+    )
+
+    add(
+        "--fbcnn-quality", type=str, default="auto", metavar="QF",
+        help=(
+            "JPEG quality factor for --deblock fbcnn (1-100, lower = more compressed = "
+            "stronger removal). Default 'auto': the DCT-coefficient comb MEASURES the "
+            "quantization per 128px tile over a rolling frame window and the net runs "
+            "with per-tile QF conditioning, so lightly compressed regions get gentle "
+            "treatment while heavy ones get strong removal; tiles with no detectable "
+            "JPEG history fall back to --fbcnn-quality-fallback. A NUMBER pins one "
+            "global QF (temporally stable, compiled, fastest). 'blind' uses the net's "
+            "own per-frame estimator -- it reads loop-filtered H.264/HEVC as "
+            "near-lossless (~QF 96) and barely acts, so prefer auto or a pin on video."
+        ),
+    )
+
+    add(
+        "--fbcnn-quality-fallback", type=float, default=50.0, metavar="QF",
+        help=(
+            "QF used by --fbcnn-quality auto where the comb declines (no measurable "
+            "JPEG-family quantization): per tile when only some tiles decline, or for "
+            "the whole frame (via the fast compiled path) when nothing in the window "
+            "carries a comb. Default 50 = mild; lower it for footage you know is "
+            "heavily compressed but too re-encoded for the comb to survive."
+        ),
+    )
+
+    add(
+        "--fbcnn-strength", type=float, default=1.0, metavar="A",
+        help=(
+            "Linear dry/wet blend of FBCNN's correction for --deblock fbcnn: out = "
+            "(1-A)*input + A*fbcnn(input). 1.0 = full (default); <1 keeps more original "
+            "texture (and faint residual artifacts) uniformly; >1 over-drives (can ring). "
+            "A QF-independent strength dial, complementary to --fbcnn-quality."
+        ),
+    )
+
+    # ---- NAFNet ------------------------------------------------------------------
+    add(
+        "--nafnet", choices=["off", "gopro", "gopro32", "sidd", "sidd32", "reds"], default="off",
+        help=(
+            "NAFNet restoration pass, run LAST in the preprocess chain (a light "
+            "detail/deblur residual after deblock + denoise). off (default); "
+            "gopro/gopro32 = motion deblur (width 64/32); sidd/sidd32 = real-noise "
+            "denoise; reds = video restore. Single-image RGB net; weights are downloaded, "
+            "not bundled (see videotoolbox/nafnet/weights/README.md)."
+        ),
+    )
+
+    add(
+        "--nafnet-weights", default=None, metavar="PATH",
+        help="NAFNet .safetensors path override for --nafnet (or $NAFNET_WEIGHTS); not bundled.",
+    )
+
+    add(
+        "--nafnet-strength", type=float, default=1.0, metavar="A",
+        help=(
+            "Scale NAFNet's residual for --nafnet: out = input + A*residual. 1.0 = full "
+            "(default); lower keeps it a LIGHT pass -- recommended on video, since it is a "
+            "single-image net and a strong pass can flicker. >1 over-drives."
+        ),
+    )
+
+    add(
+        "--nafnet-pool", choices=["auto", "local", "global"], default="auto",
+        help=(
+            "NAFNet SCA pooling mode. auto (default) follows the reference config for the "
+            "selected variant: gopro/gopro32/reds use NAFNetLocal TLSC/TLC, sidd/sidd32 use "
+            "plain global-pool NAFNet. local forces TLSC; global disables TLSC."
+        ),
+    )
+
+    add(
+        "--nafnet-guard",
+        choices=["auto", "off", "residual", "control", "control-source", "fast", "reject"],
+        default="auto",
+        help=(
+            "Guard against out-of-domain NAFNet residual blow-ups. auto (default) uses "
+            "reject for gopro/gopro32 and off for other variants. reject emits "
+            "passthrough for frames whose residual explosion covers a visible area, "
+            "locks the net out after two consecutive such frames (or one catastrophic "
+            "one), and re-probes on a --nafnet-guard-lockout cadence so a scene "
+            "change recovers the stage. residual applies a local output-side soft knee; "
+            "control reruns localized risky frames on a vertically luma-smoothed "
+            "control input, but locks into control-source if risk is frame-wide. "
+            "control-source predicts the residual from a stable luma-control input "
+            "and adds it to the original; fast always uses single-pass residual "
+            "attenuation."
+        ),
+    )
+
+    add(
+        "--nafnet-guard-threshold", type=float, default=0.12, metavar="T",
+        help=(
+            "Local residual magnitude threshold for --nafnet-guard (default 0.12). "
+            "Healthy frames skip the guard bit-exactly; lower catches more lattice "
+            "but can replace more legitimate deblur residual."
+        ),
+    )
+
+    add(
+        "--nafnet-guard-fast-fraction", type=float, default=0.85, metavar="F",
+        help=(
+            "Fraction of frame-risk coverage where control guard switches to a "
+            "stable control-source residual instead of per-region blending "
+            "(default 0.85). Set <=0 or >1 to force the slower two-pass regional path."
+        ),
+    )
+
+    add(
+        "--nafnet-guard-lockout", type=int, default=48, metavar="N",
+        help=(
+            "Reject-guard lockout period: frames to hold passthrough between "
+            "re-probes of the net once the reject guard has locked (default 48, "
+            "about 1.6-2s). 0 = never re-probe; stay locked for the rest of the "
+            "clip. Locked frames skip the net entirely, so long lockouts also "
+            "run faster."
+        ),
+    )
+
+    add(
+        "--nafnet-guard-ramp", type=int, default=12, metavar="N",
+        help=(
+            "Reject-guard transition smoothing: restoration strength eases in "
+            "over N clean frames (smoothstep, so fades start and stop without a "
+            "visible temporal edge) and eases OUT on moderate trips instead of "
+            "cutting to passthrough (default 12; fall length from "
+            "--nafnet-guard-fall). Catastrophic or large-area explosions still "
+            "cut instantly. 0 = hard switching both ways."
+        ),
+    )
+
+    add(
+        "--nafnet-guard-fall", type=int, default=None, metavar="N",
+        help=(
+            "Frames to fade restoration OUT on a moderate reject-guard trip "
+            "(the fade emits the knee-damped residual). Default: derived from "
+            "--nafnet-guard-ramp as ramp/4, min 2. 0 = hard cut on trips while "
+            "keeping the eased fade-in. Longer = softer off-switch but more "
+            "frames carrying damped trip residual."
+        ),
+    )
+
+    # ---- Denoise And Noise Maps --------------------------------------------------
+    add(
+        "--denoise", choices=["off", "spatial", "mc", "fastdvd", "bsvd", "pvdd"], default="off",
+        help=(
+            "Pre-upscale denoise, applied at native resolution before VSR (the "
+            "correct order - SR amplifies noise). off (default); spatial = "
+            "per-frame CoreImage CINoiseReduction (cheap, no temporal state); "
+            "mc = motion-compensated temporal denoise via VideoToolbox optical "
+            "flow (Quality tier plus startup self-test; recursive, GPU; averages "
+            "static regions over time without ghosting moving edges); fastdvd = "
+            "FastDVDnet CNN denoiser (MLX, learned; causal 5-frame window, "
+            "strongest denoise, weights bundled); bsvd = BSVD bidirectional-buffer "
+            "streaming denoiser (MLX, learned; 16-frame delay, weights local); "
+            "pvdd = PVDD real-world denoiser (MLX, learned; bidirectional window "
+            "attention, real-noise-trained -- unlike the AWGN-trained fastdvd/bsvd; "
+            "--pvdd-variant picks pvdd/crvd/davis, weights local). "
+            "Enabling denoise routes frames through the MLX upload path instead of "
+            "the zero-copy direct feed."
+        ),
+    )
+
+    add(
+        "--denoise-strength", type=float, default=0.5,
+        help=(
+            "Denoise strength 0..1 (default 0.5). For mc, the max temporal blend "
+            "toward motion-compensated history; for spatial, the noise level; for "
+            "fastdvd/bsvd, the noise sigma (mapped onto sigma_255 in [5, 55]). "
+            "With --noise-map auto the estimated map REPLACES this constant "
+            "(strength then only serves as the fallback when estimation is "
+            "impossible); scale the estimate with --noise-map-gain instead."
+        ),
+    )
+
+    add(
+        "--denoise-luma-strength", type=float, default=1.0, metavar="A",
+        help=(
+            "Luma half of --denoise: blend strength for the luma channel between the "
+            "input and the denoiser output. 1.0 = full denoise (default); lower keeps "
+            "original luma texture. Split from --denoise-chroma-strength via a BT.601 "
+            "recombine (works with any --denoise backend), so you can preserve luma "
+            "detail while still cleaning chroma. >1 over-drives."
+        ),
+    )
+
+    add(
+        "--denoise-chroma-strength", type=float, default=1.0, metavar="A",
+        help=(
+            "Chroma half of --denoise: blend strength for the chroma channels. 1.0 = "
+            "full (default). The standard split is a low --denoise-luma-strength with "
+            "this at 1.0 (aggressive chroma NR, gentle luma -- the eye barely sees chroma "
+            "detail). <1 keeps original chroma noise."
+        ),
+    )
+
+    add(
+        "--fastdvd-weights", default=None, metavar="PATH",
+        help=(
+            "Override FastDVDnet weights (.safetensors) for --denoise fastdvd. "
+            "Optional - defaults to the bundled --fastdvd-variant weights (or "
+            "$FASTDVD_WEIGHTS). Convert a .pth with scripts/pth_to_safetensors.py."
+        ),
+    )
+
+    add(
+        "--fastdvd-variant", choices=["clipped", "standard"], default="clipped",
+        help=(
+            "Which bundled FastDVDnet model for --denoise fastdvd. clipped "
+            "(default) is trained with clipped noise and stays clean on real "
+            "footage at moderate strength; standard is the plain-AWGN model and "
+            "shows a faint pixel-shuffle grid above ~0.1 strength on clean content. "
+            "Ignored when --fastdvd-weights is given."
+        ),
+    )
+
+    add(
+        "--bsvd-weights", default=None, metavar="PATH",
+        help=(
+            "Override BSVD weights (.safetensors) for --denoise bsvd. Optional - "
+            "defaults to the local --bsvd-variant weights (or $BSVD_WEIGHTS). "
+            "Convert a .pth with scripts/pth_to_safetensors.py --param-key params."
+        ),
+    )
+
+    add(
+        "--bsvd-variant", choices=["c64", "c32"], default="c64",
+        help=(
+            "Which local BSVD model token for --denoise bsvd. c64 matches the "
+            "public unblind test config; c32 is a smaller mirror checkpoint with "
+            "weaker provenance. Ignored when --bsvd-weights is given."
+        ),
+    )
+
+    add(
+        "--bsvd-dtype", choices=["float16", "float32"], default="float16",
+        help="MLX dtype for --denoise bsvd (default float16; use float32 for parity probes).",
+    )
+
+    add(
+        "--pvdd-variant",
+        choices=["pvdd", "crvd", "davis", "pvdd_level", "pvdd_raw", "pvdd_raw_level"],
+        default="pvdd",
+        help=(
+            "Which local PVDD model for --denoise pvdd. pvdd (default) = real-world "
+            "sRGB blind; crvd = real high-ISO sensor noise; davis = synthetic-AWGN "
+            "sibling (baseline, behaves like fastdvd); pvdd_level = noise-level dial "
+            "(non-blind, see --pvdd-noise-*); pvdd_raw / pvdd_raw_level = packed "
+            "Bayer (need a raw pipeline, not sRGB video). Ignored when --pvdd-weights "
+            "is given."
+        ),
+    )
+
+    add(
+        "--pvdd-weights", default=None, metavar="PATH",
+        help=(
+            "Override PVDD weights (.safetensors) for --denoise pvdd. Optional - "
+            "defaults to the local --pvdd-variant weights (or $PVDD_WEIGHTS). Not "
+            "bundled; convert a .pth with scripts/pth_to_safetensors.py (see "
+            "videotoolbox/pvdd/weights/README.md)."
+        ),
+    )
+
+    add(
+        "--pvdd-window", type=int, default=10, metavar="N",
+        help=(
+            "Sliding-window length (frames) for --denoise pvdd's bidirectional "
+            "recurrence (default 10). Larger windows give more temporal context at "
+            "higher cost; use --pvdd-trim to overlap windows."
+        ),
+    )
+
+    add(
+        "--pvdd-trim", type=int, default=0, metavar="N",
+        help=(
+            "Overlap frames trimmed from each --denoise pvdd window edge (default 0 = "
+            "reference-like non-overlapping chunks). Must be < window/2."
+        ),
+    )
+
+    add(
+        "--pvdd-noise-preset", choices=["off", "S", "M", "L"], default="M",
+        help=(
+            "Noise-level preset for the pvdd_level variants (non-blind). S/M/L map to "
+            "the reference noise-variance levels (0.00069 / 0.0022 / 0.0055); M is "
+            "default. off disables (needs --pvdd-noise-variance). Ignored by blind "
+            "variants."
+        ),
+    )
+
+    add(
+        "--pvdd-noise-variance", type=float, default=None, metavar="V",
+        help=(
+            "Explicit noise-variance value for the pvdd_level variants, overriding "
+            "--pvdd-noise-preset. This is variance (sigma^2), not sigma. Ignored by "
+            "blind variants."
+        ),
+    )
+
+    add(
+        "--pvdd-dtype", choices=["float16", "float32"], default="float16",
+        help="MLX dtype for --denoise pvdd (default float16; use float32 for parity probes).",
+    )
+
+    add(
+        "--noise-map", choices=["constant", "auto"], default="constant",
+        help=(
+            "Noise conditioning for map-driven denoisers (fastdvd, bsvd, pvdd level "
+            "variants). constant (default) = one sigma everywhere (from "
+            "--denoise-strength / --pvdd-noise-*). auto = estimate a per-pixel sigma "
+            "map from the footage itself (temporal frame-difference statistics: "
+            "texture-safe, motion-capped, smooth), so noisy shadows get denoised "
+            "harder than clean lit areas. For mc, the map replaces --mc-sigma as "
+            "the per-pixel residual-rejection scale. Ignored with a warning by "
+            "denoisers that have no map input (spatial, blind pvdd variants)."
+        ),
+    )
+
+    add(
+        "--noise-map-gain", type=float, default=1.0, metavar="G",
+        help=(
+            "Multiplier on the auto-estimated noise map (default 1.0). >1 denoises "
+            "harder everywhere while keeping the spatial shape; <1 is gentler. For "
+            "fastdvd/bsvd the gained map is clamped into the nets' trained sigma "
+            "range [5/255, 55/255] -- the same span the manual --denoise-strength "
+            "dial has -- so heavily compressed clips whose measured temporal noise "
+            "sits below the dial floor get the floor (a mild denoise) instead of a "
+            "no-op. Only used with --noise-map auto."
+        ),
+    )
+
+    add(
+        "--noise-map-debug", action="store_true",
+        help=(
+            "With --noise-map auto: after the run, write the estimated sigma map as "
+            "<output>_noisemap.png (grayscale, sigma 0..0.15 -> black..white) and "
+            "print its stats, so the estimate can be eyeballed."
+        ),
+    )
+
+    add(
+        "--noise-map-refresh", type=int, default=64, metavar="N",
+        help=(
+            "With --noise-map auto in plain streaming mode (fastdvd/bsvd without "
+            "--gop-align): re-estimate the map from the last frames every N input "
+            "frames, EMA-blended so it adapts without pumping (default 64; 0 = "
+            "estimate once from the first frames and hold). Windowed modes "
+            "(--gop-align, pvdd) re-estimate per window and ignore this."
+        ),
+    )
+
+    add(
+        "--noise-map-masking", type=float, default=0.0, metavar="S",
+        help=(
+            "Perceptual masking weight for the noise map (default 0 = off; 1 = "
+            "full). Noise visibility is highest in flat regions and lowest near "
+            "edges/texture, while over-conditioning near detail reads as "
+            "softness -- so at 1.0 flat blocks get a ~1.75x suppression margin "
+            "over the measured amplitude (the visual-kill margin) and detailed "
+            "blocks are tempered to ~0.5x. Fixes the constant-beats-map case "
+            "where the map smooths hardest exactly where the eye punishes "
+            "softness most."
+        ),
+    )
+
+    add(
+        "--noise-map-motion-cap", choices=["strict", "loose", "off"], default="strict",
+        help=(
+            "How aggressively the noise map's motion cap suppresses blocks that "
+            "look motion-like. Temporal statistics cannot separate compression "
+            "flicker that persists a couple of frames (lag ratio ~1.5) from "
+            "occlusion edges (~1.41), so this is a material decision: strict "
+            "(default) = displacement-safe, right for real subject/camera "
+            "motion; loose = static-camera material, persistent flicker also "
+            "escapes the cap; off = tripod/archival footage, no cap -- the map "
+            "reports exactly what it measured."
+        ),
+    )
+
+    add(
+        "--noise-map-floor-mode", choices=["mc", "flat"], default="mc",
+        help=(
+            "Source of the motion-immune noise floor that anchors the map's "
+            "luma model on moving content. mc (default): 32px blocks are "
+            "aligned by phase correlation (subpixel) before the whitened "
+            "residual median, so the floor is read on ALL pixels -- stronger "
+            "on pans over weak texture where flat pixels are scarce or "
+            "drift-contaminated, and cheaper. flat: whitened median over "
+            "gradient-free pixels only (motion cannot flicker flat pixels); "
+            "the two agree wherever the flat set is healthy."
+        ),
+    )
+
+    add(
+        "--noise-map-floor", type=float, default=0.0, metavar="S",
+        help=(
+            "Minimum sigma under the auto noise map (0..1 scale; default 0 = the "
+            "net's own trained floor, 5/255 for fastdvd/bsvd). The temporal "
+            "estimator measures FLICKERING noise only; static grain, dirt, and "
+            "structured junk do not flicker and read near zero even though "
+            "conditioning the denoiser higher visibly cleans them. The floor "
+            "guarantees a base denoise level -- the role of the manual strength "
+            "dial -- with the map's spatial and pulse adaptation applying above "
+            "it. E.g. 0.02 ~= --denoise-strength 0.005, 0.03 ~= 0.1."
+        ),
+    )
+
+    add(
+        "--noise-map-pulse", action="store_true",
+        help=(
+            "Per-frame gain on the noise conditioning that tracks GOP-phase noise "
+            "pulsing: old encoders re-code the grain at every I-frame, so temporal "
+            "noise is elevated right after keyframes and suppressed once P/B "
+            "prediction settles. Each frame's global sigma is measured against the "
+            "running settled level and the sigma plane is scaled by the ratio "
+            "(clamped 0.6..1.8), so I-frame grain refreshes get proportionally "
+            "stronger denoising. With --noise-map auto, whole-frame pulse spikes "
+            "are damped out of the base map so they are not counted twice. Works "
+            "with --noise-map constant or auto; "
+            "map-conditioned denoisers only (fastdvd, bsvd, mc, pvdd level "
+            "variants)."
+        ),
+    )
+
+    add(
+        "--mc-window", type=int, default=0, metavar="N",
+        help=(
+            "mc temporal structure (mutually exclusive). 0 (default) = recursive "
+            "IIR (blends the previous output; strongest denoise, longest ghosts). "
+            "N>=1 = causal FIR over the last N input frames (bounded ghost "
+            "lifetime, ~N optical-flow computes per frame)."
+        ),
+    )
+
+    add(
+        "--mc-sigma", type=float, default=0.06, metavar="S",
+        help=(
+            "mc residual-rejection scale (luma, 0..1; default 0.06 ~= 15/255). The "
+            "blend gate is exp(-(current-vs-history residual / sigma)^2); noise "
+            "inflates that residual, so at the default it throttles its own removal "
+            "even at --denoise-strength 1. RAISE it (e.g. 0.10-0.15) to denoise "
+            "harder when strength alone plateaus -- the real 'make it stronger' knob "
+            "for noisy footage. Cost: it also tolerates motion mismatch, so higher = "
+            "more ghosting/smearing on fast motion. With --noise-map auto this "
+            "scalar is REPLACED by the estimated per-pixel map (in residual units); "
+            "scale that with --noise-map-gain instead."
+        ),
+    )
+
+    add(
+        "--mc-clamp", action="store_true",
+        help="mc: clamp warped history to the current frame's local color box "
+             "(TAA variance-clip). The strongest single anti-ghost. Combinable.",
+    )
+
+    add(
+        "--mc-occlusion", action="store_true",
+        help="mc: reject history via forward-backward flow consistency "
+             "(occlusion / bad-flow detection). Combinable.",
+    )
+
+    add(
+        "--mc-confidence", action="store_true",
+        help="mc: down-weight history where flow magnitude is large (fast "
+             "motion). Combinable.",
+    )
+
+    # ---- Spatial Upscalers -------------------------------------------------------
+    add(
         "--spatial-mode",
         choices=["fast", "balanced", "image", "none", "basicvsrpp", "realbasicvsr",
                  "realesrgan", "safmn", "esc", "realviformer", "realplksr"],
@@ -2100,741 +3150,8 @@ def main() -> None:
             "alternative to balanced if you prefer the smoother trade-off."
         ),
     )
-    parser.add_argument(
-        "--encode-quality", type=float, default=0.65,
-        help="AVVideoQualityKey (0..1) for the HEVC encoder. 0.65 matches the default tier.",
-    )
-    parser.add_argument(
-        "--source-color", choices=["auto", "bt709", "bt601", "bt2020"], default="auto",
-        help=(
-            "How the source is interpreted. auto (default) trusts the container's "
-            "color tags, or VideoToolbox's resolution guess when untagged (SD "
-            "width -> BT.601, HD -> BT.709). bt601/bt709/bt2020 FORCE the source to "
-            "be decoded as that matrix -- the fix for untagged/mistagged clips VT "
-            "guesses wrong. For balanced/image it decodes raw YUV and re-interprets "
-            "it (not just an output tag); fast/NV12 keeps VideoToolbox's decode and "
-            "only re-tags. The output is tagged to match."
-        ),
-    )
-    parser.add_argument(
-        "--source-range", choices=["auto", "video", "full"], default="auto",
-        help=(
-            "How the source's YUV code values map to RGB. auto (default) trusts "
-            "the container's range flag (untagged = video/limited range, the "
-            "standard assumption -- Y 16-235). video/full FORCE the interpretation "
-            "for mis-flagged sources, e.g. full-range screen recordings or "
-            "phone/webcam MP4s an encoder left untagged: read as limited they get "
-            "shadows crushed to black and highlights clipped BEFORE any model runs "
-            "(and the learned upscalers respond badly to the clipped regions). The "
-            "reinterpretation is exact -- same decoded code values, different "
-            "YUV->RGB scaling -- and the output is tagged to match. Not available "
-            "with --spatial-mode fast (its YUV passes through untouched)."
-        ),
-    )
-    parser.add_argument(
-        "--encode-chroma", choices=["auto", "420", "422"], default="auto",
-        help=(
-            "HEVC profile chroma subsampling. auto = 4:2:2 (Main42210) for "
-            "balanced/image modes, 4:2:0 (Main10) for fast. 420 forces Main10 for "
-            "generate.py-tier parity."
-        ),
-    )
-    parser.add_argument(
-        "--audio", action="store_true",
-        help=(
-            "Mux audio into both MP4s. For --latent the audio is decoded from "
-            "final_audio_latent (audio VAE + vocoder); for --video the source "
-            "file's audio track is read natively (AVFoundation) and carried "
-            "through. A --video input with no audio track stays silent."
-        ),
-    )
-    parser.add_argument(
-        "--audio-codec", choices=["alac", "aac"], default="alac",
-        help="Audio codec for muxed audio (alac=lossless, aac=256kbps).",
-    )
-    parser.add_argument(
-        "--save-audio-sidecar", action="store_true",
-        help="Also write the muxed audio as <stem>_audio.wav next to the MP4s.",
-    )
-    parser.add_argument(
-        "--restore", default="off", metavar="off|VARIANT",
-        help=(
-            "Pre-upscale TEMPORAL restoration (BasicVSR++, recurrent). Unlike the "
-            "per-frame deblock/denoise stages, this is bidirectional + second-order "
-            "over a frame window, so it enforces frame-to-frame consistency -- the fix "
-            "for GOP-periodic compression flicker (artifacts that appear/disappear "
-            "between keyframes) and temporally-varying sensor noise that per-frame "
-            "models pulse on. Runs FIRST by default (before deblock/denoise/nafnet) so "
-            "it stabilizes the sequence before any per-frame stage. Accepts a "
-            "COMMA-SEPARATED list to chain restorers in one pass, in order -- e.g. "
-            "'decompress_track1,denoise' runs temporal deblock then temporal denoise. "
-            "Variants: off "
-            "(default); decompress_track1 (NTIRE'21 compressed-video enhancement, the "
-            "H.264/HEVC deblock choice) / decompress_track2 / decompress_track3; "
-            "denoise (temporal video denoise -- softens far less than a per-frame "
-            "denoiser); deblur_dvd / deblur_gopro (real / synthetic motion deblur). "
-            "Weights downloaded, not bundled -- see basicvsrpp/weights/README.md. "
-            "Domain note: trained on HEVC/synthetic degradations, so temporal-right "
-            "but domain-approximate for 2010-era H.264."
-        ),
-    )
-    parser.add_argument(
-        "--restore-weights", default=None, metavar="VARIANT|PATH",
-        help="Weights for --restore: a restoration variant token or a .safetensors path "
-             "(or $BASICVSRPP_RESTORE_WEIGHTS). Overrides the --restore token's default file.",
-    )
-    parser.add_argument(
-        "--restore-strength", type=str, default="1.0", metavar="S[,S...]",
-        help="Blend each restored frame with the original (1.0 = full restore, default; "
-             "0.0 = passthrough). A single value applies to every chained --restore stage; "
-             "a comma-separated list sets per-stage strengths in order and must match the "
-             "number of --restore variants -- e.g. --restore decompress_track1,denoise "
-             "--restore-strength 1.0,0.5 = full deblock then a gentle denoise.",
-    )
-    parser.add_argument(
-        "--restore-window", type=int, default=14, metavar="N",
-        help="Sliding-window length (frames) for --restore recurrence (default 14). "
-             "Longer = more temporal context (better consistency) but more memory/compute.",
-    )
-    parser.add_argument(
-        "--restore-trim", type=int, default=2, metavar="N",
-        help="Warm-up frames trimmed at each --restore window join (default 2); the "
-             "propagation's transient edge. Interior frames match the full-clip result.",
-    )
-    parser.add_argument(
-        "--restore-flow-mode", choices=["spynet", "zero", "vt"], default="spynet",
-        help="Optical-flow source for --restore alignment: spynet (default, the trained "
-             "flow net), zero (no motion), or vt (VideoToolbox flow).",
-    )
-    parser.add_argument(
-        "--snap-start", action="store_true",
-        help=(
-            "Snap --start to the nearest source keyframe, so the output actually "
-            "BEGINS on a clean I-frame (a clean editorial cut, a pristine first frame, "
-            "and no context-decode overhead). This MOVES the start -- you get a "
-            "slightly different range than requested -- so it is warned and the "
-            "effective range is echoed. Contrast --gop-align's anchor, which keeps "
-            "your exact --start and reads the pre-start frames as context. --video only."
-        ),
-    )
-    parser.add_argument(
-        "--gop-align", action="store_true",
-        help=(
-            "Align recurrent windows (--restore and the basicvsrpp/realbasicvsr/"
-            "realviformer upscalers) to the source's GOP: detect keyframes natively "
-            "(no ffprobe) and window keyframe-to-keyframe so BOTH recurrence "
-            "directions cold-start on a clean I-frame -- no warm-up trim needed. "
-            "Overhead is ~1 re-processed frame per GOP (a few percent) instead of "
-            "trim's ~2x, and it removes window-boundary flicker on GOP-structured "
-            "video. Falls back to fixed max-window tiling when the source has no "
-            "keyframe cadence. --video only. Overrides the per-stage --*-window/-trim."
-        ),
-    )
-    parser.add_argument(
-        "--gop-min-window", type=int, default=16, metavar="N",
-        help="Minimum recurrent window (frames) under --gop-align (default 16). A "
-             "window spans whole GOPs until it reaches this, so short GOPs are merged "
-             "for enough temporal context.",
-    )
-    parser.add_argument(
-        "--gop-max-window", type=int, default=96, metavar="N",
-        help="Maximum recurrent window (frames) under --gop-align (default 96). A GOP "
-             "longer than this is split into sub-windows (with a small trim at the "
-             "internal splits) to bound memory.",
-    )
-    parser.add_argument(
-        "--restore-ensemble", action="store_true",
-        help="Run --restore through the reference's 8-way geometric self-ensemble "
-             "(the SpatialTemporalEnsemble the NTIRE decompress/ntire-vsr configs apply "
-             "at inference, dropped as dead config in the mmagic re-port): restore under "
-             "8 flip/rotate variants and average. Cancels orientation-specific "
-             "hallucinated texture -- measured ~2.5x less flat-region 'alligator skin' "
-             "and ~1.7x less temporal crawl on the aggressive decompress_track2 -- at 8x "
-             "the compute. Off by default; worth it when a variant hallucinates on smooth "
-             "surfaces and you still want its aggression. Applies to every chained "
-             "--restore stage.",
-    )
-    parser.add_argument(
-        "--deblock", choices=["off", "stdf", "fbcnn"], default="off",
-        help=(
-            "Pre-upscale compression-artifact deblock, applied before denoise + VSR "
-            "(deblock before SR amplifies the blocking). off (default); stdf = STDF "
-            "deformable spatio-temporal fusion (HEVC-trained, luma-only 7-frame window, "
-            "weights bundled); fbcnn = FBCNN flexible blind JPEG-artifact removal "
-            "(single-image RGB, ~72M params, weights downloaded not bundled -- see "
-            "videotoolbox/fbcnn/weights/README.md). Routes frames through the MLX path."
-        ),
-    )
-    parser.add_argument(
-        "--deblock-weights", default=None, metavar="VARIANT|PATH",
-        help=(
-            "Weights for --deblock. stdf: a bundled token (mfqev2 = HEVC multi-QP, the "
-            "default; vimeo90k = All-Intra QP37) or a path (or $STDF_WEIGHTS). fbcnn: a "
-            "fbcnn_color.safetensors path (or $FBCNN_WEIGHTS); not bundled."
-        ),
-    )
-    parser.add_argument(
-        "--deblock-strength", type=float, default=1.0, metavar="S",
-        help=(
-            "Scale the STDF deblock residual (1.0 = full, default; lower keeps more "
-            "fine texture at the cost of less deblocking -- try 0.5-0.7 on faces)."
-        ),
-    )
-    parser.add_argument(
-        "--fbcnn-quality", type=str, default="auto", metavar="QF",
-        help=(
-            "JPEG quality factor for --deblock fbcnn (1-100, lower = more compressed = "
-            "stronger removal). Default 'auto': the DCT-coefficient comb MEASURES the "
-            "quantization per 128px tile over a rolling frame window and the net runs "
-            "with per-tile QF conditioning, so lightly compressed regions get gentle "
-            "treatment while heavy ones get strong removal; tiles with no detectable "
-            "JPEG history fall back to --fbcnn-quality-fallback. A NUMBER pins one "
-            "global QF (temporally stable, compiled, fastest). 'blind' uses the net's "
-            "own per-frame estimator -- it reads loop-filtered H.264/HEVC as "
-            "near-lossless (~QF 96) and barely acts, so prefer auto or a pin on video."
-        ),
-    )
-    parser.add_argument(
-        "--fbcnn-quality-fallback", type=float, default=50.0, metavar="QF",
-        help=(
-            "QF used by --fbcnn-quality auto where the comb declines (no measurable "
-            "JPEG-family quantization): per tile when only some tiles decline, or for "
-            "the whole frame (via the fast compiled path) when nothing in the window "
-            "carries a comb. Default 50 = mild; lower it for footage you know is "
-            "heavily compressed but too re-encoded for the comb to survive."
-        ),
-    )
-    parser.add_argument(
-        "--fbcnn-strength", type=float, default=1.0, metavar="A",
-        help=(
-            "Linear dry/wet blend of FBCNN's correction for --deblock fbcnn: out = "
-            "(1-A)*input + A*fbcnn(input). 1.0 = full (default); <1 keeps more original "
-            "texture (and faint residual artifacts) uniformly; >1 over-drives (can ring). "
-            "A QF-independent strength dial, complementary to --fbcnn-quality."
-        ),
-    )
-    parser.add_argument(
-        "--nafnet", choices=["off", "gopro", "gopro32", "sidd", "sidd32", "reds"], default="off",
-        help=(
-            "NAFNet restoration pass, run LAST in the preprocess chain (a light "
-            "detail/deblur residual after deblock + denoise). off (default); "
-            "gopro/gopro32 = motion deblur (width 64/32); sidd/sidd32 = real-noise "
-            "denoise; reds = video restore. Single-image RGB net; weights are downloaded, "
-            "not bundled (see videotoolbox/nafnet/weights/README.md)."
-        ),
-    )
-    parser.add_argument(
-        "--nafnet-weights", default=None, metavar="PATH",
-        help="NAFNet .safetensors path override for --nafnet (or $NAFNET_WEIGHTS); not bundled.",
-    )
-    parser.add_argument(
-        "--nafnet-strength", type=float, default=1.0, metavar="A",
-        help=(
-            "Scale NAFNet's residual for --nafnet: out = input + A*residual. 1.0 = full "
-            "(default); lower keeps it a LIGHT pass -- recommended on video, since it is a "
-            "single-image net and a strong pass can flicker. >1 over-drives."
-        ),
-    )
-    parser.add_argument(
-        "--nafnet-pool", choices=["auto", "local", "global"], default="auto",
-        help=(
-            "NAFNet SCA pooling mode. auto (default) follows the reference config for the "
-            "selected variant: gopro/gopro32/reds use NAFNetLocal TLSC/TLC, sidd/sidd32 use "
-            "plain global-pool NAFNet. local forces TLSC; global disables TLSC."
-        ),
-    )
-    parser.add_argument(
-        "--nafnet-guard",
-        choices=["auto", "off", "residual", "control", "control-source", "fast", "reject"],
-        default="auto",
-        help=(
-            "Guard against out-of-domain NAFNet residual blow-ups. auto (default) uses "
-            "reject for gopro/gopro32 and off for other variants. reject emits "
-            "passthrough for frames whose residual explosion covers a visible area, "
-            "locks the net out after two consecutive such frames (or one catastrophic "
-            "one), and re-probes on a --nafnet-guard-lockout cadence so a scene "
-            "change recovers the stage. residual applies a local output-side soft knee; "
-            "control reruns localized risky frames on a vertically luma-smoothed "
-            "control input, but locks into control-source if risk is frame-wide. "
-            "control-source predicts the residual from a stable luma-control input "
-            "and adds it to the original; fast always uses single-pass residual "
-            "attenuation."
-        ),
-    )
-    parser.add_argument(
-        "--nafnet-guard-threshold", type=float, default=0.12, metavar="T",
-        help=(
-            "Local residual magnitude threshold for --nafnet-guard (default 0.12). "
-            "Healthy frames skip the guard bit-exactly; lower catches more lattice "
-            "but can replace more legitimate deblur residual."
-        ),
-    )
-    parser.add_argument(
-        "--nafnet-guard-fast-fraction", type=float, default=0.85, metavar="F",
-        help=(
-            "Fraction of frame-risk coverage where control guard switches to a "
-            "stable control-source residual instead of per-region blending "
-            "(default 0.85). Set <=0 or >1 to force the slower two-pass regional path."
-        ),
-    )
-    parser.add_argument(
-        "--nafnet-guard-lockout", type=int, default=48, metavar="N",
-        help=(
-            "Reject-guard lockout period: frames to hold passthrough between "
-            "re-probes of the net once the reject guard has locked (default 48, "
-            "about 1.6-2s). 0 = never re-probe; stay locked for the rest of the "
-            "clip. Locked frames skip the net entirely, so long lockouts also "
-            "run faster."
-        ),
-    )
-    parser.add_argument(
-        "--nafnet-guard-ramp", type=int, default=12, metavar="N",
-        help=(
-            "Reject-guard transition smoothing: restoration strength eases in "
-            "over N clean frames (smoothstep, so fades start and stop without a "
-            "visible temporal edge) and eases OUT on moderate trips instead of "
-            "cutting to passthrough (default 12; fall length from "
-            "--nafnet-guard-fall). Catastrophic or large-area explosions still "
-            "cut instantly. 0 = hard switching both ways."
-        ),
-    )
-    parser.add_argument(
-        "--nafnet-guard-fall", type=int, default=None, metavar="N",
-        help=(
-            "Frames to fade restoration OUT on a moderate reject-guard trip "
-            "(the fade emits the knee-damped residual). Default: derived from "
-            "--nafnet-guard-ramp as ramp/4, min 2. 0 = hard cut on trips while "
-            "keeping the eased fade-in. Longer = softer off-switch but more "
-            "frames carrying damped trip residual."
-        ),
-    )
-    parser.add_argument(
-        "--denoise-first", action="store_true",
-        help=(
-            "Run --denoise before --deblock (default is deblock then denoise). The "
-            "default suits captured-then-encoded footage: undo the last degradation "
-            "(compression) first, and a denoiser's white-noise assumption is broken by "
-            "structured blocking. Use --denoise-first only when noise was added AFTER "
-            "compression (regrained master, analog/transmission noise)."
-        ),
-    )
-    parser.add_argument(
-        "--sanitize-edges", default=None, metavar="auto|T,B,L,R",
-        help=(
-            "Detect and clean synthetic border junk (letterbox lines, capture "
-            "garbage rows) BEFORE any processor sees the frame: the affected "
-            "edge rows/cols are overwritten with the adjacent interior line "
-            "(replicate fill), because learned restorers are trained on "
-            "photographic content and hallucinate texture around synthetic "
-            "edges. Frame dimensions and pixel-aspect are untouched, so the "
-            "output geometry is identical. auto (needs --video) samples early "
-            "frames and only trims edges that are anomalous in every sample, "
-            "capped at 8 px per edge; thick constant bars (letterbox-class) "
-            "are reported but never filled -- crop those instead. T,B,L,R "
-            "forces explicit per-edge pixel counts. Default: off."
-        ),
-    )
-    parser.add_argument(
-        "--sanitize-edges-fill", choices=["restore", "extend", "trim"],
-        default="restore",
-        help=(
-            "What happens where junk edges were detected. restore (default) "
-            "= the nets see a replicate-extended frame and the ORIGINAL "
-            "border is composited back over the processed output, feathered "
-            "into the content (--sanitize-edges-feather): the border stays "
-            "exactly as quiet/static/dark as the source. extend = keep the "
-            "replicated content in the output, removing the junk -- but "
-            "replicated content MOVES with the interior, visible shimmer "
-            "where the eye expects a static border. trim = CROP the junk "
-            "lines off entirely (folded into the crop before --crop-aspect "
-            "runs, so the aspect window is computed on the clean picture; "
-            "bottom/right bumped 1 px if needed to keep even dimensions)."
-        ),
-    )
-    parser.add_argument(
-        "--sanitize-edges-feather", type=int, default=2, metavar="N",
-        help=(
-            "Crossfade width (source px) from a restored border band into the "
-            "processed content (default 2). Softens the seam between the "
-            "authentic soft border and the crisply processed interior. "
-            "0 = hard splice."
-        ),
-    )
-    parser.add_argument(
-        "--crop-bars", default=None, metavar="auto|T,B,L,R",
-        help=(
-            "Crop constant letterbox/pillarbox bars off BEFORE processing and "
-            "output only the active picture (e.g. 16:9 letterboxed in 4:3 "
-            "becomes true 16:9 out; 9:16 pillarboxed in 16:9 becomes true "
-            "9:16). auto detects bars that are constant-extreme in every "
-            "sampled frame, up to 45 percent per edge, and rounds so the "
-            "active area keeps even dimensions; T,B,L,R forces explicit "
-            "counts. The pixel aspect is unchanged -- the display aspect "
-            "becomes the content's true aspect, which is the point. Composes "
-            "with --sanitize-edges (junk detection runs on the cropped "
-            "picture). Needs --video. Default: off."
-        ),
-    )
-    parser.add_argument(
-        "--crop-aspect", default=None, metavar="W:H",
-        help=(
-            "Crop the picture to the largest even-dimension window with this "
-            "DISPLAY aspect (e.g. 16:9 on a 4:3 source, 1:1, 9:16 for a "
-            "portrait extract). On anamorphic sources the pixel aspect is "
-            "folded into the target automatically, so 16:9 means 16:9 on "
-            "screen, not in storage pixels. Even-integer windows approximate "
-            "most ratios; the closest fit is chosen. Applies AFTER "
-            "--crop-bars, so a letterboxed source can be bar-cropped and then "
-            "reframed in one run. Place with --crop-anchor, shift with "
-            "--crop-offset. Needs --video."
-        ),
-    )
-    parser.add_argument(
-        "--crop-anchor",
-        choices=["top-left", "top", "top-right", "left", "center", "right",
-                 "bottom-left", "bottom", "bottom-right"],
-        default="center",
-        help=(
-            "Where to place the --crop-aspect window (default center). "
-            "E.g. 16:9 from a 4:3 source anchored at 'bottom' keeps the "
-            "lower two-thirds; 'top-right' pins the window to that corner. "
-            "--crop-offset nudges from the anchor."
-        ),
-    )
-    parser.add_argument(
-        "--square-pixels", action="store_true",
-        help=(
-            "Resample anamorphic sources to square pixels (1:1 pixel aspect) "
-            "before processing: a horizontal-only resample at SOURCE "
-            "resolution (Lanczos-3, GPU-resident precomputed plan) -- the "
-            "cheapest point, and the upscaler re-synthesizes the mild resample "
-            "softness -- with the output tagged 1:1 for "
-            "PAR-ignorant players and toolchains. Also a mild DISPLAY-domain "
-            "sharpness win (~7 percent measured): the anamorphic stretch must "
-            "happen somewhere, and pre-SR (here, then re-synthesized by the "
-            "net) beats post-SR in the player, which dilutes rendered detail. "
-            "Default behavior (off) passes the source pixel aspect through "
-            "losslessly instead. No-op on square-pixel sources."
-        ),
-    )
-    parser.add_argument(
-        "--crop-offset", default="0,0", metavar="DX,DY",
-        help=(
-            "Pixel offset of the --crop-aspect window from its anchor "
-            "(right/down positive, clamped so the window stays inside the "
-            "frame). Default 0,0."
-        ),
-    )
-    parser.add_argument(
-        "--preprocess-order", type=_pp_order, default=None, metavar="A,B,C",
-        help=(
-            "Explicit order for the preprocess stages, comma-separated from "
-            "{deblock, denoise, nafnet}, e.g. 'nafnet,denoise,deblock'. Only enabled "
-            "stages run; any enabled stage you omit is appended in the default order "
-            "(deblock, denoise, nafnet). Overrides --denoise-first when set."
-        ),
-    )
-    parser.add_argument(
-        "--denoise", choices=["off", "spatial", "mc", "fastdvd", "bsvd", "pvdd"], default="off",
-        help=(
-            "Pre-upscale denoise, applied at native resolution before VSR (the "
-            "correct order - SR amplifies noise). off (default); spatial = "
-            "per-frame CoreImage CINoiseReduction (cheap, no temporal state); "
-            "mc = motion-compensated temporal denoise via VideoToolbox optical "
-            "flow (Quality tier plus startup self-test; recursive, GPU; averages "
-            "static regions over time without ghosting moving edges); fastdvd = "
-            "FastDVDnet CNN denoiser (MLX, learned; causal 5-frame window, "
-            "strongest denoise, weights bundled); bsvd = BSVD bidirectional-buffer "
-            "streaming denoiser (MLX, learned; 16-frame delay, weights local); "
-            "pvdd = PVDD real-world denoiser (MLX, learned; bidirectional window "
-            "attention, real-noise-trained -- unlike the AWGN-trained fastdvd/bsvd; "
-            "--pvdd-variant picks pvdd/crvd/davis, weights local). "
-            "Enabling denoise routes frames through the MLX upload path instead of "
-            "the zero-copy direct feed."
-        ),
-    )
-    parser.add_argument(
-        "--denoise-strength", type=float, default=0.5,
-        help=(
-            "Denoise strength 0..1 (default 0.5). For mc, the max temporal blend "
-            "toward motion-compensated history; for spatial, the noise level; for "
-            "fastdvd/bsvd, the noise sigma (mapped onto sigma_255 in [5, 55]). "
-            "With --noise-map auto the estimated map REPLACES this constant "
-            "(strength then only serves as the fallback when estimation is "
-            "impossible); scale the estimate with --noise-map-gain instead."
-        ),
-    )
-    parser.add_argument(
-        "--denoise-luma-strength", type=float, default=1.0, metavar="A",
-        help=(
-            "Luma half of --denoise: blend strength for the luma channel between the "
-            "input and the denoiser output. 1.0 = full denoise (default); lower keeps "
-            "original luma texture. Split from --denoise-chroma-strength via a BT.601 "
-            "recombine (works with any --denoise backend), so you can preserve luma "
-            "detail while still cleaning chroma. >1 over-drives."
-        ),
-    )
-    parser.add_argument(
-        "--denoise-chroma-strength", type=float, default=1.0, metavar="A",
-        help=(
-            "Chroma half of --denoise: blend strength for the chroma channels. 1.0 = "
-            "full (default). The standard split is a low --denoise-luma-strength with "
-            "this at 1.0 (aggressive chroma NR, gentle luma -- the eye barely sees chroma "
-            "detail). <1 keeps original chroma noise."
-        ),
-    )
-    parser.add_argument(
-        "--fastdvd-weights", default=None, metavar="PATH",
-        help=(
-            "Override FastDVDnet weights (.safetensors) for --denoise fastdvd. "
-            "Optional - defaults to the bundled --fastdvd-variant weights (or "
-            "$FASTDVD_WEIGHTS). Convert a .pth with scripts/pth_to_safetensors.py."
-        ),
-    )
-    parser.add_argument(
-        "--fastdvd-variant", choices=["clipped", "standard"], default="clipped",
-        help=(
-            "Which bundled FastDVDnet model for --denoise fastdvd. clipped "
-            "(default) is trained with clipped noise and stays clean on real "
-            "footage at moderate strength; standard is the plain-AWGN model and "
-            "shows a faint pixel-shuffle grid above ~0.1 strength on clean content. "
-            "Ignored when --fastdvd-weights is given."
-        ),
-    )
-    parser.add_argument(
-        "--bsvd-weights", default=None, metavar="PATH",
-        help=(
-            "Override BSVD weights (.safetensors) for --denoise bsvd. Optional - "
-            "defaults to the local --bsvd-variant weights (or $BSVD_WEIGHTS). "
-            "Convert a .pth with scripts/pth_to_safetensors.py --param-key params."
-        ),
-    )
-    parser.add_argument(
-        "--bsvd-variant", choices=["c64", "c32"], default="c64",
-        help=(
-            "Which local BSVD model token for --denoise bsvd. c64 matches the "
-            "public unblind test config; c32 is a smaller mirror checkpoint with "
-            "weaker provenance. Ignored when --bsvd-weights is given."
-        ),
-    )
-    parser.add_argument(
-        "--bsvd-dtype", choices=["float16", "float32"], default="float16",
-        help="MLX dtype for --denoise bsvd (default float16; use float32 for parity probes).",
-    )
-    parser.add_argument(
-        "--pvdd-variant",
-        choices=["pvdd", "crvd", "davis", "pvdd_level", "pvdd_raw", "pvdd_raw_level"],
-        default="pvdd",
-        help=(
-            "Which local PVDD model for --denoise pvdd. pvdd (default) = real-world "
-            "sRGB blind; crvd = real high-ISO sensor noise; davis = synthetic-AWGN "
-            "sibling (baseline, behaves like fastdvd); pvdd_level = noise-level dial "
-            "(non-blind, see --pvdd-noise-*); pvdd_raw / pvdd_raw_level = packed "
-            "Bayer (need a raw pipeline, not sRGB video). Ignored when --pvdd-weights "
-            "is given."
-        ),
-    )
-    parser.add_argument(
-        "--pvdd-weights", default=None, metavar="PATH",
-        help=(
-            "Override PVDD weights (.safetensors) for --denoise pvdd. Optional - "
-            "defaults to the local --pvdd-variant weights (or $PVDD_WEIGHTS). Not "
-            "bundled; convert a .pth with scripts/pth_to_safetensors.py (see "
-            "videotoolbox/pvdd/weights/README.md)."
-        ),
-    )
-    parser.add_argument(
-        "--pvdd-window", type=int, default=10, metavar="N",
-        help=(
-            "Sliding-window length (frames) for --denoise pvdd's bidirectional "
-            "recurrence (default 10). Larger windows give more temporal context at "
-            "higher cost; use --pvdd-trim to overlap windows."
-        ),
-    )
-    parser.add_argument(
-        "--pvdd-trim", type=int, default=0, metavar="N",
-        help=(
-            "Overlap frames trimmed from each --denoise pvdd window edge (default 0 = "
-            "reference-like non-overlapping chunks). Must be < window/2."
-        ),
-    )
-    parser.add_argument(
-        "--pvdd-noise-preset", choices=["off", "S", "M", "L"], default="M",
-        help=(
-            "Noise-level preset for the pvdd_level variants (non-blind). S/M/L map to "
-            "the reference noise-variance levels (0.00069 / 0.0022 / 0.0055); M is "
-            "default. off disables (needs --pvdd-noise-variance). Ignored by blind "
-            "variants."
-        ),
-    )
-    parser.add_argument(
-        "--pvdd-noise-variance", type=float, default=None, metavar="V",
-        help=(
-            "Explicit noise-variance value for the pvdd_level variants, overriding "
-            "--pvdd-noise-preset. This is variance (sigma^2), not sigma. Ignored by "
-            "blind variants."
-        ),
-    )
-    parser.add_argument(
-        "--pvdd-dtype", choices=["float16", "float32"], default="float16",
-        help="MLX dtype for --denoise pvdd (default float16; use float32 for parity probes).",
-    )
-    parser.add_argument(
-        "--noise-map", choices=["constant", "auto"], default="constant",
-        help=(
-            "Noise conditioning for map-driven denoisers (fastdvd, bsvd, pvdd level "
-            "variants). constant (default) = one sigma everywhere (from "
-            "--denoise-strength / --pvdd-noise-*). auto = estimate a per-pixel sigma "
-            "map from the footage itself (temporal frame-difference statistics: "
-            "texture-safe, motion-capped, smooth), so noisy shadows get denoised "
-            "harder than clean lit areas. For mc, the map replaces --mc-sigma as "
-            "the per-pixel residual-rejection scale. Ignored with a warning by "
-            "denoisers that have no map input (spatial, blind pvdd variants)."
-        ),
-    )
-    parser.add_argument(
-        "--noise-map-gain", type=float, default=1.0, metavar="G",
-        help=(
-            "Multiplier on the auto-estimated noise map (default 1.0). >1 denoises "
-            "harder everywhere while keeping the spatial shape; <1 is gentler. For "
-            "fastdvd/bsvd the gained map is clamped into the nets' trained sigma "
-            "range [5/255, 55/255] -- the same span the manual --denoise-strength "
-            "dial has -- so heavily compressed clips whose measured temporal noise "
-            "sits below the dial floor get the floor (a mild denoise) instead of a "
-            "no-op. Only used with --noise-map auto."
-        ),
-    )
-    parser.add_argument(
-        "--noise-map-debug", action="store_true",
-        help=(
-            "With --noise-map auto: after the run, write the estimated sigma map as "
-            "<output>_noisemap.png (grayscale, sigma 0..0.15 -> black..white) and "
-            "print its stats, so the estimate can be eyeballed."
-        ),
-    )
-    parser.add_argument(
-        "--noise-map-refresh", type=int, default=64, metavar="N",
-        help=(
-            "With --noise-map auto in plain streaming mode (fastdvd/bsvd without "
-            "--gop-align): re-estimate the map from the last frames every N input "
-            "frames, EMA-blended so it adapts without pumping (default 64; 0 = "
-            "estimate once from the first frames and hold). Windowed modes "
-            "(--gop-align, pvdd) re-estimate per window and ignore this."
-        ),
-    )
-    parser.add_argument(
-        "--reader", choices=["auto", "native", "ffmpeg"], default="auto",
-        help=(
-            "Video reader backend. auto (default) = the native AVFoundation reader "
-            "(zero-copy, full precision), falling back to the ffmpeg compatibility "
-            "reader when the container/codec is refused (MKV, VP9, AVI-era "
-            "material). ffmpeg = force the compatibility reader (needs PyAV: "
-            "install the 'ffmpeg' extra). native = never fall back. The ffmpeg "
-            "reader mirrors color tags, keyframe windows (--gop-align), trims, and "
-            "audio; its frame indices are self-consistent but may differ from the "
-            "native reader's by an edit-list offset on the same file."
-        ),
-    )
-    parser.add_argument(
-        "--deblock-map", choices=["constant", "auto"], default="constant",
-        help=(
-            "Spatial gating for --deblock stdf/fbcnn. constant (default) = the "
-            "correction applies everywhere at --deblock-strength. auto = estimate a "
-            "per-pixel blockiness mask from the footage (coding-grid phase detection "
-            "+ boundary-vs-interior gradient contrast; texture and 1D content edges "
-            "reject) and gate the correction by it -- blocked flats get the full "
-            "deblock, detailed/clean areas keep their texture."
-        ),
-    )
-    parser.add_argument(
-        "--deblock-map-gain", type=float, default=1.0, metavar="G",
-        help=(
-            "Multiplier on the auto blockiness mask (default 1.0). >1 saturates the "
-            "mask sooner (more area fully deblocked); <1 is more conservative. The "
-            "mask clamps at 1.0 after the gain, so the blend never extrapolates "
-            "past the deblocked frame. Only used with --deblock-map auto."
-        ),
-    )
-    parser.add_argument(
-        "--noise-map-masking", type=float, default=0.0, metavar="S",
-        help=(
-            "Perceptual masking weight for the noise map (default 0 = off; 1 = "
-            "full). Noise visibility is highest in flat regions and lowest near "
-            "edges/texture, while over-conditioning near detail reads as "
-            "softness -- so at 1.0 flat blocks get a ~1.75x suppression margin "
-            "over the measured amplitude (the visual-kill margin) and detailed "
-            "blocks are tempered to ~0.5x. Fixes the constant-beats-map case "
-            "where the map smooths hardest exactly where the eye punishes "
-            "softness most."
-        ),
-    )
-    parser.add_argument(
-        "--noise-map-motion-cap", choices=["strict", "loose", "off"], default="strict",
-        help=(
-            "How aggressively the noise map's motion cap suppresses blocks that "
-            "look motion-like. Temporal statistics cannot separate compression "
-            "flicker that persists a couple of frames (lag ratio ~1.5) from "
-            "occlusion edges (~1.41), so this is a material decision: strict "
-            "(default) = displacement-safe, right for real subject/camera "
-            "motion; loose = static-camera material, persistent flicker also "
-            "escapes the cap; off = tripod/archival footage, no cap -- the map "
-            "reports exactly what it measured."
-        ),
-    )
-    parser.add_argument(
-        "--noise-map-floor-mode", choices=["mc", "flat"], default="mc",
-        help=(
-            "Source of the motion-immune noise floor that anchors the map's "
-            "luma model on moving content. mc (default): 32px blocks are "
-            "aligned by phase correlation (subpixel) before the whitened "
-            "residual median, so the floor is read on ALL pixels -- stronger "
-            "on pans over weak texture where flat pixels are scarce or "
-            "drift-contaminated, and cheaper. flat: whitened median over "
-            "gradient-free pixels only (motion cannot flicker flat pixels); "
-            "the two agree wherever the flat set is healthy."
-        ),
-    )
-    parser.add_argument(
-        "--probe-noise", action="store_true",
-        help=(
-            "Analyze the clip's noise instead of processing it: per-block "
-            "quantile/energy/amplitude sigma statistics, flicker density and "
-            "amplitude, temporal persistence, edge/luma correlation, a "
-            "static-grain proxy, per-channel split, and the per-frame flash "
-            "trace with keyframe distances. Three sample windows across the "
-            "trim range; prints and exits."
-        ),
-    )
-    parser.add_argument(
-        "--noise-map-floor", type=float, default=0.0, metavar="S",
-        help=(
-            "Minimum sigma under the auto noise map (0..1 scale; default 0 = the "
-            "net's own trained floor, 5/255 for fastdvd/bsvd). The temporal "
-            "estimator measures FLICKERING noise only; static grain, dirt, and "
-            "structured junk do not flicker and read near zero even though "
-            "conditioning the denoiser higher visibly cleans them. The floor "
-            "guarantees a base denoise level -- the role of the manual strength "
-            "dial -- with the map's spatial and pulse adaptation applying above "
-            "it. E.g. 0.02 ~= --denoise-strength 0.005, 0.03 ~= 0.1."
-        ),
-    )
-    parser.add_argument(
-        "--noise-map-pulse", action="store_true",
-        help=(
-            "Per-frame gain on the noise conditioning that tracks GOP-phase noise "
-            "pulsing: old encoders re-code the grain at every I-frame, so temporal "
-            "noise is elevated right after keyframes and suppressed once P/B "
-            "prediction settles. Each frame's global sigma is measured against the "
-            "running settled level and the sigma plane is scaled by the ratio "
-            "(clamped 0.6..1.8), so I-frame grain refreshes get proportionally "
-            "stronger denoising. With --noise-map auto, whole-frame pulse spikes "
-            "are damped out of the base map so they are not counted twice. Works "
-            "with --noise-map constant or auto; "
-            "map-conditioned denoisers only (fastdvd, bsvd, mc, pvdd level "
-            "variants)."
-        ),
-    )
-    parser.add_argument(
+
+    add(
         "--basicvsrpp-variant",
         choices=["reds4", "vimeo90k_bi", "vimeo90k_bd", "ntire_vsr"], default="vimeo90k_bd",
         help=(
@@ -2846,7 +3163,8 @@ def main() -> None:
             "when --basicvsrpp-weights is given."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--basicvsrpp-weights", default=None, metavar="VARIANT|PATH",
         help=(
             "BasicVSR++ weights for --spatial-mode basicvsrpp: a bundled variant token "
@@ -2854,7 +3172,8 @@ def main() -> None:
             "--basicvsrpp-variant (or $BASICVSRPP_WEIGHTS)."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--basicvsrpp-window", type=int, default=14, metavar="N",
         help=(
             "Sliding-window length (frames) for --spatial-mode basicvsrpp. The "
@@ -2863,7 +3182,8 @@ def main() -> None:
             "processed whole."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--basicvsrpp-trim", type=int, default=2, metavar="N",
         help=(
             "Warm-up frames trimmed at each window join for --spatial-mode "
@@ -2871,7 +3191,8 @@ def main() -> None:
             "neighbouring window with fuller propagation context."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--basicvsrpp-ensemble", action="store_true",
         help=(
             "Run --spatial-mode basicvsrpp through the reference's 8-way geometric "
@@ -2882,7 +3203,8 @@ def main() -> None:
             "8x the compute. Off by default."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--basicvsrpp-flow-mode", choices=["spynet", "zero", "vt"], default="spynet",
         help=(
             "Optical-flow source for --spatial-mode basicvsrpp (default spynet). "
@@ -2892,14 +3214,16 @@ def main() -> None:
             "no content-shaped flow noise)."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--basicvsrpp-history-strength", type=float, default=1.0, metavar="S",
         help=(
             "Scale BasicVSR++'s aligned propagation features (default 1.0 = "
             "reference strength). 0 disables temporal propagation entirely."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--basicvsrpp-history-gate", choices=["off", "improve"], default="off",
         help=(
             "Per-pixel history admission for BasicVSR++'s propagation (default "
@@ -2910,7 +3234,8 @@ def main() -> None:
             "content optical flow cannot explain."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realbasicvsr-weights", default=None, metavar="VARIANT|PATH",
         help=(
             "RealBasicVSR weights for --spatial-mode realbasicvsr: the bundled variant "
@@ -2919,14 +3244,16 @@ def main() -> None:
             "generator_ema. --strip-prefix generator_ema."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realbasicvsr-window", type=int, default=14, metavar="N",
         help=(
             "Sliding-window length (frames) for --spatial-mode realbasicvsr "
             "(default 14). Larger = more temporal context, but more memory + compute."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realbasicvsr-trim", type=int, default=0, metavar="N",
         help=(
             "Warm-up frames trimmed at each window join for --spatial-mode "
@@ -2935,18 +3262,21 @@ def main() -> None:
             "discard boundary frames, which costs more compute."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realbasicvsr-dynamic-refine-thres", type=float, default=5.0, metavar="V",
         help=(
             "RealBasicVSR cleaning stop threshold in 0..255 units (default 5, "
             "the GAN test-time setting; 255 forces one cleaning pass)."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realbasicvsr-clean-iters", type=int, default=3, metavar="N",
         help="Maximum RealBasicVSR cleaning passes before propagation (default 3).",
     )
-    parser.add_argument(
+
+    add(
         "--realbasicvsr-residual-strength", type=float, default=1.0, metavar="V",
         help=(
             "Scale the learned RealBasicVSR residual before adding it to the 4x "
@@ -2954,7 +3284,8 @@ def main() -> None:
             "lattice artifacts on moving objects while retaining most sharpening."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realbasicvsr-flow-consistency", type=float, default=0.0, metavar="S",
         help=(
             "Forward-backward flow-consistency masking strength in 0..1 for "
@@ -2968,7 +3299,8 @@ def main() -> None:
             "for that. Try 0.7-1.0."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realbasicvsr-flow-mode", choices=["spynet", "zero", "vt"], default="spynet",
         help=(
             "Optical-flow source for --spatial-mode realbasicvsr (default spynet). "
@@ -2978,7 +3310,8 @@ def main() -> None:
             "no content-shaped flow noise)."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realbasicvsr-history-strength", type=float, default=1.0, metavar="S",
         help=(
             "Scale RealBasicVSR's propagated features before each trunk (default "
@@ -2986,7 +3319,8 @@ def main() -> None:
             "(per-frame within the cleaning + upsampler)."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realbasicvsr-history-gate", choices=["off", "improve"], default="off",
         help=(
             "Per-pixel history admission for RealBasicVSR's propagation (default "
@@ -2998,7 +3332,8 @@ def main() -> None:
             "window-start (zero history) behavior."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realesrgan-weights", default=None, metavar="VARIANT|PATH",
         help=(
             "RRDBNet/SRVGG weights for --spatial-mode realesrgan: a variant token or a "
@@ -3009,7 +3344,8 @@ def main() -> None:
             "(see videotoolbox/realesrgan/weights/README.md)."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realesrgan-denoise", type=float, default=1.0, metavar="S",
         help=(
             "Denoise dial (dni) for realesr-general-x4v3 only, 0..1 (default "
@@ -3018,7 +3354,8 @@ def main() -> None:
             "texture/grain. Needs the realesr_general_wdn_x4v3 companion weight."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realviformer-weights", default=None, metavar="VARIANT|PATH",
         help=(
             "RealViformer weights for --spatial-mode realviformer: the x4 token or a "
@@ -3028,7 +3365,8 @@ def main() -> None:
             "videotoolbox/realviformer/weights/README.md."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realviformer-dtype", choices=["float16", "float32"], default="float16",
         help=(
             "Compute/weight dtype for --spatial-mode realviformer. float16 is the "
@@ -3036,7 +3374,8 @@ def main() -> None:
             "useful when isolating recurrent-flow artifacts."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realviformer-window", type=int, default=100, metavar="N",
         help=(
             "Recurrence chunk length (frames) for --spatial-mode realviformer: the "
@@ -3048,7 +3387,8 @@ def main() -> None:
             "recurrence, deeper temporal lock than the released tool ever runs."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realviformer-flow-mode", choices=["spynet", "zero", "vt"], default="spynet",
         help=(
             "Optical-flow source for --spatial-mode realviformer (default spynet). "
@@ -3057,7 +3397,8 @@ def main() -> None:
             "VTOpticalFlow in the current-to-previous warp convention."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realviformer-history-strength", type=float, default=1.0, metavar="S",
         help=(
             "Scale RealViformer's normalized propagated-history branch before the "
@@ -3066,7 +3407,8 @@ def main() -> None:
             "1 soften temporal etching."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realviformer-history-gate", choices=["off", "improve", "holistic"], default="off",
         help=(
             "History confidence gate for --spatial-mode realviformer. off = "
@@ -3077,28 +3419,32 @@ def main() -> None:
             "confidence + risk memory, with optional hidden-state cleanup."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realviformer-history-cleanup", type=float, default=0.25, metavar="S",
         help=(
             "For --realviformer-history-gate holistic, max blend toward a 3x3 "
             "box-blurred warped hidden state in risky regions (default 0.25)."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realviformer-history-gate-drop", type=float, default=0.85, metavar="S",
         help=(
             "For --realviformer-history-gate holistic, max fraction of temporal "
             "history gate removed in risky regions (default 0.85)."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realviformer-history-risk-decay", type=float, default=0.80, metavar="S",
         help=(
             "For --realviformer-history-gate holistic, decay for the flow-warped "
             "risk memory between frames (default 0.80; must be <1)."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realviformer-history-static-cap", type=float, default=0.0, metavar="S",
         help=(
             "For --realviformer-history-gate holistic, capped confidence admitted "
@@ -3106,7 +3452,8 @@ def main() -> None:
             "tests prove a nonzero cap is safe)."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--esc-weights", default=None, metavar="VARIANT|PATH",
         help=(
             "ESC-Real weights for --spatial-mode esc: a variant token or a .safetensors "
@@ -3115,7 +3462,8 @@ def main() -> None:
             "videotoolbox/esc/weights/README.md."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realplksr-weights", default=None, metavar="VARIANT|PATH",
         help=(
             "RealPLKSR weights for --spatial-mode realplksr: a variant token or a "
@@ -3129,7 +3477,8 @@ def main() -> None:
             "see videotoolbox/realplksr/weights/README.md."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--realplksr-dtype", choices=["float16", "float32"], default="float16",
         help=(
             "Compute/storage dtype for --spatial-mode realplksr. float16 (default) "
@@ -3139,7 +3488,8 @@ def main() -> None:
             "forces a full single-precision run (slower, more memory)."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--safmn-weights", default=None, metavar="VARIANT|PATH",
         help=(
             "SAFMN weights for --spatial-mode safmn: a variant token or a .safetensors "
@@ -3158,7 +3508,8 @@ def main() -> None:
             "videotoolbox/safmn/weights/README.md."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--safmn-safm-up", choices=["auto", "nearest", "bicubic"], default="auto",
         help=(
             "SAFM upsampler inside the SAFMN blocks. auto (default) = the mode each "
@@ -3176,7 +3527,8 @@ def main() -> None:
             "corrupts the output."
         ),
     )
-    parser.add_argument(
+
+    add(
         "--safmn-pool-clamp", type=float, default=0.0, metavar="K",
         help=(
             "Winsorize SAFM pooled features to mean +/- K sigma per channel; a "
@@ -3197,59 +3549,21 @@ def main() -> None:
             "artifact at the root and do not need this."
         ),
     )
-    parser.add_argument(
-        "--mc-window", type=int, default=0, metavar="N",
+
+    # ---- Runtime And Diagnostics -------------------------------------------------
+    add(
+        "--probe-noise", action="store_true",
         help=(
-            "mc temporal structure (mutually exclusive). 0 (default) = recursive "
-            "IIR (blends the previous output; strongest denoise, longest ghosts). "
-            "N>=1 = causal FIR over the last N input frames (bounded ghost "
-            "lifetime, ~N optical-flow computes per frame)."
+            "Analyze the clip's noise instead of processing it: per-block "
+            "quantile/energy/amplitude sigma statistics, flicker density and "
+            "amplitude, temporal persistence, edge/luma correlation, a "
+            "static-grain proxy, per-channel split, and the per-frame flash "
+            "trace with keyframe distances. Three sample windows across the "
+            "trim range; prints and exits."
         ),
     )
-    parser.add_argument(
-        "--mc-sigma", type=float, default=0.06, metavar="S",
-        help=(
-            "mc residual-rejection scale (luma, 0..1; default 0.06 ~= 15/255). The "
-            "blend gate is exp(-(current-vs-history residual / sigma)^2); noise "
-            "inflates that residual, so at the default it throttles its own removal "
-            "even at --denoise-strength 1. RAISE it (e.g. 0.10-0.15) to denoise "
-            "harder when strength alone plateaus -- the real 'make it stronger' knob "
-            "for noisy footage. Cost: it also tolerates motion mismatch, so higher = "
-            "more ghosting/smearing on fast motion. With --noise-map auto this "
-            "scalar is REPLACED by the estimated per-pixel map (in residual units); "
-            "scale that with --noise-map-gain instead."
-        ),
-    )
-    parser.add_argument(
-        "--mc-clamp", action="store_true",
-        help="mc: clamp warped history to the current frame's local color box "
-             "(TAA variance-clip). The strongest single anti-ghost. Combinable.",
-    )
-    parser.add_argument(
-        "--mc-occlusion", action="store_true",
-        help="mc: reject history via forward-backward flow consistency "
-             "(occlusion / bad-flow detection). Combinable.",
-    )
-    parser.add_argument(
-        "--mc-confidence", action="store_true",
-        help="mc: down-weight history where flow magnitude is large (fast "
-             "motion). Combinable.",
-    )
-    parser.add_argument(
-        "--cut-detect", choices=["off", "simple", "hist"], default="off",
-        help=(
-            "Reset VSR's prev-frame chain at hard cuts. off = never reset "
-            "(correct for single-shot LTX latents). Only meaningful for "
-            "edited --video input under --spatial-mode balanced (which "
-            "chains prev-frame state); a no-op under fast/image modes."
-        ),
-    )
-    parser.add_argument("--cut-threshold", type=float, default=0.25)
-    parser.add_argument(
-        "--cut-log", default=None,
-        help="Write detected cut frame indices to this file (one per line).",
-    )
-    parser.add_argument(
+
+    add(
         "--video-chunk-size", type=int, default=32,
         help=(
             "Upper bound on decoded frames held in flight for --video input. "
@@ -3258,48 +3572,13 @@ def main() -> None:
             "(often 1 frame at 4K, this many at SD)."
         ),
     )
-    parser.add_argument(
-        "--start", default=None,
-        help=(
-            "Trim the input to start at this position (process the middle of a "
-            "clip). Accepts frames or time: bare integer = frames (e.g. 120), "
-            "Nf = frames (120f), Ns / decimal = seconds (5s, 1.5), or a clock "
-            "string mm:ss / hh:mm:ss (0:05, 1:02:03). --video seeks here "
-            "natively (the head is not decoded); --latent windows the decode."
-        ),
-    )
-    parser.add_argument(
-        "--end", default=None,
-        help=(
-            "Trim the input to stop before this position (exclusive), same "
-            "frames-or-time forms as --start. Output is a fresh clip starting "
-            "at PTS 0 spanning [--start, --end)."
-        ),
-    )
-    parser.add_argument(
-        "--max-frames", default=None,
-        help=(
-            "Cap the number of OUTPUT frames. Same frames-or-time forms as "
-            "--start (a time here is output duration, measured at the target "
-            "fps). Composes with --start/--end, which trim the input."
-        ),
-    )
-    parser.add_argument("--save-pre-frames", action="store_true")
-    parser.add_argument("--save-post-frames", action="store_true")
-    parser.add_argument(
-        "--skip-post-mp4", action="store_true",
-        help="Skip writing the upscaled _post.mp4 (e.g. when you only want frame dumps).",
-    )
-    parser.add_argument(
-        "--comparison", action="store_true",
-        help="Also write a side-by-side <stem>_comparison.mp4 "
-             "(NEAREST-upscaled pre vs VSR post).",
-    )
-    parser.add_argument(
+
+    add(
         "--mlx-cache-limit-gb", type=float, default=1.0,
         help="Cap MLX's buffer cache (GB) so per-frame allocation churn does not "
              "grow into swap; 0 disables. Default 1.0, matching generate.py.",
     )
+
     args = parser.parse_args()
 
     if args.latent and not args.weights:
