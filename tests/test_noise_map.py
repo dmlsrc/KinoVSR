@@ -177,16 +177,22 @@ def test_sparse_flicker_registers():
     assert med < 0.95 * amp                   # bounded below the raw amplitude
 
 
-def test_probe_classifier_flags_dense_motion_ambiguity():
+def test_probe_classifier_resolves_dense_motion_via_mc_floor():
     from LTX_2_MLX.videotoolbox.noise_map import analyze_noise
 
+    # rolling white-noise texture: statistically identical to per-frame noise
+    # for every unaligned statistic (the old classifier said "ambiguous"),
+    # but phase correlation aligns the roll away -- the MC floor resolves it
+    # as MOTION with a confidently low noise floor
     mx.random.seed(43)
     base = mx.clip(mx.random.uniform(shape=(H, W, 3)) * 0.6 + 0.2, 0, 1)
     clip = [mx.roll(base, shift=t * 3, axis=1) for t in range(T)]
-    diag = classify_noise_analysis(analyze_noise(clip))
-    assert "motion/noise ambiguous" in diag["labels"]
-    assert diag["risk"] == "high"
-    assert diag["warnings"]
+    stats = analyze_noise(clip)
+    assert stats["mc_sigma"] < 0.02
+    diag = classify_noise_analysis(stats)
+    assert "dense motion, low noise floor" in diag["labels"]
+    assert "motion/noise ambiguous" not in diag["labels"]
+    assert "dense sensor noise" not in diag["labels"]
 
 
 def test_probe_classifier_flags_source_wide_motion_contamination():
@@ -627,3 +633,18 @@ def test_mc_floor_rejects_bad_mode():
     import pytest
     with pytest.raises(ValueError):
         estimate_sigma_map(_panning_clip(0.0), floor_mode="phase")
+
+
+def test_probe_mc_floor_resolves_full_texture_pan():
+    # no flat pixels anywhere: the flat floor cannot decide, but the MC floor
+    # (the map's default) aligns the pan away -- the probe verdict must follow
+    # the shipping estimator, not just the flat diagnostic
+    clean_stats = analyze_noise(_full_texture_pan_clip(0.0))
+    noisy_stats = analyze_noise(_full_texture_pan_clip(0.05))
+    assert clean_stats["mc_sigma"] < 0.02
+    assert noisy_stats["mc_sigma"] > 0.03
+    noisy_diag = classify_noise_analysis(noisy_stats)
+    assert "dense sensor noise" in noisy_diag["labels"]
+    assert any("motion-compensated" in s for s in noisy_diag["suggestions"])
+    clean_diag = classify_noise_analysis(clean_stats)
+    assert "dense sensor noise" not in clean_diag["labels"]

@@ -956,6 +956,34 @@ def analyze_noise(frames: list, thresh: float = 2.0 / 255.0) -> dict:
     else:
         out["flat_lag21"] = 1.0
 
+    # motion-compensated floor, mirroring the sigma map's DEFAULT floor
+    # (floor_mode="mc"): probe verdicts should describe what the shipping
+    # estimator actually measures, not just the flat-pixel diagnostic
+    if H >= 32 and W >= 32 and K >= 1:
+        p1a = list(range(K))
+        p1b = list(range(1, K + 1))
+        med1p, _ = _mc_pair_medians(y, p1a, p1b)
+        P1 = int(med1p.shape[0])
+        med1b = mx.sort(mx.transpose(med1p, (1, 0)), axis=-1)[:, P1 // 2]
+        m1 = mx.sort(med1b)
+        mc_med = float(m1[int(m1.shape[0]) // 2])
+        out["mc_sigma"] = mc_med * (_CHANNEL_FROM_LUMA / 0.6745)
+        if K >= 2 and mc_med > 1e-6:
+            p2a = list(range(K - 1))
+            p2b = list(range(2, K + 1))
+            med2p, _ = _mc_pair_medians(y, p2a, p2b)
+            P2 = int(med2p.shape[0])
+            med2b = mx.sort(mx.transpose(med2p, (1, 0)), axis=-1)[:, P2 // 2]
+            rr = sorted(float(b) / max(float(a), 1e-6)
+                        for a, b in zip(med1b.tolist(), med2b.tolist(), strict=True)
+                        if float(a) >= 2.0 / 255.0)
+            out["mc_lag21"] = rr[len(rr) // 2] if rr else 1.0
+        else:
+            out["mc_lag21"] = 1.0
+    else:
+        out["mc_sigma"] = 0.0
+        out["mc_lag21"] = 1.0
+
     # per-frame flash trace (whole-frame RMS sigma per diff)
     tr = [float(mx.sqrt(mx.mean(d[i] * d[i]))) * _CHANNEL_FROM_LUMA for i in range(K)]
     out["frame_trace"] = tr
@@ -1059,6 +1087,9 @@ def classify_noise_analysis(stats: dict) -> dict:
     flat_corr = float(stats.get("flat_diff_corr", 0.0))
     flat_trusted = (float(stats.get("flat_thr", 1.0)) <= 0.045
                     and flat_sigma <= 0.120)
+    mc_sigma = float(stats.get("mc_sigma", 0.0))
+    mc_lag21 = float(stats.get("mc_lag21", 1.0))
+    mc_trusted = 0.0 < mc_sigma <= 0.120
     row_coherence = float(stats.get("row_coherence", 0.0))
     row_periodicity = float(stats.get("row_periodicity", 0.0))
     row_period_px = float(stats.get("row_period_px", 0.0))
@@ -1097,15 +1128,24 @@ def classify_noise_analysis(stats: dict) -> dict:
             suggestions.append("compare against a reencode-only baseline or manual constant denoise")
     if static <= 0.06 and dens_p90 >= 0.55 and tail5_p90 >= 0.045:
         labels.append("dense temporal change")
-        if flat_trusted and flat_sigma >= 0.030 and flat_lag21 <= 1.30:
-            # motion cannot flicker flat pixels (and the flat set's own lag
-            # ratio confirms it is not drifting weak texture): the dense
-            # change is real noise, not texture motion
+        mc_says_noise = mc_trusted and mc_sigma >= 0.030 and mc_lag21 <= 1.35
+        flat_says_noise = flat_trusted and flat_sigma >= 0.030 and flat_lag21 <= 1.30
+        if mc_says_noise or flat_says_noise:
+            # the MC floor aligns each pair before measuring, so it reads the
+            # noise level on all pixels (matches the map's default floor);
+            # the flat floor is the aperture-gated second opinion
             labels.append("dense sensor noise")
-            suggestions.append("--noise-map auto should track this; the flat-pixel floor anchors the map")
+            suggestions.append("--noise-map auto should track this; the "
+                               + ("motion-compensated" if mc_says_noise else "flat-pixel")
+                               + " floor anchors the map")
+        elif mc_trusted and mc_sigma < 0.020 and mc_lag21 <= 1.35:
+            # the MC floor aligned the change away: dense MOTION with a
+            # confidently low noise floor -- resolved, not ambiguous
+            labels.append("dense motion, low noise floor")
+            suggestions.append("auto map stays conservative here; heavy denoising would eat texture")
         elif edge < 1.8 and lag <= 1.30 and (
             not flat_trusted or flat_sigma < 0.020 or flat_lag21 > 1.30
-        ):
+        ) and (not mc_trusted or mc_sigma < 0.020 or mc_lag21 > 1.35):
             labels.append("motion/noise ambiguous")
             warnings.append("dense texture motion can look like dense noise; strict auto maps may over-condition")
             suggestions.append("compare the debug noise map against a constant/manual denoise run")
@@ -1136,6 +1176,8 @@ def classify_noise_analysis(stats: dict) -> dict:
             "flat_sigma": flat_sigma,
             "flat_lag21": flat_lag21,
             "flat_diff_corr": flat_corr,
+            "mc_sigma": mc_sigma,
+            "mc_lag21": mc_lag21,
             "static_fraction": static,
             "static_spatial_hf": static_hf,
             "row_coherence": row_coherence,

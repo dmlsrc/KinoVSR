@@ -998,11 +998,13 @@ def run(args: argparse.Namespace) -> None:
                   f"static-spatial-hf {r['static_spatial_hf']:.4f}   "
                   f"row-period {r.get('row_periodicity', 0.0):.2f}@"
                   f"{r.get('row_period_px', 0.0):.0f}px")
-            print(f"  flat floor: sigma {r.get('flat_sigma', 0.0):.4f}   "
-                  f"lag2/lag1 {r.get('flat_lag21', 1.0):.2f}   "
+            print(f"  noise floor: mc sigma {r.get('mc_sigma', 0.0):.4f} "
+                  f"lag {r.get('mc_lag21', 1.0):.2f}   |   "
+                  f"flat sigma {r.get('flat_sigma', 0.0):.4f} "
+                  f"lag {r.get('flat_lag21', 1.0):.2f} "
                   f"diff-corr {r.get('flat_diff_corr', 0.0):.2f}   "
-                  f"(whitened noise level where motion cannot reach; "
-                  f"lag ~1 + high sigma = dense real noise)")
+                  f"(mc = the map's default floor: aligned-residual noise on "
+                  f"all pixels; lag ~1 + sigma >= 0.03 = dense real noise)")
             print(f"  channels: R {r['sigma_R']:.4f}  G {r['sigma_G']:.4f}  B {r['sigma_B']:.4f}")
             print(f"  verdict: {', '.join(diag['labels'])}  risk={diag['risk']}")
             for _msg in diag["warnings"][:2]:
