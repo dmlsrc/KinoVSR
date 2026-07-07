@@ -1151,6 +1151,10 @@ def run(args: argparse.Namespace) -> None:
     restorer: Any = None   # BasicVSR++ 1x recurrent restoration when --restore set
     deflicker_stage: Any = None  # static-state deflicker when --deflicker on
 
+    def _den_members(d: Any) -> list:
+        """The denoise slot as a list: None, a single denoiser, or a chain."""
+        return [] if d is None else (d if isinstance(d, list) else [d])
+
     def _build_post_pipeline() -> tuple[
         VsrSession, VtfrcSession | None, AVWriter | None, AVWriter | None,
         Any, Any, Any, Any, Any, Any
@@ -1228,16 +1232,30 @@ def run(args: argparse.Namespace) -> None:
         # per-frame gain (GOP-phase noise pulsing) on the same conditioning.
         nm_tracker: Any = None
         nm_pulse: Any = None
-        _map_capable = (args.denoise in ("fastdvd", "bsvd", "mc")
-                        or (args.denoise == "pvdd" and "level" in args.pvdd_variant))
+        _den_names = ([] if args.denoise == "off" else
+                      [s.strip() for s in str(args.denoise).split(",")
+                       if s.strip() and s.strip() != "off"])
+        _den_known = {"spatial", "mc", "fastdvd", "bsvd", "pvdd"}
+        _den_bad = [n for n in _den_names if n not in _den_known]
+        if _den_bad:
+            raise SystemExit(f"--denoise: unknown stage(s) {_den_bad}; "
+                             f"choose from {sorted(_den_known)} (comma-chain to "
+                             f"run several in order, e.g. mc,bsvd)")
+        _den_str = [s.strip() for s in str(args.denoise_strength).split(",")]
+        if len(_den_str) == 1:
+            _den_str = _den_str * max(1, len(_den_names))
+        if _den_names and len(_den_str) != len(_den_names):
+            raise SystemExit("--denoise-strength: give one value or exactly one "
+                             "per chained --denoise stage")
+        _den_strengths = [float(s) for s in _den_str]
+
+        def _stage_map_capable(n: str) -> bool:
+            return (n in ("fastdvd", "bsvd", "mc")
+                    or (n == "pvdd" and "level" in args.pvdd_variant))
+
+        _map_capable = any(_stage_map_capable(n) for n in _den_names)
         if args.noise_map == "auto":
             if _map_capable:
-                from LTX_2_MLX.videotoolbox.noise_map import NoiseMapTracker
-                nm_tracker = NoiseMapTracker(gain=args.noise_map_gain,
-                                             motion_cap=args.noise_map_motion_cap,
-                                             masking=args.noise_map_masking,
-                                             pulse_robust=args.noise_map_pulse,
-                                             floor_mode=args.noise_map_floor_mode)
                 _floor_note = (f", floor {args.noise_map_floor:g}"
                                if args.noise_map_floor > 0 else "")
                 print(f"[noise-map] auto: per-pixel sigma estimated from the footage "
@@ -1245,58 +1263,89 @@ def run(args: argparse.Namespace) -> None:
                       f"floor-mode {args.noise_map_floor_mode})")
             elif args.denoise != "off":
                 why = ("blind PVDD variant (use --pvdd-variant pvdd_level)"
-                       if args.denoise == "pvdd" else f"--denoise {args.denoise} has no map input")
+                       if "pvdd" in _den_names else f"--denoise {args.denoise} has no map input")
                 print(f"[noise-map] auto ignored: {why}")
         if args.noise_map_pulse:
             if _map_capable:
-                from LTX_2_MLX.videotoolbox.noise_map import PulseGain
-                nm_pulse = PulseGain()
                 print("[noise-map] pulse: per-frame gain tracking GOP-phase noise "
                       "(I-frame grain refresh)")
             elif args.denoise != "off":
                 print("[noise-map] pulse ignored: needs a map-conditioned denoiser "
                       "(fastdvd, bsvd, mc, or a pvdd level variant)")
 
+        def _make_tracker(n: str) -> tuple:
+            # one tracker/pulse pair PER map-capable stage: the trackers keep
+            # rolling frame state, so sharing one across chained denoisers
+            # would double-feed it
+            tr = pu = None
+            if _stage_map_capable(n):
+                if args.noise_map == "auto":
+                    from LTX_2_MLX.videotoolbox.noise_map import NoiseMapTracker
+                    tr = NoiseMapTracker(gain=args.noise_map_gain,
+                                         motion_cap=args.noise_map_motion_cap,
+                                         masking=args.noise_map_masking,
+                                         pulse_robust=args.noise_map_pulse,
+                                         floor_mode=args.noise_map_floor_mode)
+                if args.noise_map_pulse:
+                    from LTX_2_MLX.videotoolbox.noise_map import PulseGain
+                    pu = PulseGain()
+            return tr, pu
+
+        def _make_denoiser(name: str, stg: float) -> Any:
+            nonlocal nm_tracker, nm_pulse
+            tr, pu = _make_tracker(name)
+            if tr is not None:
+                nm_tracker = tr          # last one wins for the debug report
+            if pu is not None:
+                nm_pulse = pu
+            if name == "spatial":
+                return SpatialDenoiser(strength=stg)
+            if name == "mc":
+                return McTemporalDenoiser(
+                    in_w, in_h, strength=stg,
+                    window=args.mc_window, clamp=args.mc_clamp,
+                    occlusion=args.mc_occlusion, confidence=args.mc_confidence,
+                    sigma=args.mc_sigma, gate=args.mc_gate,
+                    noise_map=tr,
+                    map_refresh=args.noise_map_refresh,
+                    pulse=pu,
+                    map_floor=args.noise_map_floor,
+                )
+            if name == "fastdvd":
+                # Weights ship with the package; --fastdvd-variant picks one, or
+                # --fastdvd-weights / $FASTDVD_WEIGHTS overrides the path entirely.
+                return FastDvdDenoiser(
+                    args.fastdvd_weights or os.environ.get("FASTDVD_WEIGHTS"),
+                    variant=args.fastdvd_variant,
+                    strength=stg,
+                    noise_map=tr,
+                    map_refresh=args.noise_map_refresh,
+                    pulse=pu,
+                    map_floor=args.noise_map_floor,
+                )
+            if name == "bsvd":
+                # BSVD weights are not bundled; --bsvd-variant picks a local token,
+                # or --bsvd-weights / $BSVD_WEIGHTS overrides the path entirely.
+                return BsvdDenoiser(
+                    args.bsvd_weights or os.environ.get("BSVD_WEIGHTS"),
+                    variant=args.bsvd_variant,
+                    strength=stg,
+                    dtype=parse_mlx_dtype_name(args.bsvd_dtype),
+                    noise_map=tr,
+                    map_refresh=args.noise_map_refresh,
+                    pulse=pu,
+                    map_floor=args.noise_map_floor,
+                )
+            raise AssertionError(name)
+
         den: Any = None
-        if args.denoise == "spatial":
-            den = SpatialDenoiser(strength=args.denoise_strength)
-        elif args.denoise == "mc":
-            den = McTemporalDenoiser(
-                in_w, in_h, strength=args.denoise_strength,
-                window=args.mc_window, clamp=args.mc_clamp,
-                occlusion=args.mc_occlusion, confidence=args.mc_confidence,
-                sigma=args.mc_sigma,
-                noise_map=nm_tracker,
-                map_refresh=args.noise_map_refresh,
-                pulse=nm_pulse,
-                map_floor=args.noise_map_floor,
-            )
-        elif args.denoise == "fastdvd":
-            # Weights ship with the package; --fastdvd-variant picks one, or
-            # --fastdvd-weights / $FASTDVD_WEIGHTS overrides the path entirely.
-            den = FastDvdDenoiser(
-                args.fastdvd_weights or os.environ.get("FASTDVD_WEIGHTS"),
-                variant=args.fastdvd_variant,
-                strength=args.denoise_strength,
-                noise_map=nm_tracker,
-                map_refresh=args.noise_map_refresh,
-                pulse=nm_pulse,
-                map_floor=args.noise_map_floor,
-            )
-        elif args.denoise == "bsvd":
-            # BSVD weights are not bundled; --bsvd-variant picks a local token,
-            # or --bsvd-weights / $BSVD_WEIGHTS overrides the path entirely.
-            den = BsvdDenoiser(
-                args.bsvd_weights or os.environ.get("BSVD_WEIGHTS"),
-                variant=args.bsvd_variant,
-                strength=args.denoise_strength,
-                dtype=parse_mlx_dtype_name(args.bsvd_dtype),
-                noise_map=nm_tracker,
-                map_refresh=args.noise_map_refresh,
-                pulse=nm_pulse,
-                map_floor=args.noise_map_floor,
-            )
-        elif args.denoise == "pvdd":
+        _dens: list = []
+        for _dn, _ds in zip(_den_names, _den_strengths):
+            if _dn != "pvdd":
+                _dens.append(_make_denoiser(_dn, _ds))
+                continue
+            _dens.append(None)           # placeholder, built below
+        if "pvdd" in _den_names:
             # PVDD weights are not bundled; --pvdd-variant picks a local token, or
             # --pvdd-weights / $PVDD_WEIGHTS overrides the path. The `level`
             # variants take a noise-variance dial (--pvdd-noise-preset/-variance);
@@ -1306,21 +1355,31 @@ def run(args: argparse.Namespace) -> None:
             nv = args.pvdd_noise_variance
             if nv is None and args.pvdd_noise_preset != "off":
                 nv = LEVEL_PRESETS[args.pvdd_noise_preset]
-            den = PvddDenoiser(
+            _ptr, _ppu = _make_tracker("pvdd")
+            if _ptr is not None:
+                nm_tracker = _ptr
+            if _ppu is not None:
+                nm_pulse = _ppu
+            _dens[_den_names.index("pvdd")] = PvddDenoiser(
                 args.pvdd_weights or os.environ.get("PVDD_WEIGHTS"),
                 variant=args.pvdd_variant,
                 window=args.pvdd_window, trim=args.pvdd_trim,
                 noise_variance=nv,
                 dtype=parse_mlx_dtype_name(args.pvdd_dtype),
-                noise_map=nm_tracker,
-                pulse=nm_pulse,
+                noise_map=_ptr,
+                pulse=_ppu,
             )
 
-        if den is not None and (args.denoise_luma_strength != 1.0
-                                or args.denoise_chroma_strength != 1.0):
+        if _dens and (args.denoise_luma_strength != 1.0
+                      or args.denoise_chroma_strength != 1.0):
             kr, kb = _yuv.coef_for_matrix(_resolved_color[2])    # match the source color matrix
-            den = LumaChromaDenoiser(den, args.denoise_luma_strength,
-                                     args.denoise_chroma_strength, kr=kr, kb=kb)
+            _dens = [LumaChromaDenoiser(_d, args.denoise_luma_strength,
+                                        args.denoise_chroma_strength, kr=kr, kb=kb)
+                     for _d in _dens]
+        if len(_den_names) > 1:
+            print(f"[denoise] chain: {' -> '.join(_den_names)} "
+                  f"(strengths {', '.join(f'{s:g}' for s in _den_strengths)})")
+        den = (_dens if len(_dens) > 1 else (_dens[0] if _dens else None))
 
         # --deblock-map auto: a per-pixel blockiness mask (grid-phase detected,
         # boundary-vs-interior contrast) gating the deblocker's correction, so
@@ -1348,12 +1407,14 @@ def run(args: argparse.Namespace) -> None:
                                         strength=args.deflicker_strength,
                                         frac=args.deflicker_frac,
                                         max_fix=args.deflicker_max_fix,
-                                        jitter=(args.deflicker_jitter == "on"))
+                                        jitter=(args.deflicker_jitter == "on"),
+                                        flow_reclaim=(args.deflicker_flow == "on"))
             _jit = ", jitter-compensated" if args.deflicker_jitter == "on" else ""
+            _flw = ", flow-reclaim" if args.deflicker_flow == "on" else ""
             print(f"[deflicker] static-state integration: window +/-"
                   f"{args.deflicker_window}, band {args.deflicker_band:g}, "
                   f"frac {args.deflicker_frac:g}, max-fix "
-                  f"{args.deflicker_max_fix:g}{_jit} (verified-static only; "
+                  f"{args.deflicker_max_fix:g}{_jit}{_flw} (verified-static only; "
                   f"untouched pixels pass through bit-identical)")
 
         deb: Any = None
@@ -1673,7 +1734,7 @@ def run(args: argparse.Namespace) -> None:
         --preprocess-order sets the full explicit order (any enabled stage omitted from it
         is appended in the default order). Only enabled (non-None) stages run."""
         by_name = {"restore": restorer, "deflicker": deflicker_stage, "deblock": deblocker,
-                   "denoise": denoiser, "nafnet": nafnet}
+                   "denoise": denoiser, "nafnet": nafnet}   # denoise may be a chain (list)
         if args.preprocess_order:
             order = list(args.preprocess_order)
         else:
@@ -1765,7 +1826,7 @@ def run(args: argparse.Namespace) -> None:
                 # Per-frame stages lack the method and are skipped.
                 if gop_schedule is not None:
                     for _st in [*(restorer or []),
-                                *([denoiser] if denoiser is not None else []),
+                                *_den_members(denoiser),
                                 *([upscaler] if upscaler is not None else [])]:
                         if hasattr(_st, "set_schedule"):
                             _st.set_schedule(gop_schedule)
@@ -1824,7 +1885,7 @@ def run(args: argparse.Namespace) -> None:
                         # lookahead stage's window bridges the cut.
                         if (deblocker is not None or deflicker_stage is not None
                                 or restorer is not None
-                                or (denoiser is not None and hasattr(denoiser, "flush"))):
+                                or any(hasattr(_d, "flush") for _d in _den_members(denoiser))):
                             for d_rgb, (d_sf, d_sa) in _preprocess_flush():
                                 _emit_scaled(d_rgb, d_sf, d_sa)
                         if upscaler is not None:
@@ -1833,8 +1894,8 @@ def run(args: argparse.Namespace) -> None:
                         session.reset_temporal_context()
                         if deblocker is not None:
                             deblocker.reset()
-                        if denoiser is not None:
-                            denoiser.reset()
+                        for _d in _den_members(denoiser):
+                            _d.reset()
                         if deflicker_stage is not None:
                             deflicker_stage.reset()
                         if nafnet is not None:
@@ -1896,7 +1957,7 @@ def run(args: argparse.Namespace) -> None:
         # Drain any frames a lookahead preprocessor still holds.
         if (deblocker is not None or restorer is not None
                 or deflicker_stage is not None
-                or (denoiser is not None and hasattr(denoiser, "flush"))) and session is not None:
+                or any(hasattr(_d, "flush") for _d in _den_members(denoiser))) and session is not None:
             for d_rgb, (d_sf, d_sa) in _preprocess_flush():
                 if max_frames is not None and appended >= max_frames:
                     break
@@ -1928,12 +1989,14 @@ def run(args: argparse.Namespace) -> None:
             vtfrc.close()
         if session is not None:
             session.close()
-        if denoiser is not None:
-            denoiser.close()
+        for _d in _den_members(denoiser):
+            _d.close()
         if deflicker_stage is not None:
             _dst = deflicker_stage.stats()
             _jit = (f", compensated jitter avg {_dst['jitter_px']:.2f}px"
                     if _dst["jitter_px"] else "")
+            _jit += (f", flow-reclaimed {_dst['reclaimed'] * 100:.1f}%"
+                     if _dst.get("reclaimed") else "")
             print(f"[deflicker] run avg: static-verified "
                   f"{_dst['verified'] * 100:.1f}% of pixels, oscillatory "
                   f"{_dst['oscillatory'] * 100:.1f}%, fired "
@@ -1974,20 +2037,32 @@ def run(args: argparse.Namespace) -> None:
                     _u8 = (mx.clip(_bm[:, :, 0], 0, 1) * 255).astype(mx.uint8)
                     save_image(mx.stack([_u8, _u8, _u8], axis=-1), _png)
                     print(f"[deblock-map] mask written: {_png}")
-        if denoiser is not None and args.noise_map_pulse:
-            _pl = getattr(denoiser, "_pulse_log", None)
-            if _pl is None:
-                _pl = getattr(getattr(denoiser, "_base", None), "_pulse_log", None)
+        _den_dbg = _den_members(denoiser)
+        if _den_dbg and args.noise_map_pulse:
+            _pl = None
+            for _d in _den_dbg:
+                _pl = (getattr(_d, "_pulse_log", None)
+                       or getattr(getattr(_d, "_base", None), "_pulse_log", None))
+                if _pl:
+                    break
             if _pl:
                 _ps = sorted(_pl)
                 print(f"[noise-map] pulse gain over {len(_ps)} frames: "
                       f"min {_ps[0]:.2f}  median {_ps[len(_ps) // 2]:.2f}  "
                       f"max {_ps[-1]:.2f}  ({sum(1 for g in _ps if g > 1.2)} frames > 1.2)")
-        if denoiser is not None and args.noise_map == "auto":
-            # surface the estimated map (unwrap the luma/chroma splitter if present)
-            _nm_src = getattr(denoiser, "last_noise_map", None)
-            if _nm_src is None:
-                _nm_src = getattr(getattr(denoiser, "_base", None), "last_noise_map", None)
+        if _den_dbg and args.noise_map == "auto":
+            # surface the estimated map (unwrap the luma/chroma splitter if
+            # present; in a chain, report the first member that has one)
+            _nm_src = None
+            _nm_holder = None
+            for _d in _den_dbg:
+                _nm_src = getattr(_d, "last_noise_map", None)
+                _nm_holder = _d
+                if _nm_src is None:
+                    _nm_src = getattr(getattr(_d, "_base", None), "last_noise_map", None)
+                    _nm_holder = getattr(_d, "_base", None) if _nm_src is not None else _nm_holder
+                if _nm_src is not None:
+                    break
             if _nm_src is not None:
                 _s = mx.sort(_nm_src.reshape(-1))
                 _n = _s.shape[0]
@@ -1996,7 +2071,7 @@ def run(args: argparse.Namespace) -> None:
                       f"max {float(_s[-1]):.4f}")
                 # what the net actually receives: the estimate clamped into the
                 # consumer's conditioning bounds (trained range and/or user floor)
-                _dsrc = denoiser if hasattr(denoiser, "_map_floor") else getattr(denoiser, "_base", None)
+                _dsrc = _nm_holder if hasattr(_nm_holder, "_map_floor") else getattr(_nm_holder, "_base", None)
                 _lo = max(float(getattr(_dsrc, "SIGMA_MIN", 0.0) or 0.0),
                           float(getattr(_dsrc, "_map_floor", 0.0) or 0.0))
                 _hi = float(getattr(_dsrc, "SIGMA_MAX", 0.0) or 0.0)
@@ -2647,6 +2722,25 @@ def main() -> None:
     )
 
     add(
+        "--deflicker-flow", choices=["off", "on"], default="off",
+        help=(
+            "Per-pixel stillness reclaim via VideoToolbox optical flow "
+            "(Quality tier, startup self-test). Tile verification is "
+            "32px-coarse, so one small mover invalidates a 16-48px ring of "
+            "genuinely still pixels around it -- exactly where mosquito "
+            "churn lives. Flow between adjacent frames gives each pixel a "
+            "motion path; pixels whose accumulated path stays under 0.5px "
+            "are verified still even inside a failed tile (accumulated "
+            "magnitudes cannot cancel, so return trips count as motion -- "
+            "conservative). Only ADDS validity; tile verdicts are never "
+            "downgraded. Measured trade: most of the halo flicker kill for "
+            "~0.15 dB fidelity (slow sub-noise-floor drift gets "
+            "integrated) -- leave off for fidelity-first runs. One flow "
+            "eval per frame (~17 ms)."
+        ),
+    )
+
+    add(
         "--deflicker-jitter", choices=["off", "on"], default="off",
         help=(
             "Compensate global camera micro-jitter before static "
@@ -2859,10 +2953,14 @@ def main() -> None:
 
     # ---- Denoise And Noise Maps --------------------------------------------------
     add(
-        "--denoise", choices=["off", "spatial", "mc", "fastdvd", "bsvd", "pvdd"], default="off",
+        "--denoise", default="off", metavar="NAME[,NAME...]",
         help=(
             "Pre-upscale denoise, applied at native resolution before VSR (the "
-            "correct order - SR amplifies noise). off (default); spatial = "
+            "correct order - SR amplifies noise). Comma-chain to run several in "
+            "order at low strengths (e.g. mc,bsvd: mc's flow-warped temporal "
+            "average and bsvd's learned prior remove DIFFERENT noise kinds; the "
+            "chain runs left to right, each stage feeding the next). off "
+            "(default); spatial = "
             "per-frame CoreImage CINoiseReduction (cheap, no temporal state); "
             "mc = motion-compensated temporal denoise via VideoToolbox optical "
             "flow (Quality tier plus startup self-test; recursive, GPU; averages "
@@ -2879,9 +2977,11 @@ def main() -> None:
     )
 
     add(
-        "--denoise-strength", type=float, default=0.5,
+        "--denoise-strength", default="0.5", metavar="S[,S...]",
         help=(
-            "Denoise strength 0..1 (default 0.5). For mc, the max temporal blend "
+            "Denoise strength 0..1 (default 0.5); with a chained --denoise, give "
+            "one value per stage (comma list) or one value for all. For mc, the "
+            "max temporal blend "
             "toward motion-compensated history; for spatial, the noise level; for "
             "fastdvd/bsvd, the noise sigma (mapped onto sigma_255 in [5, 55]). "
             "With --noise-map auto the estimated map REPLACES this constant "
@@ -3146,6 +3246,20 @@ def main() -> None:
             "IIR (blends the previous output; strongest denoise, longest ghosts). "
             "N>=1 = causal FIR over the last N input frames (bounded ghost "
             "lifetime, ~N optical-flow computes per frame)."
+        ),
+    )
+
+    add(
+        "--mc-gate", choices=["smooth", "curr"], default="smooth",
+        help=(
+            "What mc measures each reference's residual against. smooth "
+            "(default): a 3x3 box mean of the current frame, gate width "
+            "recalibrated to match -- the anchor's own noise stops randomly "
+            "opening/closing the gate per pixel, measured +0.2..+0.5 dB on "
+            "ground truth with ghost rejection intact. curr: legacy, the raw "
+            "current frame. (Gating against the warped-reference consensus "
+            "was tried and REFUTED: flow-warp errors correlate across "
+            "references, so in occlusion regions the consensus IS the ghost.)"
         ),
     )
 

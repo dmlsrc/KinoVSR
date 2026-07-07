@@ -205,6 +205,47 @@ def test_pan_stays_passthrough_with_jitter_on():
         assert float(mx.max(mx.abs(outs[t] - clip[t]))) < 1e-6
 
 
+def test_flow_reclaim_fixes_halo_around_mover():
+    # a mover invalidates every covering 32px tile, leaving a still,
+    # flickering halo untreated; per-pixel flow paths reclaim it. The
+    # mover itself stays bit-identical (its path is huge), and pixels it
+    # occludes are protected: pairs spanning the occlusion accumulate the
+    # mover's own motion.
+    import pytest
+    mx.random.seed(31)
+    base = _base()
+    d = 0.02 * (1.0 + _blocky((H, W)))
+    clip = []
+    boxes = []
+    for t_i in range(T):
+        f = mx.clip(base + (d if (t_i // 3) % 2 == 0 else -d), 0, 1)
+        x0 = 8 + 3 * t_i
+        yy = mx.arange(H).reshape(H, 1, 1)
+        xx = mx.arange(W).reshape(1, W, 1)
+        sq = ((yy >= 84) & (yy < 108) & (xx >= x0) & (xx < x0 + 24)).astype(mx.float32)
+        clip.append(mx.clip(f * (1 - sq) + 0.9 * sq, 0, 1))
+        boxes.append((84, 108, x0, x0 + 24))
+    try:
+        outs_on = _run(clip, flow_reclaim=True)
+    except RuntimeError as e:
+        pytest.skip(f"VT optical flow unavailable: {e}")
+    outs_off = _run(clip)
+    # halo: rows the mover's tiles cover but the mover never occupies
+    halo = (slice(56, 80), slice(8, 128))
+    lo, hi = 8, T - 8
+    err_off = sum(float(mx.mean(mx.abs(outs_off[t][halo] - base[halo])))
+                  for t in range(lo, hi))
+    err_on = sum(float(mx.mean(mx.abs(outs_on[t][halo] - base[halo])))
+                 for t in range(lo, hi))
+    assert err_on < 0.6 * err_off, (err_on, err_off)
+    # the mover itself is never touched
+    for t_i in range(T):
+        y0, y1, x0, x1 = boxes[t_i]
+        d_m = float(mx.max(mx.abs(outs_on[t_i][y0:y1, x0:x1]
+                                  - clip[t_i][y0:y1, x0:x1])))
+        assert d_m < 1e-6, f"mover altered by {d_m} at t={t_i}"
+
+
 def test_nonmultiple16_margin_passes_through():
     # frames not a multiple of 16: the bottom/right remainder margin has no
     # validity grid and must never fire

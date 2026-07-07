@@ -67,7 +67,8 @@ class StaticStateDeflicker:
                  frac: float = 0.5, max_fix: float = 0.25,
                  tau: float = 0.75, min_valid: int = 6,
                  strength: float = 1.0, jitter: bool = False,
-                 jitter_max: float = 3.0):
+                 jitter_max: float = 3.0, flow_reclaim: bool = False,
+                 flow_tau: float = 0.5):
         # window: +/-K frames integrated (latency = K).
         # band: luma half-width around the window median that counts as the
         #   same quantization-state cluster; the reference regime's state
@@ -97,6 +98,27 @@ class StaticStateDeflicker:
         self._strength = float(strength)
         self._jitter = bool(jitter)
         self._jitter_max = float(jitter_max)
+        # flow_reclaim: per-pixel stillness reclaim for the unverified halo
+        # around movers. Tile verification is 32px-coarse: one small mover
+        # invalidates every covering tile, leaving a 16-48px ring of
+        # genuinely still pixels untreated -- exactly where mosquito churn
+        # lives. VT optical flow between ADJACENT buffered frames gives a
+        # per-pixel motion path; its accumulated magnitude bounds the
+        # displacement of any pair, so a pixel whose path between t and j
+        # stays under flow_tau is verified still even inside a failed
+        # tile. Accumulation cannot cancel (magnitudes), so return trips
+        # count as motion -- conservative by construction. Reclaim only
+        # ever ADDS validity; tile verdicts are never overridden downward.
+        # Measured trade on the crushed fixtures (deadzone 0.05, tau 0.5):
+        # most of the halo flicker kill for about -0.15 dB fidelity from
+        # slow sub-deadzone drift being integrated; a fidelity-first run
+        # should leave this off.
+        # The engine self-test raises up front on the silent-zero VT flow
+        # failure (trusting silent zeros would reclaim moving pixels).
+        self._flow_reclaim = bool(flow_reclaim)
+        self._flow_tau = float(flow_tau)
+        self._flow_deadzone = 0.05       # sub-noise-floor flow ignored
+        self._flow_engine: Any = None
         self.last_fix_fraction = 0.0     # fraction of pixels touched (debug)
         # gate attribution (run averages); lives OUTSIDE _reset_state so it
         # survives flush() and cut-boundary resets -- it describes the run,
@@ -108,6 +130,8 @@ class StaticStateDeflicker:
         self._stat_applied = 0.0
         self._stat_jit_px = 0.0
         self._stat_jit_pairs = 0
+        self._stat_reclaim = 0.0
+        self._stat_reclaim_pairs = 0
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -116,6 +140,7 @@ class StaticStateDeflicker:
         self._received = 0
         self._emitted = 0
         self._masks: dict = {}           # {(lo, hi): (H,W) static mask}
+        self._cums: dict = {}            # {index: (H,W) accumulated |flow| px}
 
     def reset(self) -> None:
         self._reset_state()
@@ -140,10 +165,14 @@ class StaticStateDeflicker:
                 "oscillatory": self._stat_osc / n,
                 "applied": self._stat_applied / n,
                 "jitter_px": (self._stat_jit_px / self._stat_jit_pairs
-                              if self._stat_jit_pairs else 0.0)}
+                              if self._stat_jit_pairs else 0.0),
+                "reclaimed": (self._stat_reclaim / self._stat_reclaim_pairs
+                              if self._stat_reclaim_pairs else 0.0)}
 
     def close(self) -> None:
-        pass
+        if self._flow_engine is not None:
+            self._flow_engine.close()
+            self._flow_engine = None
 
     # ---- static verification ---------------------------------------------
 
@@ -273,6 +302,12 @@ class StaticStateDeflicker:
                 Vs.append(mx.ones(cur_l.shape, dtype=mx.float32))
                 continue
             m, gy, gx = self._pair_mask(t, j)
+            if self._flow_reclaim:
+                path = mx.abs(self._cums[j] - self._cums[t])
+                still = (path < self._flow_tau).astype(mx.float32)
+                self._stat_reclaim += float(mx.mean(mx.maximum(still - m, 0.0)))
+                self._stat_reclaim_pairs += 1
+                m = mx.maximum(m, still)
             if gy or gx:
                 # cached shift aligns the higher-index frame onto the lower
                 sgn = 1.0 if j > t else -1.0
@@ -370,11 +405,31 @@ class StaticStateDeflicker:
             self._base += 1
         gone = self._base
         self._masks = {k: v for k, v in self._masks.items() if k[0] >= gone}
+        self._cums = {k: v for k, v in self._cums.items() if k >= gone}
         return out, tok
 
     def feed(self, rgb: Any, token: Any = None) -> list:
         a = rgb[0] if rgb.ndim == 4 else rgb
         a = mx.clip(a[..., :3].astype(mx.float32), 0.0, 1.0)
+        if self._flow_reclaim:
+            r = self._received
+            if r == 0:
+                cum = mx.zeros(a.shape[:2], dtype=mx.float32)
+            else:
+                if self._flow_engine is None:
+                    from .flow import VtFlowEngine
+                    self._flow_engine = VtFlowEngine(int(a.shape[1]),
+                                                     int(a.shape[0]))
+                prev = self._buf[-1][0]
+                f = self._flow_engine.flow(prev, a)
+                mag = mx.sqrt(f[..., 0] ** 2 + f[..., 1] ** 2 + 1e-12)
+                # deadzone the sub-0.1px flow noise floor (codec flicker
+                # induces spurious micro-flow that would otherwise
+                # accumulate into long-window paths and starve the
+                # reclaim); real motion clears it every frame
+                cum = self._cums[r - 1] + mx.maximum(mag - self._flow_deadzone, 0.0)
+            mx.eval(cum)
+            self._cums[r] = cum
         self._buf.append((a, _to_luma_2d(a), token))
         self._received += 1
         last = self._received - 1

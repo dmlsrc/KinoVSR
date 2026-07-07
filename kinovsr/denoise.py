@@ -159,7 +159,7 @@ class McTemporalDenoiser:
         window: int = 0, clamp: bool = False, occlusion: bool = False,
         confidence: bool = False, sigma: float = 0.06, self_test: bool = True,
         noise_map: Any = None, map_refresh: int = 64, pulse: Any = None,
-        map_floor: float = 0.0,
+        map_floor: float = 0.0, gate: str = "smooth",
     ):
         require_pyobjc()
         self.w, self.h = int(width), int(height)
@@ -174,6 +174,23 @@ class McTemporalDenoiser:
         # difference before throttling the blend, so noise (which inflates that
         # residual) stops gating its own removal -> stronger denoise, more ghosting.
         self.sigma = float(sigma)   # residual rejection scale (luma, [0,1])
+        # gate: what a reference's residual is measured AGAINST.
+        # "smooth" (default): the residual anchor is a 3x3 box mean of the
+        # current frame, with the gate width recalibrated so the mean
+        # tolerance matches "curr". The anchor's own noise then stops
+        # randomly opening/closing the gate per pixel (less self-gating)
+        # while the anchor still needs no correspondence, so ghost
+        # rejection is untouched. "curr": legacy, residual vs the raw
+        # current frame. ("median" -- gating against the warped-consensus
+        # median -- was tried and REFUTED on ground truth: flow-warp
+        # errors are correlated across references, so in occlusion regions
+        # the median IS the ghost and gating against it admits it, -6 dB
+        # on a motion fixture. Do not retry.)
+        self.gate = str(gate)
+        # E|curr - warped| for two sigma-noisy frames is sqrt(2)*sqrt(2/pi)
+        # *sigma; with a box-9 anchor it is sqrt(1+1/9)*sqrt(2/pi)*sigma,
+        # a factor 0.745 -- fold it in so the sigma knob keeps its meaning.
+        self._resid_scale = 0.745 if self.gate == "smooth" else 1.0
         # optional NoiseMapTracker / PulseGain: replace the scalar sigma with a
         # per-pixel plane (estimated from the footage, scaled to residual units)
         # and scale it per frame for GOP-phase noise pulsing. mc's sigma has an
@@ -430,13 +447,16 @@ class McTemporalDenoiser:
             ))
         return out
 
-    def _weight(self, curr: Any, warped: Any, fwd: Any, bwd: Any) -> Any:
+    def _weight(self, anchor: Any, warped: Any, fwd: Any, bwd: Any) -> Any:
         """Per-pixel blend weight (H,W,1) toward `warped`, combining the enabled
-        gates: residual match, FB-consistency occlusion, motion confidence."""
-        resid = mx.mean(mx.abs(curr - warped), axis=-1, keepdims=True)
+        gates: residual match (vs the anchor -- current frame or window
+        median), FB-consistency occlusion, motion confidence."""
+        resid = mx.mean(mx.abs(anchor - warped), axis=-1, keepdims=True)
         sigma = self.sigma if self._sigma_plane is None else self._sigma_plane
         if self._gain != 1.0:
             sigma = sigma * self._gain
+        if self._resid_scale != 1.0:
+            sigma = sigma * self._resid_scale
         w = self.strength * mx.exp(-((resid / sigma) ** 2))
         if self.occlusion:
             # Round-trip: curr pixel p -> ref at p+bwd[p], then fwd should return
@@ -465,13 +485,17 @@ class McTemporalDenoiser:
             std = mx.sqrt(var)
             lo, hi = mean - self.clamp_gamma * std, mean + self.clamp_gamma * std
         flows = self._compute_flows(rgb_f32, refs)      # references run concurrently
-        acc = rgb_f32                                   # current frame, weight 1
-        wsum = mx.ones((self.h, self.w, 1))
-        for ref, (fwd, bwd) in zip(refs, flows, strict=True):
+        warpeds = []
+        for ref, (fwd, _bwd) in zip(refs, flows, strict=True):
             warped = warp(ref, -fwd)
             if self.clamp:
                 warped = mx.clip(warped, lo, hi)
-            w = self._weight(rgb_f32, warped, fwd, bwd)
+            warpeds.append(warped)
+        anchor = _box_mean(rgb_f32, 3) if self.gate == "smooth" else rgb_f32
+        acc = rgb_f32                                   # current frame, weight 1
+        wsum = mx.ones((self.h, self.w, 1))
+        for warped, (fwd, bwd) in zip(warpeds, flows, strict=True):
+            w = self._weight(anchor, warped, fwd, bwd)
             acc = acc + w * warped
             wsum = wsum + w
         out = mx.clip(acc / wsum, 0.0, 1.0)
