@@ -183,6 +183,33 @@ def _warp_flow_new(pair: list[Any]) -> Any:
     return _bilinear(img, sy, sx, "zeros")
 
 
+def _node_signature(node: dict) -> tuple:
+    """Structure + attrs + param NAMES (not weight keys): two Torch7 clones
+    of the same module tree have equal signatures even though their param
+    keys differ (clones share weights but keep per-clone batchnorm running
+    stats)."""
+    return (
+        node["type"],
+        json.dumps(node.get("attrs", {}), sort_keys=True),
+        tuple(sorted(node.get("params", {}).keys())),
+        tuple(_node_signature(c) for c in node.get("modules", ())),
+    )
+
+
+def _stack_tables(items: list[Any]) -> Any:
+    if isinstance(items[0], list):
+        return [_stack_tables([it[i] for it in items]) for i in range(len(items[0]))]
+    return mx.concatenate(items, axis=0)
+
+
+def _unstack_tables(x: Any, nb: int) -> list[Any]:
+    if isinstance(x, list):
+        parts = [_unstack_tables(xi, nb) for xi in x]
+        return [[p[i] for p in parts] for i in range(nb)]
+    step = int(x.shape[0]) // nb
+    return [x[i * step:(i + 1) * step] for i in range(nb)]
+
+
 class _TOFlowGraph:
     def __init__(self, weights_path: Path, graph_path: Path, dtype: Any):
         self.params = _cast_weights(mx.load(str(weights_path)), dtype)
@@ -190,9 +217,71 @@ class _TOFlowGraph:
         if self.graph.get("format") != "toflow-mlx-graph-v1":
             raise ValueError(f"unsupported TOFlow graph format in {graph_path}")
         self.root = self.graph["root"]
+        # Torch7 unrolls the per-neighbor flow module into N cloned branches
+        # evaluated one by one at batch 1 -- the dominant cost of the whole
+        # net (measured ~90% of a forward). The clones share every conv
+        # weight and differ only in batchnorm running stats, so the N
+        # branches can be evaluated ONCE as a batch: stack the branch inputs
+        # along N, point the cloned tree at (N,1,1,C)-stacked batchnorm
+        # stats, and split the outputs back. Exact same math, one kernel
+        # per op instead of N.
+        self._batch_par: dict[int, tuple[int, dict]] = {}
+        self._prepare_batched_tables(self.root)
+        # mx.compile per input-shape signature: the interpreter builds the
+        # same static graph every frame, so trace once and replay (~8%:
+        # fuses the elementwise batchnorm/relu/join chains; the conv-bound
+        # bulk is untouched). fp32 compile reorders shift results < 3e-4.
+        self._compiled: dict = {}
+
+    def _prepare_batched_tables(self, node: dict) -> None:
+        if node["type"] == "nn.ParallelTable":
+            kids = node.get("modules", [])
+            branches = [k for k in kids if k["type"] != "nn.Identity"]
+            if (len(branches) >= 2 and len(branches) == len(kids) - 1
+                    and kids[0]["type"] == "nn.Identity"):
+                sig0 = _node_signature(branches[0])
+                if all(_node_signature(k) == sig0 for k in branches[1:]):
+                    virt = self._build_virtual(branches)
+                    self._batch_par[id(node)] = (len(branches), virt)
+        for c in node.get("modules", ()):
+            self._prepare_batched_tables(c)
+
+    def _build_virtual(self, branches: list[dict]) -> dict:
+        def rec(nodes: list[dict]) -> dict:
+            n0 = nodes[0]
+            out: dict[str, Any] = {"type": n0["type"]}
+            if n0.get("attrs"):
+                out["attrs"] = n0["attrs"]
+            params = n0.get("params", {})
+            if params:
+                newp = {}
+                for name in params:
+                    keys = [n["params"][name] for n in nodes]
+                    if all(k == keys[0] for k in keys[1:]):
+                        newp[name] = keys[0]           # shared weight
+                    else:
+                        vkey = f"__batched__{keys[0]}"
+                        if vkey not in self.params:
+                            stacked = mx.stack([self.params[k] for k in keys], axis=0)
+                            if stacked.ndim == 2:      # (N,C) stats -> NHWC broadcast
+                                stacked = stacked[:, None, None, :]
+                            self.params[vkey] = stacked
+                        newp[name] = vkey
+                out["params"] = newp
+            subs = [n.get("modules", ()) for n in nodes]
+            if subs[0]:
+                out["modules"] = [rec([s[i] for s in subs]) for i in range(len(subs[0]))]
+            return out
+
+        return rec(branches)
 
     def forward(self, inputs: list[Any]) -> Any:
-        return self._eval(self.root, inputs)
+        key = tuple((tuple(x.shape), str(x.dtype)) for x in inputs)
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = mx.compile(lambda *xs: self._eval(self.root, list(xs)))
+            self._compiled[key] = fn
+        return fn(*inputs)
 
     def _params(self, node: dict) -> dict[str, Any]:
         return {name: self.params[key] for name, key in node.get("params", {}).items()}
@@ -211,6 +300,12 @@ class _TOFlowGraph:
         if typ == "nn.ParallelTable":
             if not isinstance(x, list) or len(x) != len(children):
                 raise ValueError("TOFlow ParallelTable input arity mismatch")
+            batched = self._batch_par.get(id(node))
+            if batched is not None:
+                nb, virt = batched
+                head = self._eval(children[0], x[0])
+                y = self._eval(virt, _stack_tables(x[1:]))
+                return [head, *_unstack_tables(y, nb)]
             return [self._eval(child, xi) for child, xi in zip(children, x, strict=True)]
         if typ == "nn.SelectTable":
             return x[int(attrs["index"]) - 1]
