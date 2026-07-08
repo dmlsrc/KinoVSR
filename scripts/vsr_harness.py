@@ -118,6 +118,7 @@ from LTX_2_MLX.videotoolbox.edge_sanitize import (
     sanitize_rgb as _sanitize_rgb,
 )
 from LTX_2_MLX.videotoolbox.fastdvdnet import FastDvdDenoiser
+from LTX_2_MLX.videotoolbox.toflow import TOFlowDenoiser
 from LTX_2_MLX.videotoolbox.vsr import NativePassthrough
 from LTX_2_MLX.videotoolbox.vsr_blocks import make_lanczos_plan, resample_width
 from LTX_2_MLX.videotoolbox.writer import (
@@ -447,7 +448,8 @@ def _pick_hevc_profile(spatial_mode: str, encode_chroma: str) -> str:
     # balanced/image/none/learned upscalers carry RGB (4:4:4 chroma) to the encoder -> 4:2:2.
     return (HEVC_PROFILE_MAIN422_10
             if spatial_mode in ("balanced", "image", "none", "basicvsrpp", "realbasicvsr",
-                                "realesrgan", "safmn", "esc", "realviformer", "realplksr")
+                                "realesrgan", "safmn", "esc", "realviformer", "realplksr",
+                                "toflow")
             else HEVC_PROFILE_MAIN10)
 
 
@@ -1168,7 +1170,7 @@ def run(args: argparse.Namespace) -> None:
         s: Any
         if args.spatial_mode == "none":
             s = NativePassthrough(in_w, in_h, fps=source_fps)
-        elif args.spatial_mode in ("basicvsrpp", "realbasicvsr", "realesrgan", "safmn", "esc", "realviformer", "realplksr"):
+        elif args.spatial_mode in ("basicvsrpp", "realbasicvsr", "realesrgan", "safmn", "esc", "realviformer", "realplksr", "toflow"):
             # Learned MLX upscalers do the upscale in the loop; the session is a
             # passthrough at the output dims that just packs the already-upscaled
             # frame for the encoder.
@@ -1235,7 +1237,7 @@ def run(args: argparse.Namespace) -> None:
         _den_names = ([] if args.denoise == "off" else
                       [s.strip() for s in str(args.denoise).split(",")
                        if s.strip() and s.strip() != "off"])
-        _den_known = {"spatial", "mc", "fastdvd", "bsvd", "pvdd"}
+        _den_known = {"spatial", "mc", "fastdvd", "bsvd", "pvdd", "toflow"}
         _den_bad = [n for n in _den_names if n not in _den_known]
         if _den_bad:
             raise SystemExit(f"--denoise: unknown stage(s) {_den_bad}; "
@@ -1337,11 +1339,22 @@ def run(args: argparse.Namespace) -> None:
                     pulse=pu,
                     map_floor=args.noise_map_floor,
                 )
+            if name == "toflow":
+                # TOFlow's Torch7 checkpoints convert into a safetensors + JSON
+                # pair. It is blind (no noise-map input); strength is an output
+                # dry/wet blend to keep the old model usable on real footage.
+                return TOFlowDenoiser(
+                    args.toflow_weights or os.environ.get("TOFLOW_WEIGHTS"),
+                    variant=args.toflow_variant,
+                    graph=args.toflow_graph or os.environ.get("TOFLOW_GRAPH"),
+                    strength=stg,
+                    dtype=parse_mlx_dtype_name(args.toflow_dtype),
+                )
             raise AssertionError(name)
 
         den: Any = None
         _dens: list = []
-        for _dn, _ds in zip(_den_names, _den_strengths):
+        for _dn, _ds in zip(_den_names, _den_strengths, strict=False):
             if _dn != "pvdd":
                 _dens.append(_make_denoiser(_dn, _ds))
                 continue
@@ -1501,6 +1514,13 @@ def run(args: argparse.Namespace) -> None:
                 history_gate_drop=args.realviformer_history_gate_drop,
                 history_risk_decay=args.realviformer_history_risk_decay,
                 history_static_cap=args.realviformer_history_static_cap,
+            )
+        elif args.spatial_mode == "toflow":
+            from LTX_2_MLX.videotoolbox.toflow import TOFlowSrUpscaler
+            up = TOFlowSrUpscaler(
+                args.toflow_sr_weights or os.environ.get("TOFLOW_SR_WEIGHTS"),
+                graph=args.toflow_sr_graph or os.environ.get("TOFLOW_SR_GRAPH"),
+                dtype=parse_mlx_dtype_name(args.toflow_sr_dtype),
             )
 
         naf: Any = None
@@ -2173,11 +2193,11 @@ def main() -> None:
         prefix_groups = (
             (("--restore", "--deflicker"), restore_args),
             (("--deblock", "--fbcnn"), deblock_args),
-            (("--denoise", "--fastdvd", "--bsvd", "--pvdd",
+            (("--denoise", "--fastdvd", "--bsvd", "--pvdd", "--toflow",
               "--noise-map", "--mc"), denoise_args),
             (("--nafnet",), nafnet_args),
             (("--basicvsrpp", "--realbasicvsr", "--realesrgan",
-              "--realviformer", "--esc", "--realplksr", "--safmn"), upscale_args),
+              "--realviformer", "--esc", "--realplksr", "--safmn", "--toflow-sr"), upscale_args),
             (("--start", "--end", "--max-frames", "--snap-start", "--gop",
               "--sanitize", "--crop", "--square-pixels", "--cut"), geometry_args),
         )
@@ -2953,6 +2973,8 @@ def main() -> None:
             "FastDVDnet CNN denoiser (MLX, learned; causal 5-frame window, "
             "strongest denoise, weights bundled); bsvd = BSVD bidirectional-buffer "
             "streaming denoiser (MLX, learned; 16-frame delay, weights local); "
+            "toflow = TOFlow task-oriented-flow denoise/deblock (MLX interpreter "
+            "for converted Torch7 checkpoints; 7-frame window, blind); "
             "pvdd = PVDD real-world denoiser (MLX, learned; bidirectional window "
             "attention, real-noise-trained -- unlike the AWGN-trained fastdvd/bsvd; "
             "--pvdd-variant picks pvdd/crvd/davis, weights local). "
@@ -2969,6 +2991,7 @@ def main() -> None:
             "max temporal blend "
             "toward motion-compensated history; for spatial, the noise level; for "
             "fastdvd/bsvd, the noise sigma (mapped onto sigma_255 in [5, 55]). "
+            "For toflow, a dry/wet output blend (0 = passthrough, 1 = full model). "
             "With --noise-map auto the estimated map REPLACES this constant "
             "(strength then only serves as the fallback when estimation is "
             "impossible); scale the estimate with --noise-map-gain instead."
@@ -3037,6 +3060,39 @@ def main() -> None:
     add(
         "--bsvd-dtype", choices=["float16", "float32"], default="float16",
         help="MLX dtype for --denoise bsvd (default float16; use float32 for parity probes).",
+    )
+
+    add(
+        "--toflow-variant", choices=["denoise", "deblock"], default="denoise",
+        help=(
+            "Which converted TOFlow model for --denoise toflow. denoise (default) "
+            "is the seven-frame video denoiser; deblock uses the released TOFlow "
+            "deblocking checkpoint in the same seven-frame runtime shape. Ignored "
+            "when --toflow-weights points at a specific converted checkpoint."
+        ),
+    )
+
+    add(
+        "--toflow-weights", default=None, metavar="VARIANT|PATH",
+        help=(
+            "Override TOFlow weights (.safetensors) for --denoise toflow. Optional - "
+            "defaults to the local --toflow-variant weights (or $TOFLOW_WEIGHTS). "
+            "Convert a .t7 with "
+            "LTX_2_MLX/videotoolbox/toflow/convert_t7_to_safetensors.py."
+        ),
+    )
+
+    add(
+        "--toflow-graph", default=None, metavar="PATH",
+        help=(
+            "Override TOFlow graph JSON for --denoise toflow (or $TOFLOW_GRAPH). "
+            "Default: same stem as --toflow-weights with .json suffix."
+        ),
+    )
+
+    add(
+        "--toflow-dtype", choices=["float16", "float32"], default="float32",
+        help="MLX dtype for --denoise toflow (default float32; float16 is faster but less parity-faithful).",
     )
 
     add(
@@ -3313,12 +3369,13 @@ def main() -> None:
     add(
         "--spatial-mode",
         choices=["fast", "balanced", "image", "none", "basicvsrpp", "realbasicvsr",
-                 "realesrgan", "safmn", "esc", "realviformer", "realplksr"],
+                 "realesrgan", "safmn", "esc", "realviformer", "realplksr", "toflow"],
         default="balanced",
         help=(
             "VSR spatial mode.  Scale factor is implied by the mode (fast=2x, "
             "balanced=4x, image=4x, none=1x, basicvsrpp=4x, realbasicvsr=4x, "
-            "realesrgan=4x, safmn=4x, esc=4x, realviformer=4x, realplksr=2x/4x). "
+            "realesrgan=4x, safmn=4x, esc=4x, realviformer=4x, realplksr=2x/4x, "
+            "toflow=4x). "
             "realplksr = MLX RealPLKSR per-frame SR (Phhofm checkpoints; scale from "
             "the checkpoint -- nomos4x is 4x, public2x is 2x). Single-image, no "
             "pooled modulation gate so it cannot produce SAFMN's block lattice; "
@@ -3327,6 +3384,8 @@ def main() -> None:
             "(single-image: no temporal propagation, so no flow ghosting; choose "
             "the checkpoint with --realesrgan-weights). "
             "basicvsrpp = MLX BasicVSR++ 4x super-resolution (recurrent, learned); "
+            "toflow = MLX TOFlow SR 4x (seven-frame task-oriented-flow SR; expects "
+            "bicubic-upsampled LR and predicts a residual over the center frame); "
             "realbasicvsr = MLX RealBasicVSR 4x real-world video SR with an "
             "iterative cleaning stage before BasicVSR propagation; "
             "runs on the GPU via MLX instead of VideoToolbox, processed in sliding "
@@ -3646,6 +3705,32 @@ def main() -> None:
             "For --realviformer-history-gate holistic, capped confidence admitted "
             "for perfectly static regions (default 0.0 until long-static etch "
             "tests prove a nonzero cap is safe)."
+        ),
+    )
+
+    add(
+        "--toflow-sr-weights", default=None, metavar="VARIANT|PATH",
+        help=(
+            "TOFlow SR weights for --spatial-mode toflow: the bundled sr token or a "
+            ".safetensors path (or $TOFLOW_SR_WEIGHTS). This is the released "
+            "task-oriented-flow SR checkpoint converted from sr.t7."
+        ),
+    )
+
+    add(
+        "--toflow-sr-graph", default=None, metavar="PATH",
+        help=(
+            "Override TOFlow SR graph JSON for --spatial-mode toflow (or "
+            "$TOFLOW_SR_GRAPH). Default: same stem as --toflow-sr-weights with "
+            ".json suffix."
+        ),
+    )
+
+    add(
+        "--toflow-sr-dtype", choices=["float16", "float32"], default="float32",
+        help=(
+            "MLX dtype for --spatial-mode toflow (default float32; float16 is "
+            "faster but less parity-faithful)."
         ),
     )
 
