@@ -9,9 +9,16 @@ names stay out of git.
 - `face_yunet_metrics.py`: detects faces in a baseline video with OpenCV YuNet,
   tracks those face boxes, and scores each candidate on face-region cleanup
   versus preservation. It writes CSV/JSON plus an optional contact sheet.
+- `perceptual_metrics.py`: scores a manifest of variant videos (plus the
+  source) with MUSIQ, DOVER-Mobile (tech/aes/fused), NIQE, flicker on
+  source-static pixels, and VMAF-vs-source, printing one ranked table and
+  writing CSV/JSON. The module docstring says what each column means and
+  which are ranking columns versus tripwires/anchors.
 - `run_denoise_sweep.py`: runs `scripts/vsr_harness.py` across configured clips
   and variants, writes per-run logs/manifests, then optionally invokes the face
-  evaluator and aggregates the metrics.
+  and perceptual evaluators and aggregates the metrics.
+- `musiq_score.py`, `dover_score.py`, `niqe.py`: the individual metric CLIs
+  behind `perceptual_metrics.py`, for scoring ad-hoc files.
 
 ## Local Config
 

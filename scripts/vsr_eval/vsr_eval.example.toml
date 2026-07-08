@@ -72,6 +72,17 @@ flags = [
   "--denoise-chroma-strength", "1.0",
 ]
 
+# Perceptual metric columns per variant (perceptual_metrics.py):
+# MUSIQ (per-frame opinion), DOVER-Mobile tech/aes/fused (temporal-aware
+# opinion), NIQE (over-smoothing tripwire only), flicker vs source-static
+# pixels, VMAF vs source (fidelity anchor). Metrics whose weights or
+# tools are missing leave null columns instead of failing the sweep.
+[perceptual]
+enabled = true
+max_frames = 400
+musiq_every = 10
+metrics = "musiq,dover,niqe,flicker,vmaf"
+
 [face_eval]
 enabled = true
 # The repo includes this small MIT-licensed YuNet model by default.

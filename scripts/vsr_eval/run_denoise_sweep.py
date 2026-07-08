@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run config-driven denoiser sweeps and optionally score face regions.
+"""Run config-driven denoiser sweeps; score faces and perceptual metrics.
 
 This wraps `scripts/vsr_harness.py` for repeatable local experiments. Checked-in
 logic is generic; machine-specific clips, output roots, and artifact paths live
@@ -31,6 +31,7 @@ from config import (
 REPO = Path(__file__).resolve().parents[2]
 TOOL_DIR = Path(__file__).resolve().parent
 FACE_EVAL = TOOL_DIR / "face_yunet_metrics.py"
+PERC_EVAL = TOOL_DIR / "perceptual_metrics.py"
 
 DEFAULT_BASE_FLAGS = [
     "--reader", "ffmpeg",
@@ -130,6 +131,7 @@ def _normalise_config(args: argparse.Namespace) -> argparse.Namespace:
     config, config_path = load_config(args.config)
     sweep = config_section(config, "sweep")
     face_eval = config_section(config, "face_eval")
+    perceptual = config_section(config, "perceptual")
     config_base = config_path.parent if config_path is not None else None
 
     merged = argparse.Namespace()
@@ -155,6 +157,11 @@ def _normalise_config(args: argparse.Namespace) -> argparse.Namespace:
     merged.face_model = face_eval.get("model")
     if merged.face_model is not None:
         merged.face_model = resolve_path(merged.face_model, config_base)
+    merged.evaluate_perceptual = bool(perceptual.get("enabled", True))
+    merged.perceptual_max_frames = int(perceptual.get("max_frames", 400))
+    merged.perceptual_musiq_every = int(perceptual.get("musiq_every", 10))
+    merged.perceptual_metrics = str(
+        perceptual.get("metrics", "musiq,dover,niqe,flicker,vmaf"))
 
     clip_rows = listify(sweep.get("clips"))
     if not clip_rows:
@@ -264,6 +271,29 @@ def evaluate_clip_faces(args: argparse.Namespace, clip: dict[str, Any], manifest
     return rows
 
 
+def evaluate_clip_perceptual(args: argparse.Namespace, clip: dict[str, Any], manifest: Path) -> list[dict[str, Any]]:
+    out_dir = args.output_root / str(clip["label"]) / "perceptual_eval"
+    cmd = [
+        str(args.python),
+        str(PERC_EVAL),
+        "--variants-json", str(manifest),
+        "--source", str(clip["video"]),
+        "--out-dir", str(out_dir),
+        "--max-frames", str(args.perceptual_max_frames),
+        "--musiq-every", str(args.perceptual_musiq_every),
+        "--metrics", args.perceptual_metrics,
+    ]
+    print(f"[perceptual] {clip['label']}", flush=True)
+    proc = subprocess.run(cmd, cwd=REPO, check=False)
+    if proc.returncode != 0:
+        print(f"[perceptual] {clip['label']} failed rc={proc.returncode}; continuing", flush=True)
+        return []
+    rows = json.loads((out_dir / "perceptual_metrics.json").read_text(encoding="utf-8"))
+    for row in rows:
+        row["clip"] = clip["label"]
+    return rows
+
+
 def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
     if not rows:
         return
@@ -282,6 +312,7 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
         "base_flags": args.base_flags,
         "runs": [],
         "face_metrics": [],
+        "perceptual_metrics": [],
     }
     for clip in args.clips:
         clip_dir = args.output_root / str(clip["label"])
@@ -299,6 +330,10 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
             summary["face_metrics"].extend(evaluate_clip_faces(args, clip, manifest_path))
             (args.output_root / "face_metrics.json").write_text(json.dumps(summary["face_metrics"], indent=2) + "\n", encoding="utf-8")
             write_csv(summary["face_metrics"], args.output_root / "face_metrics.csv")
+        if args.evaluate_perceptual and manifest and not args.dry_run:
+            summary["perceptual_metrics"].extend(evaluate_clip_perceptual(args, clip, manifest_path))
+            (args.output_root / "perceptual_metrics.json").write_text(json.dumps(summary["perceptual_metrics"], indent=2) + "\n", encoding="utf-8")
+            write_csv(summary["perceptual_metrics"], args.output_root / "perceptual_metrics.csv")
     (args.output_root / "run_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     write_csv(summary["runs"], args.output_root / "run_summary.csv")
     return summary
@@ -325,6 +360,8 @@ def main() -> int:
     print(f"[done] {Path(summary['output_root']) / 'run_summary.json'}", flush=True)
     if summary.get("face_metrics"):
         print(f"[done] {Path(summary['output_root']) / 'face_metrics.csv'}", flush=True)
+    if summary.get("perceptual_metrics"):
+        print(f"[done] {Path(summary['output_root']) / 'perceptual_metrics.csv'}", flush=True)
     return 0
 
 
