@@ -509,7 +509,11 @@ class TOFlowDenoiser:
             )
         self.net = TOFlow(wp, variant=variant, graph=graph, dtype=dtype,
                           flow_scale=flow_scale)
-        self._strength = max(0.0, min(1.0, float(strength)))
+        # strength is a dry/wet residual blend; the reference network has NO
+        # conditioning input, so values above 1.0 EXTRAPOLATE the residual
+        # past the trained operating point (a boost the reference cannot
+        # express) -- useful in moderation, amplifies model error with it
+        self._strength = max(0.0, float(strength))
         self._radius = self.net.NUM_FRAMES // 2
         self._reset()
 
@@ -541,7 +545,7 @@ class TOFlowDenoiser:
         window = [self._frame(t + d, last) for d in range(-self._radius, self._radius + 1)]
         out = self.net.denoise_center(window)
         center, tok = self._buf[t - self._base]
-        if self._strength < 1.0:
+        if self._strength != 1.0:
             out = center.astype(mx.float32) + self._strength * (out - center.astype(mx.float32))
             out = mx.clip(out, 0.0, 1.0)
         mx.eval(out)

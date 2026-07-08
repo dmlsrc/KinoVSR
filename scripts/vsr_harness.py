@@ -2848,7 +2848,12 @@ def main() -> None:
             "fine texture at the cost of less deblocking -- try 0.5-0.7 on "
             "faces). With a chained --deblock, give one value per stage "
             "(comma list) or one value for all. For stdf this scales the "
-            "residual; for toflow it is the dry/wet blend; fbcnn uses "
+            "residual; for toflow it is the dry/wet blend -- and since the "
+            "reference network has NO strength conditioning, values above "
+            "1.0 EXTRAPOLATE the correction past the trained operating "
+            "point (measured: 1.3 costs ~0.1 dB, 1.6 ~0.2 dB vs ground "
+            "truth for visibly harder deblocking; chaining toflow,toflow "
+            "deepens the cleaning instead at ~0.3 dB/pass). fbcnn uses "
             "--fbcnn-strength instead."
         ),
     )
