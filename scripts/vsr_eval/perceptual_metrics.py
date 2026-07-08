@@ -14,6 +14,18 @@ Scores every variant video (and optionally the source) with:
 - ``flicker_e3``  mean |frame-to-frame luma diff| x1000 on pixels the
                   SOURCE says are static; lower is stabler. Needs
                   ``--source``.
+- ``moving_dev_e3``  p90 over frames of mean |variant - source| luma
+                  x1000 on pixels the SOURCE says are MOVING; the
+                  content-erasure guard. Measured on a resurrected
+                  flow-reclaim deflicker bug (movers ghosted away): the
+                  opinion metrics scored the corrupted output the same
+                  or higher and flicker REWARDED it, while this column
+                  separated corrupted from safe 3.8x (localized ghost)
+                  and 1.6x (mild ghosting on a large mover). p90 rather
+                  than mean because erasure is bursty (measured: mean
+                  only reached 1.2x on the mild case). A jump here for
+                  a supposedly low-touch stage means content is being
+                  altered where the source moved -- go look.
 - ``vmaf_src``    VMAF against the source: fidelity anchor (how far the
                   variant strayed), not a quality score. Needs
                   ``--source`` and an ffmpeg build with libvmaf.
@@ -49,6 +61,7 @@ from LTX_2_MLX.videotoolbox.musiq import Musiq  # noqa: E402
 
 ALL_METRICS = ("musiq", "dover", "niqe", "flicker", "vmaf")
 STATIC_THRESHOLD = 0.01          # source luma |diff| below this = static
+MOVING_THRESHOLD = 6.0 / 255.0   # source luma |diff| above this = moving
 EDGE_SKIP = (3, 2)               # frames dropped at clip head/tail
 
 
@@ -82,6 +95,18 @@ def static_masks(src_lumas: list) -> list:
             for t in range(1, len(src_lumas))]
 
 
+def moving_masks(src_lumas: list) -> list:
+    """masks[k] flags pixels moving across source frames (k, k+1)."""
+    return [mx.abs(src_lumas[t] - src_lumas[t - 1]) > MOVING_THRESHOLD
+            for t in range(1, len(src_lumas))]
+
+
+def _masked_mean_e3(values: list) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values) * 1000.0
+
+
 def flicker_e3(cand_lumas: list, masks: list) -> float | None:
     head, tail = EDGE_SKIP
     n = min(len(cand_lumas), len(masks) + 1)
@@ -93,9 +118,24 @@ def flicker_e3(cand_lumas: list, masks: list) -> float | None:
             continue
         d = mx.abs(cand_lumas[t] - cand_lumas[t - 1])
         vals.append(float((d * m).sum()) / denom)
+    return _masked_mean_e3(vals)
+
+
+def moving_dev_e3(cand_lumas: list, src_lumas: list,
+                  masks: list) -> float | None:
+    head, tail = EDGE_SKIP
+    n = min(len(cand_lumas), len(src_lumas), len(masks) + 1)
+    vals = []
+    for t in range(head, n - tail):
+        m = masks[t - 1].astype(mx.float32)
+        denom = float(m.sum())
+        if denom == 0.0:
+            continue
+        d = mx.abs(cand_lumas[t] - src_lumas[t])
+        vals.append(float((d * m).sum()) / denom)
     if not vals:
         return None
-    return sum(vals) / len(vals) * 1000.0
+    return sorted(vals)[int(0.9 * (len(vals) - 1))] * 1000.0
 
 
 def vmaf_src(cand: Path, ref: Path, log_path: Path) -> float | None:
@@ -151,11 +191,13 @@ def main() -> int:
         for name, p in json.loads(
             args.variants_json.read_text(encoding="utf-8")).items()
     }
-    masks = None
+    masks = mmasks = src_lumas = None
     if args.source is not None:
         src_frames = read_frames(args.source, args.max_frames)
         if "flicker" in want:
-            masks = static_masks(_lumas01(src_frames))
+            src_lumas = _lumas01(src_frames)
+            masks = static_masks(src_lumas)
+            mmasks = moving_masks(src_lumas)
         videos = {"source": args.source, **videos}
     elif want & {"flicker", "vmaf"}:
         _note("no --source; flicker and vmaf columns skipped")
@@ -181,6 +223,7 @@ def main() -> int:
                 row["niqe"] = score_lumas(lumas[::3])
             if masks is not None:
                 row["flicker_e3"] = flicker_e3(lumas, masks)
+                row["moving_dev_e3"] = moving_dev_e3(lumas, src_lumas, mmasks)
         if "vmaf" in want and args.source is not None:
             row["vmaf_src"] = (100.0 if name == "source" else vmaf_src(
                 vp, args.source, args.out_dir / f"vmaf_{name}.json"))
@@ -202,18 +245,22 @@ def main() -> int:
 
     cols = [("musiq", "{:.2f}"), ("dover_fused", "{:.4f}"),
             ("niqe", "{:.2f}"), ("flicker_e3", "{:.2f}"),
-            ("vmaf_src", "{:.1f}")]
-    present = [(k, fmt) for k, fmt in cols if any(k in r for r in rows)]
-    print(f"\n{'variant':20s}" + "".join(f"{k:>12s}" for k, _ in present))
+            ("moving_dev_e3", "{:.2f}"), ("vmaf_src", "{:.1f}")]
+    present = [(k, fmt, max(12, len(k) + 2))
+               for k, fmt in cols if any(k in r for r in rows)]
+    name_w = max(20, max(len(str(r["variant"])) for r in rows) + 2)
+    print(f"\n{'variant':{name_w}s}"
+          + "".join(f"{k:>{w}s}" for k, _, w in present))
     for r in sorted(rows, key=sort_key):
-        line = f"{r['variant']:20s}"
-        for k, fmt in present:
+        line = f"{r['variant']:{name_w}s}"
+        for k, fmt, w in present:
             v = r.get(k)
             cell = fmt.format(v) if isinstance(v, (int, float)) else "-"
-            line += cell.rjust(12)
+            line += cell.rjust(w)
         print(line)
     print("\nhigher better: musiq, dover_fused; lower better: niqe "
-          "(tripwire only), flicker_e3; vmaf_src = fidelity anchor")
+          "(tripwire only), flicker_e3, moving_dev_e3 (content-erasure "
+          "guard); vmaf_src = fidelity anchor")
     return 0
 
 

@@ -11,9 +11,11 @@ names stay out of git.
   versus preservation. It writes CSV/JSON plus an optional contact sheet.
 - `perceptual_metrics.py`: scores a manifest of variant videos (plus the
   source) with MUSIQ, DOVER-Mobile (tech/aes/fused), NIQE, flicker on
-  source-static pixels, and VMAF-vs-source, printing one ranked table and
-  writing CSV/JSON. The module docstring says what each column means and
-  which are ranking columns versus tripwires/anchors.
+  source-static pixels, moving-content deviation (the content-erasure
+  guard: opinion metrics score erased movers the same or better, this
+  column catches them), and VMAF-vs-source, printing one ranked table
+  and writing CSV/JSON. The module docstring says what each column
+  means and which are ranking columns versus tripwires/anchors.
 - `run_denoise_sweep.py`: runs `scripts/vsr_harness.py` across configured clips
   and variants, writes per-run logs/manifests, then optionally invokes the face
   and perceptual evaluators and aggregates the metrics.

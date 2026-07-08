@@ -75,8 +75,9 @@ flags = [
 # Perceptual metric columns per variant (perceptual_metrics.py):
 # MUSIQ (per-frame opinion), DOVER-Mobile tech/aes/fused (temporal-aware
 # opinion), NIQE (over-smoothing tripwire only), flicker vs source-static
-# pixels, VMAF vs source (fidelity anchor). Metrics whose weights or
-# tools are missing leave null columns instead of failing the sweep.
+# pixels plus moving-content deviation (content-erasure guard), VMAF vs
+# source (fidelity anchor). Metrics whose weights or tools are missing
+# leave null columns instead of failing the sweep.
 [perceptual]
 enabled = true
 max_frames = 400
