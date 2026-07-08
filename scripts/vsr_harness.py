@@ -1436,6 +1436,18 @@ def run(args: argparse.Namespace) -> None:
             deb = StdfDeblocker(args.deblock_weights or os.environ.get("STDF_WEIGHTS"),
                                 strength=args.deblock_strength, kr=kr, kb=kb,
                                 blockiness_map=blk_tracker)
+        elif args.deblock == "toflow":
+            # the TOFlow deblock checkpoint in the deblock SLOT (the same
+            # processor is also reachable as --denoise toflow
+            # --toflow-variant deblock; this placement lets it chain with a
+            # real denoiser in the natural order)
+            deb = TOFlowDenoiser(
+                args.toflow_weights or os.environ.get("TOFLOW_WEIGHTS"),
+                variant="deblock",
+                graph=args.toflow_graph or os.environ.get("TOFLOW_GRAPH"),
+                strength=args.deblock_strength,
+                dtype=parse_mlx_dtype_name(args.toflow_dtype),
+            )
         elif args.deblock == "fbcnn":
             from LTX_2_MLX.videotoolbox.fbcnn import FbcnnDeblocker
             _q = args.fbcnn_quality.strip().lower()
@@ -2037,7 +2049,8 @@ def run(args: argparse.Namespace) -> None:
                       f"(conf {_qi['global']['confidence']:g})  "
                       f"comb coverage {_qi['coverage'] * 100:.0f}%{_qmed}  "
                       f"[{_note}]")
-        if deblocker is not None and args.deblock_map == "auto":
+        if (deblocker is not None and args.deblock_map == "auto"
+                and args.deblock in ("stdf", "fbcnn")):
             _bm = getattr(deblocker, "last_blockiness_map", None)
             if _bm is None:
                 print("[deblock-map] no mask was estimated (no frames deblocked?)")
@@ -2764,12 +2777,15 @@ def main() -> None:
 
     # ---- Deblock -----------------------------------------------------------------
     add(
-        "--deblock", choices=["off", "stdf", "fbcnn"], default="off",
+        "--deblock", choices=["off", "stdf", "fbcnn", "toflow"], default="off",
         help=(
             "Pre-upscale compression-artifact deblock, applied before denoise + VSR "
             "(deblock before SR amplifies the blocking). off (default); stdf = STDF "
             "deformable spatio-temporal fusion (HEVC-trained, luma-only 7-frame window, "
-            "weights bundled); fbcnn = FBCNN flexible blind JPEG-artifact removal "
+            "weights bundled); toflow = the TOFlow deblock checkpoint (task-oriented-"
+            "flow seven-frame window, weights bundled; heavy -- see --denoise toflow "
+            "notes; --deblock-strength is its dry/wet blend, --deblock-map does not "
+            "apply); fbcnn = FBCNN flexible blind JPEG-artifact removal "
             "(single-image RGB, ~72M params, weights downloaded not bundled -- see "
             "videotoolbox/fbcnn/weights/README.md). Routes frames through the MLX path."
         ),
