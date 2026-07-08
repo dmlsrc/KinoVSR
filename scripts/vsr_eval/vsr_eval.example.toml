@@ -79,6 +79,8 @@ enabled = true
 max_frames = 150
 threshold = 0.25
 min_side = 20
+# Useful for clips with one-frame false positives on hands/clothes.
+min_track_frames = 1
 contact_sheet = true
 
 # For standalone face scoring without running a sweep, either provide a

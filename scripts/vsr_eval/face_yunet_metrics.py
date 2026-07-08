@@ -340,6 +340,19 @@ def track_summary(observations: list[FaceObs]) -> list[dict[str, Any]]:
     return rows
 
 
+def filter_observations_by_track_length(
+    observations: list[FaceObs],
+    min_track_frames: int,
+) -> list[FaceObs]:
+    if min_track_frames <= 1:
+        return observations
+    counts: dict[int, int] = {}
+    for obs in observations:
+        counts[obs.track] = counts.get(obs.track, 0) + 1
+    keep = {track for track, count in counts.items() if count >= min_track_frames}
+    return [obs for obs in observations if obs.track in keep]
+
+
 def _label_panel(rgb: np.ndarray, label: str) -> np.ndarray:
     panel = np.zeros((286, 256, 3), dtype=np.uint8)
     img = (rgb * 255.0).clip(0, 255).astype(np.uint8)
@@ -442,6 +455,7 @@ def _normalise_config(args: argparse.Namespace) -> argparse.Namespace:
     merged.max_frames = int(config_get(face_eval, args, "max_frames", 180))
     merged.threshold = float(config_get(face_eval, args, "threshold", 0.30))
     merged.min_side = int(config_get(face_eval, args, "min_side", 32))
+    merged.min_track_frames = int(config_get(face_eval, args, "min_track_frames", 1))
     merged.contact_sheet = bool(face_eval.get("contact_sheet", True))
     if args.no_contact_sheet:
         merged.contact_sheet = False
@@ -460,6 +474,7 @@ def run_eval(args: argparse.Namespace) -> list[dict[str, Any]]:
     }
     baseline_frames = frames_by_variant[args.baseline]
     observations = detect_faces(baseline_frames, args.model, args.threshold, args.min_side)
+    observations = filter_observations_by_track_length(observations, args.min_track_frames)
     if not observations:
         raise SystemExit("YuNet found no faces in baseline")
 
@@ -514,6 +529,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, help="maximum frames to decode per variant")
     parser.add_argument("--threshold", type=float, help="YuNet confidence threshold")
     parser.add_argument("--min-side", type=int, help="ignore detected faces smaller than this side length")
+    parser.add_argument("--min-track-frames", type=int, help="ignore tracks shorter than this many detected frames")
     parser.add_argument("--no-contact-sheet", action="store_true", help="skip contact sheet image")
     return parser.parse_args()
 

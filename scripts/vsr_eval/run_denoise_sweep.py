@@ -86,6 +86,13 @@ DEFAULT_VARIANTS = [
 ]
 
 
+def resolve_executable(value: str | Path, base_dir: Path | None = None) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = (base_dir or Path.cwd()) / path
+    return path
+
+
 def _parse_percent(pattern: str, text: str) -> float | None:
     m = re.search(pattern, text)
     return float(m.group(1)) if m else None
@@ -129,7 +136,7 @@ def _normalise_config(args: argparse.Namespace) -> argparse.Namespace:
     merged.config = config_path
     merged.config_base = config_base
     merged.python = config_get(sweep, args, "python", sys.executable)
-    merged.python = resolve_path(merged.python, None if args.python is not None else config_base)
+    merged.python = resolve_executable(merged.python, None if args.python is not None else config_base)
     merged.output_root = config_get(sweep, args, "output_root", None)
     if merged.output_root is None:
         merged.output_root = default_shared_temp() / f"vsr_denoise_sweep_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -144,6 +151,7 @@ def _normalise_config(args: argparse.Namespace) -> argparse.Namespace:
     merged.face_max_frames = int(face_eval.get("max_frames", 150))
     merged.face_threshold = float(face_eval.get("threshold", 0.25))
     merged.face_min_side = int(face_eval.get("min_side", 20))
+    merged.face_min_track_frames = int(face_eval.get("min_track_frames", 1))
     merged.face_model = face_eval.get("model")
     if merged.face_model is not None:
         merged.face_model = resolve_path(merged.face_model, config_base)
@@ -244,6 +252,7 @@ def evaluate_clip_faces(args: argparse.Namespace, clip: dict[str, Any], manifest
         "--max-frames", str(args.face_max_frames),
         "--threshold", str(args.face_threshold),
         "--min-side", str(args.face_min_side),
+        "--min-track-frames", str(args.face_min_track_frames),
     ]
     if args.face_model is not None:
         cmd.extend(["--model", str(args.face_model)])
