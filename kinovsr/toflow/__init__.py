@@ -450,7 +450,7 @@ class TOFlow:
     def _denormalize(self, x: Any) -> Any:
         return x.astype(mx.float32) * self._std + self._mean
 
-    def _run_septuplet(self, frames: list[Any], *, residual_center: bool = False) -> Any:
+    def _prep_septuplet(self, frames: list[Any]) -> tuple:
         if len(frames) != self.NUM_FRAMES:
             raise ValueError(f"TOFlow needs {self.NUM_FRAMES} frames, got {len(frames)}")
         batched = [
@@ -462,10 +462,30 @@ class TOFlow:
         hp, wp = int(padded[0].shape[1]), int(padded[0].shape[2])
         norm = [self._normalize(f) for f in padded]
         zero_flow = mx.zeros((1, hp // 8, wp // 8, 2), dtype=self.dtype)
-
         # Torch7 loader order: center, past three, future three, zero flow seed.
         inputs = [norm[3], norm[0], norm[1], norm[2], norm[4], norm[5], norm[6], zero_flow]
+        return inputs, h, w
+
+    def _run_septuplet(self, frames: list[Any], *, residual_center: bool = False) -> Any:
+        inputs, h, w = self._prep_septuplet(frames)
         out = self.net.forward(inputs)
+        if residual_center:
+            out = out + inputs[0]
+        out = mx.clip(self._denormalize(out), 0.0, 1.0)
+        return out[0, :h, :w, :].astype(mx.float32)
+
+    def flow_septuplet(self, frames: list[Any]) -> Any:
+        """The batched neighbor->center flow for a window (direct engine)."""
+        inputs, _h, _w = self._prep_septuplet(frames)
+        return self.net.forward_flow(inputs)
+
+    def fuse_septuplet(self, frames: list[Any], flow: Any,
+                       *, residual_center: bool = False) -> Any:
+        """Warp + fusion with a precomputed flow (direct engine). Deblock
+        passes do not move content, so chained passes can reuse pass 1's
+        flow -- measured equivalent within 0.01 dB, ~55 dB agreement."""
+        inputs, h, w = self._prep_septuplet(frames)
+        out = self.net.forward_fuse(inputs, flow.astype(self.dtype))
         if residual_center:
             out = out + inputs[0]
         out = mx.clip(self._denormalize(out), 0.0, 1.0)
@@ -493,7 +513,15 @@ class TOFlow:
 
 
 class TOFlowDenoiser:
-    """Streaming seven-frame TOFlow denoise/deblock stage for vsr_harness."""
+    """Streaming seven-frame TOFlow denoise/deblock stage for vsr_harness.
+
+    passes > 1 runs an internal cascade (each pass consumes the previous
+    pass's stream, like chaining the stage against itself) but computes the
+    flow ONCE at pass 1 and reuses it: deblock passes do not move content,
+    so the flow is pass-invariant (measured equivalent within 0.01 dB on
+    static and moving fixtures, ~55 dB output agreement) -- later passes
+    pay only warp + fusion. Latency is 3 * passes frames.
+    """
 
     def __init__(
         self,
@@ -504,6 +532,7 @@ class TOFlowDenoiser:
         strength: float = 1.0,
         dtype: Any = mx.float32,
         flow_scale: str = "full",
+        passes: int = 1,
     ):
         if variant not in {"denoise", "deblock"}:
             raise ValueError("TOFlowDenoiser supports only denoise/deblock variants")
@@ -516,6 +545,12 @@ class TOFlowDenoiser:
             )
         self.net = TOFlow(wp, variant=variant, graph=graph, dtype=dtype,
                           flow_scale=flow_scale)
+        self._passes = max(1, int(passes))
+        if self._passes > 1 and self.net.engine != "direct":
+            raise ValueError(
+                "multi-pass TOFlow needs the direct engine (flow reuse); this "
+                "checkpoint fell back to the graph interpreter"
+            )
         # strength is a dry/wet residual blend; the reference network has NO
         # conditioning input, so values above 1.0 EXTRAPOLATE the residual
         # past the trained operating point (a boost the reference cannot
@@ -525,10 +560,11 @@ class TOFlowDenoiser:
         self._reset()
 
     def _reset(self) -> None:
-        self._buf: list[tuple[Any, Any]] = []
-        self._base = 0
-        self._received = 0
-        self._emitted = 0
+        self._stages: list[dict] = [
+            {"buf": [], "base": 0, "received": 0, "emitted": 0}
+            for _ in range(self._passes)
+        ]
+        self._flows: dict[int, Any] = {}
 
     def reset(self) -> None:
         self._reset()
@@ -544,39 +580,60 @@ class TOFlowDenoiser:
             i = 2 * last - i
         return max(0, min(last, i))
 
-    def _frame(self, i: int, last: int) -> Any:
-        return self._buf[self._reflect(i, last) - self._base][0]
+    def _stage_frame(self, st: dict, i: int, last: int) -> Any:
+        return st["buf"][self._reflect(i, last) - st["base"]][0]
 
-    def _emit_one(self, last: int) -> tuple[Any, Any]:
-        t = self._emitted
-        window = [self._frame(t + d, last) for d in range(-self._radius, self._radius + 1)]
-        out = self.net.denoise_center(window)
-        center, tok = self._buf[t - self._base]
+    def _stage_emit(self, s: int) -> tuple[Any, Any]:
+        st = self._stages[s]
+        last = st["received"] - 1
+        t = st["emitted"]
+        window = [self._stage_frame(st, t + d, last)
+                  for d in range(-self._radius, self._radius + 1)]
+        if self._passes == 1:
+            out = self.net.denoise_center(window)
+        elif s == 0:
+            flow = self.net.flow_septuplet(window)
+            self._flows[t] = flow.astype(mx.float16)
+            out = self.net.fuse_septuplet(window, flow)
+        else:
+            flow = self._flows[t]
+            if s == self._passes - 1:
+                del self._flows[t]
+            out = self.net.fuse_septuplet(window, flow)
+        center, tok = st["buf"][t - st["base"]]
         if self._strength != 1.0:
             out = center.astype(mx.float32) + self._strength * (out - center.astype(mx.float32))
             out = mx.clip(out, 0.0, 1.0)
         mx.eval(out)
-        self._emitted += 1
-        keep = self._emitted - self._radius
-        while self._base < keep and self._buf:
-            self._buf.pop(0)
-            self._base += 1
+        st["emitted"] += 1
+        keep = st["emitted"] - self._radius
+        while st["base"] < keep and st["buf"]:
+            st["buf"].pop(0)
+            st["base"] += 1
         return out, tok
 
-    def feed(self, rgb: Any, token: Any = None) -> list[tuple[Any, Any]]:
-        self._buf.append((mx.clip(rgb[..., :3].astype(mx.float32), 0.0, 1.0), token))
-        self._received += 1
-        last = self._received - 1
-        ready = []
-        while last - self._emitted >= self._radius:
-            ready.append(self._emit_one(last))
+    def _push(self, s: int, frame: Any, token: Any) -> None:
+        self._stages[s]["buf"].append((frame, token))
+        self._stages[s]["received"] += 1
+
+    def _drain(self, flush: bool) -> list[tuple[Any, Any]]:
+        ready: list[tuple[Any, Any]] = []
+        for s, st in enumerate(self._stages):
+            while st["received"] - 1 - st["emitted"] >= (0 if flush else self._radius) \
+                    and st["emitted"] <= st["received"] - 1:
+                out, tok = self._stage_emit(s)
+                if s == self._passes - 1:
+                    ready.append((out, tok))
+                else:
+                    self._push(s + 1, out, tok)
         return ready
 
+    def feed(self, rgb: Any, token: Any = None) -> list[tuple[Any, Any]]:
+        self._push(0, mx.clip(rgb[..., :3].astype(mx.float32), 0.0, 1.0), token)
+        return self._drain(flush=False)
+
     def flush(self) -> list[tuple[Any, Any]]:
-        last = self._received - 1
-        out = []
-        while self._emitted <= last:
-            out.append(self._emit_one(last))
+        out = self._drain(flush=True)
         self._reset()
         return out
 

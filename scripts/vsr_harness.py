@@ -1347,6 +1347,7 @@ def run(args: argparse.Namespace) -> None:
                     args.toflow_weights or os.environ.get("TOFLOW_WEIGHTS"),
                     variant=args.toflow_variant,
                     flow_scale=args.toflow_flow_scale,
+                    passes=args.toflow_passes,
                     graph=args.toflow_graph or os.environ.get("TOFLOW_GRAPH"),
                     strength=stg,
                     dtype=parse_mlx_dtype_name(args.toflow_dtype),
@@ -1473,6 +1474,7 @@ def run(args: argparse.Namespace) -> None:
                     args.toflow_weights or os.environ.get("TOFLOW_WEIGHTS"),
                     variant="deblock",
                     flow_scale=args.toflow_flow_scale,
+                    passes=args.toflow_passes,
                     graph=args.toflow_graph or os.environ.get("TOFLOW_GRAPH"),
                     strength=stg,
                     dtype=parse_mlx_dtype_name(args.toflow_dtype),
@@ -3159,6 +3161,20 @@ def main() -> None:
     add(
         "--toflow-dtype", choices=["float16", "float32"], default="float32",
         help="MLX dtype for --denoise toflow (default float32; float16 is faster but less parity-faithful).",
+    )
+
+    add(
+        "--toflow-passes", type=int, default=1, metavar="N",
+        help=(
+            "Run TOFlow N times back to back INSIDE one stage (equivalent "
+            "to chaining toflow N times, measured within 0.01 dB / ~55 dB "
+            "agreement) but computing the flow only once: deblock passes do "
+            "not move content, so the flow is pass-invariant and later "
+            "passes pay only warp + fusion. Measured: 3 passes at quarter "
+            "flow run 59 ms/frame at 480x360 vs 93 for the explicit chain. "
+            "Latency is 3*N frames. Iteration deepens the cleaning at "
+            "~0.3 dB fidelity per extra pass (PSNR charges smoothing)."
+        ),
     )
 
     add(

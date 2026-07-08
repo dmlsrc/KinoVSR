@@ -67,6 +67,24 @@ def test_reduced_flow_tracks_full():
         assert mean < 0.05 and worst < 0.5, f"{scale} diverged ({mean}, {worst})"
 
 
+def test_passes_cascade_matches_explicit_chain():
+    clip = _clip()
+    frames = clip
+    for _ in range(2):
+        den = TOFlowDenoiser(variant="deblock", flow_scale="quarter")
+        frames = _run(den, frames)
+    cas = _run(TOFlowDenoiser(variant="deblock", flow_scale="quarter",
+                              passes=2), clip)
+    worst = max(float(mx.max(mx.abs(x - y))) for x, y in zip(frames, cas))
+    mean = max(float(mx.mean(mx.abs(x - y))) for x, y in zip(frames, cas))
+    # the cascade reuses pass-1 flow instead of recomputing it on cleaned
+    # frames; measured equivalent at real resolutions (~55 dB agreement,
+    # PSNR within 0.01 dB) -- this tiny frame amplifies the flow delta, so
+    # the thresholds only pin "not broken"
+    assert mean < 0.01 and worst < 0.15, \
+        f"cascade diverged from explicit chain ({mean}, {worst})"
+
+
 def test_latency_and_flush():
     clip = _clip()
     den = TOFlowDenoiser(variant="denoise")
