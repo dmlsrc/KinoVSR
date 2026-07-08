@@ -18,10 +18,11 @@ Extraction is structural with hard asserts; anything unexpected raises, and
 the caller falls back to the interpreter. The interp checkpoint keeps the
 interpreter (different, two-frame topology).
 
-flow_scale: "full" (default) is the faithful network. "half" starts the
-pyramid at /2 and upsamples the final flow, skipping the full-resolution
-refinement CNN -- the dominant cost of the whole net -- at a small alignment
-fidelity cost (surface it per clip before relying on it).
+flow_scale: "full" (default) is the faithful network. "half" skips the
+full-resolution flow refinement CNN -- the dominant cost of the whole net --
+and "quarter" also skips the half-resolution level, each at a further
+alignment fidelity cost (measured bills in the harness help; eyeball per
+clip before relying on them).
 """
 from __future__ import annotations
 
@@ -231,10 +232,14 @@ def _fold_convs(graph: dict, params: dict) -> dict:
 class TOFlowDirect:
     """Direct forward over params extracted by _fold_convs."""
 
+    _FLOW_STARTS = {"full": 0, "half": 1, "quarter": 2}
+
     def __init__(self, graph: dict, params: dict, dtype: Any,
                  flow_scale: str = "full"):
-        if flow_scale not in ("full", "half"):
-            raise ValueError(f"flow_scale must be full|half, got {flow_scale!r}")
+        if flow_scale not in self._FLOW_STARTS:
+            raise ValueError(
+                f"flow_scale must be one of {sorted(self._FLOW_STARTS)}, "
+                f"got {flow_scale!r}")
         self.p = {k: (v.astype(dtype) if isinstance(v, mx.array)
                       and v.dtype == mx.float32 else v)
                   for k, v in _fold_convs(graph, params).items()}
@@ -251,7 +256,7 @@ class TOFlowDirect:
 
     def _flow(self, center: Any, nb: Any) -> Any:
         """Coarse-to-fine flow aligning nb onto center; both (B,H,W,3)."""
-        start = 0 if self.flow_scale == "full" else 1
+        start = self._FLOW_STARTS[self.flow_scale]
         cs, ns = [center], [nb]
         for _ in range(_LEVELS - 1):
             cs.append(_avgpool2(cs[-1]))

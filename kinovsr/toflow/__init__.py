@@ -420,16 +420,23 @@ class TOFlow:
         wp = resolve_weights(weights or variant)
         gp = _graph_path_for(wp, graph)
         self.dtype = dtype
+        from .net import TOFlowDirect
+        if flow_scale not in TOFlowDirect._FLOW_STARTS:
+            raise ValueError(
+                f"flow_scale must be one of "
+                f"{sorted(TOFlowDirect._FLOW_STARTS)}, got {flow_scale!r}")
         self.net = _TOFlowGraph(wp, gp, dtype=dtype)
         self.engine = "interp"
         if engine in ("auto", "direct"):
             try:
-                from .net import TOFlowDirect
                 raw = mx.load(str(wp))
                 self.net = TOFlowDirect(self.net.graph, raw, dtype,
                                         flow_scale=flow_scale)
                 self.engine = "direct"
             except ValueError:
+                # structural mismatch (e.g. the two-frame interp checkpoint):
+                # keep the interpreter. flow_scale was validated above, so a
+                # bad value cannot silently land here.
                 if engine == "direct":
                     raise
         self.variant = str((getattr(self.net, "graph", {}) or {}).get("variant")

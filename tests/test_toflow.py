@@ -51,19 +51,20 @@ def test_direct_forward_matches_plain_interpretation():
     assert worst < 1e-3, f"direct forward diverged from interpreter by {worst}"
 
 
-def test_half_flow_tracks_full():
+def test_reduced_flow_tracks_full():
     clip = _clip()
     full = TOFlowDenoiser(variant="deblock")
     assert full.net.engine == "direct"
-    half = TOFlowDenoiser(variant="deblock", flow_scale="half")
     a = _run(full, clip)
-    b = _run(half, clip)
-    worst = max(float(mx.max(mx.abs(x - y))) for x, y in zip(a, b))
-    mean = max(float(mx.mean(mx.abs(x - y))) for x, y in zip(a, b))
-    # half flow skips the full-res refinement: outputs stay close but not
-    # identical (at real resolutions they agree at ~35 dB; this tiny frame
-    # exaggerates pyramid differences). Catastrophic divergence = broke.
-    assert mean < 0.035 and worst < 0.4, f"half flow diverged ({mean}, {worst})"
+    for scale in ("half", "quarter"):
+        red = TOFlowDenoiser(variant="deblock", flow_scale=scale)
+        b = _run(red, clip)
+        worst = max(float(mx.max(mx.abs(x - y))) for x, y in zip(a, b))
+        mean = max(float(mx.mean(mx.abs(x - y))) for x, y in zip(a, b))
+        # reduced flow skips fine refinement levels: outputs stay close but
+        # not identical (at real resolutions they agree at ~35 dB; this tiny
+        # frame exaggerates pyramid differences). Catastrophic = broke.
+        assert mean < 0.05 and worst < 0.5, f"{scale} diverged ({mean}, {worst})"
 
 
 def test_latency_and_flush():

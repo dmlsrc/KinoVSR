@@ -3162,15 +3162,19 @@ def main() -> None:
     )
 
     add(
-        "--toflow-flow-scale", choices=["full", "half"], default="full",
+        "--toflow-flow-scale", choices=["full", "half", "quarter"], default="full",
         help=(
             "Resolution of TOFlow's internal flow pyramid (denoise/deblock "
             "slots). full (default) = the faithful network. half = skip the "
             "full-resolution flow refinement level, the dominant cost of "
-            "the whole net: measured 3.3x faster (229 -> 70 ms/frame at "
-            "480x360) for -0.4 dB on a crushed ground-truth fixture "
-            "(outputs agree with full at ~35 dB). Eyeball it per clip "
-            "before relying on it for delivery."
+            "the whole net: measured 3.3x faster (229 -> 71 ms/frame at "
+            "480x360) for -0.2 to -0.4 dB on crushed ground-truth "
+            "fixtures. quarter = also skip the half-res level: 31 ms/frame "
+            "(7x), nearly free beyond half on static-camera content. Both "
+            "bills were measured on static-ish fixtures -- coarse flow "
+            "pays its real cost on FAST motion (misaligned neighbors "
+            "soften the fusion), so eyeball moving content before relying "
+            "on them for delivery."
         ),
     )
 
