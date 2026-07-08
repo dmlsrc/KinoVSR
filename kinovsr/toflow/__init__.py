@@ -399,7 +399,10 @@ def _reflect_pad_to16(x: Any) -> tuple[Any, int, int]:
 class TOFlow:
     """One converted TOFlow checkpoint.
 
-    denoise/deblock/SR use seven-frame sep windows. interp uses a two-frame pair.
+    denoise/deblock/SR use seven-frame sep windows. interp uses a two-frame
+    pair. The sep checkpoints run through the direct MLX forward (net.py:
+    batched branches, folded batchnorm, padded fusion conv); anything whose
+    structure does not match falls back to the graph interpreter.
     """
 
     NUM_FRAMES = 7
@@ -411,12 +414,26 @@ class TOFlow:
         variant: str = _DEFAULT_VARIANT,
         graph: Any = None,
         dtype: Any = mx.float32,
+        flow_scale: str = "full",
+        engine: str = "auto",
     ):
         wp = resolve_weights(weights or variant)
         gp = _graph_path_for(wp, graph)
         self.dtype = dtype
         self.net = _TOFlowGraph(wp, gp, dtype=dtype)
-        self.variant = str(self.net.graph.get("variant") or variant)
+        self.engine = "interp"
+        if engine in ("auto", "direct"):
+            try:
+                from .net import TOFlowDirect
+                raw = mx.load(str(wp))
+                self.net = TOFlowDirect(self.net.graph, raw, dtype,
+                                        flow_scale=flow_scale)
+                self.engine = "direct"
+            except ValueError:
+                if engine == "direct":
+                    raise
+        self.variant = str((getattr(self.net, "graph", {}) or {}).get("variant")
+                           or variant)
         self._mean = mx.array(_MEAN, dtype=mx.float32).reshape(1, 1, 1, 3)
         self._std = mx.array(_STD, dtype=mx.float32).reshape(1, 1, 1, 3)
 
@@ -479,6 +496,7 @@ class TOFlowDenoiser:
         graph: Any = None,
         strength: float = 1.0,
         dtype: Any = mx.float32,
+        flow_scale: str = "full",
     ):
         if variant not in {"denoise", "deblock"}:
             raise ValueError("TOFlowDenoiser supports only denoise/deblock variants")
@@ -489,7 +507,8 @@ class TOFlowDenoiser:
                 "LTX_2_MLX/videotoolbox/toflow/convert_t7_to_safetensors.py "
                 "or pass --toflow-weights."
             )
-        self.net = TOFlow(wp, variant=variant, graph=graph, dtype=dtype)
+        self.net = TOFlow(wp, variant=variant, graph=graph, dtype=dtype,
+                          flow_scale=flow_scale)
         self._strength = max(0.0, min(1.0, float(strength)))
         self._radius = self.net.NUM_FRAMES // 2
         self._reset()
@@ -562,6 +581,7 @@ class TOFlowSrUpscaler:
         *,
         graph: Any = None,
         dtype: Any = mx.float32,
+        flow_scale: str = "full",
     ):
         wp = resolve_weights(weights or "sr")
         if not wp.is_file():
@@ -570,7 +590,8 @@ class TOFlowSrUpscaler:
                 "LTX_2_MLX/videotoolbox/toflow/convert_t7_to_safetensors.py "
                 "or pass --toflow-sr-weights."
             )
-        self.net = TOFlow(wp, variant="sr", graph=graph, dtype=dtype)
+        self.net = TOFlow(wp, variant="sr", graph=graph, dtype=dtype,
+                          flow_scale=flow_scale)
         self._radius = self.net.NUM_FRAMES // 2
         self._reset()
 

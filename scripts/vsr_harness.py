@@ -1346,6 +1346,7 @@ def run(args: argparse.Namespace) -> None:
                 return TOFlowDenoiser(
                     args.toflow_weights or os.environ.get("TOFLOW_WEIGHTS"),
                     variant=args.toflow_variant,
+                    flow_scale=args.toflow_flow_scale,
                     graph=args.toflow_graph or os.environ.get("TOFLOW_GRAPH"),
                     strength=stg,
                     dtype=parse_mlx_dtype_name(args.toflow_dtype),
@@ -1444,6 +1445,7 @@ def run(args: argparse.Namespace) -> None:
             deb = TOFlowDenoiser(
                 args.toflow_weights or os.environ.get("TOFLOW_WEIGHTS"),
                 variant="deblock",
+                flow_scale=args.toflow_flow_scale,
                 graph=args.toflow_graph or os.environ.get("TOFLOW_GRAPH"),
                 strength=args.deblock_strength,
                 dtype=parse_mlx_dtype_name(args.toflow_dtype),
@@ -3109,6 +3111,19 @@ def main() -> None:
     add(
         "--toflow-dtype", choices=["float16", "float32"], default="float32",
         help="MLX dtype for --denoise toflow (default float32; float16 is faster but less parity-faithful).",
+    )
+
+    add(
+        "--toflow-flow-scale", choices=["full", "half"], default="full",
+        help=(
+            "Resolution of TOFlow's internal flow pyramid (denoise/deblock "
+            "slots). full (default) = the faithful network. half = skip the "
+            "full-resolution flow refinement level, the dominant cost of "
+            "the whole net: measured 3.3x faster (229 -> 70 ms/frame at "
+            "480x360) for -0.4 dB on a crushed ground-truth fixture "
+            "(outputs agree with full at ~35 dB). Eyeball it per clip "
+            "before relying on it for delivery."
+        ),
     )
 
     add(
