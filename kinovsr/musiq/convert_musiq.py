@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Convert a released MUSIQ checkpoint (.pth) to the MLX safetensors layout.
 
+Net-specific on purpose -- the general scripts/pth_to_safetensors.py would
+produce a checkpoint that loads but scores garbage, because MUSIQ's
+conversion is not a plain re-serialization:
+
 - conv weights: weight standardization folded in (they are fixed at
   inference: w = (w - mean) / (unbiased_std + 1e-5), matching the reference
   StdConv), then OIHW -> OHWI for MLX conv2d.
 - everything else passes through as fp32.
+
+Loading uses torch.load(weights_only=True) (restricted unpickler). See
+weights/README.md for the source URL and sha256.
 
 Usage: convert_musiq.py <musiq_koniq_ckpt.pth> [out.safetensors]
 """
