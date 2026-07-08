@@ -1400,19 +1400,46 @@ def run(args: argparse.Namespace) -> None:
         # boundary-vs-interior contrast) gating the deblocker's correction, so
         # blocked flats get the full correction and detailed/clean areas keep
         # their texture.
+        _deb_names = ([] if args.deblock == "off" else
+                      [s.strip() for s in str(args.deblock).split(",")
+                       if s.strip() and s.strip() != "off"])
+        _deb_known = {"stdf", "fbcnn", "toflow"}
+        _deb_bad = [n for n in _deb_names if n not in _deb_known]
+        if _deb_bad:
+            raise SystemExit(f"--deblock: unknown stage(s) {_deb_bad}; choose "
+                             f"from {sorted(_deb_known)} (comma-chain to run "
+                             f"several in order, e.g. toflow,stdf)")
+        _deb_str = [s.strip() for s in str(args.deblock_strength).split(",")]
+        if len(_deb_str) == 1:
+            _deb_str = _deb_str * max(1, len(_deb_names))
+        if _deb_names and len(_deb_str) != len(_deb_names):
+            raise SystemExit("--deblock-strength: give one value or exactly "
+                             "one per chained --deblock stage")
+        _deb_strengths = [float(s) for s in _deb_str]
+
         blk_tracker: Any = None
+        _deb_mask_capable = [n for n in _deb_names if n in ("stdf", "fbcnn")]
         if args.deblock_map == "auto":
-            if args.deblock in ("stdf", "fbcnn"):
-                from LTX_2_MLX.videotoolbox.noise_map import (
-                    NoiseMapTracker,
-                    estimate_blockiness_map,
-                )
-                blk_tracker = NoiseMapTracker(gain=args.deblock_map_gain, min_frames=1,
-                                              estimator=estimate_blockiness_map)
+            if _deb_mask_capable:
                 print(f"[deblock-map] auto: per-pixel blockiness mask on the "
                       f"correction (gain {args.deblock_map_gain:g})")
             elif args.deblock != "off":
                 print(f"[deblock-map] auto ignored: --deblock {args.deblock} unsupported")
+
+        def _make_blk_tracker() -> Any:
+            # one tracker per mask-capable stage: it keeps rolling frame
+            # state, so sharing across chained deblockers would double-feed
+            nonlocal blk_tracker
+            if args.deblock_map != "auto":
+                return None
+            from LTX_2_MLX.videotoolbox.noise_map import (
+                NoiseMapTracker,
+                estimate_blockiness_map,
+            )
+            tr = NoiseMapTracker(gain=args.deblock_map_gain, min_frames=1,
+                                 estimator=estimate_blockiness_map)
+            blk_tracker = tr             # last one wins for the debug report
+            return tr
 
         defl: Any = None
         if args.deflicker == "on":
@@ -1430,47 +1457,55 @@ def run(args: argparse.Namespace) -> None:
                   f"{args.deflicker_max_fix:g}{_jit} (verified-static only; "
                   f"untouched pixels pass through bit-identical)")
 
-        deb: Any = None
-        if args.deblock == "stdf":
-            from LTX_2_MLX.videotoolbox.stdf.deblocker import StdfDeblocker
-            kr, kb = _yuv.coef_for_matrix(_resolved_color[2])    # match the source color matrix
-            deb = StdfDeblocker(args.deblock_weights or os.environ.get("STDF_WEIGHTS"),
-                                strength=args.deblock_strength, kr=kr, kb=kb,
-                                blockiness_map=blk_tracker)
-        elif args.deblock == "toflow":
-            # the TOFlow deblock checkpoint in the deblock SLOT (the same
-            # processor is also reachable as --denoise toflow
-            # --toflow-variant deblock; this placement lets it chain with a
-            # real denoiser in the natural order)
-            deb = TOFlowDenoiser(
-                args.toflow_weights or os.environ.get("TOFLOW_WEIGHTS"),
-                variant="deblock",
-                flow_scale=args.toflow_flow_scale,
-                graph=args.toflow_graph or os.environ.get("TOFLOW_GRAPH"),
-                strength=args.deblock_strength,
-                dtype=parse_mlx_dtype_name(args.toflow_dtype),
-            )
-        elif args.deblock == "fbcnn":
-            from LTX_2_MLX.videotoolbox.fbcnn import FbcnnDeblocker
-            _q = args.fbcnn_quality.strip().lower()
-            if _q == "auto":
-                _quality: Any = "auto"
-            elif _q in ("blind", "none"):
-                _quality = None
-            else:
-                try:
-                    _quality = float(_q)
-                except ValueError:
-                    raise SystemExit(
-                        f"bad --fbcnn-quality {args.fbcnn_quality!r}: expected 'auto', "
-                        f"'blind', or a number 1-100") from None
-            deb = FbcnnDeblocker(args.deblock_weights or os.environ.get("FBCNN_WEIGHTS"),
-                                 quality=_quality, strength=args.fbcnn_strength,
-                                 blockiness_map=blk_tracker,
-                                 quality_fallback=args.fbcnn_quality_fallback)
-            if _quality == "auto":
-                print(f"[deblock] fbcnn auto QF: per-tile comb measurement "
-                      f"(128px tiles, fallback {args.fbcnn_quality_fallback:g})")
+        def _make_deblocker(name: str, stg: float) -> Any:
+            if name == "stdf":
+                from LTX_2_MLX.videotoolbox.stdf.deblocker import StdfDeblocker
+                kr, kb = _yuv.coef_for_matrix(_resolved_color[2])    # match the source color matrix
+                return StdfDeblocker(args.deblock_weights or os.environ.get("STDF_WEIGHTS"),
+                                     strength=stg, kr=kr, kb=kb,
+                                     blockiness_map=_make_blk_tracker())
+            if name == "toflow":
+                # the TOFlow deblock checkpoint in the deblock SLOT (the same
+                # processor is also reachable as --denoise toflow
+                # --toflow-variant deblock; this placement lets it chain with
+                # a real denoiser in the natural order)
+                return TOFlowDenoiser(
+                    args.toflow_weights or os.environ.get("TOFLOW_WEIGHTS"),
+                    variant="deblock",
+                    flow_scale=args.toflow_flow_scale,
+                    graph=args.toflow_graph or os.environ.get("TOFLOW_GRAPH"),
+                    strength=stg,
+                    dtype=parse_mlx_dtype_name(args.toflow_dtype),
+                )
+            if name == "fbcnn":
+                from LTX_2_MLX.videotoolbox.fbcnn import FbcnnDeblocker
+                _q = args.fbcnn_quality.strip().lower()
+                if _q == "auto":
+                    _quality: Any = "auto"
+                elif _q in ("blind", "none"):
+                    _quality = None
+                else:
+                    try:
+                        _quality = float(_q)
+                    except ValueError:
+                        raise SystemExit(
+                            f"bad --fbcnn-quality {args.fbcnn_quality!r}: expected 'auto', "
+                            f"'blind', or a number 1-100") from None
+                fb = FbcnnDeblocker(args.deblock_weights or os.environ.get("FBCNN_WEIGHTS"),
+                                    quality=_quality, strength=args.fbcnn_strength,
+                                    blockiness_map=_make_blk_tracker(),
+                                    quality_fallback=args.fbcnn_quality_fallback)
+                if _quality == "auto":
+                    print(f"[deblock] fbcnn auto QF: per-tile comb measurement "
+                          f"(128px tiles, fallback {args.fbcnn_quality_fallback:g})")
+                return fb
+            raise AssertionError(name)
+
+        _debs = [_make_deblocker(n, s) for n, s in zip(_deb_names, _deb_strengths)]
+        if len(_deb_names) > 1:
+            print(f"[deblock] chain: {' -> '.join(_deb_names)} "
+                  f"(strengths {', '.join(f'{s:g}' for s in _deb_strengths)})")
+        deb: Any = (_debs if len(_debs) > 1 else (_debs[0] if _debs else None))
 
         up: Any = None
         if args.spatial_mode == "basicvsrpp":
@@ -1925,8 +1960,8 @@ def run(args: argparse.Namespace) -> None:
                             for up_rgb, (u_sf, u_sa) in upscaler.flush():
                                 _emit(up_rgb, u_sf, u_sa)
                         session.reset_temporal_context()
-                        if deblocker is not None:
-                            deblocker.reset()
+                        for _d in _den_members(deblocker):
+                            _d.reset()
                         for _d in _den_members(denoiser):
                             _d.reset()
                         if deflicker_stage is not None:
@@ -2051,9 +2086,10 @@ def run(args: argparse.Namespace) -> None:
                       f"(conf {_qi['global']['confidence']:g})  "
                       f"comb coverage {_qi['coverage'] * 100:.0f}%{_qmed}  "
                       f"[{_note}]")
-        if (deblocker is not None and args.deblock_map == "auto"
-                and args.deblock in ("stdf", "fbcnn")):
-            _bm = getattr(deblocker, "last_blockiness_map", None)
+        _deb_dbg = [d for d in _den_members(deblocker)
+                    if getattr(d, "last_blockiness_map", None) is not None]
+        if _deb_dbg and args.deblock_map == "auto":
+            _bm = _deb_dbg[0].last_blockiness_map
             if _bm is None:
                 print("[deblock-map] no mask was estimated (no frames deblocked?)")
             else:
@@ -2779,10 +2815,13 @@ def main() -> None:
 
     # ---- Deblock -----------------------------------------------------------------
     add(
-        "--deblock", choices=["off", "stdf", "fbcnn", "toflow"], default="off",
+        "--deblock", default="off", metavar="NAME[,NAME...]",
         help=(
             "Pre-upscale compression-artifact deblock, applied before denoise + VSR "
-            "(deblock before SR amplifies the blocking). off (default); stdf = STDF "
+            "(deblock before SR amplifies the blocking). Comma-chain to run "
+            "several in order (e.g. toflow,stdf: TOFlow's gentle flow-fused pass "
+            "then STDF's deformable fusion; stages run left to right). off "
+            "(default); stdf = STDF "
             "deformable spatio-temporal fusion (HEVC-trained, luma-only 7-frame window, "
             "weights bundled); toflow = the TOFlow deblock checkpoint (task-oriented-"
             "flow seven-frame window, weights bundled; heavy -- see --denoise toflow "
@@ -2803,10 +2842,14 @@ def main() -> None:
     )
 
     add(
-        "--deblock-strength", type=float, default=1.0, metavar="S",
+        "--deblock-strength", default="1.0", metavar="S[,S...]",
         help=(
-            "Scale the STDF deblock residual (1.0 = full, default; lower keeps more "
-            "fine texture at the cost of less deblocking -- try 0.5-0.7 on faces)."
+            "Scale the deblock effect (1.0 = full, default; lower keeps more "
+            "fine texture at the cost of less deblocking -- try 0.5-0.7 on "
+            "faces). With a chained --deblock, give one value per stage "
+            "(comma list) or one value for all. For stdf this scales the "
+            "residual; for toflow it is the dry/wet blend; fbcnn uses "
+            "--fbcnn-strength instead."
         ),
     )
 
