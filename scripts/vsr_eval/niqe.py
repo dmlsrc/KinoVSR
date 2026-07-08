@@ -30,100 +30,131 @@ Usage:
 """
 from __future__ import annotations
 
+from typing import Any
+
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
+import mlx.core as mx
 import numpy as np
-from scipy.ndimage import gaussian_filter
-from scipy.special import gamma as _gamma
 
-MODEL_PATH = Path(__file__).resolve().parent / "weights" / "niqe_pristine_reds.npz"
+MODEL_PATH = Path(__file__).resolve().parent / "weights" / "niqe_pristine_reds.safetensors"
 PATCH = 96
 
+# ---- MLX compute core (numpy only at the file/CLI boundary) -----------------
+# gamma-function terms are precomputed per table entry, so nothing at runtime
+# needs a special function: alpha fits reduce to an argmin against _R_GAM.
+_GAM_NP = np.arange(0.2, 10.001, 0.001)
+_lgamma = np.vectorize(math.lgamma)
+_R_GAM_NP = np.exp(_lgamma(1.0 / _GAM_NP) + _lgamma(3.0 / _GAM_NP)
+                   - 2.0 * _lgamma(2.0 / _GAM_NP))
+_CONST_NP = np.sqrt(np.exp(_lgamma(1.0 / _GAM_NP) - _lgamma(3.0 / _GAM_NP)))
+_MEANFAC_NP = np.exp(_lgamma(2.0 / _GAM_NP) - _lgamma(1.0 / _GAM_NP)) * _CONST_NP
+_GAM = mx.array(_GAM_NP.astype(np.float32))
+_R_GAM = mx.array(_R_GAM_NP.astype(np.float32))
+_MEANFAC = mx.array(_MEANFAC_NP.astype(np.float32))
 
-def _mscn(luma: np.ndarray) -> np.ndarray:
-    mu = gaussian_filter(luma, 7.0 / 6.0, truncate=3.0)
-    sigma = np.sqrt(np.maximum(
-        gaussian_filter(luma * luma, 7.0 / 6.0, truncate=3.0) - mu * mu, 0.0))
+
+def _alpha_idx(rhat: Any) -> Any:
+    return mx.argmin(mx.abs(_R_GAM[None, :] - rhat[:, None]), axis=1)
+
+
+def _gauss_kernel(sigma: float = 7.0 / 6.0, truncate: float = 3.0) -> Any:
+    r = int(truncate * sigma + 0.5)
+    x = mx.arange(-r, r + 1).astype(mx.float32)
+    k = mx.exp(-(x * x) / (2 * sigma * sigma))
+    return k / mx.sum(k), r
+
+
+_K1D, _KRAD = _gauss_kernel()
+
+
+def _reflect_pad(x: Any, r: int, axis: int) -> Any:
+    # scipy gaussian_filter default 'reflect' = mirror including the edge
+    if axis == 0:
+        return mx.concatenate([x[r - 1::-1, :], x, x[:-r - 1:-1, :]], axis=0)
+    return mx.concatenate([x[:, r - 1::-1], x, x[:, :-r - 1:-1]], axis=1)
+
+
+def _gauss_blur(x: Any) -> Any:
+    r = _KRAD
+    k = _K1D.reshape(1, 2 * r + 1, 1, 1)
+    y = _reflect_pad(x, r, 0)
+    y = mx.conv2d(y[None, :, :, None], k)[0, :, :, 0]
+    y = _reflect_pad(y, r, 1)
+    y = mx.conv2d(y[None, :, :, None], mx.transpose(k, (0, 2, 1, 3)))[0, :, :, 0]
+    return y
+
+
+def _mscn(luma: Any) -> Any:
+    mu = _gauss_blur(luma)
+    sigma = mx.sqrt(mx.maximum(_gauss_blur(luma * luma) - mu * mu, 0.0))
     return (luma - mu) / (sigma + 1.0)
 
 
-_GAM = np.arange(0.2, 10.001, 0.001)
-_R_GAM = (_gamma(1.0 / _GAM) * _gamma(3.0 / _GAM)) / (_gamma(2.0 / _GAM) ** 2)
-
-
-def _aggd(x: np.ndarray) -> tuple[float, float, float]:
-    """Asymmetric generalized Gaussian fit -> (alpha, sigma_l, sigma_r)."""
-    left = x[x < 0]
-    right = x[x >= 0]
-    sl = np.sqrt(np.mean(left * left)) if left.size else 1e-6
-    sr = np.sqrt(np.mean(right * right)) if right.size else 1e-6
-    gh = sl / sr if sr > 0 else 1.0
-    m1 = np.mean(np.abs(x))
-    m2 = np.mean(x * x)
-    rh = (m1 * m1) / m2 if m2 > 0 else 1e-6
-    rhat = rh * (gh ** 3 + 1.0) * (gh + 1.0) / ((gh * gh + 1.0) ** 2)
-    alpha = _GAM[int(np.argmin((_R_GAM - rhat) ** 2))]
-    return float(alpha), float(sl), float(sr)
-
-
-def _ggd(x: np.ndarray) -> tuple[float, float]:
-    m2 = np.mean(x * x)
-    m1 = np.mean(np.abs(x))
+def _scale_features(m: Any, p: int) -> Any:
+    """(P, 18) GGD + 4x AGGD features for every p x p patch, vectorized."""
+    ny, nx = int(m.shape[0]) // p, int(m.shape[1]) // p
+    if not ny or not nx:
+        return mx.zeros((0, 18))
+    pt = m[: ny * p, : nx * p].reshape(ny, p, nx, p).transpose(0, 2, 1, 3) \
+        .reshape(ny * nx, p, p)
+    feats = []
+    # GGD over the patch
+    m1 = mx.mean(mx.abs(pt), axis=(1, 2))
+    m2 = mx.mean(pt * pt, axis=(1, 2))
     rho = m2 / (m1 * m1 + 1e-12)
-    rr = _gamma(1.0 / _GAM) * _gamma(3.0 / _GAM) / (_gamma(2.0 / _GAM) ** 2)
-    alpha = _GAM[int(np.argmin((rr - rho) ** 2))]
-    return float(alpha), float(np.sqrt(m2))
-
-
-def _patch_features(mscn: np.ndarray) -> np.ndarray:
-    feats = list(_ggd(mscn.reshape(-1)))
+    gi = _alpha_idx(rho)
+    feats += [_GAM[gi], mx.sqrt(m2)]
+    # AGGD over the four neighbor products, computed inside each patch
     for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
-        a = mscn[max(dy, 0):mscn.shape[0] - max(-dy, 0) or None,
-                 max(dx, 0):mscn.shape[1] - max(-dx, 0) or None]
-        b = mscn[max(-dy, 0):mscn.shape[0] - max(dy, 0) or None,
-                 max(-dx, 0):mscn.shape[1] - max(dx, 0) or None]
-        prod = (a * b).reshape(-1)
-        alpha, sl, sr = _aggd(prod)
-        const = np.sqrt(_gamma(1.0 / alpha) / _gamma(3.0 / alpha))
-        mean = (sr - sl) * (_gamma(2.0 / alpha) / _gamma(1.0 / alpha)) * const
-        feats += [alpha, mean, sl * sl, sr * sr]
-    return np.asarray(feats, dtype=np.float64)
+        a = pt[:, max(dy, 0):p - max(-dy, 0) or None,
+               max(dx, 0):p - max(-dx, 0) or None]
+        b = pt[:, max(-dy, 0):p - max(dy, 0) or None,
+               max(-dx, 0):p - max(dx, 0) or None]
+        prod = (a * b).reshape(ny * nx, -1)
+        neg = (prod < 0).astype(mx.float32)
+        pos = 1.0 - neg
+        nn = mx.maximum(mx.sum(neg, axis=1), 1.0)
+        np_ = mx.maximum(mx.sum(pos, axis=1), 1.0)
+        sl = mx.sqrt(mx.sum(prod * prod * neg, axis=1) / nn) + 1e-6
+        sr = mx.sqrt(mx.sum(prod * prod * pos, axis=1) / np_) + 1e-6
+        gh = sl / sr
+        m1p = mx.mean(mx.abs(prod), axis=1)
+        m2p = mx.mean(prod * prod, axis=1)
+        rh = (m1p * m1p) / (m2p + 1e-12)
+        rhat = rh * (gh ** 3 + 1.0) * (gh + 1.0) / ((gh * gh + 1.0) ** 2)
+        ai = _alpha_idx(rhat)
+        mean = (sr - sl) * _MEANFAC[ai]
+        feats += [_GAM[ai], mean, sl * sl, sr * sr]
+    return mx.stack(feats, axis=1)
 
 
 def _luma_of(img: np.ndarray) -> np.ndarray:
     if img.ndim == 3:
         img = 0.299 * img[..., 0] + 0.587 * img[..., 1] + 0.114 * img[..., 2]
-    return img.astype(np.float64)
+    return img.astype(np.float32)
 
 
 def image_features(luma: np.ndarray) -> np.ndarray:
     """(n_patches, 36) two-scale NIQE features over PATCH-sized tiles."""
-    rows = []
-    for scale in (1, 2):
-        lm = luma if scale == 1 else luma[::2, ::2]
-        m = _mscn(lm)
-        p = PATCH // scale
-        ny, nx = m.shape[0] // p, m.shape[1] // p
-        feats = [
-            _patch_features(m[i * p:(i + 1) * p, j * p:(j + 1) * p])
-            for i in range(ny) for j in range(nx)
-        ]
-        rows.append(np.stack(feats) if feats else np.zeros((0, 18)))
-    # pair each scale-2 patch (half-res, half patch size = same region) with
-    # its scale-1 patch
-    s1, s2 = rows
-    ny1 = luma.shape[0] // PATCH
-    nx1 = luma.shape[1] // PATCH
+    lm = mx.array(np.ascontiguousarray(luma, dtype=np.float32))
+    s1 = _scale_features(_mscn(lm), PATCH)
+    s2 = _scale_features(_mscn(lm[::2, ::2]), PATCH // 2)
+    ny1, nx1 = luma.shape[0] // PATCH, luma.shape[1] // PATCH
     ny2 = (luma.shape[0] // 2) // (PATCH // 2)
     nx2 = (luma.shape[1] // 2) // (PATCH // 2)
-    out = []
-    for i in range(min(ny1, ny2)):
-        for j in range(min(nx1, nx2)):
-            out.append(np.concatenate([s1[i * nx1 + j], s2[i * nx2 + j]]))
-    return np.stack(out) if out else np.zeros((0, 36))
+    ny, nx = min(ny1, ny2), min(nx1, nx2)
+    if not ny or not nx:
+        return np.zeros((0, 36))
+    i1 = mx.array([i * nx1 + j for i in range(ny) for j in range(nx)])
+    i2 = mx.array([i * nx2 + j for i in range(ny) for j in range(nx)])
+    out = mx.concatenate([s1[i1], s2[i2]], axis=1)
+    mx.eval(out)
+    return np.asarray(out.astype(mx.float32), dtype=np.float64)
 
 
 def fit_model(folder: Path, out: Path, max_images: int = 200,
@@ -143,20 +174,23 @@ def fit_model(folder: Path, out: Path, max_images: int = 200,
         if not len(f):
             continue
         # NIQE fits the pristine model on the SHARPEST patches only
-        m = _mscn(luma)
+        m = _mscn(mx.array(np.ascontiguousarray(luma, dtype=np.float32)))
         pch = PATCH
-        ny, nx = m.shape[0] // pch, m.shape[1] // pch
-        sharp = np.asarray([
-            np.std(m[i * pch:(i + 1) * pch, j * pch:(j + 1) * pch])
-            for i in range(ny) for j in range(nx)
-        ])
+        ny, nx = int(m.shape[0]) // pch, int(m.shape[1]) // pch
+        pt = m[: ny * pch, : nx * pch].reshape(ny, pch, nx, pch) \
+            .transpose(0, 2, 1, 3).reshape(ny * nx, -1)
+        sharp = np.asarray(mx.sqrt(mx.var(pt, axis=1)).astype(mx.float32))
         keep = sharp >= np.quantile(sharp, 1.0 - sharp_frac)
         feats.append(f[keep[: len(f)]])
     allf = np.concatenate(feats, axis=0)
     mu = allf.mean(axis=0)
     cov = np.cov(allf, rowvar=False)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, mu=mu, cov=cov, n=allf.shape[0])
+    mx.save_safetensors(str(out), {
+        "mu": mx.array(mu.astype(np.float32)),
+        "cov": mx.array(cov.astype(np.float32)),
+        "n": mx.array([allf.shape[0]], dtype=mx.int32),
+    })
     print(f"pristine model: {allf.shape[0]} patches from {len(paths)} images -> {out}")
 
 
@@ -172,8 +206,9 @@ def _read_video_lumas(path: Path, every: int = 1) -> list[np.ndarray]:
 
 
 def score_lumas(lumas: list[np.ndarray], model: Path = MODEL_PATH) -> float:
-    m = np.load(model)
-    mu_p, cov_p = m["mu"], m["cov"]
+    m = mx.load(str(model))
+    mu_p = np.asarray(m["mu"].astype(mx.float32), dtype=np.float64)
+    cov_p = np.asarray(m["cov"].astype(mx.float32), dtype=np.float64)
     feats = np.concatenate([image_features(lu) for lu in lumas], axis=0)
     mu_d = feats.mean(axis=0)
     cov_d = np.cov(feats, rowvar=False)
@@ -185,7 +220,8 @@ def score_lumas(lumas: list[np.ndarray], model: Path = MODEL_PATH) -> float:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("inputs", nargs="*", help="videos (or images) to score")
-    ap.add_argument("--fit", metavar="FOLDER", help="fit the pristine model from images")
+    ap.add_argument("--fit", metavar="FOLDER",
+                    help="fit the pristine model (safetensors) from images")
     ap.add_argument("--model", default=str(MODEL_PATH))
     ap.add_argument("--out", default=str(MODEL_PATH))
     ap.add_argument("--every", type=int, default=3, help="score every Nth frame")
