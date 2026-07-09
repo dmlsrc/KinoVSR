@@ -28,8 +28,8 @@ fidelity anchor, and let opinion-trained metrics (MUSIQ / CLIP-IQA /
 DOVER, downloads required) or eyes make the quality call.
 
 Usage:
-  fit:    niqe.py --fit <folder-of-pristine-images> [--out model.npz]
-  score:  niqe.py <video-or-image> [...] [--model model.npz]
+  fit:    niqe.py --fit <folder-of-pristine-images> [--out model.safetensors]
+  score:  niqe.py <video-or-image> [...] [--model model.safetensors]
 """
 from __future__ import annotations
 

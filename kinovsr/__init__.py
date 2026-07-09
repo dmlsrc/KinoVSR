@@ -1,11 +1,14 @@
-"""VideoToolbox-backed video post-processing for KinoVSR.
+"""KinoVSR - MLX-native video super-resolution and restoration for Apple Silicon.
 
-This subpackage bridges MLX-decoded video frames to Apple's hardware video
-pipeline: VideoToolbox Super Resolution (`VsrSession`), Frame Rate
-Conversion (`VtfrcSession`), and AVAssetWriter (`AVWriter`). All modules
-under this namespace require the PyObjC frameworks listed in the project
-dependencies; importing them on a base install raises a SystemExit with the
-install hint.
+The names re-exported at the package top level are the native VideoToolbox /
+AVFoundation bridge: VideoToolbox Super Resolution (`VsrSession`), Frame Rate
+Conversion (`VtfrcSession`), and AVAssetWriter (`AVWriter`). These require the
+PyObjC frameworks listed in the project dependencies; constructing them on a
+base install raises a SystemExit with the install hint.
+
+Learned restoration and upscaler families (denoise, deblock, toflow, nafnet,
+basicvsrpp, realesrgan, ...) live in their own submodules and are imported
+directly, for example `from kinovsr.denoise import ...`.
 
 Public surface:
 
@@ -14,7 +17,7 @@ Public surface:
         VtfrcSession,      # temporal frame-rate conversion via VTFrameRateConversion*
         AVWriter,          # HEVC + audio encoder via AVAssetWriter
         AudioTrack,        # in-memory PCM -> CMSampleBuffer wrapper
-        CutDetector,       # numpy-only scene-cut detector for VSR reset
+        CutDetector,       # pure-MLX scene-cut detector for VSR reset
     )
 
 Submodules expose lower-level helpers:
