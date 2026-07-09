@@ -216,3 +216,25 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Weights and models are local by default. Small bundled weights are
+# re-included explicitly below; larger converted checkpoints stay ignored so a
+# full local checkout can run without making every model a Git artifact.
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Bundled model weights.
+!kinovsr/fastdvdnet/weights/*.safetensors
+!kinovsr/spynet/weights/*.safetensors
+!kinovsr/stdf/weights/*.safetensors
+!kinovsr/realbasicvsr/weights/*.safetensors
+!kinovsr/toflow/weights/*.safetensors
+!kinovsr/realesrgan/weights/realesr_general_x4v3.safetensors
+!kinovsr/realesrgan/weights/realesr_general_wdn_x4v3.safetensors
+!scripts/vsr_eval/weights/face_detection_yunet_2023mar.onnx
+!scripts/vsr_eval/weights/niqe_pristine_reds.safetensors
