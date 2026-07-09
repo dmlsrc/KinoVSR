@@ -5,10 +5,10 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from LTX_2_MLX.videotoolbox.basicvsrpp.upscaler import BasicVsrUpscaler
-from LTX_2_MLX.videotoolbox.realbasicvsr.upscaler import RealBasicVsrUpscaler
-from LTX_2_MLX.videotoolbox.realviformer.upscaler import RealViformerUpscaler
-from LTX_2_MLX.videotoolbox.vsr_blocks import _compute_flows, box3, history_improve_gate
+from kinovsr.basicvsrpp.upscaler import BasicVsrUpscaler
+from kinovsr.realbasicvsr.upscaler import RealBasicVsrUpscaler
+from kinovsr.realviformer.upscaler import RealViformerUpscaler
+from kinovsr.vsr_blocks import _compute_flows, box3, history_improve_gate
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -216,7 +216,7 @@ def test_pth_converter_refuses_ambiguous_params_dict(tmp_path):
 
 
 def test_nafnet_model_rgb_clips_decode_overshoot():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import model_rgb
+    from kinovsr.nafnet.restorer import model_rgb
 
     rgb = mx.array([[[[-0.25, 0.5, 1.25, 42.0]]]], dtype=mx.float32)
     inp = model_rgb(rgb)
@@ -228,14 +228,14 @@ def test_nafnet_model_rgb_clips_decode_overshoot():
 
 
 def test_nafnet_restorer_rejects_bad_pool_mode_before_loading_weights():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import resolve_pool_mode
+    from kinovsr.nafnet.restorer import resolve_pool_mode
 
     with pytest.raises(ValueError, match="pool_mode"):
         resolve_pool_mode("gopro32", pool_mode="bogus")
 
 
 def test_nafnet_pool_auto_matches_reference_variants():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import resolve_pool_mode
+    from kinovsr.nafnet.restorer import resolve_pool_mode
 
     assert resolve_pool_mode("gopro", pool_mode="auto") == "local"
     assert resolve_pool_mode("gopro32", pool_mode="auto") == "local"
@@ -249,7 +249,7 @@ def test_nafnet_pool_auto_matches_reference_variants():
 
 
 def test_nafnet_guard_auto_protects_gopro_variants_only():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import resolve_guard_mode
+    from kinovsr.nafnet.restorer import resolve_guard_mode
 
     assert resolve_guard_mode("gopro", guard_mode="auto") == "reject"
     assert resolve_guard_mode("gopro32", guard_mode="auto") == "reject"
@@ -267,7 +267,7 @@ def test_nafnet_guard_auto_protects_gopro_variants_only():
 
 
 def test_nafnet_residual_guard_map_quadratic_knee():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import residual_guard_map
+    from kinovsr.nafnet.restorer import residual_guard_map
 
     low = mx.full((1, 7, 7, 3), 0.06)
     high = mx.full((1, 7, 7, 3), 0.24)
@@ -280,7 +280,7 @@ def test_nafnet_residual_guard_map_quadratic_knee():
 
 
 def test_nafnet_guard_probe_map_marks_framewide_risk():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import guard_probe_map
+    from kinovsr.nafnet.restorer import guard_probe_map
 
     safe = mx.full((1, 9, 9, 3), 0.02)
     risky = mx.full((1, 9, 9, 3), 0.08)
@@ -293,7 +293,7 @@ def test_nafnet_guard_probe_map_marks_framewide_risk():
 
 
 def test_nafnet_guard_probe_map_marks_low_amplitude_structure():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import guard_probe_map
+    from kinovsr.nafnet.restorer import guard_probe_map
 
     rows = [[0.04 if r % 2 else -0.04 for _c in range(9)] for r in range(9)]
     residual = mx.array([[[[v, v, v] for v in row] for row in rows]], dtype=mx.float32)
@@ -304,7 +304,7 @@ def test_nafnet_guard_probe_map_marks_low_amplitude_structure():
 
 
 def test_nafnet_luma_control_smooths_vertical_luma_not_chroma():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import luma_control_input
+    from kinovsr.nafnet.restorer import luma_control_input
 
     rgb = mx.array(
         [[
@@ -324,7 +324,7 @@ def test_nafnet_luma_control_smooths_vertical_luma_not_chroma():
 
 
 def test_nafnet_control_risk_map_uses_residual_disagreement():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import control_risk_map
+    from kinovsr.nafnet.restorer import control_risk_map
 
     residual = mx.full((1, 9, 9, 3), 0.08)
     control_residual = mx.zeros((1, 9, 9, 3))
@@ -338,7 +338,7 @@ def test_nafnet_control_risk_map_uses_residual_disagreement():
 
 
 def test_nafnet_control_guard_framewide_risk_locks_to_control_source():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import NafnetRestorer
+    from kinovsr.nafnet.restorer import NafnetRestorer
 
     restorer = object.__new__(NafnetRestorer)
     restorer._guard = 0.12
@@ -364,7 +364,7 @@ def test_nafnet_control_guard_framewide_risk_locks_to_control_source():
 
 def _reject_test_restorer(messages: list[str], lockout: int = 48, ramp: int = 0,
                           fall: int | None = None):
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import NafnetRestorer, _derived_fall_frames
+    from kinovsr.nafnet.restorer import NafnetRestorer, _derived_fall_frames
 
     restorer = object.__new__(NafnetRestorer)
     restorer._guard = 0.12
@@ -487,7 +487,7 @@ def test_nafnet_reject_guard_lockout_zero_never_reprobes():
 
 
 def test_nafnet_restorer_rejects_negative_lockout_before_loading_weights():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import NafnetRestorer
+    from kinovsr.nafnet.restorer import NafnetRestorer
 
     with pytest.raises(ValueError, match="guard_lockout_frames"):
         NafnetRestorer("gopro32", guard_lockout_frames=-1)
@@ -498,7 +498,7 @@ def test_nafnet_restorer_rejects_negative_lockout_before_loading_weights():
 
 
 def test_nafnet_reject_guard_explicit_fall_overrides_derived():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import (
+    from kinovsr.nafnet.restorer import (
         _REJECT_HARD_CUT_AREA,
         _REJECT_TRIP_AREA,
         _derived_fall_frames,
@@ -540,7 +540,7 @@ def test_nafnet_reject_guard_explicit_fall_overrides_derived():
 
 
 def test_nafnet_reject_guard_marginal_probe_stays_locked():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import (
+    from kinovsr.nafnet.restorer import (
         _REJECT_RESUME_AREA_RATIO,
         _REJECT_TRIP_AREA,
         _local_mag,
@@ -578,7 +578,7 @@ def test_nafnet_reject_guard_marginal_probe_stays_locked():
 
 
 def test_nafnet_reject_guard_gain_eases_out_and_back_in():
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import (
+    from kinovsr.nafnet.restorer import (
         _REJECT_HARD_CUT_AREA,
         _REJECT_TRIP_AREA,
         _local_mag,
@@ -627,7 +627,7 @@ def test_nafnet_reject_guard_gain_eases_out_and_back_in():
 
 
 def test_nafnet_guard_notice_uses_progress_callback(capsys):
-    from LTX_2_MLX.videotoolbox.nafnet.restorer import NafnetRestorer
+    from kinovsr.nafnet.restorer import NafnetRestorer
 
     restorer = object.__new__(NafnetRestorer)
     restorer._guard = 0.12
@@ -644,7 +644,7 @@ def test_nafnet_guard_notice_uses_progress_callback(capsys):
 
 
 def test_nafnet_tlsc_windows_match_reference_dummy_crop_scales():
-    from LTX_2_MLX.videotoolbox.nafnet import net
+    from kinovsr.nafnet import net
 
     cfg = (32, (1, 1, 1, 28), 1, (1, 1, 1, 1))
     assert net._tlsc_kernel("encoders.0.0.sca.1", cfg) == (384, 384)
@@ -656,7 +656,7 @@ def test_nafnet_tlsc_windows_match_reference_dummy_crop_scales():
 
 
 def test_nafnet_local_avg_pool_matches_reference_padding():
-    from LTX_2_MLX.videotoolbox.nafnet import net
+    from kinovsr.nafnet import net
 
     h, w = 5, 6
     values = [[r * w + c for c in range(w)] for r in range(h)]
@@ -681,7 +681,7 @@ def test_nafnet_local_avg_pool_matches_reference_padding():
 
 
 def test_safmn_bicubic_up_matches_torch_reference():
-    from LTX_2_MLX.videotoolbox.safmn.net import _bicubic_up
+    from kinovsr.safmn.net import _bicubic_up
 
     # Reference computed once with torch F.interpolate(scale_factor=2,
     # mode="bicubic", align_corners=False) on this exact input.
@@ -704,7 +704,7 @@ def test_safmn_bicubic_up_matches_torch_reference():
 
 
 def test_safmn_bicubic_up_reproduces_constants_and_ramps():
-    from LTX_2_MLX.videotoolbox.safmn.net import _bicubic_up
+    from kinovsr.safmn.net import _bicubic_up
 
     # Weights sum to 1 -> constants reproduce exactly, including at the
     # replicate-padded borders.
@@ -727,7 +727,7 @@ def test_safmn_bicubic_up_reproduces_constants_and_ramps():
 
 
 def test_safmn_safm_mode_inferred_from_filename():
-    from LTX_2_MLX.videotoolbox.safmn.net import _VARIANTS, _safm_mode_for
+    from kinovsr.safmn.net import _VARIANTS, _safm_mode_for
 
     assert _safm_mode_for("safmn_purescale_x4.safetensors") == "fixed"
     assert _safm_mode_for("/a/b/Safmn_PureScale_sharper_x2.safetensors") == "fixed"
@@ -741,7 +741,7 @@ def test_safmn_safm_mode_inferred_from_filename():
 
 
 def test_safmn_config_carries_safm_mode_and_trained_upsampler():
-    from LTX_2_MLX.videotoolbox.safmn.net import _config
+    from kinovsr.safmn.net import _config
 
     p = {
         "to_feat.weight": mx.zeros((128, 3, 3, 3)),
@@ -755,7 +755,7 @@ def test_safmn_config_carries_safm_mode_and_trained_upsampler():
 
 
 def test_safmn_upscaler_validates_args_before_loading_weights():
-    from LTX_2_MLX.videotoolbox.safmn.upscaler import SafmnUpscaler
+    from kinovsr.safmn.upscaler import SafmnUpscaler
 
     with pytest.raises(ValueError, match="safm_up"):
         SafmnUpscaler(safm_up="bogus")
@@ -764,7 +764,7 @@ def test_safmn_upscaler_validates_args_before_loading_weights():
 
 
 def test_safmn_pool_clamp_touches_only_interior_outliers():
-    from LTX_2_MLX.videotoolbox.safmn.net import _pool_clamp
+    from kinovsr.safmn.net import _pool_clamp
 
     mx.random.seed(4)
     s = mx.random.normal(shape=(1, 12, 16, 4)) * 0.1
@@ -793,7 +793,7 @@ def test_safmn_pool_clamp_touches_only_interior_outliers():
 
 
 def test_edge_sanitize_parse_spec():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import parse_edges_spec
+    from kinovsr.edge_sanitize import parse_edges_spec
 
     assert parse_edges_spec("0,1,0,0") == (0, 1, 0, 0)
     assert parse_edges_spec(" 2, 3 ,4,5 ") == (2, 3, 4, 5)
@@ -818,7 +818,7 @@ def _sanitize_samples(junk_bottom=False, bar_rows=0):
 
 
 def test_edge_sanitize_detects_dark_junk_row():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import detect_junk_edges
+    from kinovsr.edge_sanitize import detect_junk_edges
 
     edges, notices = detect_junk_edges(_sanitize_samples(junk_bottom=True))
     assert edges == (0, 1, 0, 0)
@@ -826,14 +826,14 @@ def test_edge_sanitize_detects_dark_junk_row():
 
 
 def test_edge_sanitize_clean_content_untouched():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import detect_junk_edges
+    from kinovsr.edge_sanitize import detect_junk_edges
 
     edges, notices = detect_junk_edges(_sanitize_samples())
     assert edges == (0, 0, 0, 0)
 
 
 def test_edge_sanitize_letterbox_reported_not_filled():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import detect_junk_edges
+    from kinovsr.edge_sanitize import detect_junk_edges
 
     edges, notices = detect_junk_edges(_sanitize_samples(bar_rows=12))
     assert edges == (0, 0, 0, 0)
@@ -841,7 +841,7 @@ def test_edge_sanitize_letterbox_reported_not_filled():
 
 
 def test_edge_sanitize_blank_samples_yield_no_detection():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import detect_junk_edges
+    from kinovsr.edge_sanitize import detect_junk_edges
 
     blanks = [mx.full((32, 32, 3), 0.02) for _ in range(5)]
     edges, notices = detect_junk_edges(blanks)
@@ -850,7 +850,7 @@ def test_edge_sanitize_blank_samples_yield_no_detection():
 
 
 def test_edge_sanitize_rgb_replaces_bands_and_keeps_dims():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import sanitize_rgb
+    from kinovsr.edge_sanitize import sanitize_rgb
 
     fr = mx.broadcast_to(mx.arange(10, dtype=mx.float32)[:, None, None], (10, 8, 3))
     out = sanitize_rgb(fr, (2, 1, 0, 0))
@@ -866,7 +866,7 @@ def test_edge_sanitize_rgb_replaces_bands_and_keeps_dims():
 
 
 def test_edge_sanitize_restore_borders_composites_original():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import restore_borders
+    from kinovsr.edge_sanitize import restore_borders
 
     mx.random.seed(9)
     src = mx.random.uniform(shape=(8, 10, 3))
@@ -894,7 +894,7 @@ def test_edge_sanitize_restore_borders_composites_original():
 
 
 def test_edge_sanitize_restore_feather_ramps_into_content():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import restore_borders
+    from kinovsr.edge_sanitize import restore_borders
 
     src = mx.zeros((8, 6, 3), dtype=mx.float32)
     out = mx.ones((16, 12, 3), dtype=mx.float32)   # processed at 2x
@@ -912,7 +912,7 @@ def test_edge_sanitize_restore_feather_ramps_into_content():
 
 
 def test_edge_sanitize_detect_bars_letterbox_and_pillarbox():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import detect_bars
+    from kinovsr.edge_sanitize import detect_bars
 
     mx.random.seed(11)
     letter, pillar = [], []
@@ -944,7 +944,7 @@ def test_edge_sanitize_detect_bars_letterbox_and_pillarbox():
 
 
 def test_edge_sanitize_crop_rgb():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import crop_rgb
+    from kinovsr.edge_sanitize import crop_rgb
 
     fr = mx.arange(6 * 8 * 3, dtype=mx.float32).reshape(6, 8, 3)
     out = crop_rgb(fr, (1, 2, 3, 0))
@@ -955,7 +955,7 @@ def test_edge_sanitize_crop_rgb():
 
 
 def test_edge_sanitize_compute_aspect_crop():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import compute_aspect_crop
+    from kinovsr.edge_sanitize import compute_aspect_crop
 
     # 16:9 window on a 4:3 frame: full width, centered vertically.
     assert compute_aspect_crop(640, 480, 16, 9) == (60, 60, 0, 0)
@@ -977,7 +977,7 @@ def test_edge_sanitize_compute_aspect_crop():
 
 
 def test_edge_sanitize_aspect_crop_anchors():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import compute_aspect_crop
+    from kinovsr.edge_sanitize import compute_aspect_crop
 
     # 16:9 on 4:3 (640x480 -> 640x360): the vertical slack is 120.
     assert compute_aspect_crop(640, 480, 16, 9, anchor="top") == (0, 120, 0, 0)
@@ -995,7 +995,7 @@ def test_edge_sanitize_aspect_crop_anchors():
 
 
 def test_edge_sanitize_aspect_crop_picks_closest_even_fit():
-    from LTX_2_MLX.videotoolbox.edge_sanitize import compute_aspect_crop
+    from kinovsr.edge_sanitize import compute_aspect_crop
 
     # 16:9 in storage px on 348x288: even boxes can only approximate;
     # 344x194 (-0.26%) beats 346x194 (+0.32%) and 348x194 (+0.90%).
@@ -1006,7 +1006,7 @@ def test_edge_sanitize_aspect_crop_picks_closest_even_fit():
 
 
 def test_lanczos_resample_plan_properties():
-    from LTX_2_MLX.videotoolbox.vsr_blocks import make_lanczos_plan, resample_width
+    from kinovsr.vsr_blocks import make_lanczos_plan, resample_width
 
     # identity when sizes match
     plan = make_lanczos_plan(12, 12)
@@ -1042,7 +1042,7 @@ def test_lanczos_resample_plan_properties():
 
 
 def test_to_rgb_batch_clips_decode_overshoot():
-    from LTX_2_MLX.videotoolbox.upscaler_base import to_rgb_batch
+    from kinovsr.upscaler_base import to_rgb_batch
 
     # decoded RGBAHalf carries legal YUV->RGB overshoot; every learned
     # upscaler entry must clip it (measured 56x confetti-speck area unclipped)
@@ -1056,7 +1056,7 @@ def test_to_rgb_batch_clips_decode_overshoot():
 
 
 def test_source_range_resolve_override():
-    from LTX_2_MLX.videotoolbox import color
+    from kinovsr import color
 
     src = {"primaries": None, "transfer": None, "matrix": None,
            "full_range": False, "tagged": False}

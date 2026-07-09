@@ -7,7 +7,7 @@ across space.
 """
 import mlx.core as mx
 
-from LTX_2_MLX.videotoolbox.deflicker import StaticStateDeflicker
+from kinovsr.deflicker import StaticStateDeflicker
 
 H, W, T = 192, 256, 24
 

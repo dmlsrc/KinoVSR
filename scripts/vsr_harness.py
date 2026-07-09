@@ -85,8 +85,8 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from LTX_2_MLX.progress import StackedPhaseBars
-from LTX_2_MLX.videotoolbox import (
+from kinovsr.progress import StackedPhaseBars
+from kinovsr import (
     AudioTrack,
     AVWriter,
     CutDetector,
@@ -95,33 +95,33 @@ from LTX_2_MLX.videotoolbox import (
     autorelease_pool,
     require_pyobjc,
 )
-from LTX_2_MLX.videotoolbox import color as _color
-from LTX_2_MLX.videotoolbox import pixel_buffers as _pb
-from LTX_2_MLX.videotoolbox import video_reader as _vr
-from LTX_2_MLX.videotoolbox import yuv as _yuv
-from LTX_2_MLX.videotoolbox.bsvd import BsvdDenoiser
-from LTX_2_MLX.videotoolbox.comparison import render_comparison
-from LTX_2_MLX.videotoolbox.denoise import LumaChromaDenoiser, McTemporalDenoiser, SpatialDenoiser
-from LTX_2_MLX.videotoolbox.edge_sanitize import (
+from kinovsr import color as _color
+from kinovsr import pixel_buffers as _pb
+from kinovsr import video_reader as _vr
+from kinovsr import yuv as _yuv
+from kinovsr.bsvd import BsvdDenoiser
+from kinovsr.comparison import render_comparison
+from kinovsr.denoise import LumaChromaDenoiser, McTemporalDenoiser, SpatialDenoiser
+from kinovsr.edge_sanitize import (
     compute_aspect_crop,
     detect_bars,
     detect_junk_edges,
     parse_edges_spec,
 )
-from LTX_2_MLX.videotoolbox.edge_sanitize import (
+from kinovsr.edge_sanitize import (
     crop_rgb as _crop_rgb,
 )
-from LTX_2_MLX.videotoolbox.edge_sanitize import (
+from kinovsr.edge_sanitize import (
     restore_borders as _restore_borders,
 )
-from LTX_2_MLX.videotoolbox.edge_sanitize import (
+from kinovsr.edge_sanitize import (
     sanitize_rgb as _sanitize_rgb,
 )
-from LTX_2_MLX.videotoolbox.fastdvdnet import FastDvdDenoiser
-from LTX_2_MLX.videotoolbox.toflow import TOFlowDenoiser
-from LTX_2_MLX.videotoolbox.vsr import NativePassthrough
-from LTX_2_MLX.videotoolbox.vsr_blocks import make_lanczos_plan, resample_width
-from LTX_2_MLX.videotoolbox.writer import (
+from kinovsr.fastdvdnet import FastDvdDenoiser
+from kinovsr.toflow import TOFlowDenoiser
+from kinovsr.vsr import NativePassthrough
+from kinovsr.vsr_blocks import make_lanczos_plan, resample_width
+from kinovsr.writer import (
     HEVC_PROFILE_MAIN10,
     HEVC_PROFILE_MAIN422_10,
 )
@@ -411,7 +411,7 @@ def _read_audio_track_from_video(mp4_path: Path) -> AudioTrack | None:
     float32 MLX array - no ffmpeg, no disk WAV. Returns None if the file has
     no audio track.
     """
-    from LTX_2_MLX.videotoolbox.audio import read_wav
+    from kinovsr.audio import read_wav
 
     if hasattr(_vr, "read_audio_track"):
         # ffmpeg compatibility reader: decode audio via the same backend that
@@ -468,12 +468,25 @@ def _pp_order(spec: str) -> list:
     return names
 
 
+def sanitize_output_prefix(prefix: str | None) -> str:
+    """Keep generated filenames shell-friendly while preserving readable prefixes."""
+    prefix = (prefix or "kinovsr").strip()
+    if not prefix:
+        prefix = "kinovsr"
+    sanitized = []
+    for char in prefix:
+        if char.isalnum() or char in ("-", "_", "."):
+            sanitized.append(char)
+        else:
+            sanitized.append("_")
+    return "".join(sanitized).strip("._") or "kinovsr"
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> None:
-    from LTX_2_MLX.generate import sanitize_output_prefix
     stem = f"{sanitize_output_prefix(args.output_prefix)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     out_root = Path(args.output_dir) if args.output_dir else None
     if out_root is not None:
@@ -588,21 +601,21 @@ def run(args: argparse.Namespace) -> None:
             single_pass=args.vae_tiling == "single",
         )
     else:
-        from LTX_2_MLX.videotoolbox.vsr import source_format_for_mode
+        from kinovsr.vsr import source_format_for_mode
 
         # ---- reader selection: native (AVFoundation) unless forced or refused.
         # The ffmpeg compatibility reader mirrors the native surface for
         # containers/codecs AVFoundation cannot open (MKV, VP9, ...).
         global _vr
         if args.reader == "ffmpeg":
-            from LTX_2_MLX.videotoolbox import ffmpeg_reader
+            from kinovsr import ffmpeg_reader
             _vr = ffmpeg_reader
             print("[reader] ffmpeg compatibility reader (forced)")
         elif args.reader == "auto":
             try:
                 _vr.probe_video(Path(args.video))
             except Exception as e:
-                from LTX_2_MLX.videotoolbox import ffmpeg_reader
+                from kinovsr import ffmpeg_reader
                 _vr = ffmpeg_reader
                 print(f"[reader] native reader cannot open this file "
                       f"({type(e).__name__}); using the ffmpeg compatibility reader")
@@ -818,7 +831,7 @@ def run(args: argparse.Namespace) -> None:
         _read_start = win_start          # gop-align may extend the read back to a keyframe
         _gop_head_skip = 0               # context frames read before --start, output-dropped
         if args.gop_align:
-            from LTX_2_MLX.videotoolbox.upscaler_base import plan_gop_windows
+            from kinovsr.upscaler_base import plan_gop_windows
             _win_e = _win_end_abs
             # Anchor the first window on the keyframe enclosing --start: read from
             # it and feed [kf, start) as recurrence context (processed, not output),
@@ -928,24 +941,24 @@ def run(args: argparse.Namespace) -> None:
         print(f"[setup] audio sidecar: {sidecar}")
 
     # ---- Output geometry + encoder settings --------------------------------
-    from LTX_2_MLX.videotoolbox.vsr import scale_for_mode
+    from kinovsr.vsr import scale_for_mode
     spatial_scale = 1 if args.spatial_mode == "none" else scale_for_mode(args.spatial_mode)
     if args.spatial_mode == "realesrgan":
         # realesrgan covers 2x (x2plus) as well as 4x models; read the real scale from the
         # checkpoint instead of assuming 4x, so output dims + encoder match the frames.
-        from LTX_2_MLX.videotoolbox.realesrgan import net as _rnet
+        from kinovsr.realesrgan import net as _rnet
         spatial_scale = _rnet.scale_of(_rnet.load_params(
             _rnet.resolve_weights(args.realesrgan_weights or os.environ.get("REALESRGAN_WEIGHTS"))))
     elif args.spatial_mode == "safmn":
-        from LTX_2_MLX.videotoolbox.safmn import net as _snet
+        from kinovsr.safmn import net as _snet
         spatial_scale = _snet._config(_snet.load_params(args.safmn_weights))[3]
     elif args.spatial_mode == "esc":
-        from LTX_2_MLX.videotoolbox.esc import net as _enet
+        from kinovsr.esc import net as _enet
         spatial_scale = _enet._config(_enet.load_params(args.esc_weights))[6]
     elif args.spatial_mode == "realplksr":
         # realplksr covers 2x (public2x) and 4x (nomos4x); read the scale from the
         # checkpoint so output dims + encoder match the frames.
-        from LTX_2_MLX.videotoolbox.realplksr import net as _pnet
+        from kinovsr.realplksr import net as _pnet
         spatial_scale = _pnet._config(_pnet.load_params(args.realplksr_weights))[4]
     out_w, out_h = in_w * spatial_scale, in_h * spatial_scale
     profile = _pick_hevc_profile(args.spatial_mode, args.encode_chroma)
@@ -962,13 +975,13 @@ def run(args: argparse.Namespace) -> None:
         raise SystemExit(f"bad --max-frames value: {e}") from None
 
     if getattr(args, "probe_noise", False) and args.video:
-        from LTX_2_MLX.videotoolbox.noise_map import (
+        from kinovsr.noise_map import (
             analyze_noise,
             classify_noise_analysis,
             detect_grid_period,
             estimate_blockiness_map,
         )
-        from LTX_2_MLX.videotoolbox.quant_comb import estimate_qf
+        from kinovsr.quant_comb import estimate_qf
         _pw_end = win_end if win_end is not None else total_frames
         _span = max(1, _pw_end - win_start)
         _starts = sorted({win_start + int(f * max(0, _span - 12)) for f in (0.1, 0.5, 0.9)})
@@ -1282,14 +1295,14 @@ def run(args: argparse.Namespace) -> None:
             tr = pu = None
             if _stage_map_capable(n):
                 if args.noise_map == "auto":
-                    from LTX_2_MLX.videotoolbox.noise_map import NoiseMapTracker
+                    from kinovsr.noise_map import NoiseMapTracker
                     tr = NoiseMapTracker(gain=args.noise_map_gain,
                                          motion_cap=args.noise_map_motion_cap,
                                          masking=args.noise_map_masking,
                                          pulse_robust=args.noise_map_pulse,
                                          floor_mode=args.noise_map_floor_mode)
                 if args.noise_map_pulse:
-                    from LTX_2_MLX.videotoolbox.noise_map import PulseGain
+                    from kinovsr.noise_map import PulseGain
                     pu = PulseGain()
             return tr, pu
 
@@ -1366,8 +1379,8 @@ def run(args: argparse.Namespace) -> None:
             # --pvdd-weights / $PVDD_WEIGHTS overrides the path. The `level`
             # variants take a noise-variance dial (--pvdd-noise-preset/-variance);
             # blind variants ignore it. --denoise-strength does not apply.
-            from LTX_2_MLX.videotoolbox.pvdd import LEVEL_PRESETS
-            from LTX_2_MLX.videotoolbox.pvdd.upscaler import PvddDenoiser
+            from kinovsr.pvdd import LEVEL_PRESETS
+            from kinovsr.pvdd.upscaler import PvddDenoiser
             nv = args.pvdd_noise_variance
             if nv is None and args.pvdd_noise_preset != "off":
                 nv = LEVEL_PRESETS[args.pvdd_noise_preset]
@@ -1433,7 +1446,7 @@ def run(args: argparse.Namespace) -> None:
             nonlocal blk_tracker
             if args.deblock_map != "auto":
                 return None
-            from LTX_2_MLX.videotoolbox.noise_map import (
+            from kinovsr.noise_map import (
                 NoiseMapTracker,
                 estimate_blockiness_map,
             )
@@ -1444,7 +1457,7 @@ def run(args: argparse.Namespace) -> None:
 
         defl: Any = None
         if args.deflicker == "on":
-            from LTX_2_MLX.videotoolbox.deflicker import StaticStateDeflicker
+            from kinovsr.deflicker import StaticStateDeflicker
             defl = StaticStateDeflicker(window=args.deflicker_window,
                                         band=args.deflicker_band,
                                         strength=args.deflicker_strength,
@@ -1460,7 +1473,7 @@ def run(args: argparse.Namespace) -> None:
 
         def _make_deblocker(name: str, stg: float) -> Any:
             if name == "stdf":
-                from LTX_2_MLX.videotoolbox.stdf.deblocker import StdfDeblocker
+                from kinovsr.stdf.deblocker import StdfDeblocker
                 kr, kb = _yuv.coef_for_matrix(_resolved_color[2])    # match the source color matrix
                 return StdfDeblocker(args.deblock_weights or os.environ.get("STDF_WEIGHTS"),
                                      strength=stg, kr=kr, kb=kb,
@@ -1480,7 +1493,7 @@ def run(args: argparse.Namespace) -> None:
                     dtype=parse_mlx_dtype_name(args.toflow_dtype),
                 )
             if name == "fbcnn":
-                from LTX_2_MLX.videotoolbox.fbcnn import FbcnnDeblocker
+                from kinovsr.fbcnn import FbcnnDeblocker
                 _q = args.fbcnn_quality.strip().lower()
                 if _q == "auto":
                     _quality: Any = "auto"
@@ -1511,7 +1524,7 @@ def run(args: argparse.Namespace) -> None:
 
         up: Any = None
         if args.spatial_mode == "basicvsrpp":
-            from LTX_2_MLX.videotoolbox.basicvsrpp.upscaler import BasicVsrUpscaler
+            from kinovsr.basicvsrpp.upscaler import BasicVsrUpscaler
             # weights spec: --basicvsrpp-weights (token or path) > env > --variant token
             up = BasicVsrUpscaler(
                 args.basicvsrpp_weights or os.environ.get("BASICVSRPP_WEIGHTS")
@@ -1523,7 +1536,7 @@ def run(args: argparse.Namespace) -> None:
                 ensemble=args.basicvsrpp_ensemble,
             )
         elif args.spatial_mode == "realbasicvsr":
-            from LTX_2_MLX.videotoolbox.realbasicvsr.upscaler import RealBasicVsrUpscaler
+            from kinovsr.realbasicvsr.upscaler import RealBasicVsrUpscaler
             up = RealBasicVsrUpscaler(
                 args.realbasicvsr_weights or os.environ.get("REALBASICVSR_WEIGHTS"),
                 window=args.realbasicvsr_window,
@@ -1537,24 +1550,24 @@ def run(args: argparse.Namespace) -> None:
                 history_gate=args.realbasicvsr_history_gate,
             )
         elif args.spatial_mode == "realesrgan":
-            from LTX_2_MLX.videotoolbox.realesrgan.upscaler import RealEsrganUpscaler
+            from kinovsr.realesrgan.upscaler import RealEsrganUpscaler
             up = RealEsrganUpscaler(
                 args.realesrgan_weights or os.environ.get("REALESRGAN_WEIGHTS"),
                 denoise_strength=args.realesrgan_denoise,
             )
         elif args.spatial_mode == "safmn":
-            from LTX_2_MLX.videotoolbox.safmn import SafmnUpscaler
+            from kinovsr.safmn import SafmnUpscaler
             up = SafmnUpscaler(args.safmn_weights, safm_up=args.safmn_safm_up,
                                pool_clamp=args.safmn_pool_clamp)
         elif args.spatial_mode == "esc":
-            from LTX_2_MLX.videotoolbox.esc import EscUpscaler
+            from kinovsr.esc import EscUpscaler
             up = EscUpscaler(args.esc_weights)
         elif args.spatial_mode == "realplksr":
-            from LTX_2_MLX.videotoolbox.realplksr import RealPlksrUpscaler
+            from kinovsr.realplksr import RealPlksrUpscaler
             up = RealPlksrUpscaler(args.realplksr_weights,
                                    dtype=parse_mlx_dtype_name(args.realplksr_dtype))
         elif args.spatial_mode == "realviformer":
-            from LTX_2_MLX.videotoolbox.realviformer import RealViformerUpscaler
+            from kinovsr.realviformer import RealViformerUpscaler
             up = RealViformerUpscaler(
                 args.realviformer_weights, window=args.realviformer_window,
                 dtype=parse_mlx_dtype_name(args.realviformer_dtype),
@@ -1567,7 +1580,7 @@ def run(args: argparse.Namespace) -> None:
                 history_static_cap=args.realviformer_history_static_cap,
             )
         elif args.spatial_mode == "toflow":
-            from LTX_2_MLX.videotoolbox.toflow import TOFlowSrUpscaler
+            from kinovsr.toflow import TOFlowSrUpscaler
             up = TOFlowSrUpscaler(
                 args.toflow_sr_weights or os.environ.get("TOFLOW_SR_WEIGHTS"),
                 graph=args.toflow_sr_graph or os.environ.get("TOFLOW_SR_GRAPH"),
@@ -1576,7 +1589,7 @@ def run(args: argparse.Namespace) -> None:
 
         naf: Any = None
         if args.nafnet != "off":
-            from LTX_2_MLX.videotoolbox.nafnet import NafnetRestorer
+            from kinovsr.nafnet import NafnetRestorer
             naf = NafnetRestorer(
                 args.nafnet_weights or os.environ.get("NAFNET_WEIGHTS") or args.nafnet,
                 strength=args.nafnet_strength,
@@ -1592,7 +1605,7 @@ def run(args: argparse.Namespace) -> None:
 
         res: Any = None
         if args.restore != "off":
-            from LTX_2_MLX.videotoolbox.basicvsrpp.restorer import BasicVsrRestorer
+            from kinovsr.basicvsrpp.restorer import BasicVsrRestorer
             # --restore accepts a comma-separated list that CHAINS restorers in one
             # pass (e.g. decompress_track1,denoise = temporal deblock then temporal
             # denoise). --restore-weights (a single path) only applies when one
@@ -2101,7 +2114,7 @@ def run(args: argparse.Namespace) -> None:
                       f"p95 {float(_s[int(0.95 * (_n - 1))]):.3f}  max {float(_s[-1]):.3f}  "
                       f"({float(mx.mean((_bm > 0.5).astype(mx.float32))) * 100:.0f}% of frame > 0.5)")
                 if args.noise_map_debug and post_writer is not None:
-                    from LTX_2_MLX.videotoolbox.images import save_image
+                    from kinovsr.images import save_image
                     _vp = Path(post_writer.path)
                     _png = _vp.with_name(_vp.stem + "_blockmap.png")
                     _u8 = (mx.clip(_bm[:, :, 0], 0, 1) * 255).astype(mx.uint8)
@@ -2158,7 +2171,7 @@ def run(args: argparse.Namespace) -> None:
                           f"median {float(_e[_n // 2]):.4f}  max {float(_e[-1]):.4f}  "
                           f"(floor {_lo:.4f}{f', ceil {_hi:.4f}' if _hi > 0 else ''})")
                 if args.noise_map_debug and post_writer is not None:
-                    from LTX_2_MLX.videotoolbox.images import save_image
+                    from kinovsr.images import save_image
                     _vp = Path(post_writer.path)
                     _png = _vp.with_name(_vp.stem + "_noisemap.png")
                     _u8 = (mx.clip(_nm_src[:, :, 0] / 0.15, 0, 1) * 255).astype(mx.uint8)

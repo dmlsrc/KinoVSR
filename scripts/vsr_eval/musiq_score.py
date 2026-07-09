@@ -19,7 +19,7 @@ from pathlib import Path
 import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from LTX_2_MLX.videotoolbox.musiq import Musiq  # noqa: E402
+from kinovsr.musiq import Musiq  # noqa: E402
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -50,7 +50,7 @@ def main() -> int:
     for inp in args.inputs:
         p = Path(inp)
         if p.suffix.lower() in IMAGE_EXTS:
-            from LTX_2_MLX.videotoolbox.images import load_image_rgb
+            from kinovsr.images import load_image_rgb
             frames = [load_image_rgb(p).astype(mx.float32) / 255.0]
         else:
             frames = _read_video_frames(p, args.every)

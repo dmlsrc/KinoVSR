@@ -17,7 +17,7 @@ import subprocess
 from fractions import Fraction
 from pathlib import Path
 
-from LTX_2_MLX.videotoolbox.images import draw_labels, load_image_rgb, resize_lanczos, save_image
+from kinovsr.images import draw_labels, load_image_rgb, resize_lanczos, save_image
 
 np = None
 

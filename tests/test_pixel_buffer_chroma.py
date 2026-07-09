@@ -20,14 +20,14 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from LTX_2_MLX.videotoolbox import pixel_buffers as pb
+from kinovsr import pixel_buffers as pb
 
 _H = _W = 8
 
 
 def _have_pyobjc() -> bool:
     try:
-        from LTX_2_MLX.videotoolbox import _compat
+        from kinovsr import _compat
         _compat.require_pyobjc()
         return True
     except Exception:
@@ -41,7 +41,7 @@ def _np_frame(kind: str) -> np.ndarray:
 
 
 def _make_buffer(fmt: int):
-    from LTX_2_MLX.videotoolbox._compat import Quartz
+    from kinovsr._compat import Quartz
     attrs = {
         Quartz.kCVPixelBufferPixelFormatTypeKey: fmt,
         Quartz.kCVPixelBufferWidthKey: _W,
@@ -83,8 +83,8 @@ def test_retype_range_copy_reinterprets_not_rescales():
     SAME code values differently: below-black (negative, extended-range fp16)
     under the video-range identity, exactly black under full-range.
     """
-    from LTX_2_MLX.videotoolbox import video_reader as vr
-    from LTX_2_MLX.videotoolbox._compat import Quartz, vt
+    from kinovsr import video_reader as vr
+    from kinovsr._compat import Quartz, vt
 
     src = _make_buffer(vr._YUV10_VIDEO)
     # Y plane: code 0. Chroma plane: neutral (10-bit 512, left-justified in

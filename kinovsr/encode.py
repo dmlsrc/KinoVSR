@@ -1,7 +1,7 @@
 """High-level VideoToolbox encode helper for generate.py.
 
 `encode_video_videotoolbox()` is the AVAssetWriter-backed sister of
-`LTX_2_MLX.ffmpeg_encoder.encode_video_ffmpeg()`.  It accepts the same frame
+`kinovsr.ffmpeg_encoder.encode_video_ffmpeg()`.  It accepts the same frame
 list / audio waveform shape generate.py already builds and emits an
 HEVC mp4 - no ffmpeg, no on-disk WAV unless `save_audio_sidecar=True`.
 
@@ -44,7 +44,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from ..progress import StackedPhaseBars
+from .progress import StackedPhaseBars
 from . import color as _color
 from . import pixel_buffers as _pb
 from ._compat import autorelease_pool, require_pyobjc
@@ -282,7 +282,7 @@ def encode_video_videotoolbox(
             # adapter for CoreMedia.  See
             # LTX_2_MLX.audio.onset and docs/AUDIO_ISSUES.md ->
             # "Sequence-Start Audio Spike".
-            from ..audio import DEFAULT_TRIM_MS, mitigate_onset
+            from .audio import DEFAULT_TRIM_MS, mitigate_onset
 
             onset_trim_ms = (
                 audio_onset_trim_ms

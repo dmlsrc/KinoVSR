@@ -10,8 +10,8 @@ import math
 
 import mlx.core as mx
 
-from LTX_2_MLX.videotoolbox.pvdd import net
-from LTX_2_MLX.videotoolbox.pvdd import load_pvdd
+from kinovsr.pvdd import net
+from kinovsr.pvdd import load_pvdd
 
 
 def test_window_partition_reverse_roundtrip():
@@ -32,7 +32,7 @@ def test_get_window_size_shrinks_on_small_input():
 
 
 def test_pad4_geometry_and_crop_roundtrip():
-    from LTX_2_MLX.videotoolbox.pvdd import _pad4
+    from kinovsr.pvdd import _pad4
     mx.random.seed(1)
     x = mx.random.uniform(shape=(1, 50, 66, 3))
     y = _pad4(x)

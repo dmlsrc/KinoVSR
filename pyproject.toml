@@ -1,0 +1,109 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kinovsr"
+version = "0.1.0"
+description = "MLX-native video super-resolution and restoration for Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.14"
+license = {text = "MIT"}
+authors = [
+    {name = "KinoVSR Contributors"}
+]
+keywords = [
+    "apple silicon",
+    "mlx",
+    "video restoration",
+    "video super-resolution",
+    "vsr",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mlx>=0.32.0",
+    "numpy>=2.4.6",
+    "pyobjc-core>=12.2",
+    "pyobjc-framework-AVFoundation>=12.2",
+    "pyobjc-framework-CoreAudio>=12.2",
+    "pyobjc-framework-CoreMedia>=12.2",
+    "pyobjc-framework-Cocoa>=12.2",
+    "pyobjc-framework-libdispatch>=12.2",
+    "pyobjc-framework-Quartz>=12.2",
+    "pyobjc-framework-VideoToolbox>=12.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "av>=18.0",
+    "opencv-python-headless>=5.0",
+    "pytest>=9.1.0",
+    "ruff>=0.15.17",
+]
+ffmpeg = [
+    "av>=18.0",
+]
+eval = [
+    "av>=18.0",
+    "opencv-python-headless>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/dmlsrc/KinoVSR"
+Repository = "https://github.com/dmlsrc/KinoVSR"
+Issues = "https://github.com/dmlsrc/KinoVSR/issues"
+
+[project.scripts]
+kinovsr = "scripts.vsr_harness:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kinovsr", "scripts"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "requires_weights: marks tests that require model weights",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+pythonpath = "."
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "B",
+    "C4",
+    "UP",
+]
+ignore = [
+    "E501",
+    "B008",
+    "C901",
+    "W191",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"scripts/vsr_harness.py" = ["E402"]

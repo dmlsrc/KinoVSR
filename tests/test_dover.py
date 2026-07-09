@@ -17,7 +17,7 @@ import pytest
 
 import mlx.core as mx
 
-from LTX_2_MLX.videotoolbox.dover import WEIGHTS_PATH, DoverMobile
+from kinovsr.dover import WEIGHTS_PATH, DoverMobile
 
 pytestmark = pytest.mark.skipif(
     not WEIGHTS_PATH.is_file(), reason="DOVER-Mobile weights not converted"

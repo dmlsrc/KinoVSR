@@ -1,15 +1,15 @@
-"""VideoToolbox-backed video post-processing for LTX-2-MLX.
+"""VideoToolbox-backed video post-processing for KinoVSR.
 
 This subpackage bridges MLX-decoded video frames to Apple's hardware video
 pipeline: VideoToolbox Super Resolution (`VsrSession`), Frame Rate
 Conversion (`VtfrcSession`), and AVAssetWriter (`AVWriter`). All modules
-under this namespace require the PyObjC frameworks listed in the `[vsr]`
-optional install group; importing them on a base install raises a
-SystemExit with the install hint.
+under this namespace require the PyObjC frameworks listed in the project
+dependencies; importing them on a base install raises a SystemExit with the
+install hint.
 
 Public surface:
 
-    from LTX_2_MLX.videotoolbox import (
+    from kinovsr import (
         VsrSession,        # spatial upscale via VTSuperResolutionScaler*
         VtfrcSession,      # temporal frame-rate conversion via VTFrameRateConversion*
         AVWriter,          # HEVC + audio encoder via AVAssetWriter
@@ -22,7 +22,7 @@ Submodules expose lower-level helpers:
     pixel_buffers   CVPixelBuffer create/read/write, CMTime helpers
     comparison      Side-by-side composite for `comparison.mp4`
 
-The stacked progress-bar primitives moved to `LTX_2_MLX.progress`
+The stacked progress-bar primitives moved to `kinovsr.progress`
 (was previously re-exported here when the bars only had VSR callers).
 """
 

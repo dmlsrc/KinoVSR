@@ -164,7 +164,7 @@ def image_features(luma: Any) -> Any:
 
 def fit_model(folder: Path, out: Path, max_images: int = 200,
               sharp_frac: float = 0.75) -> None:
-    from LTX_2_MLX.videotoolbox.images import load_image_rgb
+    from kinovsr.images import load_image_rgb
     import mlx.core as mx
     paths = sorted(p for p in folder.rglob("*.png"))
     if len(paths) > max_images:

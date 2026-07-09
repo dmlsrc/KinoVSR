@@ -10,7 +10,7 @@ import pytest
 
 import mlx.core as mx
 
-from LTX_2_MLX.videotoolbox.musiq import WEIGHTS_PATH, Musiq
+from kinovsr.musiq import WEIGHTS_PATH, Musiq
 
 pytestmark = pytest.mark.skipif(
     not WEIGHTS_PATH.is_file(), reason="MUSIQ weights not converted"

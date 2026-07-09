@@ -12,7 +12,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from LTX_2_MLX.videotoolbox.cut_detect import (
+from kinovsr.cut_detect import (
     CutDetector,
     _frame_histogram,
     _frame_thumbnail,

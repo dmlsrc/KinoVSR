@@ -15,7 +15,7 @@ import subprocess
 import mlx.core as mx
 import pytest
 
-from LTX_2_MLX.ffmpeg_encoder import (
+from kinovsr.ffmpeg_encoder import (
     _frame_buffer,
     encode_video_ffmpeg,
 )

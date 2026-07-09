@@ -72,7 +72,7 @@ def require_pyobjc() -> None:
     """
     if _IMPORT_ERROR is not None:
         raise SystemExit(
-            "LTX_2_MLX.videotoolbox requires PyObjC (VideoToolbox / "
+            "kinovsr requires PyObjC (VideoToolbox / "
             "AVFoundation / CoreMedia / CoreAudio / Quartz / Foundation / "
             "libdispatch). Install the optional 'vsr' extra:\n"
             "    uv pip install '.[vsr]'\n"

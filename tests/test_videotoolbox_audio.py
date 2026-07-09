@@ -16,7 +16,7 @@ import pytest
 
 def _have_pyobjc() -> bool:
     try:
-        from LTX_2_MLX.videotoolbox import _compat
+        from kinovsr import _compat
         _compat.require_pyobjc()
         return True
     except Exception:
@@ -36,7 +36,7 @@ def _sha(b: bytes) -> str:
 
 @pytest.mark.parametrize("container", ["numpy", "mlx"])
 def test_audiotrack_interleaved_bytes(container):
-    from LTX_2_MLX.videotoolbox.audio import AudioTrack
+    from kinovsr.audio import AudioTrack
     w = _waveform_np()
     if container == "mlx":
         w = mx.array(w)
@@ -46,7 +46,7 @@ def test_audiotrack_interleaved_bytes(container):
 
 @pytest.mark.parametrize("container", ["numpy", "mlx"])
 def test_audiotrack_save_wav(container, tmp_path):
-    from LTX_2_MLX.videotoolbox.audio import AudioTrack, read_wav
+    from kinovsr.audio import AudioTrack, read_wav
     w = _waveform_np()
     if container == "mlx":
         w = mx.array(w)
@@ -68,7 +68,7 @@ def test_audiotrack_save_wav(container, tmp_path):
 )
 def test_read_wav_roundtrip(writer_name, tol, tmp_path):
     # AVFoundation AVAudioFile reads both PCM int16 and IEEE float32 WAV.
-    from LTX_2_MLX.videotoolbox.audio import (
+    from kinovsr.audio import (
         read_wav,
         write_wav_float32,
         write_wav_int16,

@@ -8,7 +8,7 @@ import math
 
 import mlx.core as mx
 
-from LTX_2_MLX.videotoolbox.noise_map import (
+from kinovsr.noise_map import (
     NoiseMapTracker,
     PulseGain,
     analyze_noise,
@@ -178,7 +178,7 @@ def test_sparse_flicker_registers():
 
 
 def test_probe_classifier_resolves_dense_motion_via_mc_floor():
-    from LTX_2_MLX.videotoolbox.noise_map import analyze_noise
+    from kinovsr.noise_map import analyze_noise
 
     # rolling white-noise texture: statistically identical to per-frame noise
     # for every unaligned statistic (the old classifier said "ambiguous"),
@@ -280,7 +280,7 @@ def test_tracker_holds_map_on_degenerate_window():
 
 
 def test_select_runs_spread_and_adjacent():
-    from LTX_2_MLX.videotoolbox.noise_map import _select_runs
+    from kinovsr.noise_map import _select_runs
     # short windows: one consecutive run, unchanged behavior
     assert _select_runs(8, 12) == [list(range(8))]
     # long windows: runs of consecutive indices spread across the whole span
@@ -328,7 +328,7 @@ def _blockify(img, size=8):
 
 
 def test_blockiness_map_localizes_and_rejects():
-    from LTX_2_MLX.videotoolbox.noise_map import estimate_blockiness_map
+    from kinovsr.noise_map import estimate_blockiness_map
     mx.random.seed(10)
     base = _bcontent()
     # half blocked, half clean: mask lights the blocked half only
@@ -361,7 +361,7 @@ def test_blockiness_map_localizes_and_rejects():
 
 
 def test_blockiness_grid_phase_offset_detected():
-    from LTX_2_MLX.videotoolbox.noise_map import estimate_blockiness_map
+    from kinovsr.noise_map import estimate_blockiness_map
     mx.random.seed(11)
     base = _bcontent()
     # blocking on a grid shifted by 3px must still be found
@@ -377,7 +377,7 @@ def test_blockiness_grid_phase_offset_detected():
 
 
 def test_blockiness_global_saturation_is_tempered():
-    from LTX_2_MLX.videotoolbox.noise_map import estimate_blockiness_map
+    from kinovsr.noise_map import estimate_blockiness_map
     mx.random.seed(13)
     base = _bcontent()
     blocked = _blockify(base)
@@ -465,7 +465,7 @@ def test_pulse_robust_map_damps_global_noise_pulse():
 def test_fastdvd_pulse_emits_all_and_varies():
     # integration: pulse on, sigma jumps mid-stream; all frames out in order and
     # the logged gains actually respond.
-    from LTX_2_MLX.videotoolbox.fastdvdnet import FastDvdDenoiser
+    from kinovsr.fastdvdnet import FastDvdDenoiser
     mx.random.seed(8)
     base = mx.clip(_content()[:48, :80, :], 0, 1)
     den = FastDvdDenoiser(strength=0.3, pulse=PulseGain(min_history=6))
@@ -486,7 +486,7 @@ def test_mc_sigma_plane_and_pulse():
     # the flow self-test refuses (unsupported device / too-small buffers).
     import pytest
 
-    from LTX_2_MLX.videotoolbox.denoise import McTemporalDenoiser
+    from kinovsr.denoise import McTemporalDenoiser
     mx.random.seed(9)
     h, w = 240, 320
     base = mx.clip(mx.full((h, w, 3), 0.45) + 0.15 * mx.random.uniform(shape=(h, w, 3)), 0, 1)
@@ -517,7 +517,7 @@ def test_mc_sigma_plane_and_pulse():
 def test_fastdvd_streaming_refresh_adapts():
     # noise jumps 0.01 -> 0.08 at frame 20 of a 60-frame stream. With refresh on,
     # the held map must climb toward the new level; with refresh off it must not.
-    from LTX_2_MLX.videotoolbox.fastdvdnet import FastDvdDenoiser
+    from kinovsr.fastdvdnet import FastDvdDenoiser
     mx.random.seed(5)
     base = mx.clip(_content()[:48, :80, :], 0, 1)
     frames = [mx.clip(base + (0.01 if t < 20 else 0.08) * mx.random.normal(shape=base.shape), 0, 1)
@@ -669,7 +669,7 @@ def _bilinear_up(img, s=1.5):
 def test_blockiness_auto_detects_resized_grid():
     # compressed-then-resized: an 8-grid upscaled 1.5x lives at period 12,
     # invisible to the 8-locked legacy detector but found by period="auto"
-    from LTX_2_MLX.videotoolbox.noise_map import estimate_blockiness_map
+    from kinovsr.noise_map import estimate_blockiness_map
 
     mx.random.seed(21)
     base = _bcontent()

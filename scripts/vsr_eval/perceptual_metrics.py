@@ -56,8 +56,8 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from niqe import _luma_of, score_lumas  # noqa: E402
-from LTX_2_MLX.videotoolbox.dover import DoverMobile  # noqa: E402
-from LTX_2_MLX.videotoolbox.musiq import Musiq  # noqa: E402
+from kinovsr.dover import DoverMobile  # noqa: E402
+from kinovsr.musiq import Musiq  # noqa: E402
 
 ALL_METRICS = ("musiq", "dover", "niqe", "flicker", "vmaf")
 STATIC_THRESHOLD = 0.01          # source luma |diff| below this = static

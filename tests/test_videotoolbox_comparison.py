@@ -14,13 +14,13 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from LTX_2_MLX.videotoolbox import comparison
-from LTX_2_MLX.videotoolbox import pixel_buffers as pb
+from kinovsr import comparison
+from kinovsr import pixel_buffers as pb
 
 
 def _have_pyobjc() -> bool:
     try:
-        from LTX_2_MLX.videotoolbox import _compat
+        from kinovsr import _compat
         _compat.require_pyobjc()
         return True
     except Exception:
@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(not _have_pyobjc(), reason="pyobjc / VideoToolbo
 
 
 def _make_buf(fmt, w, h):
-    from LTX_2_MLX.videotoolbox._compat import Quartz
+    from kinovsr._compat import Quartz
     attrs = {
         Quartz.kCVPixelBufferPixelFormatTypeKey: fmt,
         Quartz.kCVPixelBufferWidthKey: w,

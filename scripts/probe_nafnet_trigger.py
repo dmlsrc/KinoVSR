@@ -23,8 +23,8 @@ if str(ROOT) not in sys.path:
 
 import mlx.core as mx  # noqa: E402
 
-from LTX_2_MLX.videotoolbox.nafnet import net  # noqa: E402
-from LTX_2_MLX.videotoolbox.nafnet.restorer import model_rgb, resolve_pool_mode  # noqa: E402
+from kinovsr.nafnet import net  # noqa: E402
+from kinovsr.nafnet.restorer import model_rgb, resolve_pool_mode  # noqa: E402
 
 
 Transform = tuple[str, Callable[[np.ndarray], np.ndarray]]

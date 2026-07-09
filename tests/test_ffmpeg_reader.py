@@ -12,8 +12,8 @@ import pytest
 av = pytest.importorskip("av")
 import mlx.core as mx  # noqa: E402  (after importorskip, the standard pattern)
 
-from LTX_2_MLX.videotoolbox import ffmpeg_reader as fr  # noqa: E402
-from LTX_2_MLX.videotoolbox.pixel_buffers import (  # noqa: E402
+from kinovsr import ffmpeg_reader as fr  # noqa: E402
+from kinovsr.pixel_buffers import (  # noqa: E402
     PIX_BGRA,
     PIX_RGBAHALF,
     read_buffer_rgb_f32,
@@ -96,7 +96,7 @@ def test_bgra_path_matches_rgbahalf(clip):
 
 
 def test_unsupported_format_raises(clip):
-    from LTX_2_MLX.videotoolbox.pixel_buffers import PIX_NV12
+    from kinovsr.pixel_buffers import PIX_NV12
     with pytest.raises(ValueError):
         next(iter(fr.iter_video_buffer_chunks(clip, PIX_NV12)))
 
@@ -165,7 +165,7 @@ def test_coded_frame_sizes(clip):
     assert min(sizes[i] for i in kf) > max(p_sizes)
     # cross-reader parity: the native reader must account the same bytes
     try:
-        from LTX_2_MLX.videotoolbox import video_reader as nvr
+        from kinovsr import video_reader as nvr
         native = nvr.coded_frame_sizes(clip)
     except Exception:
         pytest.skip("native reader unavailable for this container")

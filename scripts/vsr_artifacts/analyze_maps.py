@@ -41,7 +41,7 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from LTX_2_MLX.videotoolbox.noise_map import (  # noqa: E402
+from kinovsr.noise_map import (  # noqa: E402
     analyze_noise,
     classify_noise_analysis,
     estimate_blockiness_map,

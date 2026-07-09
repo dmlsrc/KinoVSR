@@ -7,7 +7,7 @@ in check.
 """
 import mlx.core as mx
 
-from LTX_2_MLX.videotoolbox.toflow import TOFlowDenoiser
+from kinovsr.toflow import TOFlowDenoiser
 
 H, W, T = 96, 128, 10
 
@@ -29,7 +29,7 @@ def _run(den, clip):
 
 
 def test_direct_forward_matches_plain_interpretation():
-    from LTX_2_MLX.videotoolbox.toflow import (
+    from kinovsr.toflow import (
         _TOFlowGraph,
         _graph_path_for,
         resolve_weights,
