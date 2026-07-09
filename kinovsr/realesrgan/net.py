@@ -286,8 +286,8 @@ def _compiled_forward(p: dict):
     at 512px) -- MLX's whole-graph planner reuses buffers better than manual eviction.
 
     Keyed by id(p); the cache entry closes over p, so p stays alive and its id stays
-    stable. Best paired with a capped MLX buffer cache (mx.set_cache_limit, as
-    generate.py sets) so per-frame allocation churn does not grow into swap --
+    stable. Best paired with a capped MLX buffer cache (mx.set_cache_limit) so
+    per-frame allocation churn does not grow into swap --
     uncapped, MLX hoards freed buffers as RSS.
     """
     forward = _upscale_rrdbnet if "conv_first.weight" in p else _upscale_srvgg

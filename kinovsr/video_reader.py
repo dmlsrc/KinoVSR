@@ -228,7 +228,7 @@ def probe_color(path: Path) -> dict:
 
     Returns explicit primaries/transfer/matrix + full-range flag (None where
     untagged) so the encoder can tag the output to match the source instead of a
-    hard-coded BT.709. See videotoolbox/color.py.
+    hard-coded BT.709. See kinovsr/color.py.
     """
     from . import color
     require_pyobjc()

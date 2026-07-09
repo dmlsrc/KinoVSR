@@ -10,9 +10,9 @@ weights/statistics used by the released TOFlow module subset, and writes:
 
 Example:
 
-    python LTX_2_MLX/videotoolbox/toflow/convert_t7_to_safetensors.py \\
+    python kinovsr/toflow/convert_t7_to_safetensors.py \\
       "$TOFLOW_REF/models/denoise.t7" \\
-      -o LTX_2_MLX/videotoolbox/toflow/weights/toflow_denoise.safetensors
+      -o kinovsr/toflow/weights/toflow_denoise.safetensors
 """
 from __future__ import annotations
 

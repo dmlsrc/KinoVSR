@@ -21,7 +21,7 @@ mkdir -p weights-src
 curl -L -o weights-src/musiq_koniq_ckpt-e95806b9.pth \
   https://github.com/chaofengc/IQA-PyTorch/releases/download/v0.1-weights/musiq_koniq_ckpt-e95806b9.pth
 shasum -a 256 weights-src/musiq_koniq_ckpt-e95806b9.pth
-python LTX_2_MLX/videotoolbox/musiq/convert_musiq.py \
+python kinovsr/musiq/convert_musiq.py \
   weights-src/musiq_koniq_ckpt-e95806b9.pth
 ```
 

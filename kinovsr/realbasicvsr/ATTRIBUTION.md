@@ -1,6 +1,6 @@
 # Attribution
 
-`videotoolbox/realbasicvsr/` is an independent MLX reimplementation of RealBasicVSR, written
+`kinovsr/realbasicvsr/` is an independent MLX reimplementation of RealBasicVSR, written
 from the published architecture as a spec -- no upstream code is bundled. The model weights
 are the upstream project's, redistributed under its license (see `weights/README.md` for
 the download).

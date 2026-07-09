@@ -1,10 +1,10 @@
 """Phase-accurate stacked progress bars for the VSR pipeline.
 
 Single-line bars rendered directly to stderr via carriage-return +
-ANSI cursor movement - no third-party progress-bar dependency. The layout matches
-LTX_2_MLX/generate.py's `DenoiseProgress` shape, minus the STEP1 column
-(meaningful for seconds-long denoise steps, useless for 50 ms VSR
-frames that round to "0m 00s"):
+ANSI cursor movement - no third-party progress-bar dependency. The layout grew
+out of the original harness progress display and keeps fixed-width timing
+columns that stay readable for both heavy MLX stages and quick per-frame VSR
+steps:
 
     <indent><label> [<bar>] <n:>W>/<total:<W> <pct:5.1f>% \
         | RUN <duration> | ETA <duration> | <pace>
@@ -13,7 +13,7 @@ Bar on the LEFT (right after the label), numbers on the RIGHT,
 separated by ` | `. Durations use `X.Xs` under a minute, `XmYYs`
 above - sub-second resolution where it matters, compact above.
 
-PhaseBar features beyond generate.py's DenoiseProgress:
+PhaseBar features:
 
 * **Wall-clock origin** - each bar's clock starts at its construction
   time. RUN displays wall time from origin to the bar's last tick,
@@ -48,7 +48,7 @@ __all__ = ["PhaseBar", "StackedPhaseBars"]
 
 
 # ---------------------------------------------------------------------------
-# Formatting helpers - matched 1:1 to LTX_2_MLX/generate.py
+# Formatting helpers
 # ---------------------------------------------------------------------------
 
 def _fmt_duration(seconds: float) -> str:
@@ -123,8 +123,8 @@ class _StackState:
         self.count_width: int = 7  # n_width=3 floor -> 2*3+1 = 7
         # Label slot width is grown to the longest registered bar's
         # `desc` so the `[` opening every bar's progress segment lines
-        # up vertically across the stack ("VAE chunks [...]" and
-        # "VT encode  [...]" instead of mis-aligned brackets).
+        # up vertically across the stack ("Decode [...]" and
+        # "VT encode [...]" instead of mis-aligned brackets).
         self.label_width: int = 0
         # Pace-number slot width - grown lazily during render when a
         # bar's natural pace formatting needs more digits than the
@@ -250,8 +250,7 @@ class PhaseBar:
         Forwards to `update()` with the computed delta `n - self._n`,
         so timing/pace/STEP1 capture work identically.  Useful for
         callbacks that report progress as `(current_step, total_steps)`
-        tuples rather than per-update deltas - e.g.,
-        `LTX_2_MLX/generate.py`'s denoise stage callback.
+        tuples rather than per-update deltas.
 
         Backward steps (n < self._n) are clamped to a no-op rather
         than rewinding the count.  Backward progress would invalidate
@@ -338,18 +337,16 @@ class PhaseBar:
             pace_str = "measuring"
 
         # Pad the label to the stack's max so the `[` opening lines up
-        # across bars (e.g. "VAE chunks" (10) and "VT encode " (9) both
+        # across bars (e.g. "Decode" and "VT encode" both
         # render in a 10-char slot when stacked together).  Standalone
         # bars use their own natural width.
         label_width = max(self._stack.label_width, len(self._desc_label))
         padded_label = f"{self._desc_label:<{label_width}}"
 
         # Optional STEP1 column: wall-clock cost of the first update
-        # (origin -> first update timestamp).  Matches the DenoiseProgress
-        # surface in LTX_2_MLX/generate.py so a PhaseBar can drop-in
-        # replace it for denoise-style runs where the first step is
-        # typically warmup-heavy.  Same 8-char `_fmt_duration` format
-        # as RUN / ETA.
+        # (origin -> first update timestamp). Useful for denoise-style runs
+        # where the first step is typically warmup-heavy. Same 8-char
+        # `_fmt_duration` format as RUN / ETA.
         if self._show_step1:
             if self._t_first_update is not None:
                 step1_dur = max(0.0, self._t_first_update - self._t_origin)
@@ -400,10 +397,10 @@ class StackedPhaseBars:
     Usage::
 
         with StackedPhaseBars() as bars:
-            vae = bars.add(total=N, desc="VAE chunks", unit="chunk")
+            decode = bars.add(total=N, desc="Decode", unit="chunk")
             vsr = bars.add(total=M, desc="VSR frames", unit="frame")
             for chunk in chunks:
-                vae.update(1)
+                decode.update(1)
                 vsr.start()        # idempotent post-first-tick
                 for frame in chunk:
                     ...

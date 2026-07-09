@@ -16,8 +16,8 @@ AUDIO_FORMAT_ALAC = 1634492771     # 'alac' kAudioFormatAppleLossless
 
 
 class AudioTrack:
-    """In-memory audio decoded from a latent. No disk WAV unless save_wav()
-    is called explicitly.
+    """In-memory audio for AVWriter. No disk WAV unless save_wav() is called
+    explicitly.
 
     Constructed from a (channels, samples) float32 array (mlx or numpy). Builds
     CMSampleBuffers on demand via `make_sample_buffer(start_frame, end_frame)`

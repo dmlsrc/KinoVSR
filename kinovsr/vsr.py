@@ -29,9 +29,9 @@ def _suppress_native_stderr():
     sys.stderr, so contextlib.redirect_stderr can't catch it. This redirects the
     file descriptor itself for the brief compile. VideoToolbox reports real
     failures through API return values (the ok/err tuple), not stderr, so
-    nothing important is hidden. Set LTX_VSR_VERBOSE=1 to keep the native logs.
+    nothing important is hidden. Set KINOVSR_VERBOSE=1 to keep the native logs.
     """
-    if os.environ.get("LTX_VSR_VERBOSE"):
+    if os.environ.get("KINOVSR_VERBOSE"):
         yield
         return
     sys.stderr.flush()
@@ -184,9 +184,7 @@ class VsrSession:
                   if you prefer the smoother / less-edge-boosted trade-off.
 
     The previous-frame state can be reset at hard cuts via
-    `reset_temporal_context()` - useful for `--video` input that may contain
-    edits. LTX latents are single-shot generations so this never matters for
-    `--latent`.
+    `reset_temporal_context()` - useful for input that may contain edits.
     """
 
     def __init__(self, in_w: int, in_h: int, mode: str, fps: float = 24.0):
@@ -276,7 +274,7 @@ class VsrSession:
         Pool caching is what makes hot-path buffer allocation fast, but at
         steady state the cache should be ~3 buffers. Periodic flushing
         reclaims peak-watermark allocations that the workload no longer
-        needs (e.g. an early VAE chunk that briefly inflated buffer demand).
+        needs after an early decode or processing burst.
         """
         _pb.flush_pool(self._src_pool)
 

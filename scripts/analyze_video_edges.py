@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Inspect edge/boundary artifacts in a rendered video.
 
-This is a lightweight visual diagnostic for the VAE boundary artifacts that are
-most visible near frame edges. It extracts representative frames, writes contact
+This is a lightweight visual diagnostic for boundary artifacts that are most
+visible near frame edges. It extracts representative frames, writes contact
 sheets for full frames and edge strips, and records simple edge-vs-center
 statistics so future runs can be compared without redoing scratch work.
 """

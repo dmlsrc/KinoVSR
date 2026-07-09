@@ -183,7 +183,7 @@ class Musiq:
         if not wp.is_file():
             raise FileNotFoundError(
                 f"MUSIQ weights not found at {wp}. Convert the released "
-                "checkpoint with LTX_2_MLX/videotoolbox/musiq/convert_musiq.py "
+                "checkpoint with kinovsr/musiq/convert_musiq.py "
                 "(see weights/README.md)."
             )
         self.p = {k: v for k, v in mx.load(str(wp)).items()}

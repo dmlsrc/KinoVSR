@@ -1,6 +1,6 @@
 # Attribution
 
-`videotoolbox/realplksr/` is an independent MLX reimplementation of RealPLKSR,
+`kinovsr/realplksr/` is an independent MLX reimplementation of RealPLKSR,
 written from the spandrel reference architecture as a spec -- no upstream code is
 bundled. The model weights are the upstream project's, redistributed under their
 licenses (see `weights/README.md` for the downloads).

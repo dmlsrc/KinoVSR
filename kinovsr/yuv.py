@@ -3,7 +3,7 @@
 AVAssetWriter's internal RGB->YUV is colorspace-metadata-dependent: it keys off
 the input buffer's IOSurface-level colorspace, which VideoToolbox's own producers
 (decoder, VSR scaler) bake in but uploaded buffers (fastdvd / realesrgan / learned
-upscalers / latent) lack. `CVBufferSetAttachment` only sets the CVBuffer attachment,
+upscalers) lack. `CVBufferSetAttachment` only sets the CVBuffer attachment,
 not the IOSurface one, so feeding RGB gives a path-dependent color shift that can't
 be fully tagged away (measured: a uniform green-biased darkening on uploaded paths,
 ~0.0145 mean, ~5% on green).

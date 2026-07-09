@@ -1,10 +1,9 @@
 # VSR Harness Performance Notes
 
-Findings, gotchas, and methodology from the 2026-07 optimization campaign over the
-`videotoolbox/` processors (deblockers, denoisers, restorers, and learned upscalers
-driven by `scripts/vsr_harness.py`). Everything here was measured on an M1 Max
-(64 GB) with MLX, fp16-first, MLX buffer cache capped at 1 GB. Companion docs:
-`PERFORMANCE.md` (diffusion pipeline), `PARITY.md` (port validation standards).
+Findings, gotchas, and methodology from the 2026-07 optimization campaign over
+the `kinovsr/` processors (deblockers, denoisers, restorers, and learned
+upscalers driven by `scripts/vsr_harness.py`). Everything here was measured on
+an M1 Max (64 GB) with MLX, fp16-first, MLX buffer cache capped at 1 GB.
 
 The single most important lesson: **"compute-bound" must be established by
 kernel-path analysis, not FLOP counting.** Four separate "this net is at the
@@ -61,7 +60,7 @@ is only 1-7x over floor (acceptable).
 **Fix:** a manual 9-tap shift-and-add (`sum over (i,j) of
 xp[:, i:i+H, j:j+W, :] * w[:, i, j, 0]`) is 8.2x faster at the pathological
 scale, 1.0x elsewhere, so it is safe to apply unconditionally. See
-`videotoolbox/nafnet/net.py:_depthwise3x3`. Whole-net NAFNet: 1.37-1.44x.
+`kinovsr/nafnet/net.py:_depthwise3x3`. Whole-net NAFNet: 1.37-1.44x.
 Output shift ~55 dB PSNR (fp32 summation-order compounding through 36 residual
 blocks; the op itself matches conv2d to 1e-6).
 
@@ -73,7 +72,7 @@ channel-norm (small C = 32-512, many N*H*W rows) the threadgroup underfills
 than a hand-rolled `mx.mean`/`mx.rsqrt` reduction. The penalty is shape-bound,
 not dtype-bound (the kernel accumulates in fp32 regardless). Reserve
 `mx.fast.*norm` for transformer-width axes; keep manual reductions for NHWC
-channel norms (see `videotoolbox/nafnet/net.py:_layernorm`). Re-verified on
+channel norms (see `kinovsr/nafnet/net.py:_layernorm`). Re-verified on
 RealPLKSR (C=64): manual is 1.89x faster than `mx.fast.layer_norm`.
 
 ### GroupNorm: reduce the contiguous spatial axes first
@@ -89,7 +88,7 @@ ms/frame (1.38x). The reduction stays fp32 (load-bearing: refine-out activations
 reach ~370, so both `mean(x)` and `mean(x^2)` overflow an fp16 accumulator);
 use the two-pass form (mu, then `(x-mu)^2`) rather than `E[x^2]-E[x]^2` so the
 variance cannot go negative from cancellation. See
-`videotoolbox/realplksr/net.py:_groupnorm`.
+`kinovsr/realplksr/net.py:_groupnorm`.
 
 Corollary from the same audit: a numerically stable softplus Mish
 (`max(x,0)+log1p(exp(-|x|))`, `exp(-|x|)` <= 1 so no fp16 overflow) needs no
@@ -118,7 +117,7 @@ copies per block x 69 blocks) disappear. RRDBNet (bsrgan / x4plus / esrgan /
 realesrnet / bsrnet / anime / x2plus): **1.54x**, output parity 65.5 dB. The
 recombination sums must run in fp32: the split rounds each partial conv output
 to fp16 where the original GEMM accumulated all of K in fp32. See
-`videotoolbox/realesrgan/net.py:_restack_rdb_weights` and `_rdb`.
+`kinovsr/realesrgan/net.py:_restack_rdb_weights` and `_rdb`.
 
 ### Window attention is intrinsically expensive on M1
 
@@ -135,7 +134,7 @@ tiny and the cost lives in the qkv convs.
 
 ### Deformable conv: follow the input dtype
 
-The DCNv2 path (`videotoolbox/deform_conv.py`) originally forced fp32: three
+The DCNv2 path (`kinovsr/deform_conv.py`) originally forced fp32: three
 cast-copies plus a `Cin*K*K x N*oH*oW` fp32 columns buffer (~1.9 GB at
 128ch/480p) written by the im2col kernel and re-read by an fp32 GEMM -- 2x the
 necessary traffic for data that only ever had fp16 precision. Running the whole
@@ -199,7 +198,7 @@ All measured, all worth not re-litigating:
 - `mx.compile` every shape-stable forward once, in a module-level cache. Gains:
   1.3-1.4x for dispatch-bound graphs (many small ops), ~1.05x for compute-bound
   ones. Every net here follows the `make_forward` + bounded-cache pattern.
-- Compile caches must be **bounded** (`videotoolbox/compile_cache.py`, FIFO cap
+- Compile caches must be **bounded** (`kinovsr/compile_cache.py`, FIFO cap
   16): entries close over the checkpoint, so an unbounded id(p)-keyed dict
   retains every checkpoint ever constructed in the process. Eviction is safe --
   a params dict can only be collected (and its id recycled) after its entries
@@ -356,8 +355,7 @@ video maps outside [0,1] on conversion -- inherent colorimetry, not a defect;
 overshoot from in-range input at hard edges. WHERE it enters: only the
 fp16-preserving decode path (`read_rgbahalf_rgb`, used by balanced/image/none
 and all learned-upscaler modes) -- the NV12/fast path reads 8-bit (clipped by
-construction) and the latent path's VAE converter clips. GUARDS, both
-boundaries: every learned-net ENTRY clips (preprocessors:
+construction). GUARDS, both boundaries: every learned-net ENTRY clips (preprocessors:
 nafnet/fbcnn/stdf/spatial/mc/fastdvd; upscalers via `to_rgb_batch`;
 realviformer also locally), and every stage OUTPUT clips (audited: safmn,
 realesrgan, esc, realviformer, basicvsrpp, realbasicvsr, stdf, fastdvd,
@@ -423,7 +421,7 @@ gracefully on hard out-of-distribution frame edges (a junk half-dark border
 row becomes a near-scale thin line rather than a thick smeared band with
 blotches above it). CAUTION: unlike every other checkpoint in this table, the
 PureScale weights are CC BY-NC-SA 4.0 -- NON-COMMERCIAL use only (see
-`videotoolbox/safmn/ATTRIBUTION.md`).
+`kinovsr/safmn/ATTRIBUTION.md`).
 
 Two SAFM dials expose what is and is not swappable at inference.
 `--safmn-safm-up auto|nearest|bicubic`: the upsampler is a mild shape-only
@@ -841,10 +839,10 @@ state_dicts; NAFNet ships `params` only.
   runs at 2.9 TF/s-eff but output-padding it wider is a wash (measured), and
   the precise softmax costs nothing -- keep it.
 
-## 10. Cross-references: the diffusion-pipeline and transformer perf work
+## 10. Cross-references: prior MLX performance work
 
-`PERFORMANCE.md` / `PERFORMANCE_NOTES.md` (this repo, DiT denoise path) contain
-several findings that border this work; checked for applicability 2026-07:
+Several earlier MLX performance findings border this work; checked for
+applicability 2026-07:
 
 - **The steel_gemm BlockLoader "pretranspose cliff"** (PERFORMANCE_NOTES.md,
   BlockLoader characterization): a plain `x @ w.T` matmul at large K uses the
@@ -855,11 +853,11 @@ several findings that border this work; checked for applicability 2026-07:
   outputs, minor share) and the deform GEMM (no transpose) -- checked, no
   action. Remember it if a future processor leans on big Linear layers.
 - **The local STEEL attention retile is NOT reusable here.** Its domain is
-  hard-constrained (D=64/128, no mask, LTX shapes; masked text attention falls
-  back to stock), so ESC's D=16 window attention with a dense additive bias is
-  out of scope, and the KinoMLX ISA-level analysis concluded that kernel is at
-  the M1 silicon floor for its own shapes -- corroborating section 2's verdict
-  that there is no custom-kernel rescue for window attention on M1.
+  hard-constrained (D=64/128, no mask; masked text attention falls back to
+  stock), so ESC's D=16 window attention with a dense additive bias is out of
+  scope, and the KinoMLX ISA-level analysis concluded that kernel is at the M1
+  silicon floor for its own shapes -- corroborating section 2's verdict that
+  there is no custom-kernel rescue for window attention on M1.
 - **Custom fused elementwise/FFN kernels bottomed out at a 3-7% ceiling** in
   the transformer work (and FlashAttention-2 ports were abandoned twice).
   Consistent with this campaign's experience: mx.compile already fuses the
@@ -870,20 +868,6 @@ several findings that border this work; checked for applicability 2026-07:
   code; run them on new ports.
 - The transformer-side norm usage (mx.fast.rms_norm at model width) and this
   doc's channel-norm rule (section 2) are the same shape rule from both sides.
-
-Reverse-direction audit (done 2026-07): the VAE decode and spatial upscaler
-conv3d paths are CLEAN. The conv3d dispatch (mlx conv.cpp,
-`dispatch_conv_3D_gpu`) differs from 2D in two ways worth knowing: there is no
-winograd and no depthwise path, and a %16 channel miss with groups==1 is
-handled INTERNALLY by `pad_and_slice_conv_3D_gpu` (pad to 16, implicit GEMM,
-slice) -- mild copy overhead rather than 2D's 2-4x general-kernel penalty; only
-grouped non-mod16 conv3d falls to the slow explicit path. Census of the video
-VAE weights: every decoder conv is %16-aligned (128/256/512/1024/4096 widths,
-conv_out 128->48), as is the spatial upscaler (ResBlock3d 128<->1024); no
-grouped or dilated convs; the runtime concats are temporal-axis causal padding
-(channel counts unchanged). The single miss is the encoder's conv_out
-(1024->129, the logvar channel) -- on the internal pad-and-slice path, at tiny
-latent resolution, encoder-only: not worth fixing.
 
 ## 11. Benchmarking gotchas checklist
 

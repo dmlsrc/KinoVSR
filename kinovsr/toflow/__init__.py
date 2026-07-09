@@ -1,7 +1,7 @@
 """TOFlow processors (MLX).
 
 TOFlow's released Torch7 models are table-heavy, flow-warping task nets. The
-converter in `LTX_2_MLX/videotoolbox/toflow/convert_t7_to_safetensors.py`
+converter in `kinovsr/toflow/convert_t7_to_safetensors.py`
 serializes the Torch7 module tree into JSON and tensors into safetensors; this
 module interprets the small operator subset used by those checkpoints.
 
@@ -54,7 +54,7 @@ def _graph_path_for(weights: Path, graph: Any = None) -> Path:
         return p
     raise FileNotFoundError(
         f"TOFlow graph JSON not found beside weights: {p}. Convert the source "
-        ".t7 with LTX_2_MLX/videotoolbox/toflow/convert_t7_to_safetensors.py "
+        ".t7 with kinovsr/toflow/convert_t7_to_safetensors.py "
         "so both .safetensors and .json are present."
     )
 
@@ -540,7 +540,7 @@ class TOFlowDenoiser:
         if not wp.is_file():
             raise FileNotFoundError(
                 f"TOFlow weights not found at {wp}. Convert the source .t7 with "
-                "LTX_2_MLX/videotoolbox/toflow/convert_t7_to_safetensors.py "
+                "kinovsr/toflow/convert_t7_to_safetensors.py "
                 "or pass --toflow-weights."
             )
         self.net = TOFlow(wp, variant=variant, graph=graph, dtype=dtype,
@@ -655,7 +655,7 @@ class TOFlowSrUpscaler:
         if not wp.is_file():
             raise FileNotFoundError(
                 f"TOFlow SR weights not found at {wp}. Convert sr.t7 with "
-                "LTX_2_MLX/videotoolbox/toflow/convert_t7_to_safetensors.py "
+                "kinovsr/toflow/convert_t7_to_safetensors.py "
                 "or pass --toflow-sr-weights."
             )
         self.net = TOFlow(wp, variant="sr", graph=graph, dtype=dtype,
@@ -736,7 +736,7 @@ class TOFlowInterpolator:
         if not wp.is_file():
             raise FileNotFoundError(
                 f"TOFlow interpolation weights not found at {wp}. Convert interp.t7 "
-                "with LTX_2_MLX/videotoolbox/toflow/convert_t7_to_safetensors.py."
+                "with kinovsr/toflow/convert_t7_to_safetensors.py."
             )
         self.net = TOFlow(wp, variant="interp", graph=graph, dtype=dtype)
         self._prev: tuple[Any, Any] | None = None

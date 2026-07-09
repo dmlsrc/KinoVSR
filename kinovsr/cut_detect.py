@@ -3,8 +3,8 @@
 Pure MLX on the CPU. VSR's `balanced` mode propagates previous source +
 output frames into the upscaler for temporal coherence; across a hard cut
 that's the wrong context and produces ghosting around the cut frame. For
-single-shot LTX latents there are no cuts (mode="off" is correct). For
-arbitrary `--video` input on edited footage, enable one of the detection
+continuous generated clips with no edits, mode="off" is correct. For
+arbitrary video input on edited footage, enable one of the detection
 modes so VSR resets at cut boundaries.
 
 Two algorithms:

@@ -1,7 +1,7 @@
-"""ffmpeg (software-codec) encode backend for LTX-2 outputs.
+"""ffmpeg (software-codec) encode backend for KinoVSR outputs.
 
 This is one of two encode backends. The other is the VideoToolbox /
-AVAssetWriter backend in `videotoolbox/encode.py`
+AVAssetWriter backend in `kinovsr.encode`
 (`encode_video_videotoolbox`), which hardware-encodes the `default` tier.
 The `default` tier auto-routes to VideoToolbox; this ffmpeg backend handles
 the tiers VideoToolbox does not: `web` (libx264 - software x264 produces
@@ -33,10 +33,9 @@ encoder flags - the flags are an implementation detail.
              later. Has alpha for compositing/VFX work. Large files.
              ProRes 4444 + PCM 24-bit + alpha (.mov), 10-bit 4:4:4.
 
-Call `encode_video_ffmpeg(frames, output_path, tier=...)` from generate.py / pipelines.
+Call `encode_video_ffmpeg(frames, output_path, tier=...)` from pipelines.
 Importers may read `TIERS` and extend with additional `EncodePreset` entries;
-the encode_modes_harness.py benchmarking script does exactly this, so keep
-tier names and the `EncodePreset` shape stable.
+keep tier names and the `EncodePreset` shape stable for that extension point.
 
 Encoder-choice details that aren't obvious from the flags alone:
   - The libswscale `scale` filter is used instead of `zscale` because zscale
@@ -294,7 +293,7 @@ def encode_video_ffmpeg(
     temp path and deleted once ffmpeg consumes it.
 
     `audio_onset_trim_mode` / `audio_onset_trim_ms` route through to
-    `LTX_2_MLX.audio.onset.mitigate_onset()` before WAV writing.  Default
+    `kinovsr.audio.mitigate_onset()` before WAV writing.  Default
     is "auto" (detect-then-zero-fill); pass "off" to disable.  The trim
     is applied to BOTH the ffmpeg input and (if kept) the sidecar so the
     on-disk artifact and the muxed track agree.
@@ -340,7 +339,7 @@ def encode_video_ffmpeg(
             )
         # Sequence-start onset mitigation, applied once here so both the
         # ffmpeg input WAV and the optional sidecar carry the cleaned
-        # waveform.  See LTX_2_MLX.audio.onset for the detector spec.
+        # waveform.  See kinovsr.audio for the detector spec.
         from .audio import DEFAULT_TRIM_MS, mitigate_onset
 
         onset_trim_ms = (

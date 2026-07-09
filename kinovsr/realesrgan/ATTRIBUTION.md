@@ -1,6 +1,6 @@
 # Attribution
 
-`videotoolbox/realesrgan/` is an independent MLX reimplementation of the RRDBNet / SRVGG
+`kinovsr/realesrgan/` is an independent MLX reimplementation of the RRDBNet / SRVGG
 generators below, written from the published architectures as a spec -- no upstream code is
 bundled. The model weights are the upstream projects', redistributed under their licenses
 (see `weights/README.md` for the per-token downloads).

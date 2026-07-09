@@ -12,7 +12,7 @@ Convert:
 ```bash
 curl -L -O https://download.openmmlab.com/mmediting/restorers/real_basicvsr/realbasicvsr_c64b20_1x30x8_lr5e-5_150k_reds_20211104-52f77c2c.pth
 python scripts/pth_to_safetensors.py realbasicvsr_c64b20_1x30x8_lr5e-5_150k_reds_20211104-52f77c2c.pth \
-  -o LTX_2_MLX/videotoolbox/realbasicvsr/weights/realbasicvsr_x4.safetensors --strip-prefix 'generator.'
+  -o kinovsr/realbasicvsr/weights/realbasicvsr_x4.safetensors --strip-prefix 'generator.'
 ```
 
 The mmediting checkpoint nests under `state_dict` and prefixes keys with `generator.`.

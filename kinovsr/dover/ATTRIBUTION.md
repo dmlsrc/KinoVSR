@@ -1,6 +1,6 @@
 # Attribution
 
-`videotoolbox/dover/` is an independent MLX reimplementation of
+`kinovsr/dover/` is an independent MLX reimplementation of
 DOVER-Mobile, written from the published paper and from reading the
 official implementation as a specification -- no upstream code is
 bundled or executed.

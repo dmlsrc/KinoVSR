@@ -1,6 +1,6 @@
 # Attribution
 
-`videotoolbox/musiq/` is an independent MLX reimplementation of MUSIQ,
+`kinovsr/musiq/` is an independent MLX reimplementation of MUSIQ,
 written from the published paper and from reading the IQA-PyTorch
 reference implementation as a specification -- no upstream code is bundled
 or executed.

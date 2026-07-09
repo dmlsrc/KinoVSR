@@ -1,7 +1,7 @@
 # Attribution
 
-`videotoolbox/spynet/` holds the STOCK SpyNet optical-flow weights consumed by
-the shared MLX SpyNet implementation in `videotoolbox/vsr_blocks.py`
+`kinovsr/spynet/` holds the STOCK SpyNet optical-flow weights consumed by
+the shared MLX SpyNet implementation in `kinovsr/vsr_blocks.py`
 (`spynet_flow`). The implementation is an independent MLX port written from
 the published architecture and the BasicSR reference as a spec; the weights
 are the upstream project's, redistributed under its license, converted to

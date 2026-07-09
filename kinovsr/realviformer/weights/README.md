@@ -11,7 +11,7 @@ Convert -- the output name must match `net.py`'s `_VARIANTS`:
 
 ```bash
 python scripts/pth_to_safetensors.py weights.pth --param-key params \
-  -o LTX_2_MLX/videotoolbox/realviformer/weights/realviformer_x4.safetensors
+  -o kinovsr/realviformer/weights/realviformer_x4.safetensors
 ```
 
 `--param-key params` matters: the checkpoint carries BOTH `params` and

@@ -1,6 +1,6 @@
 # Attribution
 
-`videotoolbox/bsvd/` is an independent MLX reimplementation of BSVD, written
+`kinovsr/bsvd/` is an independent MLX reimplementation of BSVD, written
 from the published architecture and the reference forward pass as a spec. No
 upstream code is bundled. The weights are not bundled; see `weights/README.md`
 for the source and conversion notes.

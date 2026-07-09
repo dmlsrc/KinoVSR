@@ -1,11 +1,11 @@
-"""High-level VideoToolbox encode helper for generate.py.
+"""High-level VideoToolbox encode helper for KinoVSR pipelines.
 
 `encode_video_videotoolbox()` is the AVAssetWriter-backed sister of
 `kinovsr.ffmpeg_encoder.encode_video_ffmpeg()`.  It accepts the same frame
-list / audio waveform shape generate.py already builds and emits an
+list / audio waveform shape used by MLX video pipelines and emits an
 HEVC mp4 - no ffmpeg, no on-disk WAV unless `save_audio_sidecar=True`.
 
-Two optional post-VAE stages can be inserted between the frame source
+Two optional video stages can be inserted between the frame source
 and the writer:
 
   vsr_spatial_mode={fast,balanced,image}   VideoToolbox Super Resolution.
@@ -22,9 +22,9 @@ into AVWriter's pool - frames never round-trip through main memory once
 they enter the chain.
 
 Frames may be supplied as:
-  - list[(H,W,3) uint8]   - generate.py's normalized output
-  - list[(H,W,4) float16] - future streaming-VAE path (kept in bf16
-                            precision through to VSR's RGBAHalf source)
+  - list[(H,W,3) uint8]   - normalized RGB frames
+  - list[(H,W,4) float16] - RGBA frames kept in half precision through to
+                            VSR's RGBAHalf source
   - (T,H,W,3) uint8 ndarray
   - Iterator yielding any of the above per-frame shapes
 
@@ -184,10 +184,10 @@ def encode_video_videotoolbox(
     `audio_bit_depth` is accepted for API parity with encode_video_ffmpeg();
     AVAssetWriter always consumes float32 PCM internally regardless.
 
-    `audio_onset_trim_mode` / `audio_onset_trim_ms` route through to
-    `LTX_2_MLX.audio.onset.mitigate_onset()` before the AudioTrack is
-    built.  The same cleaned waveform feeds both the muxed audio track
-    and the optional sidecar (`save_audio_sidecar=True`).
+    `audio_onset_trim_mode` / `audio_onset_trim_ms` route through KinoVSR's
+    onset mitigation before the AudioTrack is built.  The same cleaned waveform
+    feeds both the muxed audio track and the optional sidecar
+    (`save_audio_sidecar=True`).
 
     `vsr_save_original`: when True AND any VT post-processing is engaged
     (VSR spatial or VTFRC temporal), also write the un-processed source-
@@ -241,9 +241,8 @@ def encode_video_videotoolbox(
     # VsrSession / VtfrcSession / AVWriter constructors each print to stdout
     # unconditionally ("VSR session ready ...", "Temporal session ready ...",
     # "[encode] AVAssetWriter -> ..."), plus we add the chain description
-    # and the optional audio sidecar line.  When `progress_stack` is alive
-    # (the caller is showing a "VAE chunks" bar above us), those raw prints
-    # would stomp on the bar row.  Redirect them through a StringIO and
+    # and the optional audio sidecar line.  When `progress_stack` is alive,
+    # those raw prints would stomp on the bar row.  Redirect them through a StringIO and
     # emit the captured block via `progress_stack.write()` so the lines
     # land cleanly above the bars (scroll-message-above-bars style); when no stack is
     # supplied, the prints flow normally to stdout.
@@ -280,8 +279,7 @@ def encode_video_videotoolbox(
             # build while the generated waveform can still stay MLX-native;
             # `_normalize_audio_for_track` is the final NumPy byte-boundary
             # adapter for CoreMedia.  See
-            # LTX_2_MLX.audio.onset and docs/AUDIO_ISSUES.md ->
-            # "Sequence-Start Audio Spike".
+            # docs/AUDIO_ISSUES.md -> "Sequence-Start Audio Spike".
             from .audio import DEFAULT_TRIM_MS, mitigate_onset
 
             onset_trim_ms = (
@@ -356,8 +354,8 @@ def encode_video_videotoolbox(
         # 10-bit); the original matches that too - upgrading the
         # original's source format past what its companion uses adds
         # bits the encoder would just throw away.  When the input frames
-        # are fp16 RGBA from the streaming-VAE path, RGBAHalf preserves
-        # them all the way to the encoder's internal 4:2:2 conversion;
+        # are fp16 RGBA from a native decoder or host engine, RGBAHalf
+        # preserves them all the way to the encoder's internal 4:2:2 conversion;
         # uint8 RGB input goes through upload_frame_to_buffer's RGBA
         # promotion path with no loss vs. the NV12 alternative.
         writer_orig: AVWriter | None = None
@@ -429,8 +427,8 @@ def encode_video_videotoolbox(
     # (count-only, no ETA).  Suppress entirely when verbose=False.
     #
     # When `progress_stack` is provided, the encoder shares the caller's
-    # stack - useful when generate.py wants a "VAE chunks" bar above the
-    # encoder's "VT encode" bar, both rendered in one cohesive display.
+    # stack so upstream decode/restoration and the encoder can render in one
+    # cohesive display.
     # The caller owns close() in that mode; we just add our row.
     bars: StackedPhaseBars | None = None
     owns_bars = False

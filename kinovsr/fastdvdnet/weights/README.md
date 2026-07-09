@@ -14,7 +14,7 @@ Convert:
 ```bash
 curl -L -O https://github.com/m-tassano/fastdvdnet/raw/master/model.pth
 python scripts/pth_to_safetensors.py model.pth \
-  -o LTX_2_MLX/videotoolbox/fastdvdnet/weights/model.safetensors
+  -o kinovsr/fastdvdnet/weights/model.safetensors
 ```
 
 The default `--strip-prefix 'module.'` handles the DataParallel prefix.

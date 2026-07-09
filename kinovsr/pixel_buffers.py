@@ -253,8 +253,8 @@ def upload_frame_to_buffer(frame: Any, pb: Any) -> None:
     """Upload `frame` into `pb`, dispatching on the buffer's pixel format.
 
     Accepted inputs (mlx or numpy array):
-      - (H,W,3) uint8 RGB           : --video / ffmpeg rgb24 path
-      - (H,W,4) fp16 RGBA           : --latent / chunk_to_rgba_fp16 path
+      - (H,W,3) uint8 RGB           : video / ffmpeg rgb24 path
+      - (H,W,4) fp16 RGBA           : native decoder or MLX frame source path
 
     Accepted destinations:
       - NV12 ('420v')               : LowLatency VSR source

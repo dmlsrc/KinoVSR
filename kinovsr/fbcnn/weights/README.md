@@ -16,7 +16,7 @@ Convert (color is the RGB model the driver uses):
 ```bash
 curl -L -O https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn_color.pth
 python scripts/pth_to_safetensors.py fbcnn_color.pth \
-  -o LTX_2_MLX/videotoolbox/fbcnn/weights/fbcnn_color.safetensors --strip-prefix ''
+  -o kinovsr/fbcnn/weights/fbcnn_color.safetensors --strip-prefix ''
 ```
 
 `--deblock fbcnn` finds it here, or point `$FBCNN_WEIGHTS` / `--deblock-weights` at any

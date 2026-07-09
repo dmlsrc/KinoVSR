@@ -1,6 +1,6 @@
 # Attribution
 
-`videotoolbox/pvdd/` is an independent MLX reimplementation of PVDD, written from
+`kinovsr/pvdd/` is an independent MLX reimplementation of PVDD, written from
 the published architecture and reference forward pass as a spec. No upstream code
 is bundled. The weights are not bundled; see `weights/README.md` for sources and
 conversion notes.

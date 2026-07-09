@@ -18,9 +18,9 @@ NOT run its code. Extract + convert:
 curl -L -O https://github.com/ryanxingql/stdf-pytorch/releases/download/v1.0.0/exp.zip
 unzip exp.zip
 python scripts/pth_to_safetensors.py exp/MFQEv2_R3_enlarge300x/ckp_290000.pt \
-  -o LTX_2_MLX/videotoolbox/stdf/weights/stdf_mfqev2_r3.safetensors --strip-prefix ''
+  -o kinovsr/stdf/weights/stdf_mfqev2_r3.safetensors --strip-prefix ''
 python scripts/pth_to_safetensors.py exp/Vimeo90K_R3_enlarge300x/ckp_300000.pt \
-  -o LTX_2_MLX/videotoolbox/stdf/weights/stdf_vimeo90k_r3.safetensors --strip-prefix ''
+  -o kinovsr/stdf/weights/stdf_vimeo90k_r3.safetensors --strip-prefix ''
 ```
 
 Source: Deng et al., "Spatio-Temporal Deformable Convolution for Compressed Video Quality

@@ -1,6 +1,6 @@
 # Attribution
 
-`videotoolbox/nafnet/` is an independent MLX reimplementation of NAFNet, written from the
+`kinovsr/nafnet/` is an independent MLX reimplementation of NAFNet, written from the
 published architecture as a spec -- no upstream code is bundled. The model weights are the
 upstream project's, redistributed under its license (see `weights/README.md` for the
 download).

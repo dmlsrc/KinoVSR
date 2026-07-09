@@ -25,7 +25,7 @@ animevideo -> `realesr_animevideov3.safetensors`, esrgan -> `esrgan_x4.safetenso
 ```bash
 curl -L -O https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
 python scripts/pth_to_safetensors.py RealESRGAN_x4plus.pth \
-  -o LTX_2_MLX/videotoolbox/realesrgan/weights/realesrgan_x4plus.safetensors --strip-prefix ''
+  -o kinovsr/realesrgan/weights/realesrgan_x4plus.safetensors --strip-prefix ''
 ```
 
 Scale and block count auto-detect (x2plus outputs 2x, the rest 4x); the converter picks

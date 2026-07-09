@@ -14,7 +14,7 @@ Convert -- the output name must match `net.py`'s `_VARIANTS`:
 ```bash
 curl -L -O https://huggingface.co/Meloo/SAFMN/resolve/main/SAFMN_L_Real_LSDIR_x4.pth
 python scripts/pth_to_safetensors.py SAFMN_L_Real_LSDIR_x4.pth --param-key params \
-  -o LTX_2_MLX/videotoolbox/safmn/weights/safmn_l_real_lsdir_x4.safetensors
+  -o kinovsr/safmn/weights/safmn_l_real_lsdir_x4.safetensors
 ```
 
 (`light_safmnpp.pth` -> `light_safmnpp.safetensors` the same way.) `--param-key
@@ -58,7 +58,7 @@ Convert (these checkpoints nest only `params_ema`):
 ```bash
 curl -L -O https://github.com/limitlesslab/AI-upscaling-models/releases/download/PureScale2/4x_SAFMN_PureScale.pth
 python scripts/pth_to_safetensors.py 4x_SAFMN_PureScale.pth --param-key params_ema \
-  -o LTX_2_MLX/videotoolbox/safmn/weights/safmn_purescale_x4.safetensors
+  -o kinovsr/safmn/weights/safmn_purescale_x4.safetensors
 ```
 
 (`2x_SAFMN_PureScale.pth` -> `safmn_purescale_x2.safetensors`,

@@ -1,4 +1,4 @@
-"""Native still-image I/O for LTX-2: ImageIO + CoreImage + AppKit, no Pillow.
+"""Native still-image I/O for KinoVSR: ImageIO + CoreImage + AppKit, no Pillow.
 
 The still-image sister of `audio.py` (native audio I/O). It replaces Pillow with
 the Apple frameworks this project already requires:

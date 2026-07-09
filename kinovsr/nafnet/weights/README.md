@@ -22,7 +22,7 @@ Convert (output name must match `net.py`'s `_VARIANTS`, `nafnet_<task>_width<NN>
 ```bash
 curl -L -O https://huggingface.co/nyanko7/nafnet-models/resolve/main/NAFNet-GoPro-width64.pth
 python scripts/pth_to_safetensors.py NAFNet-GoPro-width64.pth \
-  -o LTX_2_MLX/videotoolbox/nafnet/weights/nafnet_gopro_width64.safetensors --strip-prefix ''
+  -o kinovsr/nafnet/weights/nafnet_gopro_width64.safetensors --strip-prefix ''
 ```
 
 The converter statically scans the pickle (nothing executed); basicsr checkpoints nest

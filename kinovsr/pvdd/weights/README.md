@@ -31,7 +31,7 @@ to OHWI at load, so no conversion flags are needed.
 ```bash
 python scripts/pth_to_safetensors.py \
   weights-src/pvdd_srgb_nolevel.pth \
-  -o LTX_2_MLX/videotoolbox/pvdd/weights/pvdd_srgb_nolevel.safetensors
+  -o kinovsr/pvdd/weights/pvdd_srgb_nolevel.safetensors
 # ... repeat for the other five, keeping the filenames in the table above.
 ```
 

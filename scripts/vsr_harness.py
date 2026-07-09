@@ -1,20 +1,12 @@
 #!/usr/bin/env python3
-"""VAE-decode (or read MP4) and pump frames through VideoToolbox VSR +
-optional temporal frame-rate conversion. Writes the upscaled MP4 directly
-via AVAssetWriter - no ffmpeg, no PNG round-trip, no disk WAV by default.
+"""Read video and pump frames through KinoVSR spatial/temporal processing.
+Writes the upscaled MP4 directly via AVAssetWriter - no PNG round-trip, no
+disk WAV by default.
 
 Usage
 -----
-    # Latent path: VAE-decode the NPZ sidecar, then VSR it.
-    scripts/vsr_harness.py --latent run.npz --weights $LTX_DEFAULT_WEIGHTS_PATH \
-        --output-dir outputs/vsr/run1
-
-    # Same, with audio muxed and frame rate doubled to 48 fps.
-    scripts/vsr_harness.py --latent run.npz --weights ... \
-        --output-dir outputs/vsr/run1 --audio --target-fps 48
-
-    # Video path: skip VAE; VSR an existing clip. Add --audio to carry the
-    # source file's audio track through to the upscaled MP4.
+    # VSR an existing clip. Add --audio to carry the source file's audio track
+    # through to the upscaled MP4.
     scripts/vsr_harness.py --video clip.mp4 \
         --output-dir outputs/vsr/run2 --spatial-mode balanced --audio
 
@@ -53,20 +45,12 @@ Temporal modes (only relevant when --target-fps is set)
     high      VTFrameRateConversion's QualityPrioritizationQuality - more
               compute per interpolated frame, cleaner motion.
 
-The VAE decoder defaults track LTX_2_MLX/generate.py's happy path
-(native backend + zero spatial padding) via the encode_modes_harness
-helpers. Chunks are cast to fp16 RGBA inside MLX so the full bf16
-precision is preserved through to VSR's RGBAHalf source format -
-quantization happens at the destination (either CIContext rendering
-to NV12 for LL, or AVAssetWriter encoding to HEVC for HQ).
-
-Known limitation for `--video` on edited footage
-------------------------------------------------
+Known limitation on edited footage
+----------------------------------
 `--spatial-mode balanced` chains previous-frame state through VSR for
 temporal coherence. Across a hard cut that's the wrong context and can
-produce ghosting around the cut frame. LTX latents are single-shot
-generations so this is moot for `--latent`. For edited MP4s, enable
-`--cut-detect` to reset the chain at hard cuts.
+produce ghosting around the cut frame. Enable `--cut-detect` to reset the
+chain at hard cuts.
 """
 
 from __future__ import annotations
@@ -74,16 +58,12 @@ from __future__ import annotations
 import argparse
 import gc
 import os
-import sys
 import time
-from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from kinovsr.progress import StackedPhaseBars
 from kinovsr import (
@@ -125,9 +105,6 @@ from kinovsr.writer import (
     HEVC_PROFILE_MAIN10,
     HEVC_PROFILE_MAIN422_10,
 )
-
-NATIVE_FPS = 24.0
-
 
 def parse_mlx_dtype_name(name: str) -> Any:
     try:
@@ -203,204 +180,6 @@ def resolve_trim(
     if total_frames and end_frame is not None:
         end_frame = min(end_frame, total_frames)
     return start_frame, end_frame
-
-
-# ---------------------------------------------------------------------------
-# MLX-side chunk conversion. Lives in the harness (not the videotoolbox
-# package) because it depends on LTX_2_MLX.model.video_vae internals.
-# ---------------------------------------------------------------------------
-
-# A/B toggle (env): VSR_CHUNK_AS_ARRAY=1 returns one big ndarray per chunk
-# (300 MiB resident until chunk-end). Default 0 returns a list of per-frame
-# ndarrays so each frame's ~1.2 MiB can be freed as the inner loop progresses.
-#
-# Measured A/B (721-frame latent, bare `time`, no instrumentation):
-#   --vae-tiling auto  list   wall 142.2s  VAE 109.3s  5.07 fps
-#   --vae-tiling auto  array  wall 142.3s  VAE 109.3s  5.07 fps
-#   --vae-tiling single list  wall 151.1s  VAE  58.3s  4.77 fps
-#   --vae-tiling single array wall 165.5s  VAE  70.2s  4.36 fps
-# Tiled mode: list/array indistinguishable - chunks are small enough that
-# list-vs-array allocation overhead is in the noise. Single-shot: list is
-# ~10% faster wall and ~17% faster through the VAE itself. So this env var
-# is NOT a no-op - it controls a real perf difference for `--vae-tiling off`.
-# List stays the default because it's the faster path everywhere AND lets
-# the inner loop drop per-frame memory as it goes.
-import os as _os
-
-_CHUNK_AS_ARRAY = _os.environ.get("VSR_CHUNK_AS_ARRAY", "0") == "1"
-
-
-def chunk_to_rgba_fp16(chunk: Any, mx_mod: Any):
-    """(B,3,T,H,W) bf16 in [-1,1] -> list[(H,W,4) fp16] per-frame arrays.
-
-    Direct path for VSR's RGBAHalf source format and for CIImage's
-    kCIFormatRGBAh upload to NV12. Skips uint8 quantization that
-    chunk_to_uint8 would impose, so the VAE's full bf16 precision
-    survives into VSR.
-
-    Returns a list of independently-allocated per-frame ndarrays rather than
-    one big (T,H,W,4) array. The downstream inner loop can then null out
-    `chunk[i]` once a frame is consumed, freeing that frame's ~1.2 MB back
-    to the OS - so the resident chunk memory tapers as we work through it
-    instead of sitting at full size until chunk-end. Allocator overhead is
-    one mmap per frame (cheap; macOS mmaps allocations >= 16 KiB directly).
-    """
-    B, C, T, H, W = chunk.shape
-    rescaled = mx_mod.clip((chunk + 1.0) * 0.5, 0.0, 1.0).astype(mx_mod.float16)
-    alpha = mx_mod.ones((B, 1, T, H, W), dtype=mx_mod.float16)
-    rgba = mx_mod.concatenate([rescaled, alpha], axis=1)
-    transposed = mx_mod.transpose(rgba, (0, 2, 3, 4, 1))  # (B, T, H, W, 4)
-    mx_mod.eval(transposed)
-    if _CHUNK_AS_ARRAY:
-        arr = mx_mod.contiguous(transposed)
-        result: Any = arr[0] if arr.ndim == 5 else arr
-    else:
-        # List of per-frame mx arrays so each frame's memory can be freed
-        # independently by the main loop. mx.contiguous gives each frame its own
-        # buffer, so dropping a frame lets MLX release it without pinning the
-        # whole chunk's Metal state across the loop.
-        result = [mx_mod.contiguous(transposed[0, t]) for t in range(T)]
-    # Drop refs to all MLX intermediates AND force the cache to release.
-    # Without clear_cache here, the rescaled/alpha/rgba/transposed Metal
-    # buffers (which can be GiB-scale for single-shot decodes) sit in MLX's
-    # cache for the entire downstream inner loop - only released when the
-    # generator resumes after the loop drains. The numpy result is already
-    # an independent Python-owned copy, so MLX state is safe to drop now.
-    del rescaled, alpha, rgba, transposed
-    try:
-        mx_mod.clear_cache()
-    except Exception:
-        pass
-    return result
-
-
-def make_video_decoder_default(
-    weights_path: str, compute_dtype: Any,
-):
-    """generate.py's happy-path defaults via encode_modes_harness."""
-    from scripts.encode_modes_harness import make_video_decoder
-    return make_video_decoder(weights_path, compute_dtype)
-
-
-def latent_dims(latent: Any) -> tuple[int, int, int]:
-    _, _, latent_frames, latent_height, latent_width = latent.shape
-    n_frames = 1 + (latent_frames - 1) * 8
-    height = latent_height * 32
-    width = latent_width * 32
-    return n_frames, height, width
-
-
-def plan_vae_tiling(latent: Any) -> tuple[Any, int, str]:
-    """Decide the tiling cfg + chunk count up front.
-
-    Returns (cfg, n_chunks, human_description). `cfg` is the TilingConfig
-    (or None for single-shot decode). Pure CPU/dim arithmetic - no GPU
-    work - so it's cheap to call before any tqdm bar starts (which is
-    what avoids clobbering the bar with VAE tiling status mid-stream).
-    """
-    from LTX_2_MLX.model.video_vae.tiling import TilingConfig
-
-    n_frames, height, width = latent_dims(latent)
-    cfg = TilingConfig.auto(
-        height=height, width=width, num_frames=n_frames,
-    )
-    if cfg is None:
-        return cfg, 1, f"off (single-shot decode of {n_frames} frames)"
-
-    sp = cfg.spatial_config
-    tp = cfg.temporal_config
-    spatial_desc = (
-        f"spatial tile={sp.tile_size_in_pixels} overlap={sp.tile_overlap_in_pixels}"
-        if sp else "no spatial"
-    )
-    temporal_desc = (
-        f"temporal tile={tp.chunk_size_in_frames} overlap={tp.chunk_overlap_in_frames}"
-        if tp else "no temporal"
-    )
-    if tp is not None:
-        tile = tp.chunk_size_in_frames
-        overlap = tp.chunk_overlap_in_frames
-        step = max(1, tile - overlap)
-        n_chunks = max(1, -(-(n_frames - overlap) // step))
-    else:
-        n_chunks = 1
-    return cfg, n_chunks, f"{spatial_desc}, {temporal_desc}"
-
-
-def iter_latent_chunks(
-    latent: Any,
-    decoder: Any,
-    *,
-    cfg: Any,
-    mx_mod: Any,
-    output_format: str = "uint8_rgb",
-    single_pass: bool = False,
-) -> Iterator[mx.array]:
-    """Yield decoded chunks. output_format selects the conversion:
-       "uint8_rgb"  -> (T,H,W,3) uint8  (for LowLatency VSR / NV12 source)
-       "fp16_rgba"  -> (T,H,W,4) fp16   (for HighQuality VSR / RGBAHalf source)
-    """
-    from LTX_2_MLX.model.video_vae.tiling import decode_single_pass, decode_streaming
-    from scripts.encode_modes_harness import chunk_to_uint8
-
-    convert = chunk_to_rgba_fp16 if output_format == "fp16_rgba" else chunk_to_uint8
-
-    if single_pass:
-        # --vae-tiling single: one whole-clip decode. decode_single_pass logs whether
-        # the frame count crosses the int32 boundary (frames past it decode white).
-        out = convert(decode_single_pass(latent, decoder), mx_mod)
-        try:
-            mx_mod.clear_cache()
-        except Exception:
-            pass
-        gc.collect()
-        yield out
-        return
-
-    # decode_streaming handles cfg=None (no spatial tiling + default temporal
-    # chunking), so this streams chunk-by-chunk for every case -- no whole-video
-    # accumulate. convert() quantizes each chunk at the destination format.
-    for chunk in decode_streaming(latent, decoder, cfg, show_progress=False):
-        out = convert(chunk, mx_mod)
-        # convert() clears the cache; `chunk` is the only MLX tensor still
-        # live, so drop it + clear before yielding to the downstream loop.
-        del chunk
-        try:
-            mx_mod.clear_cache()
-        except Exception:
-            pass
-        gc.collect()
-        yield out
-        del out
-
-
-# ---------------------------------------------------------------------------
-# Audio decode (latent only)
-# ---------------------------------------------------------------------------
-
-def _decode_audio_track(audio_latent: Any, weights: str, compute_dtype: Any) -> AudioTrack:
-    """Decode the audio latent through the audio VAE + vocoder into an
-    in-memory AudioTrack. No disk WAV unless the caller asks for a sidecar.
-    """
-    import mlx.core as mx
-
-    from scripts.decode_latent_debug import decode_audio_latent, make_audio_decoder_and_vocoder
-
-    print("Decoding audio latent (audio VAE + vocoder)...")
-    audio_decoder, vocoder, sample_rate = make_audio_decoder_and_vocoder(weights, compute_dtype)
-    waveform = decode_audio_latent(audio_latent, audio_decoder, vocoder, mx, onset_mode="auto")
-    arr = waveform
-    if arr.ndim == 3:
-        arr = arr[0]
-    track = AudioTrack(arr, sample_rate=int(sample_rate))
-    print(f"  audio: {track.channels}ch, {track.sample_rate} Hz, {track.n_samples} samples")
-    del waveform, audio_decoder, vocoder
-    gc.collect()
-    try:
-        mx.clear_cache()
-    except Exception:
-        pass
-    return track
 
 
 def _read_audio_track_from_video(mp4_path: Path) -> AudioTrack | None:
@@ -502,426 +281,332 @@ def run(args: argparse.Namespace) -> None:
     audio_track: AudioTrack | None = None
     gop_schedule: Any = None   # GOP-aligned window plan for recurrent stages (--gop-align)
     _gop_head_skip = 0         # gop-align context frames whose outputs are dropped
-    src_transform: Any = None  # source rotation/flip (set on the --video path)
+    src_transform: Any = None  # source rotation/flip from the input container
     src_pixel_aspect: tuple[int, int] | None = None
-    # Input frame window [loop_win_start, loop_win_end). The --video reader
-    # trims at decode time (efficient seek), so for that path these stay
-    # (0, None) and the trim happens upstream; the --latent path enforces the
-    # window in the main loop instead.
-    loop_win_start, loop_win_end = 0, None
-    win_start, win_end = 0, None  # resolved input window (both paths set these)
-    # Output color tags: the video path fills these from the source container;
-    # the latent path has no source container, so use the SDR BT.709/video-range
-    # default explicitly. Passing cv_color also enables the writer's deterministic
-    # RGBAHalf->YUV conversion for latent/uploaded-buffer producers.
+    win_start, win_end = 0, None  # resolved input window
+    # Output color tags are filled from the source container after probing.
     _resolved_color = _color.resolve({"full_range": False}, "bt709")
     color_props: dict | None = _color.av_color_properties(_resolved_color)
     cv_color: tuple | None = _color.cv_triple(_resolved_color)
     output_full_range = _resolved_color[3]
 
     # ---- Input source ------------------------------------------------------
-    if args.latent:
-        from scripts.decode_latent_debug import load_latents, parse_dtype
+    from kinovsr.vsr import source_format_for_mode
 
-        print(f"[setup] VAE-decoding latent: {args.latent}")
-        t = time.perf_counter()
-        latent, audio_latent = load_latents(args.latent, mx, "auto", stage=args.latent_stage)
-        compute_dtype = parse_dtype(mx, args.vae_dtype)
-        print(
-            f"[setup] load_latents done in {time.perf_counter() - t:.2f}s "
-            f"(video_latent={tuple(latent.shape)}, "
-            f"audio_latent={'yes' if audio_latent is not None else 'no'})"
-        )
-
-        # Audio decode runs serially - threading it against VAE chunk 1 was
-        # tried and made total setup slower (MLX serializes work across
-        # threads on the single Metal scheduler).
-        if audio_latent is not None and args.audio:
-            t = time.perf_counter()
-            audio_track = _decode_audio_track(audio_latent, args.weights, compute_dtype)
-            print(f"[setup] audio decode in {time.perf_counter() - t:.2f}s")
-        # The audio latent is consumed at this point; free it (and any other
-        # post-audio state) so the Metal heap is clean before VAE decode.
-        del audio_latent
-        gc.collect()
+    # ---- reader selection: native (AVFoundation) unless forced or refused.
+    # The ffmpeg compatibility reader mirrors the native surface for
+    # containers/codecs AVFoundation cannot open (MKV, VP9, ...).
+    global _vr
+    if args.reader == "ffmpeg":
+        from kinovsr import ffmpeg_reader
+        _vr = ffmpeg_reader
+        print("[reader] ffmpeg compatibility reader (forced)")
+    elif args.reader == "auto":
         try:
-            mx.clear_cache()
-        except Exception:
-            pass
-
-        t = time.perf_counter()
-        decoder = make_video_decoder_default(
-            args.weights, compute_dtype,
-        )
-        print(f"[setup] video VAE loaded in {time.perf_counter() - t:.2f}s")
-        total_frames, in_h, in_w = latent_dims(latent)
-        source_fps = args.source_fps
-        src_w, src_h = in_w, in_h
-        crop_box = None
-        _edge_samples = None
-        square_resample: tuple | None = None
-        square_apply = None
-        if args.crop_bars or args.crop_aspect:
-            print("[crop] --crop-bars/--crop-aspect need --video; disabled")
-
-        if args.snap_start or args.gop_align:
-            print("[warn] --snap-start/--gop-align apply to --video only; ignored for --latent")
-        # --start/--end trim the decoded frames. The VAE still decodes the whole
-        # latent (it is temporally tiled, not seekable), so the window is
-        # enforced in the main loop rather than at the reader.
-        win_start, win_end = resolve_trim(args.start, args.end, source_fps, total_frames)
-        _win_end_abs = win_end if win_end is not None else total_frames
-        if win_start or win_end is not None:
-            loop_win_start, loop_win_end = win_start, win_end
-            total_frames = _win_end_abs - win_start
-        if source_fps > 0:
-            print(f"[setup] range: start {win_start} ({win_start / source_fps:.3f}s) -> "
-                  f"end {_win_end_abs} ({_win_end_abs / source_fps:.3f}s), "
-                  f"{total_frames} frames @ {source_fps:.3f} fps")
-        else:
-            print(f"[setup] range: frames [{win_start}, {_win_end_abs}), {total_frames} frames")
-
-        if args.vae_tiling == "single":
-            vae_cfg, n_vae_chunks, vae_tiling_desc = None, 1, "single (one decode)"
-        else:
-            vae_cfg, n_vae_chunks, vae_tiling_desc = plan_vae_tiling(latent)
-        print(
-            f"VAE tiling: {vae_tiling_desc} "
-            f"({n_vae_chunks} chunk{'s' if n_vae_chunks != 1 else ''})"
-        )
-        # Always carry fp16 RGBA from MLX through to VSR - quantization
-        # happens at the destination format, not earlier. For LL this means
-        # CIContext quantizes once at NV12 render time (in YUV space) rather
-        # than twice (in RGB then YUV). For HQ this preserves full bf16
-        # precision into RGBAHalf.
-        chunks = iter_latent_chunks(
-            latent, decoder,
-            cfg=vae_cfg, mx_mod=mx,
-            output_format="fp16_rgba",
-            single_pass=args.vae_tiling == "single",
-        )
-    else:
-        from kinovsr.vsr import source_format_for_mode
-
-        # ---- reader selection: native (AVFoundation) unless forced or refused.
-        # The ffmpeg compatibility reader mirrors the native surface for
-        # containers/codecs AVFoundation cannot open (MKV, VP9, ...).
-        global _vr
-        if args.reader == "ffmpeg":
+            _vr.probe_video(Path(args.video))
+        except Exception as e:
             from kinovsr import ffmpeg_reader
             _vr = ffmpeg_reader
-            print("[reader] ffmpeg compatibility reader (forced)")
-        elif args.reader == "auto":
-            try:
-                _vr.probe_video(Path(args.video))
-            except Exception as e:
-                from kinovsr import ffmpeg_reader
-                _vr = ffmpeg_reader
-                print(f"[reader] native reader cannot open this file "
-                      f"({type(e).__name__}); using the ffmpeg compatibility reader")
+            print(f"[reader] native reader cannot open this file "
+                  f"({type(e).__name__}); using the ffmpeg compatibility reader")
 
-        print(f"Reading video: {args.video}")
-        in_w, in_h, source_fps, total_frames, src_transform, src_pixel_aspect = _vr.probe_video(
-            Path(args.video),
-        )
-        _src_color = _vr.probe_color(Path(args.video))
-        _resolved_color = _color.resolve(_src_color, args.source_color, args.source_range)
-        color_props = _color.av_color_properties(_resolved_color)
-        cv_color = _color.cv_triple(_resolved_color)
-        output_full_range = _resolved_color[3]
-        _origin = ("tagged" if _src_color["tagged"]
-                   else "untagged, VT guessed" if _src_color.get("guessed")
-                   else "untagged")
-        print(f"Source color: {_origin} -> output {_color.describe(_resolved_color)}")
-        if args.source_color != "auto":
-            print(f"  (forcing the source to be DECODED as {args.source_color}, "
-                  "overriding VideoToolbox's resolution guess)")
-        if args.source_range != "auto":
-            _container_range = "full" if _src_color["full_range"] else "video"
-            if args.source_range == _container_range:
-                print(f"  (--source-range {args.source_range} matches the container "
-                      "flag; no reinterpretation needed)")
-            else:
-                print(f"  (reinterpreting the source's code values as {args.source_range} "
-                      f"range, overriding the container's {_container_range}-range flag)")
-
-        # ---- Bar crop + border sampling (before any dims are consumed) -----
-        src_w, src_h = in_w, in_h
-        if (src_w % 2) or (src_h % 2):
-            print(f"[warn] source has ODD dimensions {src_w}x{src_h}: 4:2:0 "
-                  "paths (--spatial-mode fast NV12 input; Main10/H.264 encodes "
-                  "at 1x) may misalign chroma or fail downstream. Consider "
-                  "--crop-bars 0,1,0,1-style trims to even them.")
-        crop_box = None
-        _edge_samples = None
-        if args.crop_bars or args.sanitize_edges == "auto":
-            _edge_samples, s_idx = [], 0
-            want = set(range(0, 24, 4))
-            for s_chunk in _vr.iter_video_buffer_chunks(
-                    Path(args.video), _pb.PIX_RGBAHALF, chunk_size=8):
-                for s_buf in s_chunk:
-                    if s_idx in want:
-                        _edge_samples.append(mx.clip(
-                            _pb.read_pixel_buffer_rgb(s_buf).astype(mx.float32) / 255.0,
-                            0, 1))
-                    s_idx += 1
-                if s_idx > max(want):
-                    break
-        if args.crop_bars:
-            if args.crop_bars == "auto":
-                bars = detect_bars(_edge_samples)
-            else:
-                bars = list(parse_edges_spec(args.crop_bars))
-                # Keep the active area even (4:2:0 chroma / NV12 paths): bump
-                # the bottom/right trim into the content by one px if needed.
-                bumped = []
-                if (in_h - bars[0] - bars[1]) % 2:
-                    bars[1] += 1
-                    bumped.append("bottom")
-                if (in_w - bars[2] - bars[3]) % 2:
-                    bars[3] += 1
-                    bumped.append("right")
-                if bumped:
-                    print(f"[crop] bumped {'/'.join(bumped)} by 1 px so the "
-                          "active area keeps even dimensions")
-                bars = tuple(bars)
-            if any(bars):
-                if bars[0] + bars[1] >= in_h or bars[2] + bars[3] >= in_w:
-                    raise SystemExit(f"--crop-bars {bars} leaves no active area")
-                crop_box = bars
-                in_h -= bars[0] + bars[1]
-                in_w -= bars[2] + bars[3]
-                print(f"[crop] bars: top={bars[0]} bottom={bars[1]} left={bars[2]} "
-                      f"right={bars[3]} px -> active {in_w}x{in_h}")
-                if _edge_samples:
-                    _edge_samples = [_crop_rgb(s, bars) for s in _edge_samples]
-            elif args.crop_bars == "auto":
-                print("[crop] auto: no bars detected")
-
-        # Junk-edge TRIM: fold detected junk lines into the crop instead of
-        # filling them, BEFORE the aspect window is computed, so the aspect
-        # math runs on the clean picture.
-        if args.sanitize_edges and args.sanitize_edges_fill == "trim":
-            if args.sanitize_edges == "auto":
-                trim_edges, notices = detect_junk_edges(_edge_samples or [])
-                for note in notices:
-                    print(f"[sanitize] {note}")
-            else:
-                trim_edges = parse_edges_spec(args.sanitize_edges)
-            if any(trim_edges):
-                te = list(trim_edges)
-                bumped = []
-                if (in_h - te[0] - te[1]) % 2:
-                    te[1] += 1
-                    bumped.append("bottom")
-                if (in_w - te[2] - te[3]) % 2:
-                    te[3] += 1
-                    bumped.append("right")
-                if te[0] + te[1] >= in_h or te[2] + te[3] >= in_w:
-                    raise SystemExit(
-                        f"--sanitize-edges trim {tuple(te)} leaves no active area")
-                if bumped:
-                    print(f"[sanitize] trim bumped {'/'.join(bumped)} by 1 px so "
-                          "the active area keeps even dimensions")
-                te = tuple(te)
-                base = crop_box or (0, 0, 0, 0)
-                crop_box = tuple(b + a for b, a in zip(base, te, strict=True))
-                in_h -= te[0] + te[1]
-                in_w -= te[2] + te[3]
-                print(f"[sanitize] trim: top={te[0]} bottom={te[1]} left={te[2]} "
-                      f"right={te[3]} px cropped off -> active {in_w}x{in_h}")
-                if _edge_samples:
-                    _edge_samples = [_crop_rgb(s, te) for s in _edge_samples]
-            else:
-                print("[sanitize] trim: no junk edges detected")
-        if args.crop_aspect:
-            try:
-                ar_w, ar_h = (int(p) for p in args.crop_aspect.split(":"))
-            except ValueError:
-                raise SystemExit(f"--crop-aspect must be W:H, got {args.crop_aspect!r}") from None
-            try:
-                dx, dy = (int(p) for p in args.crop_offset.split(","))
-            except ValueError:
-                raise SystemExit(f"--crop-offset must be dx,dy, got {args.crop_offset!r}") from None
-            eff_w, eff_h = ar_w, ar_h
-            if src_pixel_aspect and src_pixel_aspect[0] != src_pixel_aspect[1]:
-                # The requested ratio is a DISPLAY aspect; on anamorphic
-                # sources the storage-pixel target must fold the PAR in
-                # (display = storage x PAR), or a "16:9" crop of 128:117-wide
-                # pixels would display at ~1.95:1.
-                eff_w = ar_w * src_pixel_aspect[1]
-                eff_h = ar_h * src_pixel_aspect[0]
-                print(f"[crop] aspect {ar_w}:{ar_h} at source pixel aspect "
-                      f"{src_pixel_aspect[0]}:{src_pixel_aspect[1]} -> "
-                      f"storage target {eff_w}:{eff_h}")
-            asp = compute_aspect_crop(in_w, in_h, eff_w, eff_h, dx, dy,
-                                      anchor=args.crop_anchor)
-            if any(asp):
-                base = crop_box or (0, 0, 0, 0)
-                crop_box = tuple(b + a for b, a in zip(base, asp, strict=True))
-                in_h -= asp[0] + asp[1]
-                in_w -= asp[2] + asp[3]
-                off = f" offset {dx:+d},{dy:+d}" if (dx or dy) else ""
-                print(f"[crop] aspect {ar_w}:{ar_h} anchor {args.crop_anchor}{off}: "
-                      f"window at x={crop_box[2]} y={crop_box[0]} "
-                      f"-> active {in_w}x{in_h}")
-                if _edge_samples:
-                    _edge_samples = [_crop_rgb(s, asp) for s in _edge_samples]
-
-        # ---- Square-pixel resample (anamorphic sources) --------------------
-        # Horizontal-only bilinear at SOURCE resolution: the cheapest point,
-        # and the upscaler re-synthesizes the mild resample softness. Output
-        # is then tagged 1:1. Runs AFTER the crops (which are PAR-aware).
-        square_resample: tuple | None = None
-        square_apply = None
-        if args.square_pixels and src_pixel_aspect and src_pixel_aspect[0] != src_pixel_aspect[1]:
-            sq_w = int(round(in_w * src_pixel_aspect[0] / src_pixel_aspect[1]))
-            sq_w -= sq_w % 2
-            if sq_w != in_w and sq_w >= 2:
-                square_resample = make_lanczos_plan(in_w, sq_w)
-                square_apply = mx.compile(
-                    lambda t: resample_width(t, square_resample))
-                square_ratio = sq_w / in_w
-                print(f"[square-pixels] pixel aspect {src_pixel_aspect[0]}:"
-                      f"{src_pixel_aspect[1]} -> width {in_w} -> {sq_w} "
-                      "(Lanczos-3 at source resolution); output tagged 1:1")
-                in_w = sq_w
-            src_pixel_aspect = None
-        elif args.square_pixels:
-            square_resample = None   # already square; no-op
-
-        # Decode straight into VSR's source format (NV12 for fast, RGBAHalf for
-        # balanced/image) and feed the buffers directly to VSR - no RGB
-        # intermediate, no MLX round-trip, no re-quantization. Size the decode
-        # chunk to a ~64 MiB budget so peak resident decoded frames stay bounded
-        # regardless of resolution (1 frame for 4K RGBAHalf, more for small SD).
-        vsr_src_fmt = (
-            _pb.PIX_RGBAHALF if args.spatial_mode == "none"
-            else source_format_for_mode(args.spatial_mode)
-        )
-        bytes_per_px = 8 if vsr_src_fmt == _pb.PIX_RGBAHALF else 2
-        frame_bytes = max(1, src_w * src_h * bytes_per_px)   # decode happens at source size
-        buf_chunk = max(1, min(args.video_chunk_size, (64 * 1024 * 1024) // frame_bytes))
-        # --start/--end trim the input. The reader seeks to the window so the
-        # head of a long clip is never decoded (frame-exact, see video_reader).
-        win_start, win_end = resolve_trim(args.start, args.end, source_fps, total_frames)
-        _orig_total = total_frames       # full-clip frame count (before trim)
-
-        def _tc(fr: int) -> str:         # frame index -> "N (S.SSSs)"
-            return f"{fr} ({fr / source_fps:.3f}s)" if source_fps > 0 else f"{fr}"
-
-        # Keyframes are needed by --snap-start and/or --gop-align; detect once.
-        _kf_all = (_vr.keyframe_display_indices(Path(args.video))
-                   if (args.snap_start or args.gop_align) else None)
-        if args.snap_start and _kf_all:
-            _snap = min(_kf_all, key=lambda k: abs(k - win_start))
-            if _snap != win_start:
-                print(f"[snap] --start {_tc(win_start)} snapped to nearest keyframe "
-                      f"{_tc(_snap)} (output begins there, not at the requested frame)")
-                win_start = _snap
-        _win_end_abs = win_end if win_end is not None else _orig_total
-        total_frames = _win_end_abs - win_start
-        # Always echo the effective range (frames + timecodes, ms precision).
-        print(f"[setup] range: start {_tc(win_start)} -> end {_tc(_win_end_abs)}, "
-              f"{total_frames} frames @ {source_fps:.3f} fps")
-
-        # GOP-aligned windowing: plan windows whose boundaries land on keyframes
-        # (both recurrence directions cold-start on a clean frame -> no trim needed).
-        # One schedule drives every recurrent stage (they preserve frame positions).
-        _read_start = win_start          # gop-align may extend the read back to a keyframe
-        _gop_head_skip = 0               # context frames read before --start, output-dropped
-        if args.gop_align:
-            from kinovsr.upscaler_base import plan_gop_windows
-            _win_e = _win_end_abs
-            # Anchor the first window on the keyframe enclosing --start: read from
-            # it and feed [kf, start) as recurrence context (processed, not output),
-            # so the forward pass cold-starts on a clean I-frame even on an
-            # arbitrary start.
-            _encl = [k for k in _kf_all if k <= win_start]
-            _read_start = max(_encl) if _encl else win_start
-            _gop_head_skip = win_start - _read_start
-            _n_sched = _win_e - _read_start
-            _kf = sorted({k - _read_start for k in _kf_all if _read_start <= k < _win_e})
-            gop_schedule = plan_gop_windows(_kf, _n_sched, args.gop_min_window, args.gop_max_window)
-            # ---- diagnostics: everything the scheduler saw + computed ----
-            _kf_abs = [k for k in _kf_all if _read_start <= k < _win_e]
-            # Anchor the first window on the keyframe enclosing --start: read from
-            # it and feed [kf, start) as recurrence context (processed, not output),
-            # so the forward pass cold-starts on a clean I-frame even on an
-            # arbitrary start.
-            _encl = [k for k in _kf_all if k <= win_start]
-            _read_start = max(_encl) if _encl else win_start
-            _gop_head_skip = win_start - _read_start
-            _n_sched = _win_e - _read_start
-            _kf = sorted({k - _read_start for k in _kf_all if _read_start <= k < _win_e})
-            gop_schedule = plan_gop_windows(_kf, _n_sched, args.gop_min_window, args.gop_max_window)
-            # ---- diagnostics: everything the scheduler saw + computed ----
-            _kf_abs = [k for k in _kf_all if _read_start <= k < _win_e]
-            _gaps = [_kf[i] - _kf[i - 1] for i in range(1, len(_kf))]
-            _uniq = sorted(set(_gaps))
-            _cadence = ("single-keyframe (no cadence -> fixed max-window tiling)" if not _gaps
-                        else f"constant {_uniq[0]} frames" if len(_uniq) == 1
-                        else f"variable: min {min(_gaps)} / median {sorted(_gaps)[len(_gaps) // 2]} / max {max(_gaps)}")
-            _proc = sum(p1 - p0 for p0, p1, *_ in gop_schedule)
-            _emit_n = sum(e1 - e0 for *_, e0, e1 in gop_schedule)
-            print(f"[gop-align] source: {len(_kf_abs)} keyframes in frames "
-                  f"[{_read_start}, {_win_e}); GOP cadence {_cadence}")
-            print("[gop-align]   keyframe frames: "
-                  + (str(_kf_abs) if len(_kf_abs) <= 24
-                     else f"{_kf_abs[:8]} ... {_kf_abs[-3:]}  ({len(_kf_abs)} total)"))
-            if _gop_head_skip:
-                print(f"[gop-align]   WARNING: --start {win_start} is mid-GOP; reading from "
-                      f"keyframe {_read_start} and feeding [{_read_start}, {win_start}) "
-                      f"({_gop_head_skip} frames) as recurrence context (processed, NOT output)")
-            print(f"[gop-align] planned {len(gop_schedule)} windows (min {args.gop_min_window} "
-                  f"/ max {args.gop_max_window} frames), keyframe-anchored both ends, trim 0:")
-            _show = (gop_schedule if len(gop_schedule) <= 12
-                     else [*gop_schedule[:6], None, *gop_schedule[-3:]])
-            for _w in _show:
-                if _w is None:
-                    print(f"[gop-align]   ... ({len(gop_schedule) - 9} more) ...")
-                    continue
-                _p0, _p1, _e0, _e1 = _w
-                print(f"[gop-align]   proc[{_p0}:{_p1}] emit[{_e0}:{_e1}]  "
-                      f"({_p1 - _p0} processed -> {_e1 - _e0} output)")
-            _ovh = (_proc / _emit_n - 1.0) * 100 if _emit_n else 0.0
-            print(f"[gop-align] {_proc} frames processed for {_emit_n} output "
-                  f"({_ovh:.1f}% re-processing overhead vs trim's ~2x)")
-        _force_read = args.source_color != "auto" or args.source_range != "auto"
-        if args.source_range != "auto" and vsr_src_fmt != _pb.PIX_RGBAHALF:
-            # The NV12 fast path feeds container-range-typed YUV straight into
-            # VSR and the encoder; retyping it would make the encode session
-            # rescale the values. No reinterpretation is possible there.
-            raise SystemExit(
-                "--source-range is not supported with --spatial-mode fast (the "
-                "NV12 path passes YUV through without a range conversion point). "
-                "Use --spatial-mode none/balanced/image or an MLX upscaler.")
-        if _force_read and vsr_src_fmt == _pb.PIX_RGBAHALF:
-            # Force the READ: decode raw YUV in the CONTAINER's range format
-            # (pass-through code values), re-interpret with the chosen matrix
-            # and range, overriding the container tag / VideoToolbox's
-            # resolution-based guess. (NV12 'fast' keeps the default decode;
-            # the LowLatency scaler consumes YUV directly.)
-            chunks = _vr.iter_forced_color_chunks(
-                Path(args.video), vsr_src_fmt, cv_color[2], _src_color["full_range"],
-                chunk_size=buf_chunk, start_frame=_read_start, end_frame=win_end,
-                reinterpret_full_range=output_full_range,
-            )
+    print(f"Reading video: {args.video}")
+    in_w, in_h, source_fps, total_frames, src_transform, src_pixel_aspect = _vr.probe_video(
+        Path(args.video),
+    )
+    _src_color = _vr.probe_color(Path(args.video))
+    _resolved_color = _color.resolve(_src_color, args.source_color, args.source_range)
+    color_props = _color.av_color_properties(_resolved_color)
+    cv_color = _color.cv_triple(_resolved_color)
+    output_full_range = _resolved_color[3]
+    _origin = ("tagged" if _src_color["tagged"]
+               else "untagged, VT guessed" if _src_color.get("guessed")
+               else "untagged")
+    print(f"Source color: {_origin} -> output {_color.describe(_resolved_color)}")
+    if args.source_color != "auto":
+        print(f"  (forcing the source to be DECODED as {args.source_color}, "
+              "overriding VideoToolbox's resolution guess)")
+    if args.source_range != "auto":
+        _container_range = "full" if _src_color["full_range"] else "video"
+        if args.source_range == _container_range:
+            print(f"  (--source-range {args.source_range} matches the container "
+                  "flag; no reinterpretation needed)")
         else:
-            chunks = _vr.iter_video_buffer_chunks(
-                Path(args.video), vsr_src_fmt, chunk_size=buf_chunk,
-                start_frame=_read_start, end_frame=win_end,
-            )
-        n_vae_chunks = None  # no VAE on --video path
+            print(f"  (reinterpreting the source's code values as {args.source_range} "
+                  f"range, overriding the container's {_container_range}-range flag)")
 
-        # Carry the source file's audio through to the output MP4 (native
-        # AVFoundation read; no ffmpeg). Latents decode audio from a latent
-        # instead - see _decode_audio_track above. Trim + sidecar happen below,
-        # uniformly for both paths.
-        if args.audio:
-            audio_track = _read_audio_track_from_video(Path(args.video))
+    # ---- Bar crop + border sampling (before any dims are consumed) -----
+    src_w, src_h = in_w, in_h
+    if (src_w % 2) or (src_h % 2):
+        print(f"[warn] source has ODD dimensions {src_w}x{src_h}: 4:2:0 "
+              "paths (--spatial-mode fast NV12 input; Main10/H.264 encodes "
+              "at 1x) may misalign chroma or fail downstream. Consider "
+              "--crop-bars 0,1,0,1-style trims to even them.")
+    crop_box = None
+    _edge_samples = None
+    if args.crop_bars or args.sanitize_edges == "auto":
+        _edge_samples, s_idx = [], 0
+        want = set(range(0, 24, 4))
+        for s_chunk in _vr.iter_video_buffer_chunks(
+                Path(args.video), _pb.PIX_RGBAHALF, chunk_size=8):
+            for s_buf in s_chunk:
+                if s_idx in want:
+                    _edge_samples.append(mx.clip(
+                        _pb.read_pixel_buffer_rgb(s_buf).astype(mx.float32) / 255.0,
+                        0, 1))
+                s_idx += 1
+            if s_idx > max(want):
+                break
+    if args.crop_bars:
+        if args.crop_bars == "auto":
+            bars = detect_bars(_edge_samples)
+        else:
+            bars = list(parse_edges_spec(args.crop_bars))
+            # Keep the active area even (4:2:0 chroma / NV12 paths): bump
+            # the bottom/right trim into the content by one px if needed.
+            bumped = []
+            if (in_h - bars[0] - bars[1]) % 2:
+                bars[1] += 1
+                bumped.append("bottom")
+            if (in_w - bars[2] - bars[3]) % 2:
+                bars[3] += 1
+                bumped.append("right")
+            if bumped:
+                print(f"[crop] bumped {'/'.join(bumped)} by 1 px so the "
+                      "active area keeps even dimensions")
+            bars = tuple(bars)
+        if any(bars):
+            if bars[0] + bars[1] >= in_h or bars[2] + bars[3] >= in_w:
+                raise SystemExit(f"--crop-bars {bars} leaves no active area")
+            crop_box = bars
+            in_h -= bars[0] + bars[1]
+            in_w -= bars[2] + bars[3]
+            print(f"[crop] bars: top={bars[0]} bottom={bars[1]} left={bars[2]} "
+                  f"right={bars[3]} px -> active {in_w}x{in_h}")
+            if _edge_samples:
+                _edge_samples = [_crop_rgb(s, bars) for s in _edge_samples]
+        elif args.crop_bars == "auto":
+            print("[crop] auto: no bars detected")
 
-    # ---- Audio trim + sidecar (uniform for both paths) ---------------------
+    # Junk-edge TRIM: fold detected junk lines into the crop instead of
+    # filling them, BEFORE the aspect window is computed, so the aspect
+    # math runs on the clean picture.
+    if args.sanitize_edges and args.sanitize_edges_fill == "trim":
+        if args.sanitize_edges == "auto":
+            trim_edges, notices = detect_junk_edges(_edge_samples or [])
+            for note in notices:
+                print(f"[sanitize] {note}")
+        else:
+            trim_edges = parse_edges_spec(args.sanitize_edges)
+        if any(trim_edges):
+            te = list(trim_edges)
+            bumped = []
+            if (in_h - te[0] - te[1]) % 2:
+                te[1] += 1
+                bumped.append("bottom")
+            if (in_w - te[2] - te[3]) % 2:
+                te[3] += 1
+                bumped.append("right")
+            if te[0] + te[1] >= in_h or te[2] + te[3] >= in_w:
+                raise SystemExit(
+                    f"--sanitize-edges trim {tuple(te)} leaves no active area")
+            if bumped:
+                print(f"[sanitize] trim bumped {'/'.join(bumped)} by 1 px so "
+                      "the active area keeps even dimensions")
+            te = tuple(te)
+            base = crop_box or (0, 0, 0, 0)
+            crop_box = tuple(b + a for b, a in zip(base, te, strict=True))
+            in_h -= te[0] + te[1]
+            in_w -= te[2] + te[3]
+            print(f"[sanitize] trim: top={te[0]} bottom={te[1]} left={te[2]} "
+                  f"right={te[3]} px cropped off -> active {in_w}x{in_h}")
+            if _edge_samples:
+                _edge_samples = [_crop_rgb(s, te) for s in _edge_samples]
+        else:
+            print("[sanitize] trim: no junk edges detected")
+    if args.crop_aspect:
+        try:
+            ar_w, ar_h = (int(p) for p in args.crop_aspect.split(":"))
+        except ValueError:
+            raise SystemExit(f"--crop-aspect must be W:H, got {args.crop_aspect!r}") from None
+        try:
+            dx, dy = (int(p) for p in args.crop_offset.split(","))
+        except ValueError:
+            raise SystemExit(f"--crop-offset must be dx,dy, got {args.crop_offset!r}") from None
+        eff_w, eff_h = ar_w, ar_h
+        if src_pixel_aspect and src_pixel_aspect[0] != src_pixel_aspect[1]:
+            # The requested ratio is a DISPLAY aspect; on anamorphic
+            # sources the storage-pixel target must fold the PAR in
+            # (display = storage x PAR), or a "16:9" crop of 128:117-wide
+            # pixels would display at ~1.95:1.
+            eff_w = ar_w * src_pixel_aspect[1]
+            eff_h = ar_h * src_pixel_aspect[0]
+            print(f"[crop] aspect {ar_w}:{ar_h} at source pixel aspect "
+                  f"{src_pixel_aspect[0]}:{src_pixel_aspect[1]} -> "
+                  f"storage target {eff_w}:{eff_h}")
+        asp = compute_aspect_crop(in_w, in_h, eff_w, eff_h, dx, dy,
+                                  anchor=args.crop_anchor)
+        if any(asp):
+            base = crop_box or (0, 0, 0, 0)
+            crop_box = tuple(b + a for b, a in zip(base, asp, strict=True))
+            in_h -= asp[0] + asp[1]
+            in_w -= asp[2] + asp[3]
+            off = f" offset {dx:+d},{dy:+d}" if (dx or dy) else ""
+            print(f"[crop] aspect {ar_w}:{ar_h} anchor {args.crop_anchor}{off}: "
+                  f"window at x={crop_box[2]} y={crop_box[0]} "
+                  f"-> active {in_w}x{in_h}")
+            if _edge_samples:
+                _edge_samples = [_crop_rgb(s, asp) for s in _edge_samples]
+
+    # ---- Square-pixel resample (anamorphic sources) --------------------
+    # Horizontal-only bilinear at SOURCE resolution: the cheapest point,
+    # and the upscaler re-synthesizes the mild resample softness. Output
+    # is then tagged 1:1. Runs AFTER the crops (which are PAR-aware).
+    square_resample: tuple | None = None
+    square_apply = None
+    if args.square_pixels and src_pixel_aspect and src_pixel_aspect[0] != src_pixel_aspect[1]:
+        sq_w = int(round(in_w * src_pixel_aspect[0] / src_pixel_aspect[1]))
+        sq_w -= sq_w % 2
+        if sq_w != in_w and sq_w >= 2:
+            square_resample = make_lanczos_plan(in_w, sq_w)
+            square_apply = mx.compile(
+                lambda t: resample_width(t, square_resample))
+            square_ratio = sq_w / in_w
+            print(f"[square-pixels] pixel aspect {src_pixel_aspect[0]}:"
+                  f"{src_pixel_aspect[1]} -> width {in_w} -> {sq_w} "
+                  "(Lanczos-3 at source resolution); output tagged 1:1")
+            in_w = sq_w
+        src_pixel_aspect = None
+    elif args.square_pixels:
+        square_resample = None   # already square; no-op
+
+    # Decode straight into VSR's source format (NV12 for fast, RGBAHalf for
+    # balanced/image) and feed the buffers directly to VSR - no RGB
+    # intermediate, no MLX round-trip, no re-quantization. Size the decode
+    # chunk to a ~64 MiB budget so peak resident decoded frames stay bounded
+    # regardless of resolution (1 frame for 4K RGBAHalf, more for small SD).
+    vsr_src_fmt = (
+        _pb.PIX_RGBAHALF if args.spatial_mode == "none"
+        else source_format_for_mode(args.spatial_mode)
+    )
+    bytes_per_px = 8 if vsr_src_fmt == _pb.PIX_RGBAHALF else 2
+    frame_bytes = max(1, src_w * src_h * bytes_per_px)   # decode happens at source size
+    buf_chunk = max(1, min(args.video_chunk_size, (64 * 1024 * 1024) // frame_bytes))
+    # --start/--end trim the input. The reader seeks to the window so the
+    # head of a long clip is never decoded (frame-exact, see video_reader).
+    win_start, win_end = resolve_trim(args.start, args.end, source_fps, total_frames)
+    _orig_total = total_frames       # full-clip frame count (before trim)
+
+    def _tc(fr: int) -> str:         # frame index -> "N (S.SSSs)"
+        return f"{fr} ({fr / source_fps:.3f}s)" if source_fps > 0 else f"{fr}"
+
+    # Keyframes are needed by --snap-start and/or --gop-align; detect once.
+    _kf_all = (_vr.keyframe_display_indices(Path(args.video))
+               if (args.snap_start or args.gop_align) else None)
+    if args.snap_start and _kf_all:
+        _snap = min(_kf_all, key=lambda k: abs(k - win_start))
+        if _snap != win_start:
+            print(f"[snap] --start {_tc(win_start)} snapped to nearest keyframe "
+                  f"{_tc(_snap)} (output begins there, not at the requested frame)")
+            win_start = _snap
+    _win_end_abs = win_end if win_end is not None else _orig_total
+    total_frames = _win_end_abs - win_start
+    # Always echo the effective range (frames + timecodes, ms precision).
+    print(f"[setup] range: start {_tc(win_start)} -> end {_tc(_win_end_abs)}, "
+          f"{total_frames} frames @ {source_fps:.3f} fps")
+
+    # GOP-aligned windowing: plan windows whose boundaries land on keyframes
+    # (both recurrence directions cold-start on a clean frame -> no trim needed).
+    # One schedule drives every recurrent stage (they preserve frame positions).
+    _read_start = win_start          # gop-align may extend the read back to a keyframe
+    _gop_head_skip = 0               # context frames read before --start, output-dropped
+    if args.gop_align:
+        from kinovsr.upscaler_base import plan_gop_windows
+        _win_e = _win_end_abs
+        # Anchor the first window on the keyframe enclosing --start: read from
+        # it and feed [kf, start) as recurrence context (processed, not output),
+        # so the forward pass cold-starts on a clean I-frame even on an
+        # arbitrary start.
+        _encl = [k for k in _kf_all if k <= win_start]
+        _read_start = max(_encl) if _encl else win_start
+        _gop_head_skip = win_start - _read_start
+        _n_sched = _win_e - _read_start
+        _kf = sorted({k - _read_start for k in _kf_all if _read_start <= k < _win_e})
+        gop_schedule = plan_gop_windows(_kf, _n_sched, args.gop_min_window, args.gop_max_window)
+        # ---- diagnostics: everything the scheduler saw + computed ----
+        _kf_abs = [k for k in _kf_all if _read_start <= k < _win_e]
+        # Anchor the first window on the keyframe enclosing --start: read from
+        # it and feed [kf, start) as recurrence context (processed, not output),
+        # so the forward pass cold-starts on a clean I-frame even on an
+        # arbitrary start.
+        _encl = [k for k in _kf_all if k <= win_start]
+        _read_start = max(_encl) if _encl else win_start
+        _gop_head_skip = win_start - _read_start
+        _n_sched = _win_e - _read_start
+        _kf = sorted({k - _read_start for k in _kf_all if _read_start <= k < _win_e})
+        gop_schedule = plan_gop_windows(_kf, _n_sched, args.gop_min_window, args.gop_max_window)
+        # ---- diagnostics: everything the scheduler saw + computed ----
+        _kf_abs = [k for k in _kf_all if _read_start <= k < _win_e]
+        _gaps = [_kf[i] - _kf[i - 1] for i in range(1, len(_kf))]
+        _uniq = sorted(set(_gaps))
+        _cadence = ("single-keyframe (no cadence -> fixed max-window tiling)" if not _gaps
+                    else f"constant {_uniq[0]} frames" if len(_uniq) == 1
+                    else f"variable: min {min(_gaps)} / median {sorted(_gaps)[len(_gaps) // 2]} / max {max(_gaps)}")
+        _proc = sum(p1 - p0 for p0, p1, *_ in gop_schedule)
+        _emit_n = sum(e1 - e0 for *_, e0, e1 in gop_schedule)
+        print(f"[gop-align] source: {len(_kf_abs)} keyframes in frames "
+              f"[{_read_start}, {_win_e}); GOP cadence {_cadence}")
+        print("[gop-align]   keyframe frames: "
+              + (str(_kf_abs) if len(_kf_abs) <= 24
+                 else f"{_kf_abs[:8]} ... {_kf_abs[-3:]}  ({len(_kf_abs)} total)"))
+        if _gop_head_skip:
+            print(f"[gop-align]   WARNING: --start {win_start} is mid-GOP; reading from "
+                  f"keyframe {_read_start} and feeding [{_read_start}, {win_start}) "
+                  f"({_gop_head_skip} frames) as recurrence context (processed, NOT output)")
+        print(f"[gop-align] planned {len(gop_schedule)} windows (min {args.gop_min_window} "
+              f"/ max {args.gop_max_window} frames), keyframe-anchored both ends, trim 0:")
+        _show = (gop_schedule if len(gop_schedule) <= 12
+                 else [*gop_schedule[:6], None, *gop_schedule[-3:]])
+        for _w in _show:
+            if _w is None:
+                print(f"[gop-align]   ... ({len(gop_schedule) - 9} more) ...")
+                continue
+            _p0, _p1, _e0, _e1 = _w
+            print(f"[gop-align]   proc[{_p0}:{_p1}] emit[{_e0}:{_e1}]  "
+                  f"({_p1 - _p0} processed -> {_e1 - _e0} output)")
+        _ovh = (_proc / _emit_n - 1.0) * 100 if _emit_n else 0.0
+        print(f"[gop-align] {_proc} frames processed for {_emit_n} output "
+              f"({_ovh:.1f}% re-processing overhead vs trim's ~2x)")
+    _force_read = args.source_color != "auto" or args.source_range != "auto"
+    if args.source_range != "auto" and vsr_src_fmt != _pb.PIX_RGBAHALF:
+        # The NV12 fast path feeds container-range-typed YUV straight into
+        # VSR and the encoder; retyping it would make the encode session
+        # rescale the values. No reinterpretation is possible there.
+        raise SystemExit(
+            "--source-range is not supported with --spatial-mode fast (the "
+            "NV12 path passes YUV through without a range conversion point). "
+            "Use --spatial-mode none/balanced/image or an MLX upscaler.")
+    if _force_read and vsr_src_fmt == _pb.PIX_RGBAHALF:
+        # Force the READ: decode raw YUV in the CONTAINER's range format
+        # (pass-through code values), re-interpret with the chosen matrix
+        # and range, overriding the container tag / VideoToolbox's
+        # resolution-based guess. (NV12 'fast' keeps the default decode;
+        # the LowLatency scaler consumes YUV directly.)
+        chunks = _vr.iter_forced_color_chunks(
+            Path(args.video), vsr_src_fmt, cv_color[2], _src_color["full_range"],
+            chunk_size=buf_chunk, start_frame=_read_start, end_frame=win_end,
+            reinterpret_full_range=output_full_range,
+        )
+    else:
+        chunks = _vr.iter_video_buffer_chunks(
+            Path(args.video), vsr_src_fmt, chunk_size=buf_chunk,
+            start_frame=_read_start, end_frame=win_end,
+        )
+    # Carry the source file's audio through to the output MP4.
+    if args.audio:
+        audio_track = _read_audio_track_from_video(Path(args.video))
+
+    # ---- Audio trim + sidecar ----------------------------------------------
     # When --start/--end trim the video, trim the audio to the same window so
     # the muxed track stays in sync (otherwise a short clip carries full-length
     # audio). The sidecar, if requested, reflects the trimmed audio.
@@ -1149,10 +834,9 @@ def run(args: argparse.Namespace) -> None:
 
     # ---- Sessions + writers ------------------------------------------------
     # Defer constructing the VSR session, VtfrcSession, and AVWriters until
-    # the *first* VAE chunk has materialized.  These hold Metal resources
-    # - the HQ VSR model in particular pins ~100MB of Metal heap - so
-    # creating them up front would compete with chunk-1 VAE decode for
-    # the same unified-memory pool.  Lazy init via _build_post_pipeline.
+    # the first source frame is ready.  These hold Metal resources - the HQ VSR
+    # model in particular pins ~100MB of Metal heap - so lazy init keeps startup
+    # lighter and lets source decoding own the early memory peak.
     session: VsrSession | None = None
     vtfrc: VtfrcSession | None = None
     post_writer: AVWriter | None = None
@@ -1176,9 +860,10 @@ def run(args: argparse.Namespace) -> None:
     ]:  # session, vtfrc, post_writer, comparison_writer, deblocker, denoiser, upscaler, nafnet, restorer, deflicker
         """Materialize VSR + temporal + writer sessions just-in-time.
 
-        Called on the first chunk so chunk-1 VAE has the Metal heap to
-        itself.  Returns (session, vtfrc, post_writer, comparison_writer);
-        the dst-pool wiring for zero-copy is set up before returning.
+        Called on the first source frame so decoder startup gets the early
+        Metal heap to itself. Returns (session, vtfrc, post_writer,
+        comparison_writer); the dst-pool wiring for zero-copy is set up before
+        returning.
         """
         s: Any
         if args.spatial_mode == "none":
@@ -1708,10 +1393,8 @@ def run(args: argparse.Namespace) -> None:
 
     # ---- Progress bars (stacked, deferred-start, median-window rate) -------
     # PhaseBar's clock starts at the first update() and the displayed pace
-    # is the median of the last-N inter-tick intervals; see videotoolbox/
-    # progress.py for the rationale. Plain tqdm gave both stacked bars the
-    # same wall-clock elapsed (= total run time) and inflated the VSR rate
-    # as the VAE-chunk-1 warmup amortized over a growing frame count.
+    # is the median of the last-N inter-tick intervals; see kinovsr.progress
+    # for the rationale.
     target_frame_total = total_frames
     if target_frame_total and do_temporal:
         target_frame_total = int(round(total_frames * (target_fps / source_fps)))
@@ -1721,10 +1404,6 @@ def run(args: argparse.Namespace) -> None:
         (max_frames or target_frame_total or None)
     )
     bars = StackedPhaseBars()
-    vae_pbar = (
-        bars.add(total=n_vae_chunks, desc="VAE chunks", unit="chunk")
-        if n_vae_chunks is not None else None
-    )
     out_pbar = bars.add(
         total=pbar_total,
         desc="OUT frames" if do_temporal else "VSR frames",
@@ -1734,8 +1413,6 @@ def run(args: argparse.Namespace) -> None:
     # ---- Pipeline loop -----------------------------------------------------
     processed = 0          # source frames upscaled
     appended = 0           # output frames written (= processed when no temporal)
-    in_idx = 0             # input frame index (counts skipped pre-window frames)
-    window_done = False    # set once the input window [loop_win_*) is exhausted
     t_total = time.perf_counter()
 
     def _emit(den_rgb: Any, src_frame: Any, src_arr: Any) -> None:
@@ -1871,9 +1548,7 @@ def run(args: argparse.Namespace) -> None:
 
     try:
         for chunk in chunks:
-            # Both paths yield a list, freed per-frame as consumed: the latent
-            # path a list of MLX arrays (fp16 RGBA), the --video path a list of
-            # decoded CVPixelBuffers in VSR's source format (fed to VSR direct).
+            # Chunks are lists of decoded CVPixelBuffers in VSR's source format.
             chunk_len = len(chunk)
             frames_are_buffers = not isinstance(chunk[0], mx.array)
             if frames_are_buffers:
@@ -1884,14 +1559,9 @@ def run(args: argparse.Namespace) -> None:
                 raise RuntimeError(
                     f"chunk dims {t_w}x{t_h} don't match the source {src_w}x{src_h}"
                 )
-            if vae_pbar is not None:
-                vae_pbar.update(1)
-            # Lazy init of the post-VAE pipeline.  Doing this *after* chunk 1
-            # materialized keeps the VSR HQ model + AVWriter pixel pool out of
-            # the Metal heap during chunk-1 VAE decode (which is the most
-            # memory-contended step of the run).
-            #
-            # _build_post_pipeline() prints status from VsrSession / AVWriter
+            # Lazy init of the processing pipeline after the first chunk keeps
+            # the VSR HQ model + AVWriter pixel pool out of memory until frames
+            # are actually available. _build_post_pipeline() prints status from VsrSession / AVWriter
             # constructors; route those through bars.write() so they appear
             # above the live progress bars instead of stomping mid-line.
             if session is None:
@@ -1916,16 +1586,6 @@ def run(args: argparse.Namespace) -> None:
             for i in range(chunk_len):
                 if max_frames is not None and appended >= max_frames:
                     break
-                # Input-frame window (latent path; --video already trimmed at
-                # the reader, where these bounds are 0/None). Skip frames before
-                # the window, and stop once past it.
-                if in_idx < loop_win_start:
-                    chunk[i] = None
-                    in_idx += 1
-                    continue
-                if loop_win_end is not None and in_idx >= loop_win_end:
-                    window_done = True
-                    break
                 # Wrap the per-frame body in a fresh ObjC autorelease pool so
                 # transient autoreleased objects (NSData, CIImage, CIImage
                 # affine-translated, CIImage composited, CIContext render
@@ -1942,8 +1602,7 @@ def run(args: argparse.Namespace) -> None:
                     # path - the decoded buffer feeds VSR directly. Only
                     # materialize a uint8 RGB array when a feature consumes the
                     # source pixels: cut detection, --save-pre-frames, or the
-                    # --comparison composite. For the latent path src_frame is
-                    # already the array.
+                    # --comparison composite.
                     src_arr = None
                     if (
                         cut_detector is not None
@@ -2016,11 +1675,9 @@ def run(args: argparse.Namespace) -> None:
                     for d_rgb, (d_sf, d_sa) in ready:
                         _emit_scaled(d_rgb, d_sf, d_sa)
 
-                    in_idx += 1
                     # Drop this frame's reference so its memory (the MLX array,
-                    # or the decoded CVPixelBuffer on the --video path) can be
-                    # freed now instead of staying resident until the outer
-                    # `del chunk` at chunk-end.
+                    # or the decoded CVPixelBuffer) can be freed now instead of
+                    # staying resident until the outer `del chunk` at chunk-end.
                     chunk[i] = None
                     del src_frame, src_arr
                 # autorelease pool drains here; PyObjC objects created in
@@ -2033,7 +1690,7 @@ def run(args: argparse.Namespace) -> None:
                     _pb.clear_ci_caches()
                     session.flush_pools()
 
-            if window_done or (max_frames is not None and appended >= max_frames):
+            if max_frames is not None and appended >= max_frames:
                 break
             del chunk
             gc.collect()
@@ -2207,9 +1864,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     source_select = parser.add_argument_group("Source Selection")
-    src = source_select.add_mutually_exclusive_group(required=True)
-    src.add_argument("--latent", help="--save-latents NPZ sidecar (VAE-decoded first).")
-    src.add_argument("--video", help="Already-decoded video file (mp4/mov/...).")
+    source_select.add_argument("--video", required=True, help="Video file (mp4/mov/...).")
 
     input_args = parser.add_argument_group("Input Decode")
     output_args = parser.add_argument_group("Output, Encoding, And Audio")
@@ -2226,11 +1881,6 @@ def main() -> None:
     def add(*args: Any, **kwargs: Any) -> Any:
         option = next((a for a in args if isinstance(a, str) and a.startswith("--")), "")
         exact = {
-            "--latent-stage": input_args,
-            "--weights": input_args,
-            "--vae-dtype": input_args,
-            "--vae-tiling": input_args,
-            "--source-fps": input_args,
             "--reader": input_args,
             "--output-dir": output_args,
             "--output-prefix": output_args,
@@ -2274,43 +1924,6 @@ def main() -> None:
 
     # ---- Input Decode ------------------------------------------------------------
     add(
-        "--latent-stage",
-        choices=["final", "stage1", "stage2"],
-        default="final",
-        help=(
-            "Which latent to decode from a distilled-two-stage sidecar. "
-            "'final' (default) = final_video_latent = stage 2 (the upscaled+refined result). "
-            "'stage1' = pre-upscaler half-resolution latent. "
-            "'stage2' = explicit stage 2 (same content as 'final' on distilled two-stage)."
-        ),
-    )
-
-    add("--weights", help="LTX-2 .safetensors path (required with --latent).")
-
-    add(
-        "--vae-dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16",
-    )
-
-    add(
-        "--vae-tiling", choices=["auto", "single"], default="auto",
-        help=(
-            "auto (default) lets TilingConfig.auto_native_conv3d size to RAM + the "
-            "int32 conv3d boundary (one decode if it fits, else bounded tiles). single "
-            "forces one decode; frames past the int32 boundary decode white."
-        ),
-    )
-
-    add(
-        "--source-fps", type=float, default=NATIVE_FPS,
-        help=(
-            f"Source frame rate for --latent (latents don't carry an fps; "
-            f"default {NATIVE_FPS} matches generate.py). Ignored for --video - "
-            f"the input file's r_frame_rate is honored instead. Pair with "
-            f"--target-fps to drive temporal frame-rate conversion."
-        ),
-    )
-
-    add(
         "--reader", choices=["auto", "native", "ffmpeg"], default="auto",
         help=(
             "Video reader backend. auto (default) = the native AVFoundation reader "
@@ -2329,7 +1942,7 @@ def main() -> None:
 
     add(
         "--output-prefix", default="vsr",
-        help="Filename prefix for the timestamped outputs (matches generate.py).",
+        help="Filename prefix for the timestamped outputs.",
     )
 
     add(
@@ -2362,18 +1975,15 @@ def main() -> None:
         "--encode-chroma", choices=["auto", "420", "422"], default="auto",
         help=(
             "HEVC profile chroma subsampling. auto = 4:2:2 (Main42210) for "
-            "balanced/image modes, 4:2:0 (Main10) for fast. 420 forces Main10 for "
-            "generate.py-tier parity."
+            "balanced/image modes, 4:2:0 (Main10) for fast. 420 forces Main10."
         ),
     )
 
     add(
         "--audio", action="store_true",
         help=(
-            "Mux audio into both MP4s. For --latent the audio is decoded from "
-            "final_audio_latent (audio VAE + vocoder); for --video the source "
-            "file's audio track is read natively (AVFoundation) and carried "
-            "through. A --video input with no audio track stays silent."
+            "Mux the source file's audio track into both MP4s. Inputs with no "
+            "audio track stay silent."
         ),
     )
 
@@ -2439,8 +2049,8 @@ def main() -> None:
             "Trim the input to start at this position (process the middle of a "
             "clip). Accepts frames or time: bare integer = frames (e.g. 120), "
             "Nf = frames (120f), Ns / decimal = seconds (5s, 1.5), or a clock "
-            "string mm:ss / hh:mm:ss (0:05, 1:02:03). --video seeks here "
-            "natively (the head is not decoded); --latent windows the decode."
+            "string mm:ss / hh:mm:ss (0:05, 1:02:03). KinoVSR seeks here "
+            "natively so the head is not decoded."
         ),
     )
 
@@ -2621,9 +2231,10 @@ def main() -> None:
         "--cut-detect", choices=["off", "simple", "hist"], default="off",
         help=(
             "Reset VSR's prev-frame chain at hard cuts. off = never reset "
-            "(correct for single-shot LTX latents). Only meaningful for "
-            "edited --video input under --spatial-mode balanced (which "
-            "chains prev-frame state); a no-op under fast/image modes."
+            "(correct for continuous generated clips and single-shot sources). "
+            "Only meaningful for edited --video input under --spatial-mode "
+            "balanced (which chains prev-frame state); a no-op under fast/image "
+            "modes."
         ),
     )
 
@@ -2843,7 +2454,7 @@ def main() -> None:
             "notes; --deblock-strength is its dry/wet blend, --deblock-map does not "
             "apply); fbcnn = FBCNN flexible blind JPEG-artifact removal "
             "(single-image RGB, ~72M params, weights downloaded not bundled -- see "
-            "videotoolbox/fbcnn/weights/README.md). Routes frames through the MLX path."
+            "kinovsr/fbcnn/weights/README.md). Routes frames through the MLX path."
         ),
     )
 
@@ -2939,7 +2550,7 @@ def main() -> None:
             "detail/deblur residual after deblock + denoise). off (default); "
             "gopro/gopro32 = motion deblur (width 64/32); sidd/sidd32 = real-noise "
             "denoise; reds = video restore. Single-image RGB net; weights are downloaded, "
-            "not bundled (see videotoolbox/nafnet/weights/README.md)."
+            "not bundled (see kinovsr/nafnet/weights/README.md)."
         ),
     )
 
@@ -3158,8 +2769,7 @@ def main() -> None:
         help=(
             "Override TOFlow weights (.safetensors) for --denoise toflow. Optional - "
             "defaults to the local --toflow-variant weights (or $TOFLOW_WEIGHTS). "
-            "Convert a .t7 with "
-            "LTX_2_MLX/videotoolbox/toflow/convert_t7_to_safetensors.py."
+            "Convert a .t7 with kinovsr/toflow/convert_t7_to_safetensors.py."
         ),
     )
 
@@ -3227,7 +2837,7 @@ def main() -> None:
             "Override PVDD weights (.safetensors) for --denoise pvdd. Optional - "
             "defaults to the local --pvdd-variant weights (or $PVDD_WEIGHTS). Not "
             "bundled; convert a .pth with scripts/pth_to_safetensors.py (see "
-            "videotoolbox/pvdd/weights/README.md)."
+            "kinovsr/pvdd/weights/README.md)."
         ),
     )
 
@@ -3708,7 +3318,7 @@ def main() -> None:
             "fast/gentle), x4plus (RRDBNet crisp/GAN, ~20x slower), realesrnet / bsrnet "
             "(MSE, faithful/soft), bsrgan, x2plus (2x output), anime / animevideo (anime), "
             "esrgan (original ESRGAN). Only general is bundled; the rest download + convert "
-            "(see videotoolbox/realesrgan/weights/README.md)."
+            "(see kinovsr/realesrgan/weights/README.md)."
         ),
     )
 
@@ -3729,7 +3339,7 @@ def main() -> None:
             ".safetensors path (or $REALVIFORMER_WEIGHTS). A causal recurrent real-world "
             "4x video upscaler (channel-attention transformer); streams frame by frame "
             "with temporal state, reset at cuts. Not bundled; see "
-            "videotoolbox/realviformer/weights/README.md."
+            "kinovsr/realviformer/weights/README.md."
         ),
     )
 
@@ -3852,7 +3462,7 @@ def main() -> None:
             "ESC-Real weights for --spatial-mode esc: a variant token or a .safetensors "
             "path (or $ESC_WEIGHTS). Tokens: gan (default; perceptual, Real-ESRGAN-style "
             "degradation training) and mse (fidelity twin). Neither is bundled; see "
-            "videotoolbox/esc/weights/README.md."
+            "kinovsr/esc/weights/README.md."
         ),
     )
 
@@ -3867,7 +3477,7 @@ def main() -> None:
             "Scale (2x/4x) is read from the checkpoint. Single-image, no pooled gate "
             "so no SAFMN block lattice; no denoising prior beyond its training, so "
             "prefer it on decent sources or pair with --denoise. None are bundled; "
-            "see videotoolbox/realplksr/weights/README.md."
+            "see kinovsr/realplksr/weights/README.md."
         ),
     )
 
@@ -3898,7 +3508,7 @@ def main() -> None:
             "texture -- use real with --safmn-pool-clamp there. CAUTION: "
             "PureScale weights are CC BY-NC-SA "
             "4.0 -- NON-COMMERCIAL use only). None are bundled; see "
-            "videotoolbox/safmn/weights/README.md."
+            "kinovsr/safmn/weights/README.md."
         ),
     )
 
@@ -3969,13 +3579,11 @@ def main() -> None:
     add(
         "--mlx-cache-limit-gb", type=float, default=1.0,
         help="Cap MLX's buffer cache (GB) so per-frame allocation churn does not "
-             "grow into swap; 0 disables. Default 1.0, matching generate.py.",
+             "grow into swap; 0 disables. Default 1.0.",
     )
 
     args = parser.parse_args()
 
-    if args.latent and not args.weights:
-        parser.error("--latent requires --weights")
     if not args.output_dir and not (args.probe_noise and args.video):
         parser.error("--output-dir is required unless --probe-noise is used with --video")
     if not args.output_dir and (args.save_pre_frames or args.save_post_frames or args.save_audio_sidecar):

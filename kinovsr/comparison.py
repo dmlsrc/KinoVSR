@@ -6,7 +6,7 @@ halves are composited via CoreImage and rendered into a single BGRA buffer
 in one GPU pass.
 
 Accepts pre as either (H,W,3) uint8 RGB or (H,W,4) fp16/fp32 RGBA so it
-works with both --video (uint8) and --latent HQ (fp16) chunk formats.
+works with both ordinary video frames and half-precision native decoder frames.
 """
 
 from __future__ import annotations

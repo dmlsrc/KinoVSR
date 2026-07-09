@@ -1,6 +1,6 @@
 # Attribution
 
-`videotoolbox/toflow/` is an independent MLX runtime for the released TOFlow
+`kinovsr/toflow/` is an independent MLX runtime for the released TOFlow
 Torch7 checkpoints. The Torch7 module tree is converted into a static JSON graph
 and interpreted by MLX-native operators; no upstream Lua code is bundled or
 executed at runtime.
