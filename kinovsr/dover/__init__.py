@@ -125,9 +125,13 @@ class DoverMobile:
             xp = mx.pad(x, ((0, 0), (lt // 2, lt // 2), (0, 0),
                             (0, 0), (0, 0)))
             y = None
-            for l in range(lt):
-                yl = mx.conv2d(xp[:, l:l + t].reshape(n * t, h, w, c),
-                               wt[l], padding=3, groups=c)
+            for layer_idx in range(lt):
+                yl = mx.conv2d(
+                    xp[:, layer_idx:layer_idx + t].reshape(n * t, h, w, c),
+                    wt[layer_idx],
+                    padding=3,
+                    groups=c,
+                )
                 y = yl if y is None else y + yl
         y = y.reshape(n, t, h, w, c) + p[pfx + "dwconv.bias"]
         y = _ln(y, p[pfx + "norm.weight"], p[pfx + "norm.bias"])

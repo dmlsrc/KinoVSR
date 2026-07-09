@@ -295,12 +295,11 @@ class AVWriter:
     def finish(self) -> None:
         """Mark inputs finished, drain audio, end session, finishWriting."""
         self.video_input.markAsFinished()
-        if self.audio_input is not None:
-            if not self._audio_done.wait(timeout=120.0):
-                raise RuntimeError(
-                    f"[{self.label}] audio pump didn't finish (progress="
-                    f"{self._audio_progress[0]}/{self.audio_track.n_samples})"
-                )
+        if self.audio_input is not None and not self._audio_done.wait(timeout=120.0):
+            raise RuntimeError(
+                f"[{self.label}] audio pump didn't finish (progress="
+                f"{self._audio_progress[0]}/{self.audio_track.n_samples})"
+            )
         self.writer.endSessionAtSourceTime_(_pb.frame_pts(self.frame_count, self.fps))
         done = threading.Event()
         self.writer.finishWritingWithCompletionHandler_(lambda: done.set())

@@ -13,9 +13,8 @@ which is why the direction test pulses with period 5.
 """
 import math
 
-import pytest
-
 import mlx.core as mx
+import pytest
 
 from kinovsr.dover import WEIGHTS_PATH, DoverMobile
 

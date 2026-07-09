@@ -532,8 +532,7 @@ def test_fastdvd_streaming_refresh_adapts():
         last = den.last_noise_map
         em += den.flush()
         assert [t for _, t in sorted(em, key=lambda e: e[1])] == list(range(60))
-        med = float(mx.sort(last.reshape(-1))[last.shape[0] * last.shape[1] // 2])
-        return med
+        return float(mx.sort(last.reshape(-1))[last.shape[0] * last.shape[1] // 2])
 
     med_off = run(0)       # estimate-once: stuck at the quiet start
     med_on = run(16)       # refreshing: adapts toward 0.08

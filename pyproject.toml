@@ -31,7 +31,6 @@ classifiers = [
 ]
 dependencies = [
     "mlx>=0.32.0",
-    "numpy>=2.4.6",
     "pyobjc-core>=12.2",
     "pyobjc-framework-AVFoundation>=12.2",
     "pyobjc-framework-CoreAudio>=12.2",
@@ -45,6 +44,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "av>=18.0",
+    # NumPy is a dev/test/diagnostic oracle, not a runtime dependency. Product
+    # code that needs it must import it dynamically through kinovsr._optional.
+    "numpy>=2.4.6",
     "opencv-python-headless>=5.0",
     "pytest>=9.1.0",
     "ruff>=0.15.17",
@@ -69,8 +71,8 @@ kinovsr = "scripts.vsr_harness:main"
 packages = ["kinovsr", "scripts"]
 
 [tool.pytest.ini_options]
-minversion = "7.0"
-addopts = "-ra -q --strict-markers"
+minversion = "8.0"
+addopts = "-ra -q --strict-markers --strict-config"
 testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
@@ -88,22 +90,26 @@ line-length = 100
 target-version = "py314"
 
 [tool.ruff.lint]
+# Match KinoMLX's stricter lint posture: core pycodestyle/pyflakes/import
+# checks, bugbear, pyupgrade, simplification, pathlib, pytest style, no bare
+# package prints, and ASCII-only source text.
 select = [
-    "E",
-    "W",
-    "F",
-    "I",
-    "B",
-    "C4",
-    "UP",
+    "E", "W", "F", "I", "B", "C4", "UP", "SIM", "PTH", "RET", "PIE", "PT", "T20",
+    "RUF001", "RUF002", "RUF003", "PLC2401", "PLC2403",
 ]
 ignore = [
     "E501",
-    "B008",
-    "C901",
-    "W191",
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-"scripts/vsr_harness.py" = ["E402"]
+# Scripts are CLI/diagnostic entry points; print() is legitimate user output
+# there. The inherited harness also has source-checkout import setup before
+# package imports.
+"scripts/**" = ["T20"]
+"scripts/vsr_harness.py" = ["E402", "T20"]
+# Transitional: inherited package modules still emit CLI/progress/demo output.
+# Keep T20 active elsewhere while the runtime grows a proper logging surface.
+"kinovsr/**" = ["T20"]
+# Transitional: legacy tests predate KinoMLX's stricter pytest style.
+"tests/**" = ["PT006", "PT011", "PT018"]

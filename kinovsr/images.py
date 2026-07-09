@@ -20,7 +20,6 @@ so the result mirrors Pillow's `convert("RGB")`.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -99,7 +98,7 @@ def load_image_rgb(path: str | Path) -> mx.array:
     path, ValueError for an undecodable file.
     """
     require_pyobjc()
-    if not os.path.exists(path):
+    if not Path(path).exists():
         raise FileNotFoundError(f"Image not found: {path}")
     with autorelease_pool():
         src = Quartz.CGImageSourceCreateWithURL(_url(path), None)

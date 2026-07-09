@@ -78,7 +78,7 @@ def load_params(path: str | Path | None = None, dtype: Any = mx.float32) -> dict
     w = mx.load(str(resolve_weights(path)))
     p: dict = {}
     for k, v in w.items():
-        if k.endswith(".beta") or k.endswith(".gamma"):
+        if k.endswith((".beta", ".gamma")):
             a = mx.reshape(v, (1, 1, 1, v.size))       # (1,C,1,1) -> (1,1,1,C)
         elif v.ndim == 4:
             a = mx.transpose(v, (0, 2, 3, 1))          # (O,I,kH,kW) -> (O,kH,kW,I)

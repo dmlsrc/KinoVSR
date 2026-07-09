@@ -101,10 +101,7 @@ def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict
     w = mx.load(str(resolved))
     p: dict = {}
     for k, v in w.items():
-        if v.ndim == 4:
-            a = mx.transpose(v, (0, 2, 3, 1))
-        else:
-            a = v
+        a = mx.transpose(v, (0, 2, 3, 1)) if v.ndim == 4 else v
         p[k] = a.astype(dtype)
     if "to_feat.weight" not in p:
         raise ValueError("not a SAFMN checkpoint (missing to_feat.weight)")
@@ -324,9 +321,11 @@ def _att_block_real(x: Any, p: dict, i: int, mode: str = "stock",
                     up: str = "nearest", clamp: float = 0.0) -> Any:
     x = _safm(_layernorm(x, p[f"feats.{i}.norm1.weight"], p[f"feats.{i}.norm1.bias"]),
               p, f"feats.{i}.safm", mode, up, clamp) + x
-    x = _ccm(_layernorm(x, p[f"feats.{i}.norm2.weight"], p[f"feats.{i}.norm2.bias"]),
-             p, f"feats.{i}.ccm") + x
-    return x
+    return _ccm(
+        _layernorm(x, p[f"feats.{i}.norm2.weight"], p[f"feats.{i}.norm2.bias"]),
+        p,
+        f"feats.{i}.ccm",
+    ) + x
 
 
 # ---- "light" variant blocks (light_SAFMN++) ----------------------------------
@@ -348,8 +347,11 @@ def _simple_safm(x: Any, p: dict, pre: str) -> Any:
 
 def _att_block_light(x: Any, p: dict, i: int) -> Any:
     y = _simple_safm(x, p, f"feats.{i}.conv1")
-    y = _conv(_gelu(_conv(y, p, f"feats.{i}.conv2.conv.0", pad=1)), p, f"feats.{i}.conv2.conv.2")
-    return y                                     # no per-block residual in the light net
+    return _conv(  # no per-block residual in the light net
+        _gelu(_conv(y, p, f"feats.{i}.conv2.conv.0", pad=1)),
+        p,
+        f"feats.{i}.conv2.conv.2",
+    )
 
 
 def safmn(x: Any, p: dict, cfg: tuple | None = None) -> Any:

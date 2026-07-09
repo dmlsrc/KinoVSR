@@ -442,10 +442,7 @@ def estimate_sigma_map(
                 [bool(v) for v in counted.reshape(-1).tolist()],
                 [bool(v) for v in flat_static.reshape(-1).tolist()], strict=True)
                 if c and not st]
-            if rf_l:
-                r_flat_med = sorted(rf_l)[len(rf_l) // 2]
-            else:
-                r_flat_med = 1.0                                 # all-static: noise-like
+            r_flat_med = sorted(rf_l)[len(rf_l) // 2] if rf_l else 1.0
         else:
             flat_ok = mx.zeros(fmed1.shape, dtype=mx.bool_)
         # |d| of iid per-frame noise is half-normal with median 0.6745 sigma

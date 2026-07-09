@@ -31,7 +31,10 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+from kinovsr._optional import require_numpy
 
 if TYPE_CHECKING:
     import numpy as np
@@ -69,7 +72,7 @@ def stream_tsd(path: str, w: int, h: int, grid: int) -> tuple[np.ndarray, np.nda
 
     Memory: 3 frames * w * h bytes (e.g. 3 * 4096 * 2304 = ~28 MB at 4K).
     """
-    import numpy as np  # analysis backend: percentile/median/unravel_index (not in MLX)
+    np = require_numpy("scripts/compare_video_shimmer.py")
     frame_bytes = w * h
     patch_h = h // grid
     patch_w = w // grid
@@ -133,7 +136,7 @@ def _patch_glyph(value: float) -> str:
 
 
 def main() -> None:
-    import numpy as np  # analysis backend: percentile/median/unravel_index (not in MLX)
+    np = require_numpy("scripts/compare_video_shimmer.py")
 
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -153,9 +156,8 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    import os.path
-    label_a = args.label_a or os.path.splitext(os.path.basename(args.video_a))[0]
-    label_b = args.label_b or os.path.splitext(os.path.basename(args.video_b))[0]
+    label_a = args.label_a or Path(args.video_a).stem
+    label_b = args.label_b or Path(args.video_b).stem
 
     wa, ha, fps_a, _ = probe_dimensions(args.video_a)
     wb, hb, fps_b, _ = probe_dimensions(args.video_b)

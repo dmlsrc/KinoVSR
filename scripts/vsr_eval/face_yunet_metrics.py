@@ -22,10 +22,9 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2 as cv
-import numpy as np
 from config import (
     config_get,
     config_section,
@@ -33,6 +32,26 @@ from config import (
     load_config,
     resolve_path,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
+
+np: Any = None
+
+
+def _load_numpy() -> Any:
+    global np
+    if np is None:
+        try:
+            import numpy as _np
+        except ModuleNotFoundError as exc:
+            raise SystemExit(
+                "NumPy is required for scripts/vsr_eval/face_yunet_metrics.py. "
+                "Install the developer extras for evaluation tools."
+            ) from exc
+        np = _np
+    return np
+
 
 TOOL_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = TOOL_DIR / "weights" / "face_detection_yunet_2023mar.onnx"
@@ -463,6 +482,7 @@ def _normalise_config(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def run_eval(args: argparse.Namespace) -> list[dict[str, Any]]:
+    _load_numpy()
     variants = args.variants
     if args.baseline not in variants:
         raise SystemExit(f"baseline {args.baseline!r} is not configured")
@@ -488,7 +508,7 @@ def run_eval(args: argparse.Namespace) -> list[dict[str, Any]]:
             row.update(aggregate_variant(baseline_frames, frames, observations))
         rows.append(row)
 
-    metric_keys = sorted({k for row in rows for k in row.keys()})
+    metric_keys = sorted({k for row in rows for k in row})
     with (args.out_dir / "face_yunet_metrics.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=metric_keys)
         writer.writeheader()

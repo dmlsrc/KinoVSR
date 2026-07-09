@@ -23,10 +23,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import av
-import numpy as np
 from config import (
     config_get,
     config_section,
@@ -35,6 +34,26 @@ from config import (
     load_config,
     resolve_path,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
+
+np: Any = None
+
+
+def _load_numpy() -> Any:
+    global np
+    if np is None:
+        try:
+            import numpy as _np
+        except ModuleNotFoundError as exc:
+            raise SystemExit(
+                "NumPy is required for scripts/vsr_artifacts/run_fixture_tests.py. "
+                "Install the developer extras for fixture test tools."
+            ) from exc
+        np = _np
+    return np
+
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -421,6 +440,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    _load_numpy()
     summary = run_cases(_normalise_config(parse_args()))
     print(f"[done] {Path(summary['out_root']) / 'summary.json'}", flush=True)
     return 0

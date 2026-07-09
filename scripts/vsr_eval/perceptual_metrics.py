@@ -56,6 +56,7 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from niqe import _luma_of, score_lumas  # noqa: E402
+
 from kinovsr.dover import DoverMobile  # noqa: E402
 from kinovsr.musiq import Musiq  # noqa: E402
 

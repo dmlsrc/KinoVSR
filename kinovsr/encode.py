@@ -44,11 +44,11 @@ from typing import Any
 
 import mlx.core as mx
 
-from .progress import StackedPhaseBars
 from . import color as _color
 from . import pixel_buffers as _pb
 from ._compat import autorelease_pool, require_pyobjc
 from .audio import AudioTrack
+from .progress import StackedPhaseBars
 from .temporal import VtfrcSession
 from .vsr import VsrSession, scale_for_mode
 from .writer import HEVC_PROFILE_MAIN10, HEVC_PROFILE_MAIN422_10, AVWriter
@@ -331,12 +331,10 @@ def encode_video_videotoolbox(
             audio_track=audio_track,
             audio_codec=audio_codec,
         )
-        if vtfrc is not None:
-            if not writer_yuv_feed:
-                vtfrc.use_dst_pool(writer.adaptor.pixelBufferPool())
-        elif vsr is not None:
-            if not writer_yuv_feed:
-                vsr.use_dst_pool(writer.adaptor.pixelBufferPool())
+        if vtfrc is not None and not writer_yuv_feed:
+            vtfrc.use_dst_pool(writer.adaptor.pixelBufferPool())
+        elif vsr is not None and not writer_yuv_feed:
+            vsr.use_dst_pool(writer.adaptor.pixelBufferPool())
 
         # Optional "save the un-processed original alongside the VSR/VTFRC
         # result" companion writer.  Only meaningful when some VT post-

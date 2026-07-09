@@ -6,9 +6,8 @@ deterministic synthetic score and the metric's core direction (blur scores
 lower), so regressions in preprocessing (bicubic, patching, hash positions)
 or the net surface as score drift.
 """
-import pytest
-
 import mlx.core as mx
+import pytest
 
 from kinovsr.musiq import WEIGHTS_PATH, Musiq
 

@@ -33,13 +33,12 @@ Usage:
 """
 from __future__ import annotations
 
-from typing import Any
-
 import argparse
 import json
 import math
 import sys
 from pathlib import Path
+from typing import Any
 
 import mlx.core as mx
 
@@ -89,8 +88,7 @@ def _gauss_blur(x: Any) -> Any:
     y = _reflect_pad(x, r, 0)
     y = mx.conv2d(y[None, :, :, None], k)[0, :, :, 0]
     y = _reflect_pad(y, r, 1)
-    y = mx.conv2d(y[None, :, :, None], mx.transpose(k, (0, 2, 1, 3)))[0, :, :, 0]
-    return y
+    return mx.conv2d(y[None, :, :, None], mx.transpose(k, (0, 2, 1, 3)))[0, :, :, 0]
 
 
 def _mscn(luma: Any) -> Any:
@@ -164,8 +162,9 @@ def image_features(luma: Any) -> Any:
 
 def fit_model(folder: Path, out: Path, max_images: int = 200,
               sharp_frac: float = 0.75) -> None:
-    from kinovsr.images import load_image_rgb
     import mlx.core as mx
+
+    from kinovsr.images import load_image_rgb
     paths = sorted(p for p in folder.rglob("*.png"))
     if len(paths) > max_images:
         paths = paths[:: max(1, len(paths) // max_images)][:max_images]

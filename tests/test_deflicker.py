@@ -116,7 +116,7 @@ def test_lighting_ramp_is_passthrough():
     clip = [mx.clip(base * (0.88 + 0.20 * float(g)), 0, 1) for g in tt]
     for band in (0.10, 0.25):
         outs = _run(clip, band=band)
-        worst = max(float(mx.max(mx.abs(o - c))) for o, c in zip(outs, clip))
+        worst = max(float(mx.max(mx.abs(o - c))) for o, c in zip(outs, clip, strict=True))
         assert worst < 0.012, f"ramp altered by {worst} at band {band}"
 
 
@@ -148,7 +148,7 @@ def test_spatially_coherent_flicker_is_vetoed():
     clip = [mx.clip(base * (1.0 + (d if (t // 3) % 2 == 0 else -d)), 0, 1)
             for t in range(T)]
     outs = _run(clip)
-    worst = max(float(mx.max(mx.abs(o - c))) for o, c in zip(outs, clip))
+    worst = max(float(mx.max(mx.abs(o - c))) for o, c in zip(outs, clip, strict=True))
     assert worst < 0.012, f"coherent oscillation altered by {worst}"
 
 

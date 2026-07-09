@@ -65,7 +65,6 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.progress import StackedPhaseBars
 from kinovsr import (
     AudioTrack,
     AVWriter,
@@ -98,6 +97,7 @@ from kinovsr.edge_sanitize import (
     sanitize_rgb as _sanitize_rgb,
 )
 from kinovsr.fastdvdnet import FastDvdDenoiser
+from kinovsr.progress import StackedPhaseBars
 from kinovsr.toflow import TOFlowDenoiser
 from kinovsr.vsr import NativePassthrough
 from kinovsr.vsr_blocks import make_lanczos_plan, resample_width
@@ -105,6 +105,7 @@ from kinovsr.writer import (
     HEVC_PROFILE_MAIN10,
     HEVC_PROFILE_MAIN422_10,
 )
+
 
 def parse_mlx_dtype_name(name: str) -> Any:
     try:
@@ -1201,7 +1202,7 @@ def run(args: argparse.Namespace) -> None:
                 return fb
             raise AssertionError(name)
 
-        _debs = [_make_deblocker(n, s) for n, s in zip(_deb_names, _deb_strengths)]
+        _debs = [_make_deblocker(n, s) for n, s in zip(_deb_names, _deb_strengths, strict=True)]
         if len(_deb_names) > 1:
             print(f"[deblock] chain: {' -> '.join(_deb_names)} "
                   f"(strengths {', '.join(f'{s:g}' for s in _deb_strengths)})")
@@ -1381,11 +1382,12 @@ def run(args: argparse.Namespace) -> None:
 
     # ---- Cut detector ------------------------------------------------------
     cut_detector: CutDetector | None = None
-    cut_log = None
+    cut_log_path: Path | None = None
     if args.cut_detect != "off":
         cut_detector = CutDetector(args.cut_detect, args.cut_threshold)
         if args.cut_log:
-            cut_log = open(args.cut_log, "w")
+            cut_log_path = Path(args.cut_log)
+            cut_log_path.write_text("", encoding="utf-8")
         print(
             f"Cut detector: mode={args.cut_detect} threshold={args.cut_threshold}"
             + (f", log={args.cut_log}" if args.cut_log else "")
@@ -1642,9 +1644,9 @@ def run(args: argparse.Namespace) -> None:
                             deflicker_stage.reset()
                         if nafnet is not None:
                             nafnet.reset()
-                        if cut_log is not None:
-                            cut_log.write(f"{processed}\n")
-                            cut_log.flush()
+                        if cut_log_path is not None:
+                            with cut_log_path.open("a", encoding="utf-8") as cut_log:
+                                cut_log.write(f"{processed}\n")
 
                     # Produce this input's output frame(s). No denoise -> the raw
                     # frame goes straight to VSR; spatial/mc denoise one frame in
@@ -1841,8 +1843,6 @@ def run(args: argparse.Namespace) -> None:
         for writer in (post_writer, comparison_writer):
             if writer is not None:
                 writer.finish()
-        if cut_log is not None:
-            cut_log.close()
 
     elapsed = time.perf_counter() - t_total
     rate = appended / elapsed if elapsed > 0 else 0

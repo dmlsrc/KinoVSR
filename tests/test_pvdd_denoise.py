@@ -10,8 +10,7 @@ import math
 
 import mlx.core as mx
 
-from kinovsr.pvdd import net
-from kinovsr.pvdd import load_pvdd
+from kinovsr.pvdd import load_pvdd, net
 
 
 def test_window_partition_reverse_roundtrip():

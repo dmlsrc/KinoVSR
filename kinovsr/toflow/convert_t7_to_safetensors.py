@@ -22,9 +22,21 @@ import json
 import re
 import struct
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
+from kinovsr._optional import require_numpy
+
+if TYPE_CHECKING:
+    import numpy as np
+
+np: Any = None
+
+
+def _load_numpy() -> Any:
+    global np
+    if np is None:
+        np = require_numpy("kinovsr/toflow/convert_t7_to_safetensors.py")
+    return np
 
 _PARAMS_BY_TYPE = {
     "nn.Mul": ("weight",),
@@ -90,36 +102,42 @@ _T7_FUNCTION = 6
 _T7_LEGACY_RECUR_FUNCTION = 7
 _T7_RECUR_FUNCTION = 8
 
-_TENSOR_DTYPES = {
-    b"torch.ByteTensor": np.uint8,
-    b"torch.CharTensor": np.int8,
-    b"torch.ShortTensor": np.int16,
-    b"torch.IntTensor": np.int32,
-    b"torch.LongTensor": np.int64,
-    b"torch.FloatTensor": np.float32,
-    b"torch.DoubleTensor": np.float64,
-    b"torch.CudaTensor": np.float32,
-    b"torch.CudaByteTensor": np.uint8,
-    b"torch.CudaCharTensor": np.int8,
-    b"torch.CudaShortTensor": np.int16,
-    b"torch.CudaIntTensor": np.int32,
-    b"torch.CudaDoubleTensor": np.float64,
-}
-_STORAGE_DTYPES = {
-    b"torch.ByteStorage": np.uint8,
-    b"torch.CharStorage": np.int8,
-    b"torch.ShortStorage": np.int16,
-    b"torch.IntStorage": np.int32,
-    b"torch.LongStorage": np.int64,
-    b"torch.FloatStorage": np.float32,
-    b"torch.DoubleStorage": np.float64,
-    b"torch.CudaStorage": np.float32,
-    b"torch.CudaByteStorage": np.uint8,
-    b"torch.CudaCharStorage": np.int8,
-    b"torch.CudaShortStorage": np.int16,
-    b"torch.CudaIntStorage": np.int32,
-    b"torch.CudaDoubleStorage": np.float64,
-}
+def _tensor_dtypes() -> dict[bytes, Any]:
+    np = _load_numpy()
+    return {
+        b"torch.ByteTensor": np.uint8,
+        b"torch.CharTensor": np.int8,
+        b"torch.ShortTensor": np.int16,
+        b"torch.IntTensor": np.int32,
+        b"torch.LongTensor": np.int64,
+        b"torch.FloatTensor": np.float32,
+        b"torch.DoubleTensor": np.float64,
+        b"torch.CudaTensor": np.float32,
+        b"torch.CudaByteTensor": np.uint8,
+        b"torch.CudaCharTensor": np.int8,
+        b"torch.CudaShortTensor": np.int16,
+        b"torch.CudaIntTensor": np.int32,
+        b"torch.CudaDoubleTensor": np.float64,
+    }
+
+
+def _storage_dtypes() -> dict[bytes, Any]:
+    np = _load_numpy()
+    return {
+        b"torch.ByteStorage": np.uint8,
+        b"torch.CharStorage": np.int8,
+        b"torch.ShortStorage": np.int16,
+        b"torch.IntStorage": np.int32,
+        b"torch.LongStorage": np.int64,
+        b"torch.FloatStorage": np.float32,
+        b"torch.DoubleStorage": np.float64,
+        b"torch.CudaStorage": np.float32,
+        b"torch.CudaByteStorage": np.uint8,
+        b"torch.CudaCharStorage": np.int8,
+        b"torch.CudaShortStorage": np.int16,
+        b"torch.CudaIntStorage": np.int32,
+        b"torch.CudaDoubleStorage": np.float64,
+    }
 
 
 class _LuaFunction:
@@ -249,19 +267,18 @@ class _T7Reader:
 
     def _read_torch_object(self, index: int) -> Any:
         version = self._read_string()
-        if version.startswith(b"V "):
-            typename = self._read_string()
-        else:
-            typename = version
+        typename = self._read_string() if version.startswith(b"V ") else version
 
-        if typename in _STORAGE_DTYPES:
+        storage_dtypes = _storage_dtypes()
+        tensor_dtypes = _tensor_dtypes()
+        if typename in storage_dtypes:
             self.objects[index] = None
-            obj = self._read_storage(_STORAGE_DTYPES[typename])
+            obj = self._read_storage(storage_dtypes[typename])
             self.objects[index] = obj
             return obj
-        if typename in _TENSOR_DTYPES:
+        if typename in tensor_dtypes:
             self.objects[index] = None
-            obj = self._read_tensor(_TENSOR_DTYPES[typename])
+            obj = self._read_tensor(tensor_dtypes[typename])
             self.objects[index] = obj
             return obj
 
@@ -426,6 +443,7 @@ def _count_types(node: dict, counts: dict[str, int]) -> None:
 
 
 def main() -> int:
+    _load_numpy()
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,

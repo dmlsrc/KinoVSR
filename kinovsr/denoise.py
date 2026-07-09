@@ -17,12 +17,11 @@ Interface is MLX-array in / MLX-array out: (H,W,3) float32 RGB in [0, 1].
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import mlx.core as mx
-
-import os
 
 from . import pixel_buffers as _pb
 from ._compat import Foundation, Quartz, autorelease_pool, require_pyobjc, vt

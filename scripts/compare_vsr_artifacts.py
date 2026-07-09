@@ -28,6 +28,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from kinovsr._optional import require_numpy
+
 if TYPE_CHECKING:
     import numpy as np
 
@@ -110,7 +112,7 @@ class RawVideoStream:
             self._proc.stderr.close()
 
     def read_selected(self) -> tuple[int, np.ndarray] | None:
-        import numpy as np
+        np = require_numpy("scripts/compare_vsr_artifacts.py")
 
         while True:
             raw = self._proc.stdout.read(self._frame_bytes)
@@ -232,7 +234,7 @@ def scaled_dimensions(width: int, height: int, max_width: int) -> tuple[int, int
 
 
 def gaussian_kernel(size: int = 11, sigma: float = 1.5) -> np.ndarray:
-    import numpy as np
+    np = require_numpy("scripts/compare_vsr_artifacts.py")
 
     if size <= 0 or size % 2 == 0:
         raise ValueError("kernel size must be a positive odd integer")
@@ -244,7 +246,7 @@ def gaussian_kernel(size: int = 11, sigma: float = 1.5) -> np.ndarray:
 
 
 def blur_rgb(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    import numpy as np
+    np = require_numpy("scripts/compare_vsr_artifacts.py")
 
     radius = int(kernel.shape[0] // 2)
     padded_x = np.pad(image, ((0, 0), (radius, radius), (0, 0)), mode="edge")
@@ -264,7 +266,7 @@ def local_std_rgb(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     mean = blur_rgb(image, kernel)
     mean_sq = blur_rgb(image * image, kernel)
     var = mean_sq - mean * mean
-    import numpy as np
+    np = require_numpy("scripts/compare_vsr_artifacts.py")
 
     return np.sqrt(np.maximum(var, 0.0))
 
@@ -276,7 +278,7 @@ def desra_contrast(
     constant: float = 0.03 * 0.03,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (contrast, reference_texture) for RGB float frames in [0, 1]."""
-    import numpy as np
+    np = require_numpy("scripts/compare_vsr_artifacts.py")
 
     sigma_ref = local_std_rgb(reference_rgb, kernel)
     sigma_cand = local_std_rgb(candidate_rgb, kernel)
@@ -297,7 +299,7 @@ def flat_weight_from_texture(
     This is the segmentation-free analog of DeSRA's semantic tolerance: busy
     regions are allowed more generated texture, while flat regions are not.
     """
-    import numpy as np
+    np = require_numpy("scripts/compare_vsr_artifacts.py")
 
     lo = float(np.percentile(texture, low_pct))
     hi = float(np.percentile(texture, high_pct))
@@ -314,7 +316,7 @@ def frame_metrics(
     threshold: float,
     busy_floor: float,
 ) -> tuple[FrameMetrics, np.ndarray, np.ndarray]:
-    import numpy as np
+    np = require_numpy("scripts/compare_vsr_artifacts.py")
 
     raw_risk = np.clip(1.0 - contrast, 0.0, 1.0)
     weighted_risk = raw_risk * flat_weight_from_texture(texture, busy_floor=busy_floor)
@@ -334,7 +336,7 @@ def frame_metrics(
 
 
 def risk_heatmap(risk: np.ndarray, threshold: float) -> np.ndarray:
-    import numpy as np
+    np = require_numpy("scripts/compare_vsr_artifacts.py")
 
     v = np.clip(risk / max(threshold, 1e-6), 0.0, 1.0)
     out = np.zeros((*risk.shape, 3), dtype=np.uint8)
@@ -345,7 +347,7 @@ def risk_heatmap(risk: np.ndarray, threshold: float) -> np.ndarray:
 
 
 def risk_overlay(candidate_rgb_u8: np.ndarray, risk: np.ndarray, threshold: float) -> np.ndarray:
-    import numpy as np
+    np = require_numpy("scripts/compare_vsr_artifacts.py")
 
     alpha = np.clip(risk / max(threshold, 1e-6), 0.0, 1.0)[..., None] * 0.65
     red = np.zeros_like(candidate_rgb_u8, dtype=np.float32)
@@ -369,7 +371,7 @@ def write_outputs(output_dir: Path, rows: list[FrameMetrics], summary: dict) -> 
 
 
 def summarize(rows: list[FrameMetrics], args: argparse.Namespace, info: VideoInfo) -> dict:
-    import numpy as np
+    np = require_numpy("scripts/compare_vsr_artifacts.py")
 
     if not rows:
         raise RuntimeError("no frames were compared")
@@ -408,7 +410,7 @@ def summarize(rows: list[FrameMetrics], args: argparse.Namespace, info: VideoInf
 
 
 def compare(args: argparse.Namespace) -> dict:
-    import numpy as np
+    np = require_numpy("scripts/compare_vsr_artifacts.py")
 
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         raise RuntimeError("ffmpeg and ffprobe are required")

@@ -23,11 +23,10 @@ import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import av
 import mlx.core as mx
-import numpy as np
 from config import (
     config_get,
     config_section,
@@ -36,6 +35,26 @@ from config import (
     load_config,
     resolve_path,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
+
+np: Any = None
+
+
+def _load_numpy() -> Any:
+    global np
+    if np is None:
+        try:
+            import numpy as _np
+        except ModuleNotFoundError as exc:
+            raise SystemExit(
+                "NumPy is required for scripts/vsr_artifacts/analyze_maps.py. "
+                "Install the developer extras for artifact analysis tools."
+            ) from exc
+        np = _np
+    return np
+
 
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
@@ -504,6 +523,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    _load_numpy()
     summary = run_analysis(_normalise_config(parse_args()))
     print(f"[done] {Path(summary['output_root']) / 'summary.json'}", flush=True)
     return 0

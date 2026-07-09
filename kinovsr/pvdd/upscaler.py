@@ -13,7 +13,7 @@ from typing import Any
 import mlx.core as mx
 
 from ..upscaler_base import WindowedUpscaler
-from . import PVDD, LEVEL_PRESETS, default_weights_path, _VARIANTS
+from . import _VARIANTS, LEVEL_PRESETS, PVDD, default_weights_path
 
 
 class PvddDenoiser(WindowedUpscaler):
@@ -92,4 +92,3 @@ class PvddDenoiser(WindowedUpscaler):
 
     def close(self) -> None:
         """Denoiser-protocol no-op (the harness calls close() on denoise stages)."""
-        pass

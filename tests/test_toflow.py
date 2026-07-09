@@ -30,8 +30,8 @@ def _run(den, clip):
 
 def test_direct_forward_matches_plain_interpretation():
     from kinovsr.toflow import (
-        _TOFlowGraph,
         _graph_path_for,
+        _TOFlowGraph,
         resolve_weights,
     )
     clip = _clip()
@@ -47,7 +47,7 @@ def test_direct_forward_matches_plain_interpretation():
     plain.net.engine = "interp"
     a = _run(fast, clip)
     b = _run(plain, clip)
-    worst = max(float(mx.max(mx.abs(x - y))) for x, y in zip(a, b))
+    worst = max(float(mx.max(mx.abs(x - y))) for x, y in zip(a, b, strict=True))
     assert worst < 1e-3, f"direct forward diverged from interpreter by {worst}"
 
 
@@ -59,8 +59,8 @@ def test_reduced_flow_tracks_full():
     for scale in ("half", "quarter"):
         red = TOFlowDenoiser(variant="deblock", flow_scale=scale)
         b = _run(red, clip)
-        worst = max(float(mx.max(mx.abs(x - y))) for x, y in zip(a, b))
-        mean = max(float(mx.mean(mx.abs(x - y))) for x, y in zip(a, b))
+        worst = max(float(mx.max(mx.abs(x - y))) for x, y in zip(a, b, strict=True))
+        mean = max(float(mx.mean(mx.abs(x - y))) for x, y in zip(a, b, strict=True))
         # reduced flow skips fine refinement levels: outputs stay close but
         # not identical (at real resolutions they agree at ~35 dB; this tiny
         # frame exaggerates pyramid differences). Catastrophic = broke.
@@ -75,8 +75,8 @@ def test_passes_cascade_matches_explicit_chain():
         frames = _run(den, frames)
     cas = _run(TOFlowDenoiser(variant="deblock", flow_scale="quarter",
                               passes=2), clip)
-    worst = max(float(mx.max(mx.abs(x - y))) for x, y in zip(frames, cas))
-    mean = max(float(mx.mean(mx.abs(x - y))) for x, y in zip(frames, cas))
+    worst = max(float(mx.max(mx.abs(x - y))) for x, y in zip(frames, cas, strict=True))
+    mean = max(float(mx.mean(mx.abs(x - y))) for x, y in zip(frames, cas, strict=True))
     # the cascade reuses pass-1 flow instead of recomputing it on cleaned
     # frames; measured equivalent at real resolutions (~55 dB agreement,
     # PSNR within 0.01 dB) -- this tiny frame amplifies the flow delta, so

@@ -108,10 +108,7 @@ def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict
     for k, v in w.items():
         if k == "plk_filter":
             v = _geo_ensemble(v.astype(mx.float32)).astype(v.dtype)
-        if v.ndim == 4:
-            a = mx.transpose(v, (0, 2, 3, 1))
-        else:
-            a = v
+        a = mx.transpose(v, (0, 2, 3, 1)) if v.ndim == 4 else v
         p[k] = a.astype(dtype)
     if "proj.weight" not in p or "blocks.0.attn.relative_position_bias" not in p:
         raise ValueError("not an ESCRealM checkpoint")

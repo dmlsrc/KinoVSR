@@ -73,7 +73,7 @@ class StdfDeblocker:
 
     def _update_mask(self) -> None:
         """(Re)estimate the blockiness mask from the buffered lumas."""
-        m = self._tracker.update([l for l, _, _ in self._buf])
+        m = self._tracker.update([luma for luma, _, _ in self._buf])
         if m is not None:
             self.last_blockiness_map = m
             self._mask = m[None]                       # (1,H,W,1) for luma broadcast

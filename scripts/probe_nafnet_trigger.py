@@ -12,10 +12,9 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
-
-import numpy as np
+from typing import TYPE_CHECKING, Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -23,8 +22,21 @@ if str(ROOT) not in sys.path:
 
 import mlx.core as mx  # noqa: E402
 
+from kinovsr._optional import require_numpy  # noqa: E402
 from kinovsr.nafnet import net  # noqa: E402
 from kinovsr.nafnet.restorer import model_rgb, resolve_pool_mode  # noqa: E402
+
+if TYPE_CHECKING:
+    import numpy as np
+
+np: Any = None
+
+
+def _load_numpy() -> Any:
+    global np
+    if np is None:
+        np = require_numpy("scripts/probe_nafnet_trigger.py")
+    return np
 
 
 Transform = tuple[str, Callable[[np.ndarray], np.ndarray]]
@@ -301,6 +313,7 @@ def _print_table(frame_no: int, shape: tuple[int, int, int], rows: list[dict[str
 
 
 def main() -> None:
+    _load_numpy()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--video", required=True, type=Path, help="source video to probe")
     ap.add_argument("--frames", default="0", help="frame list/ranges, e.g. 180 or 60,180,330 or 0:300:30")

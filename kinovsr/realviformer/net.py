@@ -83,10 +83,7 @@ def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict
             parts = k.split(".")                       # spynet.basic_module.L.basic_module.J.{weight,bias}
             parts[4] = f"{int(parts[4]) // 2}"         # BasicSR Sequential idx -> mmagic module idx
             k = ".".join(parts[:5]) + ".conv." + parts[5]
-        if v.ndim == 4:
-            a = mx.transpose(v, (0, 2, 3, 1))
-        else:
-            a = v
+        a = mx.transpose(v, (0, 2, 3, 1)) if v.ndim == 4 else v
         p[k] = a.astype(dtype)
     if "shallow_extraction.0.weight" not in p:
         raise ValueError("not a RealViformer checkpoint")

@@ -109,7 +109,7 @@ def _patches_of(img: Any, scale_id: int, max_seq: int) -> tuple:
     n = ny * nx
     scale = mx.full((n,), scale_id, dtype=mx.int32)
     mask = mx.ones((n,), dtype=mx.float32)
-    if 0 <= max_seq:
+    if max_seq >= 0:
         if n < max_seq:
             pad = max_seq - n
             p = mx.concatenate([p, mx.zeros((pad, PATCH, PATCH, 3))], axis=0)
@@ -186,7 +186,7 @@ class Musiq:
                 "checkpoint with kinovsr/musiq/convert_musiq.py "
                 "(see weights/README.md)."
             )
-        self.p = {k: v for k, v in mx.load(str(wp)).items()}
+        self.p = dict(mx.load(str(wp)).items())
         self._compiled: dict = {}
 
     # stem over all patches of all frames at once: (B*S, 32, 32, 3)
@@ -258,7 +258,6 @@ class Musiq:
         pos, scale, mask = pre[0][1], pre[0][2], pre[0][3]
         out: list = []
         stack = [pre[0][0]] + [preprocess(f)[0] for f in frames[1:]]
-        key = (tuple(stack[0].shape), len(stack))
         for i in range(0, len(stack), batch):
             chunk = mx.stack(stack[i:i + batch], axis=0)
             scores = self._forward(chunk, pos, scale, mask)

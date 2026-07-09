@@ -74,8 +74,7 @@ def _canonical_key(k: str) -> str:
         k = k.replace("RRDB_trunk.", "body.").replace(".RDB", ".rdb")
     k = k.replace("trunk_conv.", "conv_body.")
     k = k.replace("upconv1.", "conv_up1.").replace("upconv2.", "conv_up2.")
-    k = k.replace("HRconv.", "conv_hr.")
-    return k
+    return k.replace("HRconv.", "conv_hr.")
 
 
 def load_params(path: str | Path | None = None, dtype: Any = mx.float16,
@@ -266,10 +265,7 @@ def _upscale_srvgg(x: Any, p: dict) -> Any:
     i = 0
     while f"body.{i}.weight" in p:
         w = p[f"body.{i}.weight"]
-        if w.ndim == 4:
-            out = conv(out, p, f"body.{i}")
-        else:                                          # per-channel PReLU (NHWC: last axis)
-            out = mx.where(out >= 0, out, out * w)
+        out = conv(out, p, f"body.{i}") if w.ndim == 4 else mx.where(out >= 0, out, out * w)
         i += 1
     scale = scale_of(p)
     return mx.clip(_pixel_shuffle(out, scale) + _nearest_upsample(x, scale), 0.0, 1.0)

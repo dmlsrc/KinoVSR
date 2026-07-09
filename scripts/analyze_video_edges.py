@@ -17,6 +17,7 @@ import subprocess
 from fractions import Fraction
 from pathlib import Path
 
+from kinovsr._optional import require_numpy
 from kinovsr.images import draw_labels, load_image_rgb, resize_lanczos, save_image
 
 np = None
@@ -27,9 +28,7 @@ def load_image_deps() -> None:
     if np is not None:
         return
 
-    import numpy as _np
-
-    np = _np
+    np = require_numpy("scripts/analyze_video_edges.py")
 
 
 def run_command(cmd: list[str]) -> str:
