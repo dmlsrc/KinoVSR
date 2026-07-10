@@ -1,0 +1,117 @@
+"""The processor contract: lifecycle protocol, factory, and context.
+
+Pure core, effectful edges (planning 05): a family's MLX math is a pure
+function ``(params, inputs, state) -> (outputs, state)`` - anything
+``mx.compile``d must not mutate attributes, read hidden mutable state, or
+perform I/O. The lifecycle methods below are the deliberately impure
+edges: they own sessions, buffers, and weight loading, and they pass
+temporal state through the pure core as explicit values, so ``reset``
+means "replace the state value".
+
+Scheduler guarantees the implementations may rely on:
+
+- ``prepare`` runs once, before the first unit, with the exact input spec
+  this instance will see (compile warmup belongs here);
+- ``reset`` runs before the first unit AFTER a boundary reaches this
+  stage (including STREAM_START before the first unit of the run);
+- ``flush`` drains buffered tails at end of stream, then processing ends;
+- ``close`` runs exactly once - on success, cancellation, or failure.
+
+Framework guarantees the scheduler owes the implementations: it never
+re-enters a stage concurrently, never inserts work inside the stage's
+compiled regions, and never forces a per-frame host/device sync.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, replace
+from typing import Any, Protocol, runtime_checkable
+
+from kinovsr.reporting import NullReporter, Reporter
+from kinovsr.settings import Settings
+
+from .boundaries import Boundary
+from .capabilities import Capability, CapabilitySpec
+from .specs import StreamSpec
+from .units import FrameUnit
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineContext:
+    """What every lifecycle call receives.
+
+    A frozen value: per-stage variants are new instances via
+    :meth:`for_stage`. Carries no mutable services on purpose - progress
+    goes through the reporter contract, and nothing here may force MLX
+    evaluation.
+    """
+
+    settings: Settings
+    reporter: Reporter = NullReporter()
+    stage_id: str | None = None
+
+    def for_stage(self, stage_id: str) -> PipelineContext:
+        return replace(self, stage_id=stage_id)
+
+
+@runtime_checkable
+class Processor(Protocol):
+    """One configured stage instance's lifecycle."""
+
+    def prepare(self, input_spec: StreamSpec,
+                context: PipelineContext) -> None:
+        """Bind to the concrete input contract; compile/warm the core."""
+
+    def process(self, unit: FrameUnit,
+                context: PipelineContext) -> Iterable[FrameUnit]:
+        """Consume one unit; yield zero or more output units.
+
+        Yielding nothing is how windowed/buffering stages accumulate;
+        yielding several is how interpolation expands the timeline.
+        """
+
+    def reset(self, boundary: Boundary, context: PipelineContext) -> None:
+        """Drop temporal state: replace the explicit state value(s) with
+        their initial form. Never buffers across a boundary."""
+
+    def flush(self, context: PipelineContext) -> Iterable[FrameUnit]:
+        """Emit any buffered tail at end of stream."""
+
+    def close(self, context: PipelineContext) -> None:
+        """Release sessions/resources. Called exactly once, always."""
+
+
+@runtime_checkable
+class ProcessorFactory(Protocol):
+    """A family's entry in the catalog: metadata plus two pure-ish steps.
+
+    ``parse_config`` is a pure function over values: raw mapping in,
+    typed frozen config out (raising StageConfigError on bad keys/values).
+    ``build`` is the effectful step that may load weights and create the
+    stage instance.
+    """
+
+    name: str
+    capabilities: Mapping[Capability, CapabilitySpec]
+
+    def parse_config(
+        self,
+        raw: Mapping[str, Any],
+        *,
+        capability: Capability,
+        profile: str | None,
+        settings: Settings,
+    ) -> object:
+        ...
+
+    def build(self, config: object, *,
+              context: PipelineContext) -> Processor:
+        ...
+
+
+__all__ = [
+    "PipelineContext",
+    "Processor",
+    "ProcessorFactory",
+]
