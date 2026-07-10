@@ -22,7 +22,11 @@ from .protocol import ProcessorFactory
 # family name -> "module:attribute" of its ProcessorFactory instance.
 # Populated as families gain factories (M3 proves three; M4 migrates the
 # rest). The name on the left MUST equal the factory's own .name.
-_FACTORY_TARGETS: dict[str, str] = {}
+_FACTORY_TARGETS: dict[str, str] = {
+    "bsvd": "kinovsr.bsvd.factory:FACTORY",
+    "realplksr": "kinovsr.realplksr.factory:FACTORY",
+    "videotoolbox": "kinovsr.processors.videotoolbox:FACTORY",
+}
 
 _loaded: dict[str, ProcessorFactory] = {}
 

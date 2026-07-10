@@ -41,7 +41,7 @@ class TemporalMode(Enum):
     SEQUENCE = "sequence"
 
 
-def preserve_stream(spec: StreamSpec) -> StreamSpec:
+def preserve_stream(spec: StreamSpec, config: object = None) -> StreamSpec:
     """The identity ``produces`` transform: spatial processors normally
     preserve both frame and timeline contracts."""
     return spec
@@ -55,9 +55,11 @@ class CapabilitySpec:
     profiles: tuple[str, ...]
     accepts: StreamConstraint
     # Pure transform: the output StreamSpec this stage produces from a
-    # given (already accepted) input spec. Interpolation rewrites
-    # cadence/cardinality here, explicitly; upscalers rewrite geometry.
-    produces: Callable[[StreamSpec], StreamSpec] = preserve_stream
+    # given (already accepted) input spec and the stage's parsed config
+    # (scale and target cadence are config decisions). Interpolation
+    # rewrites cadence/cardinality here, explicitly; upscalers rewrite
+    # geometry. Must not perform I/O.
+    produces: Callable[[StreamSpec, object], StreamSpec] = preserve_stream
     # How many neighbor frames the unit consumes on each side (0 for
     # per-frame). For CAUSAL modes this is the look-back depth; for
     # CENTERED it is the symmetric radius that lookahead must cover.

@@ -88,13 +88,13 @@ class FakeFamily:
         return Passthrough()
 
 
-def upscale4x(spec: StreamSpec) -> StreamSpec:
+def upscale4x(spec: StreamSpec, config: object = None) -> StreamSpec:
     frame = dataclasses.replace(
         spec.frame, geometry=spec.frame.geometry.scaled(4))
     return dataclasses.replace(spec, frame=frame)
 
 
-def interpolate_2x(spec: StreamSpec) -> StreamSpec:
+def interpolate_2x(spec: StreamSpec, config: object = None) -> StreamSpec:
     timeline = dataclasses.replace(
         spec.timeline,
         cadence=spec.timeline.cadence * 2,

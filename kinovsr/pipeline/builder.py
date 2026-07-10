@@ -210,7 +210,7 @@ def resolve_pipeline(
             raise StreamEdgeError(upstream, stage_name, tuple(violations),
                                   produced=current)
 
-        produced = cap_spec.produces(current)
+        produced = cap_spec.produces(current, cfg)
         if cap_spec.is_tap and produced != current:
             raise StageConfigError(
                 stage_name, f"family {factory.name!r} declares a tap but "
