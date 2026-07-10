@@ -14,7 +14,10 @@ Scheduler guarantees the implementations may rely on:
   this instance will see (compile warmup belongs here);
 - ``reset`` runs before the first unit AFTER a boundary reaches this
   stage (including STREAM_START before the first unit of the run);
-- ``flush`` drains buffered tails at end of stream, then processing ends;
+- ``flush`` drains the buffered tail. It runs at end of stream, and ALSO
+  just before ``reset`` at a mid-stream boundary so the pre-boundary tail
+  leaves with pre-boundary state; implementations must tolerate further
+  ``process`` calls after a mid-stream flush;
 - ``close`` runs exactly once - on success, cancellation, or failure.
 
 Framework guarantees the scheduler owes the implementations: it never
@@ -69,6 +72,11 @@ class Processor(Protocol):
 
         Yielding nothing is how windowed/buffering stages accumulate;
         yielding several is how interpolation expands the timeline.
+        Units arrive with upstream boundaries already stripped - boundary
+        information reaches a stage only through ``reset`` - and the
+        scheduler re-attaches them downstream. Emitting a NEW boundary on
+        an output unit (cut detection) is the one legitimate reason to
+        set ``boundaries`` here.
         """
 
     def reset(self, boundary: Boundary, context: PipelineContext) -> None:
