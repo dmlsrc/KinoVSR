@@ -167,3 +167,33 @@ class TestInterpolation:
         assert first.pts == 0
         stream.close()
         assert processor._session is None  # closed exactly once
+
+
+@pytest.mark.integration
+class TestTimelineOrigin:
+    """A nonzero source origin must be preserved, not silently re-based
+    to zero - re-basing would desync the video from sibling streams."""
+
+    @staticmethod
+    def shifted(units, offset):
+        return [u.retimed(u.pts + offset) for u in units]
+
+    def test_nonzero_origin_anchors_the_grid(self):
+        origin = 48000  # 2 seconds into the timeline, grid-aligned
+        out, _ = run_interpolation(
+            self.shifted(source_units(8), origin), 60)
+        assert [u.pts for u in out] == [origin + m * 400 for m in range(20)]
+        assert sum(u.duration for u in out) == 8 * 1000
+
+    def test_non_grid_aligned_origin_is_kept_exactly(self):
+        origin = 5007   # not a multiple of any frame duration
+        out, _ = run_interpolation(
+            self.shifted(source_units(8), origin), 60)
+        assert out[0].pts == origin
+        assert [u.pts for u in out] == [origin + m * 400 for m in range(20)]
+
+    def test_origin_survives_a_hard_cut(self):
+        origin = 24000
+        out, _ = run_interpolation(
+            self.shifted(source_units(8), origin), 60, cut_at=4)
+        assert [u.pts for u in out] == [origin + m * 400 for m in range(20)]

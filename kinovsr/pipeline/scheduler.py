@@ -3,9 +3,10 @@
 The scheduler owns everything the processor contract promises
 (:mod:`kinovsr.processors.protocol`): prepare-before-first-unit,
 boundary-triggered resets, tail flushing, and exactly-once close on
-success, cancellation, or failure. It is pull-based: :func:`run_chain`
-returns a generator, closing it cancels the run, and iteration provides
-natural backpressure.
+success, cancellation, failure, or abandonment. It is pull-based:
+:func:`run_chain` returns an owning :class:`ChainRun` iterator, closing
+it cancels the run (valid even before the first pull), and iteration
+provides natural backpressure.
 
 Boundary delivery is scheduler-owned so families cannot get it wrong. At
 a mid-stream boundary the stage's buffered tail is drained FIRST (with
@@ -28,6 +29,7 @@ forces a host/device synchronization.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterable, Iterator
 
 from kinovsr.processors import (
@@ -120,55 +122,118 @@ def _ensure_stream_start(units: Iterable[FrameUnit]) -> Iterator[FrameUnit]:
     yield from iterator
 
 
-def run_chain(
-    built: tuple[tuple[ResolvedStage, Processor], ...],
-    units: Iterable[FrameUnit],
-    context: PipelineContext,
-) -> Iterator[FrameUnit]:
-    """Pull output units through the whole chain.
+class ChainRun:
+    """An owning iterator over a running chain.
 
-    Closing the returned generator cancels the run; on cancellation,
-    exception, or completion every stage instance is closed exactly once,
-    in chain order, with per-stage contexts. A close failure never masks
-    the original error.
+    Cleanup is armed from CONSTRUCTION, not from the first pull: closing
+    (or abandoning) a run before any unit was pulled still closes every
+    stage exactly once - a plain generator would never have entered its
+    own try/finally. Iteration exhaustion, a stage error, an explicit
+    ``close``, context-manager exit, and garbage collection all funnel
+    into the same exactly-once close path; a close failure surfaces on
+    the success path and never masks an active error.
     """
-    closed = False
 
-    def close_all(active_error: bool) -> None:
-        nonlocal closed
-        if closed:
+    def __init__(
+        self,
+        built: tuple[tuple[ResolvedStage, Processor], ...],
+        units: Iterable[FrameUnit],
+        context: PipelineContext,
+    ) -> None:
+        self._built = built
+        self._units: Iterable[FrameUnit] | None = units
+        self._context = context
+        self._stream: Iterator[FrameUnit] | None = None
+        self._closed = False
+
+    # -- iteration ---------------------------------------------------------
+
+    def __iter__(self) -> ChainRun:
+        return self
+
+    def __next__(self) -> FrameUnit:
+        if self._closed:
+            raise StopIteration
+        if self._stream is None:
+            stream: Iterator[FrameUnit] = _ensure_stream_start(self._units)
+            self._units = None
+            for stage, processor in self._built:
+                stream = _stage_stream(
+                    stage, processor, stream,
+                    self._context.for_stage(stage.name))
+            self._stream = stream
+        try:
+            return next(self._stream)
+        except StopIteration:
+            self._close_all(active_error=False)   # may raise a close error
+            raise
+        except BaseException:
+            self._close_all(active_error=True)
+            raise
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def close(self) -> None:
+        """Cancel the run; safe at any point, including before the first
+        pull and repeatedly."""
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            stream.close()
+        self._close_all(active_error=False)
+
+    def __enter__(self) -> ChainRun:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            stream.close()
+        self._close_all(active_error=exc_type is not None)
+
+    def __del__(self) -> None:
+        # A finalizer must never raise; close errors were the caller's to
+        # collect via an explicit close().
+        with contextlib.suppress(Exception):
+            self.close()
+
+    def _close_all(self, active_error: bool) -> None:
+        if self._closed:
             return
-        closed = True
+        self._closed = True
         first_close_error: Exception | None = None
-        for stage, processor in built:
+        for stage, processor in self._built:
             try:
-                processor.close(context.for_stage(stage.name))
+                processor.close(self._context.for_stage(stage.name))
             except Exception as exc:  # noqa: BLE001 - collected, not lost
                 if first_close_error is None:
                     first_close_error = _wrap_stage_error(stage, exc)
         if first_close_error is not None and not active_error:
             raise first_close_error
 
-    try:
-        stream: Iterator[FrameUnit] = _ensure_stream_start(units)
-        for stage, processor in built:
-            stream = _stage_stream(
-                stage, processor, stream, context.for_stage(stage.name))
-        yield from stream
-    except BaseException:
-        close_all(active_error=True)
-        raise
-    finally:
-        close_all(active_error=False)
+
+def run_chain(
+    built: tuple[tuple[ResolvedStage, Processor], ...],
+    units: Iterable[FrameUnit],
+    context: PipelineContext,
+) -> ChainRun:
+    """Pull output units through the whole chain.
+
+    Returns a :class:`ChainRun`: iterate for units, ``close()`` to cancel
+    (valid even before the first pull), or use it as a context manager.
+    Every stage instance closes exactly once - on completion, error,
+    cancellation, or abandonment - in chain order, with per-stage
+    contexts.
+    """
+    return ChainRun(built, units, context)
 
 
 def run_plan(
     plan: BuildPlan,
     units: Iterable[FrameUnit],
     context: PipelineContext,
-) -> Iterator[FrameUnit]:
+) -> ChainRun:
     """Build the plan's stages and run the chain (the common entry)."""
     return run_chain(build_processors(plan, context), units, context)
 
 
-__all__ = ["run_chain", "run_plan"]
+__all__ = ["ChainRun", "run_chain", "run_plan"]

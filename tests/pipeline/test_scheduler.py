@@ -352,3 +352,51 @@ def test_scheduler_overhead_sanity():
     stream.close()
     median_ms_per_stage = statistics.median(samples) / 8 / 1e6
     assert median_ms_per_stage < 0.05, median_ms_per_stage
+
+
+class TestOwnershipBeforeIteration:
+    """Cleanup must not depend on the first pull: a plain generator never
+    enters its own try/finally when closed or abandoned unstarted."""
+
+    def test_close_before_first_pull_closes_processors(self):
+        log = []
+        a, b = Recorder("a", log), Recorder("b", log)
+        stream = run_chain(chain(a, b), units(5), CONTEXT)
+        stream.close()  # never iterated
+        closes = [x for x in log if x[1] == "close"]
+        assert closes == [("a", "close", ""), ("b", "close", "")]
+        assert list(stream) == []  # closed run yields nothing
+        assert closes == [x for x in log if x[1] == "close"]  # still once
+
+    def test_abandonment_closes_processors(self):
+        log = []
+        a = Recorder("a", log)
+        stream = run_chain(chain(a), units(5), CONTEXT)
+        next(stream)
+        del stream  # CPython refcount finalizes immediately
+        assert [x for x in log if x[1] == "close"] == [("a", "close", "")]
+
+    def test_context_manager_closes_once(self):
+        log = []
+        a = Recorder("a", log)
+        with run_chain(chain(a), units(2), CONTEXT) as stream:
+            assert next(stream).pts == 0
+        assert [x for x in log if x[1] == "close"] == [("a", "close", "")]
+
+    def test_context_manager_does_not_mask_body_error(self):
+        class BadClose(Recorder):
+            def close(self, context):
+                super().close(context)
+                raise RuntimeError("close failed")
+
+        def drive_and_fail(stream):
+            with stream:
+                next(stream)
+                raise ValueError("body error")
+
+        bad = BadClose("bad")
+        stream = run_chain(chain(bad), units(2), CONTEXT)
+        with pytest.raises(ValueError, match="body error"):
+            drive_and_fail(stream)
+        assert [x for x in bad.log if x[1] == "close"] == [
+            ("bad", "close", "")]

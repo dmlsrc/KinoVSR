@@ -15,6 +15,7 @@ Resolution is pure: it reads values and returns values (the effectful
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -259,12 +260,24 @@ def build_processors(
     Instances come back paired with their resolved stage, in chain order,
     each built with a per-stage context. Duplicate pipeline entries get
     independent instances (state is never shared; immutable weights may be
-    cached underneath by the family)."""
+    cached underneath by the family).
+
+    Construction is transactional: if a later stage's build raises, every
+    already-built instance is closed before the original error propagates,
+    so a failing chain never leaks native sessions or weights."""
     built: list[tuple[ResolvedStage, Processor]] = []
-    for stage in plan.stages:
-        stage_context = context.for_stage(stage.name)
-        built.append(
-            (stage, stage.factory.build(stage.config, context=stage_context)))
+    try:
+        for stage in plan.stages:
+            stage_context = context.for_stage(stage.name)
+            built.append(
+                (stage,
+                 stage.factory.build(stage.config, context=stage_context)))
+    except BaseException:
+        for stage, processor in built:
+            # the build error must win over any close failure
+            with contextlib.suppress(Exception):
+                processor.close(context.for_stage(stage.name))
+        raise
     return tuple(built)
 
 

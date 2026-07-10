@@ -83,6 +83,11 @@ class VtInterpolateProcessor:
         self._time_base: Fraction | None = None
         self._source_index = 0
         self._target_index = 0
+        # The regenerated grid is anchored at the FIRST input unit's PTS,
+        # so a stream that legitimately starts at a nonzero origin keeps
+        # its alignment with sibling streams (audio) instead of being
+        # silently re-based to zero.
+        self._origin: int | None = None
 
     def _grid_ticks(self, target_index: int) -> int:
         return round(target_index / self._config.target_fps
@@ -92,7 +97,8 @@ class VtInterpolateProcessor:
         m = self._target_index
         self._target_index += 1
         pts = self._grid_ticks(m)
-        return FrameUnit(payload=payload, pts=pts,
+        origin = self._origin or 0
+        return FrameUnit(payload=payload, pts=origin + pts,
                          duration=self._grid_ticks(m + 1) - pts)
 
     def prepare(self, input_spec: StreamSpec,
@@ -114,6 +120,8 @@ class VtInterpolateProcessor:
 
     def process(self, unit: FrameUnit,
                 context: PipelineContext) -> Iterable[FrameUnit]:
+        if self._origin is None:
+            self._origin = unit.pts
         index = self._source_index
         self._source_index += 1
         for payload in self._session.feed(unit.payload, index):

@@ -413,3 +413,50 @@ class TestBuildProcessors:
             context = PipelineContext(settings=SETTINGS)
             instance.reset(Boundary(BoundaryKind.STREAM_START), context)
             assert list(instance.process(unit, context)) == [unit]
+
+
+class TestBuildRollback:
+    def test_partial_build_failure_closes_built_stages(self, families):
+        closed = []
+
+        class Session:
+            def __init__(self, name):
+                self.name = name
+
+            def prepare(self, input_spec, context):
+                pass
+
+            def process(self, unit, context):
+                yield unit
+
+            def reset(self, boundary, context):
+                pass
+
+            def flush(self, context):
+                return ()
+
+            def close(self, context):
+                closed.append((self.name, context.stage_id))
+
+        module = sys.modules["fake_builder_families"]
+        module.fakedenoise.build = (
+            lambda config, *, context: Session("first"))
+        original_upscale_build = module.fakeupscale.build
+
+        def failing_build(config, *, context):
+            raise RuntimeError("weights exploded")
+
+        module.fakeupscale.build = failing_build
+        try:
+            config = {
+                "pipeline": ["denoise", "upscale"],
+                "denoise": {"processor": "fakedenoise"},
+                "upscale": {"processor": "fakeupscale"},
+            }
+            plan = resolve_pipeline(config, input_spec=stream(),
+                                    settings=SETTINGS)
+            with pytest.raises(RuntimeError, match="weights exploded"):
+                build_processors(plan, PipelineContext(settings=SETTINGS))
+        finally:
+            module.fakeupscale.build = original_upscale_build
+        assert closed == [("first", "denoise")]

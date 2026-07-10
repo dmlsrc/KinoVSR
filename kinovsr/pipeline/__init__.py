@@ -15,7 +15,7 @@ from .builder import (
     build_processors,
     resolve_pipeline,
 )
-from .scheduler import run_chain, run_plan
+from .scheduler import ChainRun, run_chain, run_plan
 
 __all__ = [
     "INPUT_ENDPOINT",
@@ -23,6 +23,7 @@ __all__ = [
     "BuildPlan",
     "OutputEndpointSpec",
     "ResolvedStage",
+    "ChainRun",
     "build_processors",
     "resolve_pipeline",
     "run_chain",
