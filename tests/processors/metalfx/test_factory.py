@@ -123,6 +123,28 @@ class TestDriver:
         assert bool(mx.array_equal(a, b))
         up.close()
 
+    def test_unaligned_output_rows_read_back_correctly(self, mx):
+        # Readback rows are ow*8 bytes with no padding. On Apple-family
+        # GPUs the texture-to-buffer copy alignment (16 B, feature-set
+        # tables) constrains the buffer OFFSET (always 0 here), and blit
+        # destinationBytesPerRow needs only a pixel-size multiple - so
+        # widths whose rows are not 64/256-byte aligned must still read
+        # back unsheared. A vertical gradient turns any row-stride
+        # mistake into a non-monotonic column profile.
+        for h, w, scale in ((54, 77, 2), (51, 51, 3)):
+            gradient = mx.contiguous(mx.broadcast_to(
+                (mx.arange(h) / (h - 1))[:, None, None],
+                (h, w, 3)).astype(mx.float32))
+            up = MetalFxSpatialUpscaler(scale=scale)
+            try:
+                (sr, _), = up.feed(gradient)
+            except MediaError as exc:
+                skip_if_unsupported(exc)
+            assert sr.shape == (h * scale, w * scale, 3)
+            col_mean = mx.mean(sr, axis=(1, 2))
+            assert bool(mx.all(col_mean[1:] >= col_mean[:-1] - 1e-3))
+            up.close()
+
     def test_geometry_change_mid_stream_raises(self, mx):
         up = MetalFxSpatialUpscaler(scale=2)
         try:
