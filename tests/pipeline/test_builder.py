@@ -460,3 +460,75 @@ class TestBuildRollback:
         finally:
             module.fakeupscale.build = original_upscale_build
         assert closed == [("first", "denoise")]
+
+
+class TestBuildRollbackUnderInterrupts:
+    @staticmethod
+    def _plan_and_module(families):
+        module = sys.modules["fake_builder_families"]
+        config = {
+            "pipeline": ["denoise", "upscale", "interp"],
+            "denoise": {"processor": "fakedenoise"},
+            "upscale": {"processor": "fakeupscale"},
+            "interp": {"processor": "fakeinterp"},
+        }
+        return config, module
+
+    def test_close_failure_during_rollback_does_not_stop_it(self, families):
+        closed = []
+
+        def make_session(name, error=None):
+            class Session(Passthrough):
+                def close(self, context):
+                    closed.append(name)
+                    if error is not None:
+                        raise error
+
+            return Session()
+
+        config, module = self._plan_and_module(families)
+        module.fakedenoise.build = (
+            lambda cfg, *, context: make_session(
+                "first", RuntimeError("close failed")))
+        module.fakeupscale.build = (
+            lambda cfg, *, context: make_session("second"))
+
+        def failing_build(cfg, *, context):
+            raise RuntimeError("weights exploded")
+
+        module.fakeinterp.build = failing_build
+        plan = resolve_pipeline(config, input_spec=stream(),
+                                settings=SETTINGS)
+        with pytest.raises(RuntimeError, match="weights exploded"):
+            build_processors(plan, PipelineContext(settings=SETTINGS))
+        assert closed == ["first", "second"]
+
+    def test_interrupt_during_rollback_finishes_then_chains(self, families):
+        closed = []
+
+        def make_session(name, error=None):
+            class Session(Passthrough):
+                def close(self, context):
+                    closed.append(name)
+                    if error is not None:
+                        raise error
+
+            return Session()
+
+        config, module = self._plan_and_module(families)
+        module.fakedenoise.build = (
+            lambda cfg, *, context: make_session(
+                "first", KeyboardInterrupt()))
+        module.fakeupscale.build = (
+            lambda cfg, *, context: make_session("second"))
+
+        def failing_build(cfg, *, context):
+            raise RuntimeError("weights exploded")
+
+        module.fakeinterp.build = failing_build
+        plan = resolve_pipeline(config, input_spec=stream(),
+                                settings=SETTINGS)
+        with pytest.raises(KeyboardInterrupt) as exc:
+            build_processors(plan, PipelineContext(settings=SETTINGS))
+        assert closed == ["first", "second"]  # rollback finished anyway
+        assert isinstance(exc.value.__cause__, RuntimeError)  # chained

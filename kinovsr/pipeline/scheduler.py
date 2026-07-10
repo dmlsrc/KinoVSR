@@ -177,23 +177,30 @@ class ChainRun:
         """Cancel the run; safe at any point, including before the first
         pull and repeatedly."""
         stream, self._stream = self._stream, None
-        if stream is not None:
-            stream.close()
-        self._close_all(active_error=False)
+        try:
+            if stream is not None:
+                stream.close()
+        finally:
+            # Processor cleanup is unconditional, even when generator
+            # closure itself raises (a stage misbehaving under
+            # GeneratorExit must not leak the other stages).
+            self._close_all(active_error=False)
 
     def __enter__(self) -> ChainRun:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         stream, self._stream = self._stream, None
-        if stream is not None:
-            stream.close()
-        self._close_all(active_error=exc_type is not None)
+        try:
+            if stream is not None:
+                stream.close()
+        finally:
+            self._close_all(active_error=exc_type is not None)
 
     def __del__(self) -> None:
-        # A finalizer must never raise; close errors were the caller's to
-        # collect via an explicit close().
-        with contextlib.suppress(Exception):
+        # A finalizer must never raise - not even for interrupts; close
+        # errors were the caller's to collect via an explicit close().
+        with contextlib.suppress(BaseException):
             self.close()
 
     def _close_all(self, active_error: bool) -> None:
@@ -201,12 +208,20 @@ class ChainRun:
             return
         self._closed = True
         first_close_error: Exception | None = None
+        interrupt: BaseException | None = None
         for stage, processor in self._built:
             try:
                 processor.close(self._context.for_stage(stage.name))
             except Exception as exc:  # noqa: BLE001 - collected, not lost
                 if first_close_error is None:
                     first_close_error = _wrap_stage_error(stage, exc)
+            except BaseException as exc:
+                # KeyboardInterrupt/SystemExit mid-cleanup: keep closing
+                # the remaining stages, then deliver it.
+                if interrupt is None:
+                    interrupt = exc
+        if interrupt is not None:
+            raise interrupt
         if first_close_error is not None and not active_error:
             raise first_close_error
 

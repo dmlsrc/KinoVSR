@@ -15,7 +15,6 @@ Resolution is pure: it reads values and returns values (the effectful
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -272,11 +271,21 @@ def build_processors(
             built.append(
                 (stage,
                  stage.factory.build(stage.config, context=stage_context)))
-    except BaseException:
+    except BaseException as build_error:
+        interrupt: BaseException | None = None
         for stage, processor in built:
-            # the build error must win over any close failure
-            with contextlib.suppress(Exception):
+            try:
                 processor.close(context.for_stage(stage.name))
+            except Exception:  # noqa: S110
+                pass           # ordinary close failures lose to the build error
+            except BaseException as exc:
+                # KeyboardInterrupt/SystemExit during cleanup: finish
+                # closing the remaining stages first, then deliver it
+                # (chained onto the build error).
+                if interrupt is None:
+                    interrupt = exc
+        if interrupt is not None:
+            raise interrupt from build_error
         raise
     return tuple(built)
 

@@ -400,3 +400,56 @@ class TestOwnershipBeforeIteration:
             drive_and_fail(stream)
         assert [x for x in bad.log if x[1] == "close"] == [
             ("bad", "close", "")]
+
+
+class TestCleanupUnderInterrupts:
+    """The close guarantee holds even for BaseException and a failing
+    generator close: every stage still closes, nothing is masked silently."""
+
+    def test_interrupt_during_close_still_closes_the_rest(self):
+        log = []
+
+        class InterruptingClose(Recorder):
+            def close(self, context):
+                super().close(context)
+                raise KeyboardInterrupt
+
+        first = InterruptingClose("first", log)
+        second = Recorder("second", log)
+        stream = run_chain(chain(first, second), units(2), CONTEXT)
+        next(stream)
+        with pytest.raises(KeyboardInterrupt):
+            stream.close()
+        closes = [x[0] for x in log if x[1] == "close"]
+        assert closes == ["first", "second"]
+
+    def test_abandonment_before_first_pull_closes(self):
+        log = []
+        stage = Recorder("a", log)
+        stream = run_chain(chain(stage), units(3), CONTEXT)
+        del stream  # never iterated
+        assert [x for x in log if x[1] == "close"] == [("a", "close", "")]
+
+    def test_repeated_close_is_idempotent(self):
+        log = []
+        stage = Recorder("a", log)
+        stream = run_chain(chain(stage), units(3), CONTEXT)
+        next(stream)
+        stream.close()
+        stream.close()
+        assert [x for x in log if x[1] == "close"] == [("a", "close", "")]
+
+    def test_failing_stream_close_still_closes_processors(self):
+        log = []
+        stage = Recorder("a", log)
+        stream = run_chain(chain(stage), units(3), CONTEXT)
+        next(stream)
+
+        class BadStream:
+            def close(self):
+                raise RuntimeError("generator refused to die")
+
+        stream._stream = BadStream()
+        with pytest.raises(RuntimeError, match="refused to die"):
+            stream.close()
+        assert [x for x in log if x[1] == "close"] == [("a", "close", "")]
