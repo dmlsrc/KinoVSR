@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from .boundaries import BoundaryKind
 from .specs import StreamConstraint, StreamSpec
 
 
@@ -66,6 +67,13 @@ class CapabilitySpec:
     # METRIC taps observe units and publish results without rewriting the
     # stream contract; the builder enforces produces == identity for them.
     is_tap: bool = False
+    # Boundary kinds this stage ADDS to the stream (cut detectors emit
+    # HARD_CUT). Provision accumulates along the chain; input endpoints
+    # always provide STREAM_START.
+    emits_boundaries: tuple[BoundaryKind, ...] = ()
+    # Boundary kinds this stage is INCORRECT without (not merely improved
+    # by). The builder rejects a chain where no upstream provider exists.
+    requires_boundaries: tuple[BoundaryKind, ...] = ()
 
 
 __all__ = [
