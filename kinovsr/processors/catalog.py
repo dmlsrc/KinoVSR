@@ -24,6 +24,7 @@ from .protocol import ProcessorFactory
 # rest). The name on the left MUST equal the factory's own .name.
 _FACTORY_TARGETS: dict[str, str] = {
     "bsvd": "kinovsr.bsvd.factory:FACTORY",
+    "metalfx": "kinovsr.processors.metalfx:FACTORY",
     "realplksr": "kinovsr.realplksr.factory:FACTORY",
     "videotoolbox": "kinovsr.processors.videotoolbox:FACTORY",
 }

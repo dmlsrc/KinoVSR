@@ -38,6 +38,8 @@ dependencies = [
     "pyobjc-framework-CoreMedia>=12.2",
     "pyobjc-framework-Cocoa>=12.2",
     "pyobjc-framework-libdispatch>=12.2",
+    "pyobjc-framework-Metal>=12.2",
+    "pyobjc-framework-MetalFX>=12.2",
     "pyobjc-framework-Quartz>=12.2",
     "pyobjc-framework-VideoToolbox>=12.2",
 ]

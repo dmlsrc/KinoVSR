@@ -58,6 +58,9 @@ def scale_for_mode(mode: str) -> int:
         return 2
     if mode in ("balanced", "image", "basicvsrpp", "realbasicvsr", "realesrgan", "safmn", "esc", "realviformer", "realplksr", "toflow"):
         return 4
+    if mode == "metalfx":
+        # Config-driven (2/3/4); the harness overrides from --metalfx-scale.
+        return 2
     raise ValueError(f"unknown VSR spatial-mode: {mode!r}")
 
 
@@ -80,7 +83,7 @@ def source_format_for_mode(mode: str) -> int:
     """
     if mode == "fast":
         return _pb.PIX_NV12
-    if mode in ("balanced", "image", "basicvsrpp", "realbasicvsr", "realesrgan", "safmn", "esc", "realviformer", "realplksr", "toflow"):
+    if mode in ("balanced", "image", "basicvsrpp", "realbasicvsr", "realesrgan", "safmn", "esc", "realviformer", "realplksr", "toflow", "metalfx"):
         # Learned MLX upscalers do not use VideoToolbox, but they also want RGB
         # in fp16-preserving RGBAHalf on the native decoder path.
         return _pb.PIX_RGBAHALF

@@ -189,7 +189,7 @@ def _pick_hevc_profile(spatial_mode: str, encode_chroma: str) -> str:
     return (HEVC_PROFILE_MAIN422_10
             if spatial_mode in ("balanced", "image", "none", "basicvsrpp", "realbasicvsr",
                                 "realesrgan", "safmn", "esc", "realviformer", "realplksr",
-                                "toflow")
+                                "toflow", "metalfx")
             else HEVC_PROFILE_MAIN10)
 
 
@@ -606,6 +606,8 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
         # checkpoint so output dims + encoder match the frames.
         from kinovsr.realplksr import net as _pnet
         spatial_scale = _pnet._config(_pnet.load_params(realplksr_spec))[4]
+    elif args.upscale == "metalfx":
+        spatial_scale = args.metalfx_scale
     out_w, out_h = in_w * spatial_scale, in_h * spatial_scale
     profile = _pick_hevc_profile(args.upscale, args.encode_chroma)
     target_fps = args.target_fps if args.target_fps is not None else source_fps
@@ -829,7 +831,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
         s: Any
         if args.upscale == "none":
             s = NativePassthrough(in_w, in_h, fps=source_fps)
-        elif args.upscale in ("basicvsrpp", "realbasicvsr", "realesrgan", "safmn", "esc", "realviformer", "realplksr", "toflow"):
+        elif args.upscale in ("basicvsrpp", "realbasicvsr", "realesrgan", "safmn", "esc", "realviformer", "realplksr", "toflow", "metalfx"):
             # Learned MLX upscalers do the upscale in the loop; the session is a
             # passthrough at the output dims that just packs the already-upscaled
             # frame for the encoder.
@@ -1259,6 +1261,9 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
                 graph=settings.toflow_sr_graph,
                 dtype=parse_mlx_dtype_name(args.toflow_sr_dtype),
             )
+        elif args.upscale == "metalfx":
+            from kinovsr.processors.metalfx import MetalFxSpatialUpscaler
+            up = MetalFxSpatialUpscaler(scale=args.metalfx_scale)
 
         naf: Any = None
         if args.nafnet != "off":

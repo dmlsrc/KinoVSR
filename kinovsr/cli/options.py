@@ -44,6 +44,7 @@ SHARED_KEYS = frozenset({
     "chroma_strength",    # split output blend, chroma half
     "denoise_strength",   # checkpoint-interpolation denoise dial (dni)
     "dtype",              # float16 | float32
+    "scale",              # spatial scale factor when it is a free parameter
     "window",             # the family's temporal-extent knob
     "trim",               # warm-up frames trimmed at window joins
     "passes",             # in-stage iteration count
