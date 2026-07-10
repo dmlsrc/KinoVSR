@@ -1,0 +1,27 @@
+schema_version = 1
+
+[owner]
+kind = "processor"
+name = "bsvd"
+
+[profiles.c64]
+capabilities = ["denoise"]
+weights = ["c64"]
+
+[profiles.c32]
+capabilities = ["denoise"]
+weights = ["c32"]
+
+[weights.c64]
+path = "weights/bsvd_64.safetensors"
+distribution = "external"
+source = "https://raw.githubusercontent.com/gmlwns2000/sharkshark-4k/master/src/upscale/model/bsvd/bsvd-64.pth"
+source_sha256 = "1d8f7252765cf8f826d03f23c4a4b51413c51b649f0aed6994f149cbe5d6ad8f"
+license = "MIT"
+
+[weights.c32]
+path = "weights/bsvd_32.safetensors"
+distribution = "external"
+source = "https://raw.githubusercontent.com/gmlwns2000/sharkshark-4k/master/src/upscale/model/bsvd/bsvd-32.pth"
+source_sha256 = "e91af9682e2c3f71684559dd95defd243cae811375db238a71caf42850418c14"
+license = "MIT"

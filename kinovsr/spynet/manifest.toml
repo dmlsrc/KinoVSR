@@ -1,0 +1,18 @@
+schema_version = 1
+
+[owner]
+kind = "component"
+name = "spynet"
+
+# The stock BasicSR SpyNet checkpoint, used by mc's flow = "spynet" path
+# for real flow measurement. The SR families load SpyNet parameters
+# embedded in their own checkpoints (end-to-end training repurposes
+# SpyNet into a feature matcher), so this asset is deliberately separate.
+
+[weights.stock]
+path = "weights/spynet_stock_20210409.safetensors"
+distribution = "bundled"
+artifact_sha256 = "8012575105bc7e13538f5d90fe2a0ff8867e26bd944520006b129e7adb02aad1"
+source = "https://download.openmmlab.com/mmediting/restorers/basicvsr/spynet_20210409-c6c1bd09.pth"
+source_sha256 = "c6c1bd09b52d05ba17f3e701f549d6faf5e314aabce8ae462c1c171a8d6c4914"
+license = "Apache-2.0"

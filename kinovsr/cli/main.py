@@ -10,6 +10,18 @@ from .config import assemble
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        import sys
+
+        argv = sys.argv[1:]
+    if argv and argv[0] == "weights":
+        # Subcommand surface (M3): read-only weight listing/verification.
+        # The flat processing CLI remains the default invocation shape
+        # until the M4 command split.
+        from .weights_cmd import run_weights_command
+
+        return run_weights_command(argv[1:])
+
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_args(parser, args)

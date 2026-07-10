@@ -1,14 +1,16 @@
 """RealPLKSR's processor factory: the stateless per-frame prover.
 
-Profiles are the existing product tokens; scale is a profile-declared
-static fact so the ``produces`` geometry transform stays pure (no
-checkpoint I/O at resolve time). An explicit ``weights`` path must state
-``scale`` unless it is one of the known tokens.
+Profiles are the existing product tokens and resolve from the family
+manifest: each profile's ``defaults`` declares its scale, so the
+``produces`` geometry transform stays pure (no checkpoint I/O at resolve
+time). An explicit ``weights`` path must state ``scale`` unless it is
+one of the known tokens.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Mapping
 from typing import Any
 
@@ -25,9 +27,19 @@ from kinovsr.processors.specs import (
 )
 from kinovsr.settings import Settings
 
-_PROFILE_SCALE = {"public2x": 2, "public2x-nn": 2, "nomos4x": 4}
+_PROFILES = ("public2x", "public2x-nn", "nomos4x")
 _DEFAULT_PROFILE = "public2x"
 _DTYPES = {"float16", "float32"}
+
+
+@functools.cache
+def _profile_scales() -> dict[str, int]:
+    """Profile -> scale, from the family manifest (loaded once)."""
+    from kinovsr.modeling.weights import load_registered
+
+    manifest = load_registered("realplksr")
+    return {name: int(profile.defaults["scale"])
+            for name, profile in manifest.profiles.items()}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -50,7 +62,7 @@ class RealPlksrFactory:
     capabilities = {
         Capability.UPSCALE: CapabilitySpec(
             capability=Capability.UPSCALE,
-            profiles=tuple(_PROFILE_SCALE),
+            profiles=_PROFILES,
             accepts=StreamConstraint(
                 layouts=(Layout.MLX_RGB_HWC,),
                 dtypes=(DType.FLOAT32, DType.FLOAT16),
@@ -59,6 +71,12 @@ class RealPlksrFactory:
             produces=_produces,
         ),
     }
+
+    def profile_defaults(self, *, capability: Capability,
+                         profile: str) -> Mapping[str, Any]:
+        from kinovsr.modeling.weights import load_registered
+
+        return load_registered(self.name).profiles[profile].defaults
 
     def parse_config(
         self,
@@ -74,13 +92,14 @@ class RealPlksrFactory:
             raise ValueError(f"dtype must be one of {sorted(_DTYPES)}")
         weights = typed_value(raw, "weights", str) or settings.realplksr_weights
         scale = typed_value(raw, "scale", int)
-        token = profile or (weights if weights in _PROFILE_SCALE else None)
+        scales = _profile_scales()
+        token = profile or (weights if weights in scales else None)
         if scale is None:
             if token is None and weights is not None:
                 raise ValueError(
                     "state scale = 2 or 4 when weights is an explicit "
                     "path (profiles declare it)")
-            scale = _PROFILE_SCALE[token or _DEFAULT_PROFILE]
+            scale = scales[token or _DEFAULT_PROFILE]
         if scale not in (2, 4):
             raise ValueError("scale must be 2 or 4")
         return RealPlksrStageConfig(

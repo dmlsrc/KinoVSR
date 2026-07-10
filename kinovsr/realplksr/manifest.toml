@@ -1,0 +1,44 @@
+schema_version = 1
+
+[owner]
+kind = "processor"
+name = "realplksr"
+
+[profiles.public2x]
+capabilities = ["upscale"]
+weights = ["public2x"]
+
+[profiles.public2x.defaults]
+scale = 2
+
+[profiles.public2x-nn]
+capabilities = ["upscale"]
+weights = ["public2x-nn"]
+
+[profiles.public2x-nn.defaults]
+scale = 2
+
+[profiles.nomos4x]
+capabilities = ["upscale"]
+weights = ["nomos4x"]
+
+[profiles.nomos4x.defaults]
+scale = 4
+
+[weights.public2x]
+path = "weights/2xpublic_realplksr_dysample_layernorm_real.safetensors"
+distribution = "external"
+source = "https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.safetensors"
+license = "Apache-2.0"
+
+[weights.public2x-nn]
+path = "weights/2xpublic_realplksr_dysample_layernorm_real_nn.safetensors"
+distribution = "external"
+source = "https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real_nn/2xPublic_realplksr_dysample_layernorm_real_nn.safetensors"
+license = "Apache-2.0"
+
+[weights.nomos4x]
+path = "weights/4xnomoswebphoto_realplksr.safetensors"
+distribution = "external"
+source = "https://github.com/Phhofm/models/releases/download/4xNomosWebPhoto_RealPLKSR/4xNomosWebPhoto_RealPLKSR.safetensors"
+license = "CC-BY-4.0"
