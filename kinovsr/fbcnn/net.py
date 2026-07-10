@@ -20,13 +20,13 @@ from torch (out,in) so forward is x @ W + b.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 
 from ..compile_cache import cached as _cached
+from ..settings import default_settings
 from ..weights import resolve_weights as _resolve_weights
 
 # The checkpoints are ~287MB each and are NOT bundled in-repo (free-account space); see
@@ -54,7 +54,7 @@ def resolve_weights(spec: Any = None) -> Path:
     $FBCNN_WEIGHTS. The ~287MB checkpoints are not shipped in-repo, so a miss raises a
     message pointing at the download + conversion (see weights/README.md)."""
     if spec is None or spec == "":
-        spec = os.environ.get("FBCNN_WEIGHTS")
+        spec = default_settings().fbcnn_weights
     try:
         return _resolve_weights(spec, _VARIANTS, _WEIGHTS_DIR, _DEFAULT_VARIANT)
     except FileNotFoundError as e:

@@ -17,6 +17,7 @@ from typing import Any
 
 from . import pixel_buffers as _pb
 from ._compat import Quartz, require_pyobjc, vt
+from .settings import default_settings
 
 
 @contextmanager
@@ -31,7 +32,7 @@ def _suppress_native_stderr():
     failures through API return values (the ok/err tuple), not stderr, so
     nothing important is hidden. Set KINOVSR_VERBOSE=1 to keep the native logs.
     """
-    if os.environ.get("KINOVSR_VERBOSE"):
+    if default_settings().verbose:
         yield
         return
     sys.stderr.flush()

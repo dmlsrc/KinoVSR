@@ -32,13 +32,13 @@ Layout: MLX-native NHWC; conv weights -> (O,kH,kW,I) at load.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 
 from ..compile_cache import cached as _cached
+from ..settings import default_settings
 from ..weights import resolve_weights as _resolve_weights
 
 _WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
@@ -58,7 +58,7 @@ def default_weights_path(variant: str = _DEFAULT_VARIANT) -> Path:
 def resolve_weights(spec: Any = None) -> Path:
     """Variant token (gan / mse) or a path; falls back to $ESC_WEIGHTS."""
     if spec is None or spec == "":
-        spec = os.environ.get("ESC_WEIGHTS")
+        spec = default_settings().esc_weights
     try:
         return _resolve_weights(spec, _VARIANTS, _WEIGHTS_DIR, _DEFAULT_VARIANT)
     except FileNotFoundError as e:

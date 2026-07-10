@@ -17,7 +17,6 @@ Interface is MLX-array in / MLX-array out: (H,W,3) float32 RGB in [0, 1].
 
 from __future__ import annotations
 
-import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -25,6 +24,7 @@ import mlx.core as mx
 
 from . import pixel_buffers as _pb
 from ._compat import Foundation, Quartz, autorelease_pool, require_pyobjc, vt
+from .settings import default_settings
 from .vsr import _suppress_native_stderr
 from .vsr_blocks import compiled_spynet_flow
 
@@ -230,7 +230,7 @@ class McTemporalDenoiser:
         self._w_sum = 0.0
         self._w_n = 0
         if self.flow_source == "spynet":
-            path = flow_weights or os.environ.get("SPYNET_WEIGHTS")
+            path = flow_weights or default_settings().spynet_weights
             if not path:
                 # stock weights ship with the package (5.5 MB)
                 from pathlib import Path as _P

@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -98,6 +97,7 @@ from kinovsr.edge_sanitize import (
 )
 from kinovsr.fastdvdnet import FastDvdDenoiser
 from kinovsr.progress import StackedPhaseBars
+from kinovsr.settings import default_settings
 from kinovsr.toflow import TOFlowDenoiser
 from kinovsr.vsr import NativePassthrough
 from kinovsr.vsr_blocks import make_lanczos_plan, resample_width
@@ -634,7 +634,7 @@ def run(args: argparse.Namespace) -> None:
         # checkpoint instead of assuming 4x, so output dims + encoder match the frames.
         from kinovsr.realesrgan import net as _rnet
         spatial_scale = _rnet.scale_of(_rnet.load_params(
-            _rnet.resolve_weights(args.realesrgan_weights or os.environ.get("REALESRGAN_WEIGHTS"))))
+            _rnet.resolve_weights(args.realesrgan_weights or default_settings().realesrgan_weights)))
     elif args.spatial_mode == "safmn":
         from kinovsr.safmn import net as _snet
         spatial_scale = _snet._config(_snet.load_params(args.safmn_weights))[3]
@@ -1017,7 +1017,7 @@ def run(args: argparse.Namespace) -> None:
                 # Weights ship with the package; --fastdvd-variant picks one, or
                 # --fastdvd-weights / $FASTDVD_WEIGHTS overrides the path entirely.
                 return FastDvdDenoiser(
-                    args.fastdvd_weights or os.environ.get("FASTDVD_WEIGHTS"),
+                    args.fastdvd_weights or default_settings().fastdvd_weights,
                     variant=args.fastdvd_variant,
                     strength=stg,
                     noise_map=tr,
@@ -1029,7 +1029,7 @@ def run(args: argparse.Namespace) -> None:
                 # BSVD weights are not bundled; --bsvd-variant picks a local token,
                 # or --bsvd-weights / $BSVD_WEIGHTS overrides the path entirely.
                 return BsvdDenoiser(
-                    args.bsvd_weights or os.environ.get("BSVD_WEIGHTS"),
+                    args.bsvd_weights or default_settings().bsvd_weights,
                     variant=args.bsvd_variant,
                     strength=stg,
                     dtype=parse_mlx_dtype_name(args.bsvd_dtype),
@@ -1043,11 +1043,11 @@ def run(args: argparse.Namespace) -> None:
                 # pair. It is blind (no noise-map input); strength is an output
                 # dry/wet blend to keep the old model usable on real footage.
                 return TOFlowDenoiser(
-                    args.toflow_weights or os.environ.get("TOFLOW_WEIGHTS"),
+                    args.toflow_weights or default_settings().toflow_weights,
                     variant=args.toflow_variant,
                     flow_scale=args.toflow_flow_scale,
                     passes=args.toflow_passes,
-                    graph=args.toflow_graph or os.environ.get("TOFLOW_GRAPH"),
+                    graph=args.toflow_graph or default_settings().toflow_graph,
                     strength=stg,
                     dtype=parse_mlx_dtype_name(args.toflow_dtype),
                 )
@@ -1076,7 +1076,7 @@ def run(args: argparse.Namespace) -> None:
             if _ppu is not None:
                 nm_pulse = _ppu
             _dens[_den_names.index("pvdd")] = PvddDenoiser(
-                args.pvdd_weights or os.environ.get("PVDD_WEIGHTS"),
+                args.pvdd_weights or default_settings().pvdd_weights,
                 variant=args.pvdd_variant,
                 window=args.pvdd_window, trim=args.pvdd_trim,
                 noise_variance=nv,
@@ -1161,7 +1161,7 @@ def run(args: argparse.Namespace) -> None:
             if name == "stdf":
                 from kinovsr.stdf.deblocker import StdfDeblocker
                 kr, kb = _yuv.coef_for_matrix(_resolved_color[2])    # match the source color matrix
-                return StdfDeblocker(args.deblock_weights or os.environ.get("STDF_WEIGHTS"),
+                return StdfDeblocker(args.deblock_weights or default_settings().stdf_weights,
                                      strength=stg, kr=kr, kb=kb,
                                      blockiness_map=_make_blk_tracker())
             if name == "toflow":
@@ -1170,11 +1170,11 @@ def run(args: argparse.Namespace) -> None:
                 # --toflow-variant deblock; this placement lets it chain with
                 # a real denoiser in the natural order)
                 return TOFlowDenoiser(
-                    args.toflow_weights or os.environ.get("TOFLOW_WEIGHTS"),
+                    args.toflow_weights or default_settings().toflow_weights,
                     variant="deblock",
                     flow_scale=args.toflow_flow_scale,
                     passes=args.toflow_passes,
-                    graph=args.toflow_graph or os.environ.get("TOFLOW_GRAPH"),
+                    graph=args.toflow_graph or default_settings().toflow_graph,
                     strength=stg,
                     dtype=parse_mlx_dtype_name(args.toflow_dtype),
                 )
@@ -1192,7 +1192,7 @@ def run(args: argparse.Namespace) -> None:
                         raise SystemExit(
                             f"bad --fbcnn-quality {args.fbcnn_quality!r}: expected 'auto', "
                             f"'blind', or a number 1-100") from None
-                fb = FbcnnDeblocker(args.deblock_weights or os.environ.get("FBCNN_WEIGHTS"),
+                fb = FbcnnDeblocker(args.deblock_weights or default_settings().fbcnn_weights,
                                     quality=_quality, strength=args.fbcnn_strength,
                                     blockiness_map=_make_blk_tracker(),
                                     quality_fallback=args.fbcnn_quality_fallback)
@@ -1213,7 +1213,7 @@ def run(args: argparse.Namespace) -> None:
             from kinovsr.basicvsrpp.upscaler import BasicVsrUpscaler
             # weights spec: --basicvsrpp-weights (token or path) > env > --variant token
             up = BasicVsrUpscaler(
-                args.basicvsrpp_weights or os.environ.get("BASICVSRPP_WEIGHTS")
+                args.basicvsrpp_weights or default_settings().basicvsrpp_weights
                 or args.basicvsrpp_variant,
                 window=args.basicvsrpp_window, trim=args.basicvsrpp_trim,
                 flow_mode=args.basicvsrpp_flow_mode,
@@ -1224,7 +1224,7 @@ def run(args: argparse.Namespace) -> None:
         elif args.spatial_mode == "realbasicvsr":
             from kinovsr.realbasicvsr.upscaler import RealBasicVsrUpscaler
             up = RealBasicVsrUpscaler(
-                args.realbasicvsr_weights or os.environ.get("REALBASICVSR_WEIGHTS"),
+                args.realbasicvsr_weights or default_settings().realbasicvsr_weights,
                 window=args.realbasicvsr_window,
                 trim=args.realbasicvsr_trim,
                 dynamic_refine_thres=args.realbasicvsr_dynamic_refine_thres,
@@ -1238,7 +1238,7 @@ def run(args: argparse.Namespace) -> None:
         elif args.spatial_mode == "realesrgan":
             from kinovsr.realesrgan.upscaler import RealEsrganUpscaler
             up = RealEsrganUpscaler(
-                args.realesrgan_weights or os.environ.get("REALESRGAN_WEIGHTS"),
+                args.realesrgan_weights or default_settings().realesrgan_weights,
                 denoise_strength=args.realesrgan_denoise,
             )
         elif args.spatial_mode == "safmn":
@@ -1268,8 +1268,8 @@ def run(args: argparse.Namespace) -> None:
         elif args.spatial_mode == "toflow":
             from kinovsr.toflow import TOFlowSrUpscaler
             up = TOFlowSrUpscaler(
-                args.toflow_sr_weights or os.environ.get("TOFLOW_SR_WEIGHTS"),
-                graph=args.toflow_sr_graph or os.environ.get("TOFLOW_SR_GRAPH"),
+                args.toflow_sr_weights or default_settings().toflow_sr_weights,
+                graph=args.toflow_sr_graph or default_settings().toflow_sr_graph,
                 dtype=parse_mlx_dtype_name(args.toflow_sr_dtype),
             )
 
@@ -1277,7 +1277,7 @@ def run(args: argparse.Namespace) -> None:
         if args.nafnet != "off":
             from kinovsr.nafnet import NafnetRestorer
             naf = NafnetRestorer(
-                args.nafnet_weights or os.environ.get("NAFNET_WEIGHTS") or args.nafnet,
+                args.nafnet_weights or default_settings().nafnet_weights or args.nafnet,
                 strength=args.nafnet_strength,
                 pool_mode=args.nafnet_pool,
                 variant=args.nafnet,
@@ -1308,7 +1308,7 @@ def run(args: argparse.Namespace) -> None:
                 raise SystemExit(
                     f"--restore-strength: give 1 value or one per --restore stage "
                     f"({len(variants)}), got {len(strengths)}")
-            wenv = os.environ.get("BASICVSRPP_RESTORE_WEIGHTS")
+            wenv = default_settings().basicvsrpp_restore_weights
             res = []
             for variant, strength in zip(variants, strengths, strict=True):
                 spec = variant

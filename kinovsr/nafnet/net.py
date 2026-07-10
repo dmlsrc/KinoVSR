@@ -22,13 +22,13 @@ default), matching the reference.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 
 from ..compile_cache import cached as _cached
+from ..settings import default_settings
 from ..weights import resolve_weights as _resolve_weights
 
 _WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
@@ -55,7 +55,7 @@ def resolve_weights(spec: Any = None) -> Path:
     $NAFNET_WEIGHTS. Not bundled (the checkpoints are 68-464MB) -- a miss raises a
     download + conversion hint (see weights/README.md)."""
     if spec is None or spec == "":
-        spec = os.environ.get("NAFNET_WEIGHTS")
+        spec = default_settings().nafnet_weights
     try:
         return _resolve_weights(spec, _VARIANTS, _WEIGHTS_DIR, _DEFAULT_VARIANT)
     except FileNotFoundError as e:
