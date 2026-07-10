@@ -31,6 +31,7 @@ classifiers = [
 ]
 dependencies = [
     "mlx>=0.32.0",
+    "rich>=15.0",
     "pyobjc-core>=12.2",
     "pyobjc-framework-AVFoundation>=12.2",
     "pyobjc-framework-CoreAudio>=12.2",
