@@ -130,8 +130,16 @@ class ChainRun:
     stage exactly once - a plain generator would never have entered its
     own try/finally. Iteration exhaustion, a stage error, an explicit
     ``close``, context-manager exit, and garbage collection all funnel
-    into the same exactly-once close path; a close failure surfaces on
-    the success path and never masks an active error.
+    into the same exactly-once close path.
+
+    Exception precedence is fixed and documented: an ACTIVE error (a
+    stage failure, a context-manager body error) always outranks cleanup
+    failures; with no active error, the FIRST cleanup failure wins
+    (generator close before processor close). A ``KeyboardInterrupt`` or
+    ``SystemExit`` raised during cleanup outranks everything - after the
+    remaining stages have still been closed. Outranked errors are
+    preserved on the winner's ``__context__`` chain, never silently
+    dropped.
     """
 
     def __init__(
@@ -165,37 +173,76 @@ class ChainRun:
         try:
             return next(self._stream)
         except StopIteration:
-            self._close_all(active_error=False)   # may raise a close error
+            close_error, interrupt = self._close_all()
+            failure = interrupt or close_error
+            if failure is not None:
+                # success path: cleanup failures surface
+                raise failure from None
             raise
-        except BaseException:
-            self._close_all(active_error=True)
-            raise
+        except BaseException as active:
+            _, interrupt = self._close_all()
+            if interrupt is not None:
+                # a cleanup interrupt outranks the stage error but keeps
+                # it on the chain
+                raise interrupt from active
+            raise   # the active error wins; an ordinary close error loses
 
     # -- lifecycle ---------------------------------------------------------
+
+    @staticmethod
+    def _is_interrupt(exc: BaseException) -> bool:
+        return not isinstance(exc, Exception)   # KeyboardInterrupt, SystemExit
+
+    def _shutdown(self) -> BaseException | None:
+        """Close the stream, then every processor - unconditionally - and
+        return the one cleanup failure to deliver (or None). Precedence:
+        an interrupt beats ordinary failures; otherwise the FIRST failure
+        (stream close happens before processor close) wins, with the
+        loser chained onto the winner's context where possible."""
+        stream, self._stream = self._stream, None
+        stream_error: BaseException | None = None
+        if stream is not None:
+            try:
+                stream.close()
+            except BaseException as exc:  # noqa: BLE001 - re-delivered below
+                stream_error = exc
+        close_error, interrupt = self._close_all()
+        candidates = [c for c in (stream_error, close_error)
+                      if c is not None]
+        if interrupt is not None:
+            candidates.insert(0, interrupt)
+        elif stream_error is not None and self._is_interrupt(stream_error):
+            pass   # already first among the candidates
+        if not candidates:
+            return None
+        winner = next((c for c in candidates if self._is_interrupt(c)),
+                      candidates[0])
+        for loser in candidates:
+            if loser is not winner and winner.__context__ is None:
+                winner.__context__ = loser
+        return winner
 
     def close(self) -> None:
         """Cancel the run; safe at any point, including before the first
         pull and repeatedly."""
-        stream, self._stream = self._stream, None
-        try:
-            if stream is not None:
-                stream.close()
-        finally:
-            # Processor cleanup is unconditional, even when generator
-            # closure itself raises (a stage misbehaving under
-            # GeneratorExit must not leak the other stages).
-            self._close_all(active_error=False)
+        failure = self._shutdown()
+        if failure is not None:
+            raise failure
 
     def __enter__(self) -> ChainRun:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        stream, self._stream = self._stream, None
-        try:
-            if stream is not None:
-                stream.close()
-        finally:
-            self._close_all(active_error=exc_type is not None)
+        failure = self._shutdown()
+        if failure is None:
+            return
+        if exc is not None and not self._is_interrupt(failure):
+            # The active body error outranks ordinary cleanup failures;
+            # keep the cleanup trace on its context chain when free.
+            if exc.__context__ is None:
+                exc.__context__ = failure
+            return
+        raise failure
 
     def __del__(self) -> None:
         # A finalizer must never raise - not even for interrupts; close
@@ -203,9 +250,12 @@ class ChainRun:
         with contextlib.suppress(BaseException):
             self.close()
 
-    def _close_all(self, active_error: bool) -> None:
+    def _close_all(self) -> tuple[Exception | None, BaseException | None]:
+        """Close every stage exactly once; report failures instead of
+        raising so callers own delivery precedence. Returns the first
+        ordinary close error (wrapped) and the first interrupt."""
         if self._closed:
-            return
+            return None, None
         self._closed = True
         first_close_error: Exception | None = None
         interrupt: BaseException | None = None
@@ -220,10 +270,7 @@ class ChainRun:
                 # the remaining stages, then deliver it.
                 if interrupt is None:
                     interrupt = exc
-        if interrupt is not None:
-            raise interrupt
-        if first_close_error is not None and not active_error:
-            raise first_close_error
+        return first_close_error, interrupt
 
 
 def run_chain(

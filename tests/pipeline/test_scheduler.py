@@ -453,3 +453,50 @@ class TestCleanupUnderInterrupts:
         with pytest.raises(RuntimeError, match="refused to die"):
             stream.close()
         assert [x for x in log if x[1] == "close"] == [("a", "close", "")]
+
+
+class TestCleanupPrecedence:
+    """Combined-failure precedence: the active error outranks cleanup
+    noise; with no active error the FIRST cleanup failure wins; outranked
+    errors stay on the winner's context chain."""
+
+    class _BadStream:
+        def close(self):
+            raise RuntimeError("stream-close failed")
+
+    def test_body_error_outranks_failing_stream_close(self):
+        def drive_and_fail(stream):
+            with stream:
+                next(stream)
+                stream._stream = self._BadStream()
+                raise ValueError("body error")
+
+        log = []
+        stage = Recorder("a", log)
+        stream = run_chain(chain(stage), units(3), CONTEXT)
+        with pytest.raises(ValueError, match="body error") as exc:
+            drive_and_fail(stream)
+        # processors still closed, and the cleanup failure is preserved
+        # on the delivered error's context chain
+        assert [x for x in log if x[1] == "close"] == [("a", "close", "")]
+        context = exc.value.__context__
+        assert isinstance(context, RuntimeError)
+        assert "stream-close failed" in str(context)
+
+    def test_first_cleanup_failure_wins_on_explicit_close(self):
+        class BadClose(Recorder):
+            def close(self, context):
+                super().close(context)
+                raise ValueError("processor-close failed")
+
+        stage = BadClose("a")
+        stream = run_chain(chain(stage), units(3), CONTEXT)
+        next(stream)
+        stream._stream = self._BadStream()
+        with pytest.raises(RuntimeError, match="stream-close failed") as exc:
+            stream.close()
+        assert [x for x in stage.log if x[1] == "close"] == [
+            ("a", "close", "")]
+        context = exc.value.__context__
+        assert context is not None
+        assert "processor-close failed" in str(context)
