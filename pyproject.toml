@@ -66,10 +66,10 @@ Repository = "https://github.com/dmlsrc/KinoVSR"
 Issues = "https://github.com/dmlsrc/KinoVSR/issues"
 
 [project.scripts]
-kinovsr = "scripts.vsr_harness:main"
+kinovsr = "kinovsr.cli.main:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["kinovsr", "scripts"]
+packages = ["kinovsr"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"
@@ -109,8 +109,30 @@ ignore = [
 # package imports.
 "scripts/**" = ["T20"]
 "scripts/vsr_harness.py" = ["E402", "T20"]
-# Transitional: inherited package modules still emit CLI/progress/demo output.
-# Keep T20 active elsewhere while the runtime grows a proper logging surface.
-"kinovsr/**" = ["T20"]
+# Transitional: inherited runtime modules still emit CLI/progress/demo
+# output with bare print. New package modules (cli, ui, config, api,
+# settings, reporting) use logging or the reporter instead - keep them
+# OUT of this list. Entries disappear as M4 migrates each family.
+"kinovsr/_harness.py" = ["T20"]
+"kinovsr/basicvsrpp/**" = ["T20"]
+"kinovsr/deform_conv.py" = ["T20"]
+"kinovsr/dover/**" = ["T20"]
+"kinovsr/encode.py" = ["T20"]
+"kinovsr/esc/**" = ["T20"]
+"kinovsr/fbcnn/**" = ["T20"]
+"kinovsr/ffmpeg_encoder.py" = ["T20"]
+"kinovsr/musiq/**" = ["T20"]
+"kinovsr/nafnet/**" = ["T20"]
+"kinovsr/progress/**" = ["T20"]
+"kinovsr/realbasicvsr/**" = ["T20"]
+"kinovsr/realesrgan/**" = ["T20"]
+"kinovsr/realplksr/**" = ["T20"]
+"kinovsr/realviformer/**" = ["T20"]
+"kinovsr/safmn/**" = ["T20"]
+"kinovsr/stdf/**" = ["T20"]
+"kinovsr/temporal.py" = ["T20"]
+"kinovsr/toflow/**" = ["T20"]
+"kinovsr/vsr.py" = ["T20"]
+"kinovsr/writer.py" = ["T20"]
 # Transitional: legacy tests predate KinoMLX's stricter pytest style.
 "tests/**" = ["PT006", "PT011", "PT018"]

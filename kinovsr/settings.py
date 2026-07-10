@@ -150,7 +150,9 @@ class Settings:
         default=None, metadata={"env": "{{BSVD_WEIGHTS}}"})
     esc_weights: str | None = field(
         default=None, metadata={"env": "{{ESC_WEIGHTS}}"})
-    fastdvd_weights: str | None = field(
+    # Canonical family name is fastdvdnet (planning 07-cli-vocabulary.md);
+    # the env var keeps its legacy compatibility spelling.
+    fastdvdnet_weights: str | None = field(
         default=None, metadata={"env": "{{FASTDVD_WEIGHTS}}"})
     fbcnn_weights: str | None = field(
         default=None, metadata={"env": "{{FBCNN_WEIGHTS}}"})
@@ -244,7 +246,8 @@ def _reset_default_settings() -> None:
 # ===========================================================================
 
 
-def add_argparse_args(parser: argparse.ArgumentParser) -> None:
+def add_argparse_args(parser: argparse.ArgumentParser,
+                      skip: frozenset[str] | set[str] = frozenset()) -> None:
     """Add a ``--kebab-case`` flag for every Settings field.
 
     Flags default to ``None`` (unset). After parsing, apply them with
@@ -252,9 +255,16 @@ def add_argparse_args(parser: argparse.ArgumentParser) -> None:
     ``Settings.from_env()``). Booleans get a ``--flag`` / ``--no-flag``
     pair so they can be turned off explicitly. CLI values are verbatim:
     no ``{{VAR}}`` substitution.
+
+    ``skip`` names fields whose flag another parser group already owns
+    (the CLI registry defines richer per-family weight flags whose dest
+    IS the Settings field); adding them twice would be an argparse
+    conflict.
     """
     group = parser.add_argument_group("settings overrides (override env vars)")
     for f in fields(Settings):
+        if f.name in skip:
+            continue
         flag = "--" + f.name.replace("_", "-")
         annotation = f.type if isinstance(f.type, str) else str(f.type)
         if "bool" in annotation:

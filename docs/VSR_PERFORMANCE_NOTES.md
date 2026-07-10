@@ -2,7 +2,7 @@
 
 Findings, gotchas, and methodology from the 2026-07 optimization campaign over
 the `kinovsr/` processors (deblockers, denoisers, restorers, and learned
-upscalers driven by `scripts/vsr_harness.py`). Everything here was measured on
+upscalers driven by the `kinovsr` CLI). Everything here was measured on
 an M1 Max (64 GB) with MLX, fp16-first, MLX buffer cache capped at 1 GB.
 
 The single most important lesson: **"compute-bound" must be established by

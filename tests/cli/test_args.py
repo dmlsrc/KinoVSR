@@ -1,0 +1,182 @@
+"""Parser behavior: canonical flags, hidden aliases, exit codes, assembly."""
+
+import argparse
+from pathlib import Path
+
+import pytest
+
+from kinovsr.cli.args import build_parser, validate_args
+from kinovsr.cli.config import assemble, normalize_chain
+from kinovsr.config import ConfigError
+from kinovsr.settings import Settings
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(scope="module")
+def parser() -> argparse.ArgumentParser:
+    return build_parser()
+
+
+BASE = ["--video", "clip.mp4", "--output-dir", "out"]
+
+
+class TestAliases:
+    def test_canonical_and_alias_hit_the_same_dest(self, parser):
+        canon = parser.parse_args(
+            [*BASE, "--upscale", "safmn", "--basicvsrpp-flow", "vt",
+             "--fastdvdnet-profile", "standard",
+             "--realesrgan-denoise-strength", "0.3",
+             "--realbasicvsr-clean-threshold", "12"])
+        legacy = parser.parse_args(
+            [*BASE, "--spatial-mode", "safmn", "--basicvsrpp-flow-mode", "vt",
+             "--fastdvd-variant", "standard",
+             "--realesrgan-denoise", "0.3",
+             "--realbasicvsr-dynamic-refine-thres", "12"])
+        for dest in ("upscale", "basicvsrpp_flow", "fastdvdnet_profile",
+                     "realesrgan_denoise_strength",
+                     "realbasicvsr_clean_threshold"):
+            assert getattr(canon, dest) == getattr(legacy, dest)
+
+    def test_alias_absent_leaves_canonical_default(self, parser):
+        args = parser.parse_args(BASE)
+        assert args.upscale == "balanced"
+        assert args.fastdvdnet_profile == "clipped"
+
+    def test_help_shows_canonical_names_only(self, parser):
+        text = parser.format_help()
+        for hidden in ("--spatial-mode", "--basicvsrpp-flow-mode",
+                       "--fastdvd-variant", "--fastdvd-weights",
+                       "--realbasicvsr-dynamic-refine-thres",
+                       "--deblock-weights"):
+            assert hidden not in text, hidden
+        for canonical in ("--upscale", "--fastdvdnet-profile",
+                          "--stdf-weights", "--fbcnn-weights",
+                          "--realesrgan-denoise-strength", "--base-config",
+                          "--verbose", "--mc-flow "):
+            assert canonical in text, canonical
+
+
+class TestExitCodes:
+    def test_help_exits_zero(self, parser, capsys):
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(["--help"])
+        assert exc.value.code == 0
+        assert "--upscale" in capsys.readouterr().out
+
+    def test_missing_video_exits_two(self, parser, capsys):
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(["--output-dir", "out"])
+        assert exc.value.code == 2
+        capsys.readouterr()
+
+    def test_bad_choice_exits_two(self, parser, capsys):
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args([*BASE, "--upscale", "enhance"])
+        assert exc.value.code == 2
+        capsys.readouterr()
+
+    def test_output_dir_required_without_probe(self, parser, capsys):
+        args = parser.parse_args(["--video", "clip.mp4"])
+        with pytest.raises(SystemExit) as exc:
+            validate_args(parser, args)
+        assert exc.value.code == 2
+        capsys.readouterr()
+
+    def test_probe_noise_waives_output_dir(self, parser):
+        args = parser.parse_args(["--video", "clip.mp4", "--probe-noise"])
+        validate_args(parser, args)
+
+    def test_realbasicvsr_window_bounds(self, parser, capsys):
+        args = parser.parse_args(
+            [*BASE, "--upscale", "realbasicvsr", "--realbasicvsr-window", "0"])
+        with pytest.raises(SystemExit) as exc:
+            validate_args(parser, args)
+        assert exc.value.code == 2
+        capsys.readouterr()
+
+
+class TestChains:
+    def test_family_alias_normalizes(self):
+        assert normalize_chain("fastdvd,mc") == "fastdvdnet,mc"
+        assert normalize_chain("off") == "off"
+        assert normalize_chain("mc, bsvd") == "mc,bsvd"
+
+    def test_assemble_normalizes_denoise_chain(self, parser):
+        args = parser.parse_args([*BASE, "--denoise", "fastdvd,bsvd"])
+        inv = assemble(args, base=Settings())
+        assert inv.options.denoise == "fastdvdnet,bsvd"
+
+
+class TestSettingsTrifecta:
+    def test_toml_settings_then_cli_wins(self, parser, tmp_path: Path):
+        toml = tmp_path / "s.toml"
+        toml.write_text("[settings]\nquiet = true\nmlx_cache_limit_gb = 2.5\n")
+        args = parser.parse_args(
+            [*BASE, "--config", str(toml), "--mlx-cache-limit-gb", "0.5"])
+        inv = assemble(args, base=Settings())
+        assert inv.settings.quiet is True
+        assert inv.settings.mlx_cache_limit_gb == 0.5
+
+    def test_base_configs_apply_in_order(self, parser, tmp_path: Path):
+        a = tmp_path / "a.toml"
+        b = tmp_path / "b.toml"
+        a.write_text("[settings]\nmlx_cache_limit_gb = 1.5\nquiet = true\n")
+        b.write_text("[settings]\nmlx_cache_limit_gb = 3.0\n")
+        args = parser.parse_args(
+            [*BASE, "--base-config", str(a), "--base-config", str(b)])
+        inv = assemble(args, base=Settings())
+        assert inv.settings.mlx_cache_limit_gb == 3.0
+        assert inv.settings.quiet is True
+
+    def test_family_weights_flag_lands_in_settings(self, parser):
+        args = parser.parse_args([*BASE, "--basicvsrpp-weights", "/w/b.st"])
+        inv = assemble(args, base=Settings())
+        assert inv.settings.basicvsrpp_weights == "/w/b.st"
+
+    def test_unknown_settings_key_is_an_error(self, parser, tmp_path: Path):
+        toml = tmp_path / "s.toml"
+        toml.write_text("[settings]\nvebrose = true\n")
+        args = parser.parse_args([*BASE, "--config", str(toml)])
+        with pytest.raises(ConfigError, match="unknown key"):
+            assemble(args, base=Settings())
+
+    def test_wrong_type_is_an_error(self, parser, tmp_path: Path):
+        toml = tmp_path / "s.toml"
+        toml.write_text('[settings]\nquiet = "yes"\n')
+        args = parser.parse_args([*BASE, "--config", str(toml)])
+        with pytest.raises(ConfigError, match="boolean"):
+            assemble(args, base=Settings())
+
+    def test_stage_tables_are_m3(self, parser, tmp_path: Path):
+        toml = tmp_path / "p.toml"
+        toml.write_text('pipeline = ["denoise"]\n[denoise]\nprocessor = "bsvd"\n')
+        args = parser.parse_args([*BASE, "--config", str(toml)])
+        with pytest.raises(ConfigError, match="M3"):
+            assemble(args, base=Settings())
+
+
+class TestDeblockWeightsCompat:
+    def test_fills_chained_families_without_family_value(self, parser):
+        args = parser.parse_args(
+            [*BASE, "--deblock", "stdf,fbcnn",
+             "--deblock-weights", "/w/legacy.st"])
+        inv = assemble(args, base=Settings())
+        assert inv.settings.stdf_weights == "/w/legacy.st"
+        assert inv.settings.fbcnn_weights == "/w/legacy.st"
+
+    def test_family_flag_wins_over_legacy_fill(self, parser):
+        args = parser.parse_args(
+            [*BASE, "--deblock", "stdf,fbcnn",
+             "--deblock-weights", "/w/legacy.st",
+             "--fbcnn-weights", "/w/fb.st"])
+        inv = assemble(args, base=Settings())
+        assert inv.settings.stdf_weights == "/w/legacy.st"
+        assert inv.settings.fbcnn_weights == "/w/fb.st"
+
+    def test_no_fill_outside_the_chain(self, parser):
+        args = parser.parse_args(
+            [*BASE, "--deblock", "stdf", "--deblock-weights", "/w/legacy.st"])
+        inv = assemble(args, base=Settings())
+        assert inv.settings.stdf_weights == "/w/legacy.st"
+        assert inv.settings.fbcnn_weights is None
