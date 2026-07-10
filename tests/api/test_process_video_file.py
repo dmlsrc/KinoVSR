@@ -101,12 +101,18 @@ def test_facade_probes_trims_and_carries_audio(clip_with_audio, tmp_path):
     assert n_video == 1
     assert n_audio == 1, "muxed audio track missing from the output"
 
+    # The facade (not just the CLI) applies the MLX cache cap from settings.
+    import mlx.core as mx
+    previous = mx.set_cache_limit(1000 ** 3)
+    assert previous == int(0.25 * (1000 ** 3))
+
 
 def test_main_runs_legacy_spellings_end_to_end(clip_with_audio, tmp_path):
     rc = main([
         "--video", str(clip_with_audio),
         "--output-dir", str(tmp_path),
         "--spatial-mode", "none",        # hidden legacy alias for --upscale
+        "--reader", "ffmpeg",            # force the compatibility reader
         "--max-frames", "6",
         "--output-prefix", "legacy",
         "--mlx-cache-limit-gb", "0.25",
@@ -117,3 +123,9 @@ def test_main_runs_legacy_spellings_end_to_end(clip_with_audio, tmp_path):
     frames, _, n_audio = _output_streams(outputs[0])
     assert frames == 6
     assert n_audio == 0  # no --audio: silent output
+
+    # Reader choice is per-run: a forced-ffmpeg run must not rebind the
+    # module-level reader that later runs (facade calls) start from.
+    import kinovsr._harness as harness
+    import kinovsr.video_reader as native_reader
+    assert harness._native_vr is native_reader

@@ -21,21 +21,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     settings = invocation.settings
-    limit = settings.mlx_cache_limit_gb
-    if limit is None:
-        limit = 1.0  # the historical harness default
-    if limit > 0:
-        import mlx.core as mx
+    from kinovsr.api import (
+        VideoFileConfig,
+        process_video_file,
+        resolve_mlx_cache_limit_gb,
+    )
 
-        mx.set_cache_limit(int(limit * (1000 ** 3)))
-        mx.clear_cache()
-        if not settings.quiet:
-            get_console().print(f"MLX cache limit: {limit:g} GB")
+    limit = resolve_mlx_cache_limit_gb(settings)
+    if limit > 0 and not settings.quiet:
+        get_console().print(f"MLX cache limit: {limit:g} GB")
 
-    from kinovsr import require_pyobjc
-    from kinovsr.api import VideoFileConfig, process_video_file
-
-    require_pyobjc()
     process_video_file(
         VideoFileConfig(settings=settings, options=invocation.options))
     return 0

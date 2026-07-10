@@ -34,7 +34,7 @@ from kinovsr import (
 )
 from kinovsr import color as _color
 from kinovsr import pixel_buffers as _pb
-from kinovsr import video_reader as _vr
+from kinovsr import video_reader as _native_vr
 from kinovsr import yuv as _yuv
 from kinovsr.api import VideoProcessResult
 from kinovsr.bsvd import BsvdDenoiser
@@ -143,7 +143,7 @@ def resolve_trim(
     return start_frame, end_frame
 
 
-def _read_audio_track_from_video(mp4_path: Path) -> AudioTrack | None:
+def _read_audio_track_from_video(mp4_path: Path, vr: Any) -> AudioTrack | None:
     """Read the audio track of an MP4/MOV into an in-memory AudioTrack.
 
     Uses AVFoundation's AVAudioFile (via videotoolbox.audio.read_wav), which
@@ -153,12 +153,12 @@ def _read_audio_track_from_video(mp4_path: Path) -> AudioTrack | None:
     """
     from kinovsr.audio import read_wav
 
-    if hasattr(_vr, "read_audio_track"):
+    if hasattr(vr, "read_audio_track"):
         # ffmpeg compatibility reader: decode audio via the same backend that
         # reads the video (the native audio path cannot open these containers).
         print(f"[setup] reading audio track from {mp4_path} (ffmpeg)")
         try:
-            return _vr.read_audio_track(mp4_path)
+            return vr.read_audio_track(mp4_path)
         except Exception as e:
             print(f"[setup] audio decode failed ({type(e).__name__}); continuing without audio")
             return None
@@ -246,26 +246,28 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
 
     # ---- reader selection: native (AVFoundation) unless forced or refused.
     # The ffmpeg compatibility reader mirrors the native surface for
-    # containers/codecs AVFoundation cannot open (MKV, VP9, ...).
-    global _vr
+    # containers/codecs AVFoundation cannot open (MKV, VP9, ...). The choice
+    # is strictly per-run: rebinding a module global here leaked one run's
+    # ffmpeg fallback into every later facade call in the same process.
+    vr = _native_vr
     if args.reader == "ffmpeg":
         from kinovsr import ffmpeg_reader
-        _vr = ffmpeg_reader
+        vr = ffmpeg_reader
         print("[reader] ffmpeg compatibility reader (forced)")
     elif args.reader == "auto":
         try:
-            _vr.probe_video(Path(args.video))
+            vr.probe_video(Path(args.video))
         except Exception as e:
             from kinovsr import ffmpeg_reader
-            _vr = ffmpeg_reader
+            vr = ffmpeg_reader
             print(f"[reader] native reader cannot open this file "
                   f"({type(e).__name__}); using the ffmpeg compatibility reader")
 
     print(f"Reading video: {args.video}")
-    in_w, in_h, source_fps, total_frames, src_transform, src_pixel_aspect = _vr.probe_video(
+    in_w, in_h, source_fps, total_frames, src_transform, src_pixel_aspect = vr.probe_video(
         Path(args.video),
     )
-    _src_color = _vr.probe_color(Path(args.video))
+    _src_color = vr.probe_color(Path(args.video))
     _resolved_color = _color.resolve(_src_color, args.source_color, args.source_range)
     color_props = _color.av_color_properties(_resolved_color)
     cv_color = _color.cv_triple(_resolved_color)
@@ -298,7 +300,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
     if args.crop_bars or args.sanitize_edges == "auto":
         _edge_samples, s_idx = [], 0
         want = set(range(0, 24, 4))
-        for s_chunk in _vr.iter_video_buffer_chunks(
+        for s_chunk in vr.iter_video_buffer_chunks(
                 Path(args.video), _pb.PIX_RGBAHALF, chunk_size=8):
             for s_buf in s_chunk:
                 if s_idx in want:
@@ -452,7 +454,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
         return f"{fr} ({fr / source_fps:.3f}s)" if source_fps > 0 else f"{fr}"
 
     # Keyframes are needed by --snap-start and/or --gop-align; detect once.
-    _kf_all = (_vr.keyframe_display_indices(Path(args.video))
+    _kf_all = (vr.keyframe_display_indices(Path(args.video))
                if (args.snap_start or args.gop_align) else None)
     if args.snap_start and _kf_all:
         _snap = min(_kf_all, key=lambda k: abs(k - win_start))
@@ -543,19 +545,19 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
         # and range, overriding the container tag / VideoToolbox's
         # resolution-based guess. (NV12 'fast' keeps the default decode;
         # the LowLatency scaler consumes YUV directly.)
-        chunks = _vr.iter_forced_color_chunks(
+        chunks = vr.iter_forced_color_chunks(
             Path(args.video), vsr_src_fmt, cv_color[2], _src_color["full_range"],
             chunk_size=buf_chunk, start_frame=_read_start, end_frame=win_end,
             reinterpret_full_range=output_full_range,
         )
     else:
-        chunks = _vr.iter_video_buffer_chunks(
+        chunks = vr.iter_video_buffer_chunks(
             Path(args.video), vsr_src_fmt, chunk_size=buf_chunk,
             start_frame=_read_start, end_frame=win_end,
         )
     # Carry the source file's audio through to the output MP4.
     if args.audio:
-        audio_track = _read_audio_track_from_video(Path(args.video))
+        audio_track = _read_audio_track_from_video(Path(args.video), vr)
 
     # ---- Audio trim + sidecar ----------------------------------------------
     # When --start/--end trim the video, trim the audio to the same window so
@@ -632,7 +634,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
         print(f"[probe] noise analysis: {len(_starts)} windows of 12 frames in "
               f"[{win_start}, {_pw_end})")
         try:
-            _kfl = _vr.keyframe_display_indices(Path(args.video)) or [0]
+            _kfl = vr.keyframe_display_indices(Path(args.video)) or [0]
         except Exception:
             _kfl = [0]
         _all_frames: list = []
@@ -641,7 +643,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
         _mc_sigs: list = []
         for ws in _starts:
             _fr = []
-            for _chk in _vr.iter_video_buffer_chunks(
+            for _chk in vr.iter_video_buffer_chunks(
                     Path(args.video), _pb.PIX_RGBAHALF, chunk_size=6,
                     start_frame=ws, end_frame=min(ws + 12, _pw_end)):
                 _fr += [mx.clip(_pb.read_buffer_rgb_f32(b), 0, 1) for b in _chk]
@@ -753,7 +755,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
                   "tools will not touch it")
         _bpp = None
         try:
-            _sizes = _vr.coded_frame_sizes(Path(args.video))
+            _sizes = vr.coded_frame_sizes(Path(args.video))
         except Exception:
             _sizes = []
         if _sizes:

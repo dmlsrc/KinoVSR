@@ -40,8 +40,30 @@ class VideoProcessResult:
     elapsed_s: float = 0.0
 
 
+def resolve_mlx_cache_limit_gb(settings: Settings) -> float:
+    """The effective MLX buffer-cache cap in GB: the setting when given,
+    else the historical harness default of 1.0; 0 disables the cap."""
+    limit = settings.mlx_cache_limit_gb
+    return 1.0 if limit is None else limit
+
+
 def process_video_file(config: VideoFileConfig) -> VideoProcessResult:
-    """Process one video file to output files, per the resolved config."""
+    """Process one video file to output files, per the resolved config.
+
+    Runtime environment setup (the MLX cache cap, the PyObjC presence
+    check) happens here, not in the CLI, so the same ``VideoFileConfig``
+    behaves identically through the API and the console entry point.
+    """
+    from kinovsr import require_pyobjc
+
+    require_pyobjc()
+    limit = resolve_mlx_cache_limit_gb(config.settings)
+    if limit > 0:
+        import mlx.core as mx
+
+        mx.set_cache_limit(int(limit * (1000 ** 3)))
+        mx.clear_cache()
+
     from kinovsr import _harness  # heavy import (MLX, native session setup)
 
     return _harness.run(config.options, settings=config.settings)
