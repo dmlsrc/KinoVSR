@@ -8,7 +8,7 @@ import numpy as np
 
 
 def load_metric_module():
-    script = Path(__file__).resolve().parents[1] / "scripts" / "compare_vsr_artifacts.py"
+    script = Path(__file__).resolve().parents[2] / "scripts" / "compare_vsr_artifacts.py"
     spec = importlib.util.spec_from_file_location("compare_vsr_artifacts", script)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)

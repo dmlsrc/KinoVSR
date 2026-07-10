@@ -10,7 +10,7 @@ from kinovsr.realbasicvsr.upscaler import RealBasicVsrUpscaler
 from kinovsr.realviformer.upscaler import RealViformerUpscaler
 from kinovsr.vsr_blocks import _compute_flows, box3, history_improve_gate
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_compute_flows_zero_mode_returns_zero_fields():

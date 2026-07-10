@@ -73,7 +73,7 @@ packages = ["kinovsr", "scripts"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"
-addopts = "-ra -q --strict-markers --strict-config"
+addopts = "-ra -q --strict-markers --strict-config --import-mode=importlib"
 testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
