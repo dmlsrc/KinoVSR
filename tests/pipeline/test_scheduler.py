@@ -500,3 +500,25 @@ class TestCleanupPrecedence:
         context = exc.value.__context__
         assert context is not None
         assert "processor-close failed" in str(context)
+
+    def test_first_interrupt_wins_when_both_layers_interrupt(self):
+        class InterruptingClose(Recorder):
+            def close(self, context):
+                super().close(context)
+                raise SystemExit("processor-second")
+
+        class InterruptingStream:
+            def close(self):
+                raise KeyboardInterrupt("stream-first")
+
+        stage = InterruptingClose("a")
+        stream = run_chain(chain(stage), units(3), CONTEXT)
+        next(stream)
+        stream._stream = InterruptingStream()
+        with pytest.raises(KeyboardInterrupt) as exc:
+            stream.close()
+        # the earlier (stream) interrupt is delivered; the later
+        # (processor) interrupt rides its context chain; cleanup ran
+        assert isinstance(exc.value.__context__, SystemExit)
+        assert [x for x in stage.log if x[1] == "close"] == [
+            ("a", "close", "")]

@@ -207,17 +207,15 @@ class ChainRun:
             except BaseException as exc:  # noqa: BLE001 - re-delivered below
                 stream_error = exc
         close_error, interrupt = self._close_all()
-        candidates = [c for c in (stream_error, close_error)
-                      if c is not None]
-        if interrupt is not None:
-            candidates.insert(0, interrupt)
-        elif stream_error is not None and self._is_interrupt(stream_error):
-            pass   # already first among the candidates
-        if not candidates:
+        # Chronological order: the stream closed before the processors.
+        # The first interrupt wins; failing that, the first failure wins.
+        ordered = [c for c in (stream_error, close_error, interrupt)
+                   if c is not None]
+        if not ordered:
             return None
-        winner = next((c for c in candidates if self._is_interrupt(c)),
-                      candidates[0])
-        for loser in candidates:
+        winner = next((c for c in ordered if self._is_interrupt(c)),
+                      ordered[0])
+        for loser in ordered:
             if loser is not winner and winner.__context__ is None:
                 winner.__context__ = loser
         return winner
