@@ -27,7 +27,7 @@ _KINDS = ("processor", "component", "evaluator")
 # Explicit first-party manifest registry: owner name -> manifest path
 # relative to the kinovsr package root. Extended as families migrate.
 MANIFESTS = {
-    "bsvd": "bsvd/manifest.toml",
+    "bsvd": "processors/bsvd/manifest.toml",
     "realplksr": "realplksr/manifest.toml",
     "spynet": "spynet/manifest.toml",
 }

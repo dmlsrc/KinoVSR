@@ -33,7 +33,6 @@ from kinovsr import (
     autorelease_pool,
 )
 from kinovsr.api import VideoProcessResult
-from kinovsr.bsvd import BsvdDenoiser
 from kinovsr.comparison import render_comparison
 from kinovsr.denoise import LumaChromaDenoiser, McTemporalDenoiser, SpatialDenoiser
 from kinovsr.edge_sanitize import (
@@ -61,6 +60,7 @@ from kinovsr.native.writer import (
     HEVC_PROFILE_MAIN10,
     HEVC_PROFILE_MAIN422_10,
 )
+from kinovsr.processors.bsvd import BsvdDenoiser
 from kinovsr.progress import StackedPhaseBars
 from kinovsr.settings import Settings
 from kinovsr.toflow import TOFlowDenoiser

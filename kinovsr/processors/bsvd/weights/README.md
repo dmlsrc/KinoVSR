@@ -20,7 +20,7 @@ shasum -a 256 weights-src/bsvd-64.pth
 python scripts/pth_to_safetensors.py \
   weights-src/bsvd-64.pth \
   --param-key params \
-  -o kinovsr/bsvd/weights/bsvd_64.safetensors
+  -o kinovsr/processors/bsvd/weights/bsvd_64.safetensors
 
 curl -L -o weights-src/bsvd-32.pth \
   https://raw.githubusercontent.com/gmlwns2000/sharkshark-4k/master/src/upscale/model/bsvd/bsvd-32.pth
@@ -28,7 +28,7 @@ shasum -a 256 weights-src/bsvd-32.pth
 python scripts/pth_to_safetensors.py \
   weights-src/bsvd-32.pth \
   --param-key params \
-  -o kinovsr/bsvd/weights/bsvd_32.safetensors
+  -o kinovsr/processors/bsvd/weights/bsvd_32.safetensors
 ```
 
 The c64 checkpoint matches the public unblind test config shape:

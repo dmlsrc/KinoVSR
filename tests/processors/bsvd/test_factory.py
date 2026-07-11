@@ -4,7 +4,6 @@ from fractions import Fraction
 
 import pytest
 
-from kinovsr.bsvd.factory import FACTORY
 from kinovsr.processors import (
     Boundary,
     BoundaryKind,
@@ -18,6 +17,7 @@ from kinovsr.processors import (
     frame_spec_for_matrix,
     get_factory,
 )
+from kinovsr.processors.bsvd.factory import FACTORY
 from kinovsr.settings import Settings
 
 pytestmark = pytest.mark.unit

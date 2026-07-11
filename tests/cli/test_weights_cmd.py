@@ -31,8 +31,8 @@ def test_main_routes_the_weights_subcommand():
 
 
 def test_factory_profiles_match_their_manifests():
-    from kinovsr.bsvd.factory import FACTORY as bsvd_factory
     from kinovsr.modeling.weights import load_registered
+    from kinovsr.processors.bsvd.factory import FACTORY as bsvd_factory
     from kinovsr.processors.capabilities import Capability
     from kinovsr.realplksr.factory import FACTORY as realplksr_factory
 
