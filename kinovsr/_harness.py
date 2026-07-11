@@ -61,9 +61,9 @@ from kinovsr.native.writer import (
 )
 from kinovsr.processors.bsvd import BsvdDenoiser
 from kinovsr.processors.fastdvdnet import FastDvdDenoiser
+from kinovsr.processors.toflow import TOFlowDenoiser
 from kinovsr.progress import StackedPhaseBars
 from kinovsr.settings import Settings
-from kinovsr.toflow import TOFlowDenoiser
 from kinovsr.vsr_blocks import make_lanczos_plan, resample_width
 
 
@@ -1199,7 +1199,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
 
         up: Any = None
         if args.upscale == "basicvsrpp":
-            from kinovsr.basicvsrpp.upscaler import BasicVsrUpscaler
+            from kinovsr.processors.basicvsrpp.upscaler import BasicVsrUpscaler
             # weights spec: --basicvsrpp-weights (token or path) > env > --variant token
             up = BasicVsrUpscaler(
                 settings.basicvsrpp_weights or args.basicvsrpp_profile,
@@ -1210,7 +1210,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
                 ensemble=args.basicvsrpp_ensemble,
             )
         elif args.upscale == "realbasicvsr":
-            from kinovsr.realbasicvsr.upscaler import RealBasicVsrUpscaler
+            from kinovsr.processors.realbasicvsr.upscaler import RealBasicVsrUpscaler
             up = RealBasicVsrUpscaler(
                 settings.realbasicvsr_weights or args.realbasicvsr_profile,
                 window=args.realbasicvsr_window,
@@ -1255,7 +1255,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
                 history_static_cap=args.realviformer_history_static_cap,
             )
         elif args.upscale == "toflow":
-            from kinovsr.toflow import TOFlowSrUpscaler
+            from kinovsr.processors.toflow import TOFlowSrUpscaler
             up = TOFlowSrUpscaler(
                 settings.toflow_sr_weights,
                 graph=settings.toflow_sr_graph,
@@ -1283,7 +1283,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
 
         res: Any = None
         if args.restore != "off":
-            from kinovsr.basicvsrpp.restorer import BasicVsrRestorer
+            from kinovsr.processors.basicvsrpp.restorer import BasicVsrRestorer
             # --restore accepts a comma-separated list that CHAINS restorers in one
             # pass (e.g. decompress_track1,denoise = temporal deblock then temporal
             # denoise). --restore-weights (a single path) only applies when one

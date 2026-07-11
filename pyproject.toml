@@ -116,7 +116,7 @@ ignore = [
 # settings, reporting) use logging or the reporter instead - keep them
 # OUT of this list. Entries disappear as M4 migrates each family.
 "kinovsr/_harness.py" = ["T20"]
-"kinovsr/basicvsrpp/**" = ["T20"]
+"kinovsr/processors/basicvsrpp/**" = ["T20"]
 "kinovsr/deform_conv.py" = ["T20"]
 "kinovsr/dover/**" = ["T20"]
 "kinovsr/native/encode.py" = ["T20"]
@@ -126,14 +126,14 @@ ignore = [
 "kinovsr/musiq/**" = ["T20"]
 "kinovsr/processors/nafnet/**" = ["T20"]
 "kinovsr/progress/**" = ["T20"]
-"kinovsr/realbasicvsr/**" = ["T20"]
+"kinovsr/processors/realbasicvsr/**" = ["T20"]
 "kinovsr/processors/realesrgan/**" = ["T20"]
 "kinovsr/processors/realplksr/**" = ["T20"]
 "kinovsr/processors/realviformer/**" = ["T20"]
 "kinovsr/processors/safmn/**" = ["T20"]
 "kinovsr/processors/stdf/**" = ["T20"]
 "kinovsr/native/temporal.py" = ["T20"]
-"kinovsr/toflow/**" = ["T20"]
+"kinovsr/processors/toflow/**" = ["T20"]
 "kinovsr/native/vsr.py" = ["T20"]
 "kinovsr/native/writer.py" = ["T20"]
 # Transitional: legacy tests predate KinoMLX's stricter pytest style.

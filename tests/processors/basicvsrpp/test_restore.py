@@ -8,7 +8,7 @@ issue #24), the geometric transforms, and the 8-way self-ensemble's round-trip.
 """
 import mlx.core as mx
 
-from kinovsr.basicvsrpp import net
+from kinovsr.processors.basicvsrpp import net
 from kinovsr.upscaler_base import plan_gop_windows
 
 

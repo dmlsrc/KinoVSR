@@ -7,7 +7,7 @@ in check.
 """
 import mlx.core as mx
 
-from kinovsr.toflow import TOFlowDenoiser
+from kinovsr.processors.toflow import TOFlowDenoiser
 
 H, W, T = 96, 128, 10
 
@@ -29,7 +29,7 @@ def _run(den, clip):
 
 
 def test_direct_forward_matches_plain_interpretation():
-    from kinovsr.toflow import (
+    from kinovsr.processors.toflow import (
         _graph_path_for,
         _TOFlowGraph,
         resolve_weights,

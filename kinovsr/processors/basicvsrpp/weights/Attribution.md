@@ -1,8 +1,8 @@
 # Attribution
 
-`kinovsr/basicvsrpp/` is an independent MLX reimplementation of BasicVSR++, written
+`kinovsr/processors/basicvsrpp/` is an independent MLX reimplementation of BasicVSR++, written
 from the published architecture as a spec -- no upstream code is bundled. The model weights
-are the upstream project's, redistributed under its license (see `weights/README.md` for
+are the upstream project's, redistributed under its license (see `README.md` beside this file for
 the downloads).
 
 ## BasicVSR++

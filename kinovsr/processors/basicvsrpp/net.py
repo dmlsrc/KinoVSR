@@ -16,9 +16,9 @@ from typing import Any
 
 import mlx.core as mx
 
-from ..compile_cache import cached as _cached
-from ..deform_conv import deform_conv2d
-from ..vsr_blocks import (
+from kinovsr.compile_cache import cached as _cached
+from kinovsr.deform_conv import deform_conv2d
+from kinovsr.vsr_blocks import (
     _compute_flows,
     _pixelshuffle_pack,
     _resblocks_with_input,
@@ -30,7 +30,7 @@ from ..vsr_blocks import (
     pad_spynet_gates,
     resize,
 )
-from ..weights import resolve_weights as _resolve_weights
+from kinovsr.weights import resolve_weights as _resolve_weights
 
 # Per-checkpoint compiled reconstruction/upsample tail (keyed by id(p)).
 _UPSAMPLE_COMPILE_CACHE: dict = {}

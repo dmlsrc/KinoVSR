@@ -5,9 +5,9 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from kinovsr.basicvsrpp.upscaler import BasicVsrUpscaler
+from kinovsr.processors.basicvsrpp.upscaler import BasicVsrUpscaler
+from kinovsr.processors.realbasicvsr.upscaler import RealBasicVsrUpscaler
 from kinovsr.processors.realviformer.upscaler import RealViformerUpscaler
-from kinovsr.realbasicvsr.upscaler import RealBasicVsrUpscaler
 from kinovsr.vsr_blocks import _compute_flows, box3, history_improve_gate
 
 ROOT = Path(__file__).resolve().parents[2]
