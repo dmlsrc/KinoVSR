@@ -5,13 +5,13 @@ This is the fast first pass for noise-map and deblock-map logic. It decodes
 configured fixture clips, runs the diagnostic probe, estimates sigma maps under
 one or more motion-cap modes, estimates the blockiness map, and writes JSON/CSV
 summaries. Machine-specific paths belong in
-`scripts/vsr_artifacts/vsr_artifacts.local.toml`.
+`scripts/dev/vsr_artifacts/vsr_artifacts.local.toml`.
 
 Examples:
-    scripts/vsr_artifacts/analyze_maps.py
+    scripts/dev/vsr_artifacts/analyze_maps.py
 
-    scripts/vsr_artifacts/analyze_maps.py \\
-        --config scripts/vsr_artifacts/vsr_artifacts.local.toml \\
+    scripts/dev/vsr_artifacts/analyze_maps.py \\
+        --config scripts/dev/vsr_artifacts/vsr_artifacts.local.toml \\
         --videos walking__mild_high_iso__s20260705_crf34.mp4
 """
 from __future__ import annotations
@@ -49,7 +49,7 @@ def _load_numpy() -> Any:
             import numpy as _np
         except ModuleNotFoundError as exc:
             raise SystemExit(
-                "NumPy is required for scripts/vsr_artifacts/analyze_maps.py. "
+                "NumPy is required for scripts/dev/vsr_artifacts/analyze_maps.py. "
                 "Install the developer extras for artifact analysis tools."
             ) from exc
         np = _np
@@ -507,7 +507,7 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config", type=Path, help="TOML/JSON config; defaults to scripts/vsr_artifacts/vsr_artifacts.local.{toml,json} if present")
+    parser.add_argument("--config", type=Path, help="TOML/JSON config; defaults to scripts/dev/vsr_artifacts/vsr_artifacts.local.{toml,json} if present")
     parser.add_argument("--fixture-dir", help="directory containing generated fixtures")
     parser.add_argument("--manifest", help="fixture manifest; defaults to fixture_dir/manifest.json")
     parser.add_argument("--videos", nargs="*", help="specific videos or globs, relative to fixture_dir when set")

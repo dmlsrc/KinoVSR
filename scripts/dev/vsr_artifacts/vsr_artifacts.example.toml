@@ -1,4 +1,4 @@
-# Copy to scripts/vsr_artifacts/vsr_artifacts.local.toml and adjust paths for
+# Copy to scripts/dev/vsr_artifacts/vsr_artifacts.local.toml and adjust paths for
 # your machine. Relative paths are resolved from this config file's directory.
 
 [fixtures]

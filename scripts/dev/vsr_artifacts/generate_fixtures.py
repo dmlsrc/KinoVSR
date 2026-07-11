@@ -7,10 +7,10 @@ scanlines that jump between frames, block-grid compression structure, pulsed
 GOP noise, mosquito flicker around edges, and a mixed analog-plus-H.264 case.
 
 Examples:
-    scripts/vsr_artifacts/generate_fixtures.py \\
-        --config scripts/vsr_artifacts/vsr_artifacts.local.toml
+    scripts/dev/vsr_artifacts/generate_fixtures.py \\
+        --config scripts/dev/vsr_artifacts/vsr_artifacts.local.toml
 
-    scripts/vsr_artifacts/generate_fixtures.py \\
+    scripts/dev/vsr_artifacts/generate_fixtures.py \\
         --sources path/to/source.y4m \\
         --modes jumping_scanlines,mixed_analog_h264 \\
         --seconds 3 --output-dir path/to/generated-fixtures --overwrite
@@ -43,7 +43,7 @@ def _load_numpy() -> Any:
             import numpy as _np
         except ModuleNotFoundError as exc:
             raise SystemExit(
-                "NumPy is required for scripts/vsr_artifacts/generate_fixtures.py. "
+                "NumPy is required for scripts/dev/vsr_artifacts/generate_fixtures.py. "
                 "Install the developer extras for fixture generation."
             ) from exc
         np = _np
@@ -732,7 +732,7 @@ def _resolve_sources(sources: list[str | Path], base_dir: Path | None = None) ->
     if not sources:
         raise SystemExit(
             "no input sources configured; pass --sources or set fixtures.sources "
-            "in scripts/vsr_artifacts/vsr_artifacts.local.toml"
+            "in scripts/dev/vsr_artifacts/vsr_artifacts.local.toml"
         )
     selected = [resolve_path(p, base_dir) for p in sources]
     existing = [p for p in selected if p.exists()]
@@ -881,7 +881,7 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config", type=Path, help="TOML/JSON config; defaults to scripts/vsr_artifacts/vsr_artifacts.local.{toml,json} if present")
+    parser.add_argument("--config", type=Path, help="TOML/JSON config; defaults to scripts/dev/vsr_artifacts/vsr_artifacts.local.{toml,json} if present")
     parser.add_argument("--sources", nargs="*", help="source videos; overrides config sources")
     parser.add_argument("--output-dir", help="directory for generated MP4s and manifest.json")
     parser.add_argument("--seconds", type=float, help="seconds to decode from each source")

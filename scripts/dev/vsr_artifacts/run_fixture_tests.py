@@ -3,13 +3,13 @@
 
 The checked-in logic is generic. Machine-specific source paths, generated
 fixture filenames, and output roots belong in
-`scripts/vsr_artifacts/vsr_artifacts.local.toml`.
+`scripts/dev/vsr_artifacts/vsr_artifacts.local.toml`.
 
 Examples:
-    scripts/vsr_artifacts/run_fixture_tests.py \\
-        --config scripts/vsr_artifacts/vsr_artifacts.local.toml
+    scripts/dev/vsr_artifacts/run_fixture_tests.py \\
+        --config scripts/dev/vsr_artifacts/vsr_artifacts.local.toml
 
-    scripts/vsr_artifacts/run_fixture_tests.py \\
+    scripts/dev/vsr_artifacts/run_fixture_tests.py \\
         --cases scanlines,mixed --output-root "$SHARED_TEMP_DIR/vsr_tests"
 """
 from __future__ import annotations
@@ -48,7 +48,7 @@ def _load_numpy() -> Any:
             import numpy as _np
         except ModuleNotFoundError as exc:
             raise SystemExit(
-                "NumPy is required for scripts/vsr_artifacts/run_fixture_tests.py. "
+                "NumPy is required for scripts/dev/vsr_artifacts/run_fixture_tests.py. "
                 "Install the developer extras for fixture test tools."
             ) from exc
         np = _np
@@ -432,7 +432,7 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config", type=Path, help="TOML/JSON config; defaults to scripts/vsr_artifacts/vsr_artifacts.local.{toml,json} if present")
+    parser.add_argument("--config", type=Path, help="TOML/JSON config; defaults to scripts/dev/vsr_artifacts/vsr_artifacts.local.{toml,json} if present")
     parser.add_argument("--cases", help="comma-separated subset of tests.cases labels")
     parser.add_argument("--output-root", help="root directory for logs/videos/summaries")
     parser.add_argument("--python", help="Python executable for subprocesses; defaults to the current interpreter")
