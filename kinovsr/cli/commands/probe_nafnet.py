@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Probe which input traits trigger NAFNet artifact blow-ups.
 
 This is intentionally a one-frame diagnostic, not a production filter. It decodes a
@@ -10,24 +9,29 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 import mlx.core as mx  # noqa: E402
 
 from kinovsr._optional import require_numpy  # noqa: E402
 from kinovsr.processors.nafnet import net  # noqa: E402
 from kinovsr.processors.nafnet.restorer import model_rgb, resolve_pool_mode  # noqa: E402
+from kinovsr.ui.console import get_console
+
+
+def _print(*parts: object) -> None:
+    get_console().print(*parts, markup=False, highlight=False)
 
 if TYPE_CHECKING:
     import numpy as np
+
+    # Runtime evaluation of this alias crashed the original script on
+    # import (np is None until _load_numpy runs); annotations are lazy
+    # under future-annotations, so the alias lives here.
+    Transform = tuple[str, Callable[[np.ndarray], np.ndarray]]
 
 np: Any = None
 
@@ -35,11 +39,8 @@ np: Any = None
 def _load_numpy() -> Any:
     global np
     if np is None:
-        np = require_numpy("scripts/probe_nafnet_trigger.py")
+        np = require_numpy("kinovsr probe nafnet")
     return np
-
-
-Transform = tuple[str, Callable[[np.ndarray], np.ndarray]]
 
 
 def _dtype(name: str) -> Any:
@@ -292,18 +293,18 @@ def _print_table(frame_no: int, shape: tuple[int, int, int], rows: list[dict[str
         rows = sorted(rows, key=lambda r: r["residual"]["p99"])
     ident = next(r for r in rows if r["transform"] == "identity")
     base_p99 = max(ident["residual"]["p99"], 1e-12)
-    print(f"\nframe {frame_no}  {shape[1]}x{shape[0]}")
-    print(
+    _print(f"\nframe {frame_no}  {shape[1]}x{shape[0]}")
+    _print(
         "transform            "
         "res_mean  res_p99  res_max  ratio  "
         "sg1_p99  sca_p99  scamul_p99  conv3_p99  block_p99"
     )
-    print("-" * 105)
+    _print("-" * 105)
     for row in rows:
         res = row["residual"]
         tr = row["trace"]
         ratio = res["p99"] / base_p99
-        print(
+        _print(
             f"{row['transform']:<20} "
             f"{res['mean']:8.4f} {res['p99']:8.4f} {res['max']:8.4f} {ratio:6.2f} "
             f"{tr['sg1']['p99']:8.2f} {tr['sca_conv']['p99']:8.2f} "
@@ -312,9 +313,10 @@ def _print_table(frame_no: int, shape: tuple[int, int, int], rows: list[dict[str
         )
 
 
-def main() -> None:
+def run_probe_nafnet(argv: list[str] | None = None) -> int:
     _load_numpy()
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(
+        prog="kinovsr probe nafnet", description=__doc__)
     ap.add_argument("--video", required=True, type=Path, help="source video to probe")
     ap.add_argument("--frames", default="0", help="frame list/ranges, e.g. 180 or 60,180,330 or 0:300:30")
     ap.add_argument("--nafnet", choices=["gopro", "gopro32", "sidd", "sidd32", "reds"], default="gopro32")
@@ -326,7 +328,7 @@ def main() -> None:
     ap.add_argument("--tlsc-train-hw", type=int, nargs=2, default=(256, 256), metavar=("H", "W"))
     ap.add_argument("--sort", choices=["input", "p99"], default="input", help="table order")
     ap.add_argument("--json", type=Path, default=None, help="optional JSON report path")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     try:
         frames = _parse_frames(args.frames)
@@ -335,13 +337,13 @@ def main() -> None:
     weights = args.nafnet_weights if args.nafnet_weights is not None else args.nafnet
     args.pool_mode = resolve_pool_mode(weights, args.pool, variant=args.nafnet)
 
-    print(
+    _print(
         f"loading NAFNet weights={weights} dtype={args.dtype} "
         f"pool={args.pool_mode} strength={args.strength}"
     )
     p = net.load_params(weights, dtype=_dtype(args.dtype))
     cfg = net._config(p)
-    print(f"config width={cfg[0]} enc={cfg[1]} middle={cfg[2]} dec={cfg[3]} trace={args.trace_block}")
+    _print(f"config width={cfg[0]} enc={cfg[1]} middle={cfg[2]} dec={cfg[3]} trace={args.trace_block}")
 
     decoded = _read_frames(args.video, frames)
     report: dict[str, Any] = {
@@ -362,8 +364,4 @@ def main() -> None:
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        print(f"\nwrote {args.json}")
-
-
-if __name__ == "__main__":
-    main()
+        _print(f"\nwrote {args.json}")

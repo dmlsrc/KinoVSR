@@ -2,8 +2,8 @@
 
 import pytest
 
+from kinovsr.cli.commands.weights import run_weights_command
 from kinovsr.cli.main import main
-from kinovsr.cli.weights_cmd import run_weights_command
 
 pytestmark = pytest.mark.unit
 

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Inspect edge/boundary artifacts in a rendered video.
 
 This is a lightweight visual diagnostic for boundary artifacts that are most
@@ -19,6 +18,11 @@ from pathlib import Path
 
 from kinovsr._optional import require_numpy
 from kinovsr.media.images import draw_labels, load_image_rgb, resize_lanczos, save_image
+from kinovsr.ui.console import get_console
+
+
+def _print(*parts: object) -> None:
+    get_console().print(*parts, markup=False, highlight=False)
 
 np = None
 
@@ -223,8 +227,9 @@ def band_metrics(frames: list[np.ndarray], edge_pct: float, side_pct: float) -> 
     return lines
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def run_probe_edges(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="kinovsr probe edges", description=__doc__)
     parser.add_argument("--video", required=True, type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--num-samples", type=int, default=8)
@@ -233,7 +238,7 @@ def main() -> None:
     parser.add_argument("--side-pct", type=float, default=5.0)
     parser.add_argument("--sheet-width", type=int, default=320)
     parser.add_argument("--keep-extracted", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     load_image_deps()
 
     if not args.video.exists():
@@ -300,11 +305,7 @@ def main() -> None:
         metrics_lines.append("")
 
     (output_dir / "metrics.txt").write_text("\n".join(metrics_lines), encoding="utf-8")
-    print(f"Wrote edge analysis to {output_dir}")
+    _print(f"Wrote edge analysis to {output_dir}")
 
     if not args.keep_extracted:
         shutil.rmtree(extracted_dir, ignore_errors=True)
-
-
-if __name__ == "__main__":
-    main()

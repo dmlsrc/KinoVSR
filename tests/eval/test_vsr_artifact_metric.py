@@ -1,21 +1,12 @@
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-
 import numpy as np
 
 
 def load_metric_module():
-    script = Path(__file__).resolve().parents[2] / "scripts" / "compare_vsr_artifacts.py"
-    spec = importlib.util.spec_from_file_location("compare_vsr_artifacts", script)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    from kinovsr.cli.commands import artifacts
+
+    return artifacts
 
 
 def test_desra_contrast_is_one_for_identical_flat_frames() -> None:

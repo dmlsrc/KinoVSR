@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Compare two matched VSR videos with a DeSRA-style artifact map.
 
 The intended use is recurrent VSR debugging:
@@ -29,6 +28,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kinovsr._optional import require_numpy
+from kinovsr.ui.console import get_console
+
+
+def _print(*parts: object) -> None:
+    get_console().print(*parts, markup=False, highlight=False)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -470,7 +474,7 @@ def compare(args: argparse.Namespace) -> dict:
                 overlay_writer.write(risk_overlay(cand_u8, map_risk, args.threshold))
 
             if args.progress and len(rows) % args.progress == 0:
-                print(
+                _print(
                     f"[{len(rows):5d}] frame={ref_idx:6d} "
                     f"raw_mean={row.raw_mean:.5f} raw_area={row.raw_area:.5f} "
                     f"weighted_area={row.weighted_area:.5f}",
@@ -491,29 +495,29 @@ def compare(args: argparse.Namespace) -> dict:
 
 
 def print_summary(summary: dict) -> None:
-    print("=== VSR Artifact Risk ===")
-    print(f"reference: {summary['reference']}")
-    print(f"candidate: {summary['candidate']}")
-    print(
+    _print("=== VSR Artifact Risk ===")
+    _print(f"reference: {summary['reference']}")
+    _print(f"candidate: {summary['candidate']}")
+    _print(
         f"frames:    {summary['frames_compared']} at "
         f"{summary['resolution']['width']}x{summary['resolution']['height']}"
     )
-    print(f"threshold: {summary['threshold']:.3f}")
-    print()
+    _print(f"threshold: {summary['threshold']:.3f}")
+    _print()
     risk = summary["risk"]
-    print("metric                 mean       p95")
-    print(f"raw frame risk     {risk['raw_mean']:.6f}  {risk['raw_p95_frame_mean']:.6f}")
-    print(f"raw area fraction  {risk['raw_area_mean']:.6f}  {risk['raw_area_p95']:.6f}")
-    print(f"flat-weighted risk {risk['weighted_mean']:.6f}  {risk['weighted_p95_frame_mean']:.6f}")
-    print(f"weighted area      {risk['weighted_area_mean']:.6f}  {risk['weighted_area_p95']:.6f}")
-    print()
+    _print("metric                 mean       p95")
+    _print(f"raw frame risk     {risk['raw_mean']:.6f}  {risk['raw_p95_frame_mean']:.6f}")
+    _print(f"raw area fraction  {risk['raw_area_mean']:.6f}  {risk['raw_area_p95']:.6f}")
+    _print(f"flat-weighted risk {risk['weighted_mean']:.6f}  {risk['weighted_p95_frame_mean']:.6f}")
+    _print(f"weighted area      {risk['weighted_area_mean']:.6f}  {risk['weighted_area_p95']:.6f}")
+    _print()
     worst = summary["worst_frames"]
-    print(
+    _print(
         "worst raw-area frame:      "
         f"{worst['raw_area']['index']} area={worst['raw_area']['raw_area']:.6f} "
         f"p99={worst['raw_area']['raw_p99']:.6f}"
     )
-    print(
+    _print(
         "worst weighted-area frame: "
         f"{worst['weighted_area']['index']} area={worst['weighted_area']['weighted_area']:.6f} "
         f"p99={worst['weighted_area']['weighted_p99']:.6f}"
@@ -522,7 +526,7 @@ def print_summary(summary: dict) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=__doc__,
+        prog="kinovsr artifacts compare", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--reference", required=True, type=Path, help="Safer reference video.")
@@ -555,9 +559,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def run_compare(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.max_frames < 0:
         parser.error("--max-frames must be >= 0")
     if args.start_frame < 0:
@@ -577,5 +581,17 @@ def main() -> None:
     print_summary(summary)
 
 
-if __name__ == "__main__":
-    main()
+_SUBCOMMANDS = ("compare",)
+
+
+def run_artifacts_command(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        _print(f"usage: kinovsr artifacts {{{'|'.join(_SUBCOMMANDS)}}} ...")
+        return 0 if argv else 2
+    name, rest = argv[0], argv[1:]
+    if name == "compare":
+        return run_compare(rest) or 0
+    _print(f"unknown artifacts subcommand {name!r} "
+           f"(available: {', '.join(_SUBCOMMANDS)})")
+    return 2
+
