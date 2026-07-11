@@ -56,7 +56,11 @@ dev = [
     # Torch is the checkpoint-reading oracle: test fixtures save .pth files,
     # the family-local layout converters read them, and
     # scripts/dev/pth_to_safetensors.py cross-checks the torch-free
-    # `kinovsr weights convert`. Never a runtime dependency.
+    # `kinovsr weights convert`. safetensors (a separate package, not part
+    # of torch) is that oracle's writer. Neither is ever a runtime
+    # dependency: the product reads and writes safetensors through
+    # mlx.core.
+    "safetensors>=0.7",
     "torch>=2.13",
 ]
 ffmpeg = [

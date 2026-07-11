@@ -215,8 +215,8 @@ def main() -> int:
     try:
         from safetensors.torch import save_file
     except ImportError:
-        print("error: the safetensors package is required here (a torch-side "
-              "dev dependency; install the dev extras).", file=sys.stderr)
+        print("error: the safetensors package is required here (its own "
+              "package, not part of torch; install the dev extras).", file=sys.stderr)
         return 1
     out.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(out))
