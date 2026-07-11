@@ -50,7 +50,6 @@ from kinovsr.edge_sanitize import (
 from kinovsr.edge_sanitize import (
     sanitize_rgb as _sanitize_rgb,
 )
-from kinovsr.fastdvdnet import FastDvdDenoiser
 from kinovsr.media import color as _color
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media import video_reader as _native_vr
@@ -61,6 +60,7 @@ from kinovsr.native.writer import (
     HEVC_PROFILE_MAIN422_10,
 )
 from kinovsr.processors.bsvd import BsvdDenoiser
+from kinovsr.processors.fastdvdnet import FastDvdDenoiser
 from kinovsr.progress import StackedPhaseBars
 from kinovsr.settings import Settings
 from kinovsr.toflow import TOFlowDenoiser
@@ -1040,8 +1040,8 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
             # --pvdd-weights / $PVDD_WEIGHTS overrides the path. The `level`
             # variants take a noise-variance dial (--pvdd-noise-preset/-variance);
             # blind variants ignore it. --denoise-strength does not apply.
-            from kinovsr.pvdd import LEVEL_PRESETS
-            from kinovsr.pvdd.upscaler import PvddDenoiser
+            from kinovsr.processors.pvdd import LEVEL_PRESETS
+            from kinovsr.processors.pvdd.upscaler import PvddDenoiser
             nv = args.pvdd_noise_variance
             if nv is None and args.pvdd_noise_preset != "off":
                 nv = LEVEL_PRESETS[args.pvdd_noise_preset]
@@ -1148,7 +1148,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
             if override is not None:
                 stg = override
             if name == "stdf":
-                from kinovsr.stdf.deblocker import StdfDeblocker
+                from kinovsr.processors.stdf.deblocker import StdfDeblocker
                 kr, kb = _yuv.coef_for_matrix(_resolved_color[2])    # match the source color matrix
                 return StdfDeblocker(settings.stdf_weights or args.stdf_profile,
                                      strength=stg, kr=kr, kb=kb,
@@ -1168,7 +1168,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
                     dtype=parse_mlx_dtype_name(args.toflow_dtype),
                 )
             if name == "fbcnn":
-                from kinovsr.fbcnn import FbcnnDeblocker
+                from kinovsr.processors.fbcnn import FbcnnDeblocker
                 _q = args.fbcnn_quality.strip().lower()
                 if _q == "auto":
                     _quality: Any = "auto"
@@ -1241,7 +1241,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
             up = RealPlksrUpscaler(realplksr_spec,
                                    dtype=parse_mlx_dtype_name(args.realplksr_dtype))
         elif args.upscale == "realviformer":
-            from kinovsr.realviformer import RealViformerUpscaler
+            from kinovsr.processors.realviformer import RealViformerUpscaler
             up = RealViformerUpscaler(
                 settings.realviformer_weights or args.realviformer_profile,
                 window=args.realviformer_window,
@@ -1267,7 +1267,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
 
         naf: Any = None
         if args.nafnet != "off":
-            from kinovsr.nafnet import NafnetRestorer
+            from kinovsr.processors.nafnet import NafnetRestorer
             naf = NafnetRestorer(
                 settings.nafnet_weights or args.nafnet,
                 strength=args.nafnet_strength,

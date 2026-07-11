@@ -60,7 +60,7 @@ is only 1-7x over floor (acceptable).
 **Fix:** a manual 9-tap shift-and-add (`sum over (i,j) of
 xp[:, i:i+H, j:j+W, :] * w[:, i, j, 0]`) is 8.2x faster at the pathological
 scale, 1.0x elsewhere, so it is safe to apply unconditionally. See
-`kinovsr/nafnet/net.py:_depthwise3x3`. Whole-net NAFNet: 1.37-1.44x.
+`kinovsr/processors/nafnet/net.py:_depthwise3x3`. Whole-net NAFNet: 1.37-1.44x.
 Output shift ~55 dB PSNR (fp32 summation-order compounding through 36 residual
 blocks; the op itself matches conv2d to 1e-6).
 
@@ -72,7 +72,7 @@ channel-norm (small C = 32-512, many N*H*W rows) the threadgroup underfills
 than a hand-rolled `mx.mean`/`mx.rsqrt` reduction. The penalty is shape-bound,
 not dtype-bound (the kernel accumulates in fp32 regardless). Reserve
 `mx.fast.*norm` for transformer-width axes; keep manual reductions for NHWC
-channel norms (see `kinovsr/nafnet/net.py:_layernorm`). Re-verified on
+channel norms (see `kinovsr/processors/nafnet/net.py:_layernorm`). Re-verified on
 RealPLKSR (C=64): manual is 1.89x faster than `mx.fast.layer_norm`.
 
 ### GroupNorm: reduce the contiguous spatial axes first

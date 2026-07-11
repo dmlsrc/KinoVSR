@@ -23,8 +23,8 @@ if str(ROOT) not in sys.path:
 import mlx.core as mx  # noqa: E402
 
 from kinovsr._optional import require_numpy  # noqa: E402
-from kinovsr.nafnet import net  # noqa: E402
-from kinovsr.nafnet.restorer import model_rgb, resolve_pool_mode  # noqa: E402
+from kinovsr.processors.nafnet import net  # noqa: E402
+from kinovsr.processors.nafnet.restorer import model_rgb, resolve_pool_mode  # noqa: E402
 
 if TYPE_CHECKING:
     import numpy as np

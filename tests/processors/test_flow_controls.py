@@ -6,8 +6,8 @@ import mlx.core as mx
 import pytest
 
 from kinovsr.basicvsrpp.upscaler import BasicVsrUpscaler
+from kinovsr.processors.realviformer.upscaler import RealViformerUpscaler
 from kinovsr.realbasicvsr.upscaler import RealBasicVsrUpscaler
-from kinovsr.realviformer.upscaler import RealViformerUpscaler
 from kinovsr.vsr_blocks import _compute_flows, box3, history_improve_gate
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -216,7 +216,7 @@ def test_pth_converter_refuses_ambiguous_params_dict(tmp_path):
 
 
 def test_nafnet_model_rgb_clips_decode_overshoot():
-    from kinovsr.nafnet.restorer import model_rgb
+    from kinovsr.processors.nafnet.restorer import model_rgb
 
     rgb = mx.array([[[[-0.25, 0.5, 1.25, 42.0]]]], dtype=mx.float32)
     inp = model_rgb(rgb)
@@ -228,14 +228,14 @@ def test_nafnet_model_rgb_clips_decode_overshoot():
 
 
 def test_nafnet_restorer_rejects_bad_pool_mode_before_loading_weights():
-    from kinovsr.nafnet.restorer import resolve_pool_mode
+    from kinovsr.processors.nafnet.restorer import resolve_pool_mode
 
     with pytest.raises(ValueError, match="pool_mode"):
         resolve_pool_mode("gopro32", pool_mode="bogus")
 
 
 def test_nafnet_pool_auto_matches_reference_variants():
-    from kinovsr.nafnet.restorer import resolve_pool_mode
+    from kinovsr.processors.nafnet.restorer import resolve_pool_mode
 
     assert resolve_pool_mode("gopro", pool_mode="auto") == "local"
     assert resolve_pool_mode("gopro32", pool_mode="auto") == "local"
@@ -249,7 +249,7 @@ def test_nafnet_pool_auto_matches_reference_variants():
 
 
 def test_nafnet_guard_auto_protects_gopro_variants_only():
-    from kinovsr.nafnet.restorer import resolve_guard_mode
+    from kinovsr.processors.nafnet.restorer import resolve_guard_mode
 
     assert resolve_guard_mode("gopro", guard_mode="auto") == "reject"
     assert resolve_guard_mode("gopro32", guard_mode="auto") == "reject"
@@ -267,7 +267,7 @@ def test_nafnet_guard_auto_protects_gopro_variants_only():
 
 
 def test_nafnet_residual_guard_map_quadratic_knee():
-    from kinovsr.nafnet.restorer import residual_guard_map
+    from kinovsr.processors.nafnet.restorer import residual_guard_map
 
     low = mx.full((1, 7, 7, 3), 0.06)
     high = mx.full((1, 7, 7, 3), 0.24)
@@ -280,7 +280,7 @@ def test_nafnet_residual_guard_map_quadratic_knee():
 
 
 def test_nafnet_guard_probe_map_marks_framewide_risk():
-    from kinovsr.nafnet.restorer import guard_probe_map
+    from kinovsr.processors.nafnet.restorer import guard_probe_map
 
     safe = mx.full((1, 9, 9, 3), 0.02)
     risky = mx.full((1, 9, 9, 3), 0.08)
@@ -293,7 +293,7 @@ def test_nafnet_guard_probe_map_marks_framewide_risk():
 
 
 def test_nafnet_guard_probe_map_marks_low_amplitude_structure():
-    from kinovsr.nafnet.restorer import guard_probe_map
+    from kinovsr.processors.nafnet.restorer import guard_probe_map
 
     rows = [[0.04 if r % 2 else -0.04 for _c in range(9)] for r in range(9)]
     residual = mx.array([[[[v, v, v] for v in row] for row in rows]], dtype=mx.float32)
@@ -304,7 +304,7 @@ def test_nafnet_guard_probe_map_marks_low_amplitude_structure():
 
 
 def test_nafnet_luma_control_smooths_vertical_luma_not_chroma():
-    from kinovsr.nafnet.restorer import luma_control_input
+    from kinovsr.processors.nafnet.restorer import luma_control_input
 
     rgb = mx.array(
         [[
@@ -324,7 +324,7 @@ def test_nafnet_luma_control_smooths_vertical_luma_not_chroma():
 
 
 def test_nafnet_control_risk_map_uses_residual_disagreement():
-    from kinovsr.nafnet.restorer import control_risk_map
+    from kinovsr.processors.nafnet.restorer import control_risk_map
 
     residual = mx.full((1, 9, 9, 3), 0.08)
     control_residual = mx.zeros((1, 9, 9, 3))
@@ -338,7 +338,7 @@ def test_nafnet_control_risk_map_uses_residual_disagreement():
 
 
 def test_nafnet_control_guard_framewide_risk_locks_to_control_source():
-    from kinovsr.nafnet.restorer import NafnetRestorer
+    from kinovsr.processors.nafnet.restorer import NafnetRestorer
 
     restorer = object.__new__(NafnetRestorer)
     restorer._guard = 0.12
@@ -364,7 +364,7 @@ def test_nafnet_control_guard_framewide_risk_locks_to_control_source():
 
 def _reject_test_restorer(messages: list[str], lockout: int = 48, ramp: int = 0,
                           fall: int | None = None):
-    from kinovsr.nafnet.restorer import NafnetRestorer, _derived_fall_frames
+    from kinovsr.processors.nafnet.restorer import NafnetRestorer, _derived_fall_frames
 
     restorer = object.__new__(NafnetRestorer)
     restorer._guard = 0.12
@@ -487,7 +487,7 @@ def test_nafnet_reject_guard_lockout_zero_never_reprobes():
 
 
 def test_nafnet_restorer_rejects_negative_lockout_before_loading_weights():
-    from kinovsr.nafnet.restorer import NafnetRestorer
+    from kinovsr.processors.nafnet.restorer import NafnetRestorer
 
     with pytest.raises(ValueError, match="guard_lockout_frames"):
         NafnetRestorer("gopro32", guard_lockout_frames=-1)
@@ -498,7 +498,7 @@ def test_nafnet_restorer_rejects_negative_lockout_before_loading_weights():
 
 
 def test_nafnet_reject_guard_explicit_fall_overrides_derived():
-    from kinovsr.nafnet.restorer import (
+    from kinovsr.processors.nafnet.restorer import (
         _REJECT_HARD_CUT_AREA,
         _REJECT_TRIP_AREA,
         _derived_fall_frames,
@@ -540,7 +540,7 @@ def test_nafnet_reject_guard_explicit_fall_overrides_derived():
 
 
 def test_nafnet_reject_guard_marginal_probe_stays_locked():
-    from kinovsr.nafnet.restorer import (
+    from kinovsr.processors.nafnet.restorer import (
         _REJECT_RESUME_AREA_RATIO,
         _REJECT_TRIP_AREA,
         _local_mag,
@@ -578,7 +578,7 @@ def test_nafnet_reject_guard_marginal_probe_stays_locked():
 
 
 def test_nafnet_reject_guard_gain_eases_out_and_back_in():
-    from kinovsr.nafnet.restorer import (
+    from kinovsr.processors.nafnet.restorer import (
         _REJECT_HARD_CUT_AREA,
         _REJECT_TRIP_AREA,
         _local_mag,
@@ -627,7 +627,7 @@ def test_nafnet_reject_guard_gain_eases_out_and_back_in():
 
 
 def test_nafnet_guard_notice_uses_progress_callback(capsys):
-    from kinovsr.nafnet.restorer import NafnetRestorer
+    from kinovsr.processors.nafnet.restorer import NafnetRestorer
 
     restorer = object.__new__(NafnetRestorer)
     restorer._guard = 0.12
@@ -644,7 +644,7 @@ def test_nafnet_guard_notice_uses_progress_callback(capsys):
 
 
 def test_nafnet_tlsc_windows_match_reference_dummy_crop_scales():
-    from kinovsr.nafnet import net
+    from kinovsr.processors.nafnet import net
 
     cfg = (32, (1, 1, 1, 28), 1, (1, 1, 1, 1))
     assert net._tlsc_kernel("encoders.0.0.sca.1", cfg) == (384, 384)
@@ -656,7 +656,7 @@ def test_nafnet_tlsc_windows_match_reference_dummy_crop_scales():
 
 
 def test_nafnet_local_avg_pool_matches_reference_padding():
-    from kinovsr.nafnet import net
+    from kinovsr.processors.nafnet import net
 
     h, w = 5, 6
     values = [[r * w + c for c in range(w)] for r in range(h)]

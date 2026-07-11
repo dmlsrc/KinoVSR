@@ -465,7 +465,7 @@ def test_pulse_robust_map_damps_global_noise_pulse():
 def test_fastdvd_pulse_emits_all_and_varies():
     # integration: pulse on, sigma jumps mid-stream; all frames out in order and
     # the logged gains actually respond.
-    from kinovsr.fastdvdnet import FastDvdDenoiser
+    from kinovsr.processors.fastdvdnet import FastDvdDenoiser
     mx.random.seed(8)
     base = mx.clip(_content()[:48, :80, :], 0, 1)
     den = FastDvdDenoiser(strength=0.3, pulse=PulseGain(min_history=6))
@@ -517,7 +517,7 @@ def test_mc_sigma_plane_and_pulse():
 def test_fastdvd_streaming_refresh_adapts():
     # noise jumps 0.01 -> 0.08 at frame 20 of a 60-frame stream. With refresh on,
     # the held map must climb toward the new level; with refresh off it must not.
-    from kinovsr.fastdvdnet import FastDvdDenoiser
+    from kinovsr.processors.fastdvdnet import FastDvdDenoiser
     mx.random.seed(5)
     base = mx.clip(_content()[:48, :80, :], 0, 1)
     frames = [mx.clip(base + (0.01 if t < 20 else 0.08) * mx.random.normal(shape=base.shape), 0, 1)
