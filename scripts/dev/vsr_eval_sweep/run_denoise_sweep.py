@@ -28,10 +28,8 @@ from kinovsr.eval.config import (
     resolve_path,
 )
 
-REPO = Path(__file__).resolve().parents[2]
-TOOL_DIR = Path(__file__).resolve().parent
-FACE_EVAL = TOOL_DIR / "face_yunet_metrics.py"
-PERC_EVAL = TOOL_DIR / "perceptual_metrics.py"
+# scripts/dev/vsr_eval_sweep/ -> repo root is three levels up.
+REPO = Path(__file__).resolve().parents[3]
 
 DEFAULT_BASE_FLAGS = [
     "--reader", "ffmpeg",
@@ -252,7 +250,7 @@ def evaluate_clip_faces(args: argparse.Namespace, clip: dict[str, Any], manifest
     out_dir = args.output_root / str(clip["label"]) / "face_eval"
     cmd = [
         str(args.python),
-        str(FACE_EVAL),
+        "-m", "kinovsr.cli.main", "metrics", "faces",
         "--variants-json", str(manifest),
         "--baseline", args.baseline,
         "--out-dir", str(out_dir),
@@ -275,7 +273,7 @@ def evaluate_clip_perceptual(args: argparse.Namespace, clip: dict[str, Any], man
     out_dir = args.output_root / str(clip["label"]) / "perceptual_eval"
     cmd = [
         str(args.python),
-        str(PERC_EVAL),
+        "-m", "kinovsr.cli.main", "metrics", "perceptual",
         "--variants-json", str(manifest),
         "--source", str(clip["video"]),
         "--out-dir", str(out_dir),
