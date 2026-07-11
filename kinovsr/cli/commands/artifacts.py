@@ -25,17 +25,27 @@ import subprocess
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-from kinovsr._optional import require_numpy
+import mlx.core as mx
+
 from kinovsr.ui.console import get_console
 
 
 def _print(*parts: object) -> None:
     get_console().print(*parts, markup=False, highlight=False)
 
-if TYPE_CHECKING:
-    import numpy as np
+
+def _percentile(values: mx.array, q: float) -> float:
+    """Linear-interpolated percentile of a 1-D array (numpy semantics)."""
+    ordered = mx.sort(values.reshape(-1))
+    n = ordered.shape[0]
+    if n == 1:
+        return float(ordered[0])
+    pos = q / 100.0 * (n - 1)
+    lo = int(pos)
+    frac = pos - lo
+    hi = min(lo + 1, n - 1)
+    return float(ordered[lo]) * (1.0 - frac) + float(ordered[hi]) * frac
 
 
 @dataclass(frozen=True)
@@ -115,9 +125,7 @@ class RawVideoStream:
         if self._proc.stderr is not None:
             self._proc.stderr.close()
 
-    def read_selected(self) -> tuple[int, np.ndarray] | None:
-        np = require_numpy("scripts/compare_vsr_artifacts.py")
-
+    def read_selected(self) -> tuple[int, mx.array] | None:
         while True:
             raw = self._proc.stdout.read(self._frame_bytes)
             if len(raw) < self._frame_bytes:
@@ -137,7 +145,8 @@ class RawVideoStream:
             if (frame_index - self._start_frame) % self._stride:
                 continue
 
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.width, 3)
+            frame = mx.array(memoryview(raw)).reshape(
+                self.height, self.width, 3)
             return frame_index, frame
 
 
@@ -176,8 +185,8 @@ class RawVideoWriter:
         if self._proc.stdin is None:
             raise RuntimeError("ffmpeg did not expose stdin")
 
-    def write(self, frame: np.ndarray) -> None:
-        self._proc.stdin.write(frame.tobytes())
+    def write(self, frame: mx.array) -> None:
+        self._proc.stdin.write(bytes(memoryview(mx.contiguous(frame))))
 
     def close(self) -> None:
         if self._proc.stdin is not None:
@@ -237,127 +246,122 @@ def scaled_dimensions(width: int, height: int, max_width: int) -> tuple[int, int
     return scaled_w, scaled_h
 
 
-def gaussian_kernel(size: int = 11, sigma: float = 1.5) -> np.ndarray:
-    np = require_numpy("scripts/compare_vsr_artifacts.py")
-
+def gaussian_kernel(size: int = 11, sigma: float = 1.5) -> mx.array:
     if size <= 0 or size % 2 == 0:
         raise ValueError("kernel size must be a positive odd integer")
     radius = size // 2
-    xs = np.arange(-radius, radius + 1, dtype=np.float32)
-    kernel = np.exp(-(xs * xs) / (2.0 * sigma * sigma))
-    kernel /= kernel.sum()
-    return kernel.astype(np.float32)
+    xs = mx.arange(-radius, radius + 1, dtype=mx.float32)
+    kernel = mx.exp(-(xs * xs) / (2.0 * sigma * sigma))
+    return (kernel / kernel.sum()).astype(mx.float32)
 
 
-def blur_rgb(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    np = require_numpy("scripts/compare_vsr_artifacts.py")
+def _edge_pad_axis(image: mx.array, radius: int, axis: int) -> mx.array:
+    if axis == 1:
+        left = mx.broadcast_to(
+            image[:, :1], (image.shape[0], radius, image.shape[2]))
+        right = mx.broadcast_to(
+            image[:, -1:], (image.shape[0], radius, image.shape[2]))
+        return mx.concatenate([left, image, right], axis=1)
+    top = mx.broadcast_to(image[:1], (radius, *image.shape[1:]))
+    bottom = mx.broadcast_to(image[-1:], (radius, *image.shape[1:]))
+    return mx.concatenate([top, image, bottom], axis=0)
 
+
+def blur_rgb(image: mx.array, kernel: mx.array) -> mx.array:
     radius = int(kernel.shape[0] // 2)
-    padded_x = np.pad(image, ((0, 0), (radius, radius), (0, 0)), mode="edge")
-    tmp = np.zeros_like(image, dtype=np.float32)
-    for i, weight in enumerate(kernel):
-        tmp += float(weight) * padded_x[:, i:i + image.shape[1], :]
+    weights = [float(w) for w in kernel]
+    padded_x = _edge_pad_axis(image, radius, axis=1)
+    tmp = mx.zeros(image.shape, dtype=mx.float32)
+    for i, weight in enumerate(weights):
+        tmp = tmp + weight * padded_x[:, i:i + image.shape[1], :]
 
-    padded_y = np.pad(tmp, ((radius, radius), (0, 0), (0, 0)), mode="edge")
-    out = np.zeros_like(tmp, dtype=np.float32)
-    for i, weight in enumerate(kernel):
-        out += float(weight) * padded_y[i:i + image.shape[0], :, :]
+    padded_y = _edge_pad_axis(tmp, radius, axis=0)
+    out = mx.zeros(tmp.shape, dtype=mx.float32)
+    for i, weight in enumerate(weights):
+        out = out + weight * padded_y[i:i + image.shape[0], :, :]
     return out
 
 
-def local_std_rgb(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    image = image.astype("float32", copy=False)
+def local_std_rgb(image: mx.array, kernel: mx.array) -> mx.array:
+    image = image.astype(mx.float32)
     mean = blur_rgb(image, kernel)
     mean_sq = blur_rgb(image * image, kernel)
     var = mean_sq - mean * mean
-    np = require_numpy("scripts/compare_vsr_artifacts.py")
-
-    return np.sqrt(np.maximum(var, 0.0))
+    return mx.sqrt(mx.maximum(var, 0.0))
 
 
 def desra_contrast(
-    reference_rgb: np.ndarray,
-    candidate_rgb: np.ndarray,
-    kernel: np.ndarray,
+    reference_rgb: mx.array,
+    candidate_rgb: mx.array,
+    kernel: mx.array,
     constant: float = 0.03 * 0.03,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[mx.array, mx.array]:
     """Return (contrast, reference_texture) for RGB float frames in [0, 1]."""
-    np = require_numpy("scripts/compare_vsr_artifacts.py")
-
     sigma_ref = local_std_rgb(reference_rgb, kernel)
     sigma_cand = local_std_rgb(candidate_rgb, kernel)
     numerator = 2.0 * sigma_ref * sigma_cand + constant
     denominator = sigma_ref * sigma_ref + sigma_cand * sigma_cand + constant
-    contrast_rgb = np.clip(numerator / np.maximum(denominator, 1e-12), 0.0, 1.0)
+    contrast_rgb = mx.clip(numerator / mx.maximum(denominator, 1e-12), 0.0, 1.0)
     return contrast_rgb.mean(axis=2), sigma_ref.mean(axis=2)
 
 
 def flat_weight_from_texture(
-    texture: np.ndarray,
+    texture: mx.array,
     busy_floor: float = 0.25,
     low_pct: float = 20.0,
     high_pct: float = 85.0,
-) -> np.ndarray:
+) -> mx.array:
     """Softly emphasize flat/reference-smooth regions.
 
     This is the segmentation-free analog of DeSRA's semantic tolerance: busy
     regions are allowed more generated texture, while flat regions are not.
     """
-    np = require_numpy("scripts/compare_vsr_artifacts.py")
-
-    lo = float(np.percentile(texture, low_pct))
-    hi = float(np.percentile(texture, high_pct))
+    lo = _percentile(texture, low_pct)
+    hi = _percentile(texture, high_pct)
     if hi <= lo + 1e-6:
-        return np.ones_like(texture, dtype=np.float32)
-    busy = np.clip((texture - lo) / (hi - lo), 0.0, 1.0)
-    return (busy_floor + (1.0 - busy_floor) * (1.0 - busy)).astype(np.float32)
+        return mx.ones(texture.shape, dtype=mx.float32)
+    busy = mx.clip((texture - lo) / (hi - lo), 0.0, 1.0)
+    return (busy_floor + (1.0 - busy_floor) * (1.0 - busy)).astype(mx.float32)
 
 
 def frame_metrics(
     frame_index: int,
-    contrast: np.ndarray,
-    texture: np.ndarray,
+    contrast: mx.array,
+    texture: mx.array,
     threshold: float,
     busy_floor: float,
-) -> tuple[FrameMetrics, np.ndarray, np.ndarray]:
-    np = require_numpy("scripts/compare_vsr_artifacts.py")
-
-    raw_risk = np.clip(1.0 - contrast, 0.0, 1.0)
+) -> tuple[FrameMetrics, mx.array, mx.array]:
+    raw_risk = mx.clip(1.0 - contrast, 0.0, 1.0)
     weighted_risk = raw_risk * flat_weight_from_texture(texture, busy_floor=busy_floor)
     metrics = FrameMetrics(
         index=frame_index,
         raw_mean=float(raw_risk.mean()),
-        raw_p95=float(np.percentile(raw_risk, 95.0)),
-        raw_p99=float(np.percentile(raw_risk, 99.0)),
-        raw_area=float((raw_risk >= threshold).mean()),
+        raw_p95=_percentile(raw_risk, 95.0),
+        raw_p99=_percentile(raw_risk, 99.0),
+        raw_area=float(mx.mean(raw_risk >= threshold)),
         weighted_mean=float(weighted_risk.mean()),
-        weighted_p95=float(np.percentile(weighted_risk, 95.0)),
-        weighted_p99=float(np.percentile(weighted_risk, 99.0)),
-        weighted_area=float((weighted_risk >= threshold).mean()),
+        weighted_p95=_percentile(weighted_risk, 95.0),
+        weighted_p99=_percentile(weighted_risk, 99.0),
+        weighted_area=float(mx.mean(weighted_risk >= threshold)),
         ref_texture_mean=float(texture.mean()),
     )
     return metrics, raw_risk, weighted_risk
 
 
-def risk_heatmap(risk: np.ndarray, threshold: float) -> np.ndarray:
-    np = require_numpy("scripts/compare_vsr_artifacts.py")
-
-    v = np.clip(risk / max(threshold, 1e-6), 0.0, 1.0)
-    out = np.zeros((*risk.shape, 3), dtype=np.uint8)
-    out[..., 0] = np.clip(v * 255.0, 0.0, 255.0).astype(np.uint8)
-    out[..., 1] = np.clip((v ** 2) * 160.0, 0.0, 255.0).astype(np.uint8)
-    out[..., 2] = np.clip((1.0 - v) * 50.0, 0.0, 255.0).astype(np.uint8)
-    return out
+def risk_heatmap(risk: mx.array, threshold: float) -> mx.array:
+    v = mx.clip(risk / max(threshold, 1e-6), 0.0, 1.0)
+    r = mx.clip(v * 255.0, 0.0, 255.0)
+    g = mx.clip((v ** 2) * 160.0, 0.0, 255.0)
+    b = mx.clip((1.0 - v) * 50.0, 0.0, 255.0)
+    return mx.stack([r, g, b], axis=-1).astype(mx.uint8)
 
 
-def risk_overlay(candidate_rgb_u8: np.ndarray, risk: np.ndarray, threshold: float) -> np.ndarray:
-    np = require_numpy("scripts/compare_vsr_artifacts.py")
-
-    alpha = np.clip(risk / max(threshold, 1e-6), 0.0, 1.0)[..., None] * 0.65
-    red = np.zeros_like(candidate_rgb_u8, dtype=np.float32)
-    red[..., 0] = 255.0
-    base = candidate_rgb_u8.astype(np.float32)
-    return np.clip(base * (1.0 - alpha) + red * alpha, 0.0, 255.0).astype(np.uint8)
+def risk_overlay(candidate_rgb_u8: mx.array, risk: mx.array, threshold: float) -> mx.array:
+    alpha = mx.clip(risk / max(threshold, 1e-6), 0.0, 1.0)[..., None] * 0.65
+    red = mx.broadcast_to(
+        mx.array([255.0, 0.0, 0.0], dtype=mx.float32), candidate_rgb_u8.shape)
+    base = candidate_rgb_u8.astype(mx.float32)
+    return mx.clip(base * (1.0 - alpha) + red * alpha, 0.0, 255.0).astype(mx.uint8)
 
 
 def write_outputs(output_dir: Path, rows: list[FrameMetrics], summary: dict) -> None:
@@ -375,20 +379,18 @@ def write_outputs(output_dir: Path, rows: list[FrameMetrics], summary: dict) -> 
 
 
 def summarize(rows: list[FrameMetrics], args: argparse.Namespace, info: VideoInfo) -> dict:
-    np = require_numpy("scripts/compare_vsr_artifacts.py")
-
     if not rows:
         raise RuntimeError("no frames were compared")
 
-    def series(name: str) -> np.ndarray:
-        return np.asarray([getattr(row, name) for row in rows], dtype=np.float64)
+    def series(name: str) -> mx.array:
+        return mx.array([getattr(row, name) for row in rows], dtype=mx.float32)
 
     raw_mean = series("raw_mean")
     raw_area = series("raw_area")
     weighted_mean = series("weighted_mean")
     weighted_area = series("weighted_area")
-    worst_raw = rows[int(np.argmax(raw_area))]
-    worst_weighted = rows[int(np.argmax(weighted_area))]
+    worst_raw = rows[int(mx.argmax(raw_area))]
+    worst_weighted = rows[int(mx.argmax(weighted_area))]
     return {
         "reference": str(args.reference),
         "candidate": str(args.candidate),
@@ -398,13 +400,13 @@ def summarize(rows: list[FrameMetrics], args: argparse.Namespace, info: VideoInf
         "threshold": args.threshold,
         "risk": {
             "raw_mean": float(raw_mean.mean()),
-            "raw_p95_frame_mean": float(np.percentile(raw_mean, 95.0)),
+            "raw_p95_frame_mean": _percentile(raw_mean, 95.0),
             "raw_area_mean": float(raw_area.mean()),
-            "raw_area_p95": float(np.percentile(raw_area, 95.0)),
+            "raw_area_p95": _percentile(raw_area, 95.0),
             "weighted_mean": float(weighted_mean.mean()),
-            "weighted_p95_frame_mean": float(np.percentile(weighted_mean, 95.0)),
+            "weighted_p95_frame_mean": _percentile(weighted_mean, 95.0),
             "weighted_area_mean": float(weighted_area.mean()),
-            "weighted_area_p95": float(np.percentile(weighted_area, 95.0)),
+            "weighted_area_p95": _percentile(weighted_area, 95.0),
         },
         "worst_frames": {
             "raw_area": worst_raw.__dict__,
@@ -414,8 +416,6 @@ def summarize(rows: list[FrameMetrics], args: argparse.Namespace, info: VideoInf
 
 
 def compare(args: argparse.Namespace) -> dict:
-    np = require_numpy("scripts/compare_vsr_artifacts.py")
-
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         raise RuntimeError("ffmpeg and ffprobe are required")
 
@@ -459,8 +459,8 @@ def compare(args: argparse.Namespace) -> dict:
             if ref_idx != cand_idx:
                 raise RuntimeError(f"frame selection drifted: reference {ref_idx}, candidate {cand_idx}")
 
-            ref = ref_u8.astype(np.float32) / 255.0
-            cand = cand_u8.astype(np.float32) / 255.0
+            ref = ref_u8.astype(mx.float32) / 255.0
+            cand = cand_u8.astype(mx.float32) / 255.0
             contrast, texture = desra_contrast(ref, cand, kernel)
             row, raw_risk, weighted_risk = frame_metrics(
                 ref_idx, contrast, texture, args.threshold, args.busy_floor,
@@ -478,7 +478,6 @@ def compare(args: argparse.Namespace) -> dict:
                     f"[{len(rows):5d}] frame={ref_idx:6d} "
                     f"raw_mean={row.raw_mean:.5f} raw_area={row.raw_area:.5f} "
                     f"weighted_area={row.weighted_area:.5f}",
-                    flush=True,
                 )
     finally:
         ref_stream.close()

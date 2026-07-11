@@ -1,30 +1,37 @@
 """Convert a PyTorch .pth/.pt checkpoint to safetensors, directly MLX-loadable.
 
-Safe by construction - nothing in the checkpoint is executed:
+Torch-free and safe by construction - nothing in the checkpoint is
+executed, and no PyTorch installation is involved:
 
-1. A static pickle scan (pure pickletools, no unpickling) lists every global the
-   file would invoke and refuses anything outside the tensor-rebuild / container
-   allowlist (no os/subprocess/eval/exec/import machinery).
-2. torch.load(weights_only=True) loads it with PyTorch's restricted unpickler,
-   which only runs that same allowlist of tensor rebuilders - it does NOT execute
-   the pickle's __reduce__, so a malicious checkpoint raises instead of running.
+1. A static pickle scan (pure pickletools, no unpickling) lists every global
+   the file would invoke and refuses anything outside the tensor-rebuild /
+   container allowlist (no os/subprocess/eval/exec/import machinery).
+2. A restricted unpickler with a hard find_class allowlist rebuilds tensors
+   straight from the zip archive's raw storage blobs into MLX arrays. The
+   zip-format checkpoint (torch >= 1.6) is one pickle of metadata plus flat
+   per-storage byte files; dtype, shape, offset, and strides are enough to
+   reconstruct every tensor without torch. Anything outside the allowlist
+   raises instead of running.
 
-Then it makes the weights MLX-friendly: strips DataParallel 'module.' prefixes,
-demotes float64 -> float32, drops non-tensor entries, and verifies the output
-loads with mlx.core.load().
+Then it makes the weights MLX-friendly: strips DataParallel 'module.'
+prefixes, demotes float64 -> float32 (MLX has no float64), drops non-tensor
+entries, saves through mx.save_safetensors, and verifies the output loads
+with mlx.core.load().
 
     kinovsr weights convert model.pth                  # -> model.safetensors
     kinovsr weights convert model.pth -o weights.safetensors
-    kinovsr weights convert ckpt.pth --strip-prefix "" --keep-fp64
     kinovsr weights convert ckpt.pth --only-prefix generator_ema. --strip-prefix generator_ema.
 """
 
 from __future__ import annotations
 
 import argparse
+import pickle
 import pickletools
 import sys
+import zipfile
 from pathlib import Path
+from typing import Any
 
 _STDERR_CONSOLE = None
 
@@ -101,6 +108,228 @@ def _suspicious(refs: set[str]) -> list[str]:
     return bad
 
 
+# ---------------------------------------------------------------------------
+# Torch-free checkpoint reading: zip-format .pth -> dict tree of mx.array
+# ---------------------------------------------------------------------------
+
+# torch.<X>Storage token -> (mlx dtype or "float64", itemsize)
+_STORAGE_DTYPES = {
+    "FloatStorage": ("float32", 4),
+    "HalfStorage": ("float16", 2),
+    "BFloat16Storage": ("bfloat16", 2),
+    "DoubleStorage": ("float64", 8),
+    "LongStorage": ("int64", 8),
+    "IntStorage": ("int32", 4),
+    "ShortStorage": ("int16", 2),
+    "CharStorage": ("int8", 1),
+    "ByteStorage": ("uint8", 1),
+    "BoolStorage": ("bool_", 1),
+}
+
+
+class _CheckpointFormatError(RuntimeError):
+    pass
+
+
+_LEGACY_MAGIC = 0x1950A86A20F9469CFC6C
+
+
+def _storage_from_bytes(token: str, buf: bytes) -> tuple[Any, bool]:
+    """Raw storage bytes -> 1-D mx array in the storage dtype.
+
+    Returns (array, demoted): float64 demotes to float32 at this
+    boundary because MLX has no float64 (the array-module decode is slow
+    but float64 checkpoints are rare and small)."""
+    import mlx.core as mx
+
+    if token not in _STORAGE_DTYPES:
+        raise _CheckpointFormatError(f"unsupported storage type torch.{token}")
+    dtype_name, _itemsize = _STORAGE_DTYPES[token]
+    if dtype_name == "float64":
+        import array as _array
+
+        return mx.array(list(_array.array("d", buf)), dtype=mx.float32), True
+    raw = mx.array(memoryview(buf))
+    if dtype_name == "uint8":
+        return raw, False
+    return raw.view(getattr(mx, dtype_name)), False
+
+
+def _materialize(flat: Any, offset: int, shape: tuple[int, ...],
+                 strides: tuple[int, ...]) -> Any:
+    """Rebuild one tensor from its flat storage by offset/shape/strides."""
+    import mlx.core as mx
+
+    count = 1
+    for s in shape:
+        count *= s
+    if count == 0:
+        return mx.zeros(shape, dtype=flat.dtype)
+    expected = []
+    acc = 1
+    for s in reversed(shape):
+        expected.append(acc)
+        acc *= s
+    if strides == tuple(reversed(expected)) or count == 1:
+        return flat[offset:offset + count].reshape(shape)
+    # Non-contiguous save (transposed/sliced view): gather by the
+    # declared strides so the rebuilt tensor matches torch exactly.
+    index = mx.array(offset, dtype=mx.int64)
+    for axis, (extent, step) in enumerate(zip(shape, strides, strict=True)):
+        axis_shape = [1] * len(shape)
+        axis_shape[axis] = extent
+        index = index + (mx.arange(extent, dtype=mx.int64)
+                         * step).reshape(axis_shape)
+    return mx.take(flat, index.reshape(-1)).reshape(shape)
+
+
+class _LazyTensor:
+    """Tensor spec captured during the main unpickle; materialized once
+    the storage bytes are available (the legacy format streams them
+    AFTER the object pickle)."""
+
+    __slots__ = ("token", "key", "offset", "shape", "strides")
+
+    def __init__(self, token: str, key: str, offset: int,
+                 shape: tuple[int, ...], strides: tuple[int, ...]) -> None:
+        self.token = token
+        self.key = key
+        self.offset = offset
+        self.shape = shape
+        self.strides = strides
+
+
+def _make_unpickler(handle: Any) -> Any:
+    """A pickle.Unpickler locked to the tensor-rebuild allowlist. Tensors
+    come back as _LazyTensor specs; persistent ids as
+    ("storage", token, key) with the pid's numel preserved when present
+    (the legacy tail is read against it)."""
+
+    def rebuild_lazy(storage_ref: tuple, offset: Any, size: Any,
+                     stride: Any, *rest: Any) -> _LazyTensor:
+        _, token, key = storage_ref[:3]
+        return _LazyTensor(
+            token, key, int(offset),
+            tuple(int(s) for s in size), tuple(int(s) for s in stride))
+
+    class _Restricted(pickle.Unpickler):
+        storage_meta: dict[str, tuple[str, int | None]] = {}
+
+        def find_class(self, module: str, name: str) -> Any:
+            if (module, name) == ("collections", "OrderedDict"):
+                import collections
+
+                return collections.OrderedDict
+            if module == "torch._utils" and name in (
+                    "_rebuild_tensor_v2", "_rebuild_tensor"):
+                return rebuild_lazy
+            if module == "torch" and name in _STORAGE_DTYPES:
+                return name
+            if (module, name) == ("torch", "Size"):
+                return tuple
+            raise pickle.UnpicklingError(
+                f"{module}.{name} is outside the tensor-rebuild allowlist")
+
+        def persistent_load(self, pid: Any) -> Any:
+            if not (isinstance(pid, tuple) and pid and pid[0] == "storage"):
+                raise pickle.UnpicklingError(
+                    f"unsupported persistent id {pid!r}")
+            token, key = pid[1], str(pid[2])
+            numel = int(pid[4]) if len(pid) > 4 else None
+            self.storage_meta[key] = (token, numel)
+            return ("storage", token, key)
+
+    unpickler = _Restricted(handle)
+    unpickler.storage_meta = {}
+    return unpickler
+
+
+def _resolve_lazy(node: Any, storages: dict[str, Any]) -> Any:
+    if isinstance(node, _LazyTensor):
+        return _materialize(storages[node.key], node.offset,
+                            node.shape, node.strides)
+    if isinstance(node, dict):
+        return type(node)(
+            (k, _resolve_lazy(v, storages)) for k, v in node.items())
+    if isinstance(node, (list, tuple)):
+        return type(node)(_resolve_lazy(v, storages) for v in node)
+    return node
+
+
+def _load_zip_tree(src: Path) -> tuple[Any, bool]:
+    archive = zipfile.ZipFile(src)
+    pickles = [n for n in archive.namelist()
+               if n == "data.pkl" or n.endswith("/data.pkl")]
+    if not pickles:
+        raise _CheckpointFormatError("zip archive carries no data.pkl")
+    pickle_name = pickles[0]
+    prefix = pickle_name[: -len("data.pkl")]
+    with archive.open(pickle_name) as handle:
+        unpickler = _make_unpickler(handle)
+        tree = unpickler.load()
+    storages: dict[str, Any] = {}
+    demoted = False
+    for key, (token, _numel) in unpickler.storage_meta.items():
+        arr, was_demoted = _storage_from_bytes(
+            token, archive.read(f"{prefix}data/{key}"))
+        storages[key] = arr
+        demoted = demoted or was_demoted
+    return _resolve_lazy(tree, storages), demoted
+
+
+def _load_legacy_tree(src: Path) -> tuple[Any, bool]:
+    """The pre-1.6 stream: magic, protocol, sys_info, and object pickles
+    back to back, then a storage-key list, then each storage as an int64
+    numel followed by its raw bytes."""
+    import struct
+
+    with src.open("rb") as handle:
+        magic = _make_unpickler(handle).load()
+        if magic != _LEGACY_MAGIC:
+            raise _CheckpointFormatError(
+                "neither a zip-format nor a legacy torch checkpoint "
+                "(bad magic)")
+        _protocol = _make_unpickler(handle).load()
+        _sys_info = _make_unpickler(handle).load()
+        unpickler = _make_unpickler(handle)
+        tree = unpickler.load()
+        keys = _make_unpickler(handle).load()
+        storages: dict[str, Any] = {}
+        demoted = False
+        for key in keys:
+            key = str(key)
+            token, pid_numel = unpickler.storage_meta[key]
+            _dtype_name, itemsize = _STORAGE_DTYPES[token]
+            (numel,) = struct.unpack("<q", handle.read(8))
+            if pid_numel is not None and numel != pid_numel:
+                raise _CheckpointFormatError(
+                    f"storage {key}: tail carries {numel} elements, the "
+                    f"pickle declared {pid_numel}")
+            arr, was_demoted = _storage_from_bytes(
+                token, handle.read(numel * itemsize))
+            storages[key] = arr
+            demoted = demoted or was_demoted
+    return _resolve_lazy(tree, storages), demoted
+
+
+def _load_pth_tree(src: Path) -> tuple[Any, bool]:
+    """Restricted-unpickle a torch checkpoint (zip or legacy format).
+
+    Returns (tree, demoted_fp64): the unpickled object tree with every
+    tensor materialized as an mx.array, and whether any float64 storage
+    was demoted to float32 on the way in (MLX has no float64).
+    """
+    if zipfile.is_zipfile(src):
+        return _load_zip_tree(src)
+    return _load_legacy_tree(src)
+
+
+def _is_tensor(value: Any) -> bool:
+    import mlx.core as mx
+
+    return isinstance(value, mx.array)
+
+
 def run_convert(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="kinovsr weights convert",
@@ -116,7 +345,10 @@ def run_convert(argv: list[str] | None = None) -> int:
         "--only-prefix", default="",
         help="Keep only tensor keys with this prefix before applying --strip-prefix.",
     )
-    ap.add_argument("--keep-fp64", action="store_true", help="Keep float64 tensors as-is (default: demote to float32).")
+    ap.add_argument(
+        "--keep-fp64", action="store_true",
+        help="Refused: MLX has no float64, so float64 always demotes to float32.",
+    )
     ap.add_argument("--force", action="store_true", help="Convert even if the static scan flags non-tensor globals.")
     ap.add_argument(
         "--param-key", default=None,
@@ -130,6 +362,11 @@ def run_convert(argv: list[str] | None = None) -> int:
     src = Path(args.input)
     if not src.is_file():
         ap.error(f"no such file: {src}")
+    if args.keep_fp64:
+        _print("error: --keep-fp64 cannot be honored - MLX has no float64 dtype, "
+               "and the output exists to be MLX-loadable. float64 demotes to "
+               "float32.", file=sys.stderr)
+        return 2
     out = Path(args.output) if args.output else src.with_suffix(".safetensors")
 
     # ---- 1. static safety scan (no execution) ------------------------------
@@ -142,24 +379,26 @@ def run_convert(argv: list[str] | None = None) -> int:
         _print(f"[scan] SUSPICIOUS (outside tensor-rebuild allowlist): {bad}", file=sys.stderr)
         if not args.force:
             _print("[scan] refusing to load. Re-run with --force only if you trust this file "
-                  "(weights_only=True still gates the load).", file=sys.stderr)
+                  "(the restricted unpickler still hard-rejects non-allowlisted globals).",
+                  file=sys.stderr)
             return 2
     else:
         _print("[scan] clean - only tensor-rebuild / container globals.")
 
-    # ---- 2. safe load (restricted unpickler, no code execution) ------------
+    # ---- 2. safe load (restricted unpickler, torch-free) -------------------
+    import mlx.core as mx
+
     try:
-        import torch
-    except ImportError:
-        _print("error: this converter needs PyTorch (a dev dependency) to read .pth files.", file=sys.stderr)
+        obj, demoted = _load_pth_tree(src)
+    except (_CheckpointFormatError, pickle.UnpicklingError, KeyError,
+            zipfile.BadZipFile) as e:
+        _print(f"error: restricted checkpoint load refused/failed: {e}", file=sys.stderr)
+        _print("       The checkpoint carries constructs outside plain tensor "
+              "state dicts (optimizer state, custom classes, legacy format). "
+              "Extract just the weights first.", file=sys.stderr)
         return 1
-    try:
-        obj = torch.load(str(src), map_location="cpu", weights_only=True)
-    except Exception as e:
-        _print(f"error: torch.load(weights_only=True) refused/failed: {e}", file=sys.stderr)
-        _print("       The checkpoint contains non-tensor objects (optimizer state, custom "
-              "classes, ...) the safe loader won't run. Extract just the weights first.", file=sys.stderr)
-        return 1
+    if demoted:
+        _print("[load] float64 storage demoted to float32 (MLX has no float64)")
 
     # ---- 3. find the state_dict (handle common nesting) --------------------
     sd = obj
@@ -172,7 +411,7 @@ def run_convert(argv: list[str] | None = None) -> int:
             return 1
         sd = obj[args.param_key]
         _print(f"[load] using nested checkpoint key '{args.param_key}' (explicit)")
-    elif not (hasattr(sd, "items") and any(torch.is_tensor(v) for v in sd.values())):
+    elif not (hasattr(sd, "items") and any(_is_tensor(v) for v in sd.values())):
         if (
             isinstance(obj, dict)
             and "params" in obj
@@ -193,12 +432,12 @@ def run_convert(argv: list[str] | None = None) -> int:
                 _print(f"[load] using nested checkpoint key '{key}'")
                 break
 
-    # ---- 4. make MLX-friendly: strip prefix, demote fp64, drop non-tensors -
+    # ---- 4. make MLX-friendly: strip prefix, drop non-tensors --------------
     prefix = args.strip_prefix
     only_prefix = args.only_prefix
     tensors, dropped, stripped, filtered = {}, [], 0, 0
     for k, v in sd.items():
-        if not torch.is_tensor(v):
+        if not _is_tensor(v):
             dropped.append(k)
             continue
         if only_prefix and not k.startswith(only_prefix):
@@ -206,16 +445,15 @@ def run_convert(argv: list[str] | None = None) -> int:
             continue
         nk = k[len(prefix):] if prefix and k.startswith(prefix) else k
         stripped += (nk != k)
-        t = v.detach().cpu().contiguous()
-        if t.dtype == torch.float64 and not args.keep_fp64:
-            t = t.float()
-        tensors[nk] = t.clone()
+        tensors[nk] = mx.contiguous(v)
     if not tensors:
         _print("error: no tensors found in the checkpoint.", file=sys.stderr)
         return 1
-    n_params = sum(t.numel() for t in tensors.values())
+    mx.eval(list(tensors.values()))
+    n_params = sum(t.size for t in tensors.values())
+    dtype_names = sorted({str(t.dtype).split(".")[-1] for t in tensors.values()})
     _print(f"[convert] {len(tensors)} tensors, {n_params/1e6:.3f}M params, "
-          f"dtypes={sorted({str(t.dtype) for t in tensors.values()})}")
+          f"dtypes={dtype_names}")
     if stripped:
         _print(f"[convert] stripped '{prefix}' from {stripped} keys")
     if filtered:
@@ -224,19 +462,13 @@ def run_convert(argv: list[str] | None = None) -> int:
         _print(f"[convert] dropped {len(dropped)} non-tensor entries: {dropped[:6]}"
               f"{'...' if len(dropped) > 6 else ''}")
 
-    # ---- 5. save + verify it loads in MLX ----------------------------------
-    from safetensors.torch import save_file
+    # ---- 5. save + verify it loads back ------------------------------------
     out.parent.mkdir(parents=True, exist_ok=True)
-    save_file(tensors, str(out))
-    try:
-        import mlx.core as mx
-        loaded = mx.load(str(out))
-        ok = len(loaded) == len(tensors)
-        sample = next(iter(loaded.items()))
-        _print(f"[verify] mlx.core.load OK: {len(loaded)} arrays "
-              f"(e.g. {sample[0]} {tuple(sample[1].shape)} {sample[1].dtype}); match={ok}")
-    except ImportError:
-        _print("[verify] (mlx not importable here; safetensors written, but MLX load unverified)")
+    mx.save_safetensors(str(out), tensors)
+    loaded = mx.load(str(out))
+    ok = len(loaded) == len(tensors)
+    sample = next(iter(loaded.items()))
+    _print(f"[verify] mlx.core.load OK: {len(loaded)} arrays "
+          f"(e.g. {sample[0]} {tuple(sample[1].shape)} {sample[1].dtype}); match={ok}")
     _print(f"[done] {out}")
     return 0
-

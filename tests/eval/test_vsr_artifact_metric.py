@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import numpy as np
+import mlx.core as mx
 
 
 def load_metric_module():
@@ -12,19 +12,19 @@ def load_metric_module():
 def test_desra_contrast_is_one_for_identical_flat_frames() -> None:
     metric = load_metric_module()
     kernel = metric.gaussian_kernel()
-    frame = np.full((24, 32, 3), 0.5, dtype=np.float32)
+    frame = mx.full((24, 32, 3), 0.5, dtype=mx.float32)
 
-    contrast, texture = metric.desra_contrast(frame, frame.copy(), kernel)
+    contrast, texture = metric.desra_contrast(frame, frame, kernel)
 
-    assert np.allclose(contrast, 1.0)
-    assert np.allclose(texture, 0.0)
+    assert bool(mx.allclose(contrast, mx.array(1.0)))
+    assert bool(mx.allclose(texture, mx.array(0.0)))
 
 
 def test_desra_contrast_flags_texture_energy_mismatch() -> None:
     metric = load_metric_module()
     kernel = metric.gaussian_kernel()
-    ref = np.full((32, 32, 3), 0.5, dtype=np.float32)
-    cand = ref.copy()
+    ref = mx.full((32, 32, 3), 0.5, dtype=mx.float32)
+    cand = mx.contiguous(ref)
     cand[:, ::2, :] = 0.25
     cand[:, 1::2, :] = 0.75
 
@@ -37,10 +37,10 @@ def test_desra_contrast_flags_texture_energy_mismatch() -> None:
 
 def test_flat_weight_downweights_busy_reference_regions() -> None:
     metric = load_metric_module()
-    texture = np.concatenate(
+    texture = mx.concatenate(
         [
-            np.full((8, 8), 0.01, dtype=np.float32),
-            np.full((8, 8), 0.20, dtype=np.float32),
+            mx.full((8, 8), 0.01, dtype=mx.float32),
+            mx.full((8, 8), 0.20, dtype=mx.float32),
         ],
         axis=1,
     )

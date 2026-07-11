@@ -31,17 +31,27 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-from kinovsr._optional import require_numpy
+import mlx.core as mx
+
 from kinovsr.ui.console import get_console
 
 
 def _print(*parts: object) -> None:
     get_console().print(*parts, markup=False, highlight=False)
 
-if TYPE_CHECKING:
-    import numpy as np
+
+def _percentile(values: mx.array, q: float) -> float:
+    """Linear-interpolated percentile of a 1-D array (numpy semantics)."""
+    ordered = mx.sort(values.reshape(-1))
+    n = ordered.shape[0]
+    if n == 1:
+        return float(ordered[0])
+    pos = q / 100.0 * (n - 1)
+    lo = int(pos)
+    frac = pos - lo
+    hi = min(lo + 1, n - 1)
+    return float(ordered[lo]) * (1.0 - frac) + float(ordered[hi]) * frac
 
 
 def probe_dimensions(path: str) -> tuple[int, int, float, int]:
@@ -70,13 +80,12 @@ def probe_dimensions(path: str) -> tuple[int, int, float, int]:
     return w, h, fps, nframes
 
 
-def stream_tsd(path: str, w: int, h: int, grid: int) -> tuple[np.ndarray, np.ndarray]:
+def stream_tsd(path: str, w: int, h: int, grid: int) -> tuple[mx.array, mx.array]:
     """Stream the video as gray8 luma via ffmpeg; return per-frame TSD and
     per-patch (grid x grid) mean TSD.
 
     Memory: 3 frames * w * h bytes (e.g. 3 * 4096 * 2304 = ~28 MB at 4K).
     """
-    np = require_numpy("scripts/compare_video_shimmer.py")
     frame_bytes = w * h
     patch_h = h // grid
     patch_w = w // grid
@@ -90,9 +99,9 @@ def stream_tsd(path: str, w: int, h: int, grid: int) -> tuple[np.ndarray, np.nda
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     assert proc.stdout is not None
 
-    ring: list[np.ndarray] = []
+    ring: list[mx.array] = []
     tsd_per_frame: list[float] = []
-    tsd_per_patch = np.zeros((grid, grid), dtype=np.float64)
+    tsd_per_patch = mx.zeros((grid, grid), dtype=mx.float32)
     n_pairs = 0
 
     try:
@@ -100,26 +109,28 @@ def stream_tsd(path: str, w: int, h: int, grid: int) -> tuple[np.ndarray, np.nda
             raw = proc.stdout.read(frame_bytes)
             if len(raw) < frame_bytes:
                 break
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(h, w).astype(np.int16)
+            frame = mx.array(memoryview(raw)).reshape(h, w).astype(mx.int16)
             ring.append(frame)
             if len(ring) > 3:
                 ring.pop(0)
             if len(ring) == 3:
-                tsd = np.abs(ring[1] - (ring[0] + ring[2]) // 2)
-                tsd_per_frame.append(float(tsd.mean()))
+                tsd = mx.abs(ring[1] - (ring[0] + ring[2]) // 2)
+                tsd_per_frame.append(float(tsd.astype(mx.float32).mean()))
                 # Average over each grid cell.  Trim trailing pixels that
                 # don't fit a full row/column of patches.
                 trimmed = tsd[: patch_h * grid, : patch_w * grid]
-                patches = trimmed.reshape(grid, patch_h, grid, patch_w).mean(axis=(1, 3))
-                tsd_per_patch += patches
+                patches = trimmed.astype(mx.float32).reshape(
+                    grid, patch_h, grid, patch_w).mean(axis=(1, 3))
+                tsd_per_patch = tsd_per_patch + patches
+                mx.eval(tsd_per_patch)   # keep the lazy graph per-frame flat
                 n_pairs += 1
     finally:
         proc.wait()
         if proc.returncode not in (0, None):
             sys.stderr.write(f"ffmpeg exited with {proc.returncode} on {path}\n")
 
-    tsd_per_patch /= max(n_pairs, 1)
-    return np.array(tsd_per_frame), tsd_per_patch
+    tsd_per_patch = tsd_per_patch / max(n_pairs, 1)
+    return mx.array(tsd_per_frame), tsd_per_patch
 
 
 def _patch_glyph(value: float) -> str:
@@ -140,8 +151,6 @@ def _patch_glyph(value: float) -> str:
 
 
 def run_shimmer(argv: list[str] | None = None) -> int:
-    np = require_numpy("scripts/compare_video_shimmer.py")
-
     p = argparse.ArgumentParser(
         prog="kinovsr metrics shimmer", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -196,39 +205,36 @@ def run_shimmer(argv: list[str] | None = None) -> int:
     _print()
     _print("=== Temporal second-difference (TSD) per frame ===")
     _print(f"{'video':<20s}{'mean':>10s}{'median':>10s}{'std':>10s}{'p95':>10s}{'max':>10s}")
-    _print(
-        f"{label_a:<20s}"
-        f"{tsd_a.mean():>10.4f}{np.median(tsd_a):>10.4f}{tsd_a.std():>10.4f}"
-        f"{np.percentile(tsd_a, 95):>10.4f}{tsd_a.max():>10.4f}"
-    )
-    _print(
-        f"{label_b:<20s}"
-        f"{tsd_b.mean():>10.4f}{np.median(tsd_b):>10.4f}{tsd_b.std():>10.4f}"
-        f"{np.percentile(tsd_b, 95):>10.4f}{tsd_b.max():>10.4f}"
-    )
+    for label, series in ((label_a, tsd_a), (label_b, tsd_b)):
+        _print(
+            f"{label:<20s}"
+            f"{float(series.mean()):>10.4f}{_percentile(series, 50):>10.4f}"
+            f"{float(mx.std(series)):>10.4f}"
+            f"{_percentile(series, 95):>10.4f}{float(series.max()):>10.4f}"
+        )
 
     _print()
     _print(f"=== Shimmer signal: TSD({label_a}) - TSD({label_b}) ===")
-    _print(f"  mean:    {diff.mean():+.4f}")
-    _print(f"  median:  {np.median(diff):+.4f}")
-    _print(f"  p5:      {np.percentile(diff, 5):+.4f}")
-    _print(f"  p95:     {np.percentile(diff, 95):+.4f}")
-    _print(f"  max:     {diff.max():+.4f}  (frame pair {diff.argmax() + 1})")
-    _print(f"  min:     {diff.min():+.4f}  (frame pair {diff.argmin() + 1})")
-    a_higher = (diff > 0).mean() * 100
+    _print(f"  mean:    {float(diff.mean()):+.4f}")
+    _print(f"  median:  {_percentile(diff, 50):+.4f}")
+    _print(f"  p5:      {_percentile(diff, 5):+.4f}")
+    _print(f"  p95:     {_percentile(diff, 95):+.4f}")
+    _print(f"  max:     {float(diff.max()):+.4f}  (frame pair {int(mx.argmax(diff)) + 1})")
+    _print(f"  min:     {float(diff.min()):+.4f}  (frame pair {int(mx.argmin(diff)) + 1})")
+    a_higher = float(mx.mean(diff > 0)) * 100
     _print(f"  fraction of frame pairs where {label_a} > {label_b}: {a_higher:.1f}%")
 
     if args.per_second:
         _print()
         _print("=== Per-second mean TSD ===")
-        sec_buckets = np.arange(n) // int(round(fps))
-        max_sec = int(sec_buckets.max()) + 1
+        step = max(1, int(round(fps)))
         _print(f"  {'sec':>4s}  {label_a:>16s}  {label_b:>16s}  {'diff':>8s}")
-        for s in range(max_sec):
-            mask = sec_buckets == s
-            if not mask.any():
+        for s in range((n + step - 1) // step):
+            seg_a = tsd_a[s * step:(s + 1) * step]
+            seg_b = tsd_b[s * step:(s + 1) * step]
+            if seg_a.size == 0:
                 continue
-            sa, sb = tsd_a[mask].mean(), tsd_b[mask].mean()
+            sa, sb = float(seg_a.mean()), float(seg_b.mean())
             _print(f"  {s:>4d}  {sa:>16.4f}  {sb:>16.4f}  {sa - sb:>+8.4f}")
 
     diff_patches = patches_a - patches_b
@@ -238,16 +244,17 @@ def run_shimmer(argv: list[str] | None = None) -> int:
     for r in range(args.grid):
         row = "  "
         for c in range(args.grid):
-            row += _patch_glyph(diff_patches[r, c]) + " "
+            row += _patch_glyph(float(diff_patches[r, c])) + " "
         _print(row)
     _print(
         "  legend: ##>=0.10  ++>=0.05  + >=0.02  . ~0  "
         "- <=-0.02  --<=-0.05  @@<=-0.10"
     )
-    mx_idx = np.unravel_index(int(diff_patches.argmax()), diff_patches.shape)
-    mn_idx = np.unravel_index(int(diff_patches.argmin()), diff_patches.shape)
-    _print(f"  max:  {diff_patches.max():+.4f} at row {mx_idx[0]}, col {mx_idx[1]}")
-    _print(f"  min:  {diff_patches.min():+.4f} at row {mn_idx[0]}, col {mn_idx[1]}")
+    flat_max = int(mx.argmax(diff_patches))
+    flat_min = int(mx.argmin(diff_patches))
+    grid_w = diff_patches.shape[1]
+    _print(f"  max:  {float(diff_patches.max()):+.4f} at row {flat_max // grid_w}, col {flat_max % grid_w}")
+    _print(f"  min:  {float(diff_patches.min()):+.4f} at row {flat_min // grid_w}, col {flat_min % grid_w}")
 
 
 _SUBCOMMANDS = ("shimmer", "perceptual", "niqe", "faces", "dover", "musiq")

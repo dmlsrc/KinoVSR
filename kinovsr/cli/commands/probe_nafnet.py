@@ -12,11 +12,10 @@ import json
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import mlx.core as mx  # noqa: E402
 
-from kinovsr._optional import require_numpy  # noqa: E402
 from kinovsr.processors.nafnet import net  # noqa: E402
 from kinovsr.processors.nafnet.restorer import model_rgb, resolve_pool_mode  # noqa: E402
 from kinovsr.ui.console import get_console
@@ -25,22 +24,7 @@ from kinovsr.ui.console import get_console
 def _print(*parts: object) -> None:
     get_console().print(*parts, markup=False, highlight=False)
 
-if TYPE_CHECKING:
-    import numpy as np
-
-    # Runtime evaluation of this alias crashed the original script on
-    # import (np is None until _load_numpy runs); annotations are lazy
-    # under future-annotations, so the alias lives here.
-    Transform = tuple[str, Callable[[np.ndarray], np.ndarray]]
-
-np: Any = None
-
-
-def _load_numpy() -> Any:
-    global np
-    if np is None:
-        np = require_numpy("kinovsr probe nafnet")
-    return np
+Transform = tuple[str, "Callable[[mx.array], mx.array]"]
 
 
 def _dtype(name: str) -> Any:
@@ -76,19 +60,21 @@ def _parse_frames(spec: str) -> list[int]:
     return sorted(set(frames))
 
 
-def _read_frames(video: Path, wanted: list[int]) -> dict[int, np.ndarray]:
+def _read_frames(video: Path, wanted: list[int]) -> dict[int, mx.array]:
     try:
         import av
     except Exception as exc:  # pragma: no cover - environment dependent
-        raise SystemExit("PyAV is required for this probe; run it with the Kino/diffusers venv") from exc
+        raise SystemExit("PyAV is required for this probe; install the ffmpeg extra: uv pip install kinovsr[ffmpeg]") from exc
 
     wanted_set = set(wanted)
-    frames: dict[int, np.ndarray] = {}
+    frames: dict[int, mx.array] = {}
     with av.open(str(video)) as container:
         stream = container.streams.video[0]
         for i, frame in enumerate(container.decode(stream)):
             if i in wanted_set:
-                rgb = frame.to_rgb().to_ndarray().astype(np.float32) / 255.0
+                # PyAV hands back numpy; hoist to MLX at the boundary.
+                rgb = mx.array(frame.to_rgb().to_ndarray()
+                               ).astype(mx.float32) / 255.0
                 frames[i] = rgb
                 if len(frames) == len(wanted_set):
                     break
@@ -98,59 +84,72 @@ def _read_frames(video: Path, wanted: list[int]) -> dict[int, np.ndarray]:
     return frames
 
 
-def _box_blur(img: np.ndarray, ky: int, kx: int) -> np.ndarray:
+def _edge_pad(img: mx.array, py: int, px: int) -> mx.array:
+    if py:
+        img = mx.concatenate(
+            [mx.broadcast_to(img[:1], (py, *img.shape[1:])), img,
+             mx.broadcast_to(img[-1:], (py, *img.shape[1:]))], axis=0)
+    if px:
+        left = mx.broadcast_to(img[:, :1], (img.shape[0], px, img.shape[2]))
+        right = mx.broadcast_to(img[:, -1:], (img.shape[0], px, img.shape[2]))
+        img = mx.concatenate([left, img, right], axis=1)
+    return img
+
+
+def _box_blur(img: mx.array, ky: int, kx: int) -> mx.array:
     h, w, _ = img.shape
     py, px = ky // 2, kx // 2
-    padded = np.pad(img, ((py, py), (px, px), (0, 0)), mode="edge")
-    acc = np.zeros_like(img, dtype=np.float32)
+    padded = _edge_pad(img, py, px)
+    acc = mx.zeros(img.shape, dtype=mx.float32)
     for y in range(ky):
         for x in range(kx):
-            acc += padded[y:y + h, x:x + w, :]
+            acc = acc + padded[y:y + h, x:x + w, :]
     return acc / float(ky * kx)
 
 
-def _luma601(img: np.ndarray) -> np.ndarray:
-    return (img[..., :1] * 0.299 + img[..., 1:2] * 0.587 + img[..., 2:3] * 0.114).astype(np.float32)
+def _luma601(img: mx.array) -> mx.array:
+    return (img[..., :1] * 0.299 + img[..., 1:2] * 0.587
+            + img[..., 2:3] * 0.114).astype(mx.float32)
 
 
-def _luma_only(img: np.ndarray) -> np.ndarray:
-    return np.repeat(_luma601(img), 3, axis=-1)
+def _luma_only(img: mx.array) -> mx.array:
+    return mx.broadcast_to(_luma601(img), img.shape)
 
 
-def _blur_luma(img: np.ndarray, ky: int, kx: int) -> np.ndarray:
+def _blur_luma(img: mx.array, ky: int, kx: int) -> mx.array:
     y = _luma601(img)
     chroma = img - y
     out = _box_blur(y, ky, kx) + chroma
-    return np.clip(out, 0.0, 1.0).astype(np.float32)
+    return mx.clip(out, 0.0, 1.0).astype(mx.float32)
 
 
-def _blur_chroma(img: np.ndarray, ky: int, kx: int) -> np.ndarray:
+def _blur_chroma(img: mx.array, ky: int, kx: int) -> mx.array:
     y = _luma601(img)
     chroma = _box_blur(img - y, ky, kx)
     out = y + chroma
-    return np.clip(out, 0.0, 1.0).astype(np.float32)
+    return mx.clip(out, 0.0, 1.0).astype(mx.float32)
 
 
-def _block_smooth(img: np.ndarray, block: int, amount: float) -> np.ndarray:
-    out = img.copy()
+def _block_smooth(img: mx.array, block: int, amount: float) -> mx.array:
+    out = mx.contiguous(img)
     h, w, _ = out.shape
     for y0 in range(0, h, block):
         y1 = min(y0 + block, h)
         for x0 in range(0, w, block):
             x1 = min(x0 + block, w)
             tile = out[y0:y1, x0:x1, :]
-            mean = np.mean(tile, axis=(0, 1), keepdims=True)
-            tile[...] = tile * (1.0 - amount) + mean * amount
+            mean = mx.mean(tile, axis=(0, 1), keepdims=True)
+            out[y0:y1, x0:x1, :] = tile * (1.0 - amount) + mean * amount
     return out
 
 
-def _shadow_floor(img: np.ndarray, floor: float) -> np.ndarray:
-    return np.maximum(img, floor).astype(np.float32)
+def _shadow_floor(img: mx.array, floor: float) -> mx.array:
+    return mx.maximum(img, floor).astype(mx.float32)
 
 
 def _transforms() -> list[Transform]:
     return [
-        ("identity", lambda x: x.copy()),
+        ("identity", lambda x: x),
         ("blur_y3_scanline", lambda x: _box_blur(x, 3, 1)),
         ("blur_y5_scanline", lambda x: _box_blur(x, 5, 1)),
         ("blur_x3_edges", lambda x: _box_blur(x, 1, 3)),
@@ -166,14 +165,25 @@ def _transforms() -> list[Transform]:
     ]
 
 
+def _percentile(ordered: mx.array, q: float) -> float:
+    n = ordered.shape[0]
+    if n == 1:
+        return float(ordered[0])
+    pos = q / 100.0 * (n - 1)
+    lo = int(pos)
+    frac = pos - lo
+    hi = min(lo + 1, n - 1)
+    return float(ordered[lo]) * (1.0 - frac) + float(ordered[hi]) * frac
+
+
 def _stats(a: Any) -> dict[str, float]:
-    mx.eval(a)
-    arr = np.abs(np.array(a, dtype=np.float32))
+    arr = mx.abs(a.astype(mx.float32))
+    ordered = mx.sort(arr.reshape(-1))
     return {
-        "mean": float(np.mean(arr)),
-        "p95": float(np.percentile(arr, 95.0)),
-        "p99": float(np.percentile(arr, 99.0)),
-        "max": float(np.max(arr)),
+        "mean": float(mx.mean(arr)),
+        "p95": _percentile(ordered, 95.0),
+        "p99": _percentile(ordered, 99.0),
+        "max": float(ordered[-1]),
     }
 
 
@@ -264,7 +274,7 @@ def _forward_trace(
 
 
 def _probe_frame(
-    frame: np.ndarray,
+    frame: mx.array,
     p: dict,
     cfg: tuple,
     args: argparse.Namespace,
@@ -272,8 +282,8 @@ def _probe_frame(
     results: list[dict[str, Any]] = []
     for name, fn in _transforms():
         t0 = time.perf_counter()
-        changed = np.clip(fn(frame).astype(np.float32), 0.0, 1.0)
-        x = model_rgb(mx.array(changed[None, ...]))
+        changed = mx.clip(fn(frame).astype(mx.float32), 0.0, 1.0)
+        x = model_rgb(changed[None, ...])
         block_stats, residual = _forward_trace(
             x, p, cfg, args.strength, args.pool_mode,
             args.trace_block, tuple(args.tlsc_train_hw),
@@ -314,7 +324,6 @@ def _print_table(frame_no: int, shape: tuple[int, int, int], rows: list[dict[str
 
 
 def run_probe_nafnet(argv: list[str] | None = None) -> int:
-    _load_numpy()
     ap = argparse.ArgumentParser(
         prog="kinovsr probe nafnet", description=__doc__)
     ap.add_argument("--video", required=True, type=Path, help="source video to probe")

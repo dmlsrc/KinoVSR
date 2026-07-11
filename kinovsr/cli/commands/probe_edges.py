@@ -16,24 +16,14 @@ import subprocess
 from fractions import Fraction
 from pathlib import Path
 
-from kinovsr._optional import require_numpy
+import mlx.core as mx
+
 from kinovsr.media.images import draw_labels, load_image_rgb, resize_lanczos, save_image
 from kinovsr.ui.console import get_console
 
 
 def _print(*parts: object) -> None:
     get_console().print(*parts, markup=False, highlight=False)
-
-np = None
-
-
-def load_image_deps() -> None:
-    global np
-    if np is not None:
-        return
-
-    np = require_numpy("scripts/analyze_video_edges.py")
-
 
 def run_command(cmd: list[str]) -> str:
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -124,18 +114,18 @@ def extract_frame(video: Path, frame_index: int, output_path: Path) -> None:
     )
 
 
-def load_image(path: Path) -> np.ndarray:
-    return np.asarray(load_image_rgb(path))
+def load_image(path: Path) -> mx.array:
+    return load_image_rgb(path)
 
 
-def resize_to_width(image: np.ndarray, width: int) -> np.ndarray:
+def resize_to_width(image: mx.array, width: int) -> mx.array:
     if image.shape[1] == width:
         return image
     new_h = max(1, round(image.shape[0] * width / image.shape[1]))
-    return np.asarray(resize_lanczos(image, width, new_h))
+    return resize_lanczos(image, width, new_h)
 
 
-def draw_sheet(cells: list[tuple[str, np.ndarray]], output_path: Path, columns: int, cell_width: int) -> None:
+def draw_sheet(cells: list[tuple[str, mx.array]], output_path: Path, columns: int, cell_width: int) -> None:
     if not cells:
         return
 
@@ -146,7 +136,7 @@ def draw_sheet(cells: list[tuple[str, np.ndarray]], output_path: Path, columns: 
     rows = math.ceil(len(images) / columns)
     sheet_w = columns * cell_width + (columns + 1) * padding
     sheet_h = rows * cell_h + (rows + 1) * padding
-    sheet = np.full((sheet_h, sheet_w, 3), (24, 24, 24), dtype=np.uint8)
+    sheet = mx.full((sheet_h, sheet_w, 3), 24, dtype=mx.uint8)
 
     labels: list[tuple[int, int, str]] = []
     for idx, (label, image) in enumerate(images):
@@ -158,12 +148,12 @@ def draw_sheet(cells: list[tuple[str, np.ndarray]], output_path: Path, columns: 
         h, w = image.shape[0], image.shape[1]
         sheet[y + label_h:y + label_h + h, x:x + w] = image
 
-    sheet = np.asarray(draw_labels(sheet, labels, color=(235, 235, 235)))
+    sheet = draw_labels(sheet, labels, color=(235, 235, 235))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_image(sheet, output_path)
 
 
-def edge_strip(image: np.ndarray, edge_pct: float, side_pct: float) -> tuple[np.ndarray, np.ndarray]:
+def edge_strip(image: mx.array, edge_pct: float, side_pct: float) -> tuple[mx.array, mx.array]:
     height, width = image.shape[0], image.shape[1]
     top_bottom_px = max(1, int(round(height * edge_pct / 100.0)))
     side_px = max(1, int(round(width * side_pct / 100.0)))
@@ -173,17 +163,15 @@ def edge_strip(image: np.ndarray, edge_pct: float, side_pct: float) -> tuple[np.
     left = image[0:height, 0:side_px]
     right = image[0:height, width - side_px:width]
 
-    horizontal = np.full((top.shape[0] + bottom.shape[0] + 2, width, 3), (255, 0, 255), dtype=np.uint8)
-    horizontal[0:top.shape[0], 0:width] = top
-    horizontal[top.shape[0] + 2:top.shape[0] + 2 + bottom.shape[0], 0:width] = bottom
-
-    vertical = np.full((height, left.shape[1] + right.shape[1] + 2, 3), (255, 0, 255), dtype=np.uint8)
-    vertical[0:height, 0:left.shape[1]] = left
-    vertical[0:height, left.shape[1] + 2:left.shape[1] + 2 + right.shape[1]] = right
+    magenta = mx.array([255, 0, 255], dtype=mx.uint8)
+    h_rule = mx.contiguous(mx.broadcast_to(magenta, (2, width, 3)))
+    horizontal = mx.concatenate([top, h_rule, bottom], axis=0)
+    v_rule = mx.contiguous(mx.broadcast_to(magenta, (height, 2, 3)))
+    vertical = mx.concatenate([left, v_rule, right], axis=1)
     return horizontal, vertical
 
 
-def band_metrics(frames: list[np.ndarray], edge_pct: float, side_pct: float) -> list[str]:
+def band_metrics(frames: list[mx.array], edge_pct: float, side_pct: float) -> list[str]:
     if not frames:
         return []
 
@@ -200,9 +188,13 @@ def band_metrics(frames: list[np.ndarray], edge_pct: float, side_pct: float) -> 
         f"side_pct={side_pct:g} left/right band={side_px}px of {width}px ({side_px / width * 100:.2f}%)",
     ]
 
-    def region_stats(name: str, values: list[np.ndarray]) -> None:
-        stacked = np.concatenate([value.reshape(-1, 3) for value in values], axis=0).astype(np.float32)
-        lines.append(f"{name:<14} mean={stacked.mean():7.2f} std={stacked.std():7.2f}")
+    def region_stats(name: str, values: list[mx.array]) -> None:
+        stacked = mx.concatenate(
+            [value.reshape(-1, 3) for value in values], axis=0
+        ).astype(mx.float32)
+        mean = float(mx.mean(stacked))
+        std = float(mx.std(stacked))
+        lines.append(f"{name:<14} mean={mean:7.2f} std={std:7.2f}")
 
     region_stats("top", [frame[:edge_px] for frame in frames])
     region_stats("bottom", [frame[-edge_px:] for frame in frames])
@@ -212,7 +204,7 @@ def band_metrics(frames: list[np.ndarray], edge_pct: float, side_pct: float) -> 
     region_stats("center_x", [frame[:, center_x0:center_x1] for frame in frames])
 
     if len(frames) > 1:
-        deltas = [np.abs(frames[i].astype(np.float32) - frames[i - 1].astype(np.float32)) for i in range(1, len(frames))]
+        deltas = [mx.abs(frames[i].astype(mx.float32) - frames[i - 1].astype(mx.float32)) for i in range(1, len(frames))]
         lines.append("sampled-frame mean absolute change:")
         for name, slices in (
             ("top", (slice(None, edge_px), slice(None))),
@@ -221,7 +213,8 @@ def band_metrics(frames: list[np.ndarray], edge_pct: float, side_pct: float) -> 
             ("right", (slice(None), slice(-side_px, None))),
             ("center", (slice(center_y0, center_y1), slice(center_x0, center_x1))),
         ):
-            value = np.mean([delta[slices[0], slices[1]].mean() for delta in deltas])
+            samples = [float(mx.mean(delta[slices[0], slices[1]])) for delta in deltas]
+            value = sum(samples) / len(samples)
             lines.append(f"  {name:<8} {value:7.3f}")
 
     return lines
@@ -239,7 +232,6 @@ def run_probe_edges(argv: list[str] | None = None) -> int:
     parser.add_argument("--sheet-width", type=int, default=320)
     parser.add_argument("--keep-extracted", action="store_true")
     args = parser.parse_args(argv)
-    load_image_deps()
 
     if not args.video.exists():
         raise FileNotFoundError(args.video)
@@ -264,7 +256,6 @@ def run_probe_edges(argv: list[str] | None = None) -> int:
         frame_paths.append(path)
 
     images = [load_image(path) for path in frame_paths]
-    arrays = [np.array(image) for image in images]
 
     draw_sheet(
         [(f"f{idx}", image) for idx, image in zip(indices, images, strict=True)],
@@ -301,7 +292,7 @@ def run_probe_edges(argv: list[str] | None = None) -> int:
         "",
     ]
     for pct in args.edge_pct:
-        metrics_lines.extend(band_metrics(arrays, pct, args.side_pct))
+        metrics_lines.extend(band_metrics(images, pct, args.side_pct))
         metrics_lines.append("")
 
     (output_dir / "metrics.txt").write_text("\n".join(metrics_lines), encoding="utf-8")
