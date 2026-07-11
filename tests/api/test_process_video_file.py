@@ -3,7 +3,7 @@
 Proves source probing (trim math over a probed window), audio carry,
 output creation, and representative legacy CLI options (including a
 hidden-alias spelling) through ``kinovsr.cli.main`` and the internal
-``process_video_file`` facade.
+``process_video_options`` facade.
 
 The fixture clip is muxed by PyAV (no binary fixtures): mpeg4 video plus
 an AAC sine tone. The run itself uses the product's native path (reader
@@ -16,7 +16,7 @@ import pytest
 
 av = pytest.importorskip("av")
 
-from kinovsr.api import VideoFileConfig, process_video_file  # noqa: E402
+from kinovsr.api import VideoFileConfig, process_video_options  # noqa: E402
 from kinovsr.cli.args import build_parser, validate_args  # noqa: E402
 from kinovsr.cli.config import assemble  # noqa: E402
 from kinovsr.cli.main import main  # noqa: E402
@@ -90,7 +90,7 @@ def test_facade_probes_trims_and_carries_audio(clip_with_audio, tmp_path):
     ])
     validate_args(parser, args)
     invocation = assemble(args, base=Settings())
-    result = process_video_file(VideoFileConfig(
+    result = process_video_options(VideoFileConfig(
         settings=invocation.settings, options=invocation.options))
 
     assert result.post_path is not None and result.post_path.exists()

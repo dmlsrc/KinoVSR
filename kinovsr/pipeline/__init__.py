@@ -3,9 +3,10 @@
 The builder (:mod:`kinovsr.pipeline.builder`) resolves a composed user
 config against the processor catalog and preflight-validates the whole
 chain by threading a ``StreamSpec`` from input endpoint to output
-endpoint. The scheduler (M3 step 4) drives resolved chains over frames;
-the file endpoints (:mod:`kinovsr.pipeline.run`, M4 step 0) ground a
-chain against real video files.
+endpoint. The scheduler drives resolved chains over frames; the session
+(:mod:`kinovsr.pipeline.session`) is the host surface over both; the
+file endpoints (:mod:`kinovsr.pipeline.run`) ground a chain against
+real video files.
 """
 
 from .builder import (
@@ -19,18 +20,21 @@ from .builder import (
 )
 from .run import FileRunResult, FileSink, FileSource, run_file
 from .scheduler import ChainRun, run_chain, run_plan
+from .session import PipelineSession, open_pipeline
 
 __all__ = [
     "INPUT_ENDPOINT",
     "OUTPUT_ENDPOINT",
     "BuildPlan",
     "OutputEndpointSpec",
+    "PipelineSession",
     "ResolvedStage",
     "ChainRun",
     "FileRunResult",
     "FileSink",
     "FileSource",
     "build_processors",
+    "open_pipeline",
     "resolve_pipeline",
     "run_chain",
     "run_file",

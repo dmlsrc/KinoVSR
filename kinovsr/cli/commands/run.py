@@ -4,7 +4,8 @@ This is the flat invocation (``kinovsr --video ...``), also reachable as
 an explicit subcommand (``kinovsr run --video ...``). It owns the
 terminal wiring for a processing run - logging configuration and the
 MLX cache-limit echo - and hands the resolved invocation to the
-:func:`kinovsr.api.process_video_file` facade.
+:func:`kinovsr.api.process_video_options` facade (flag surface) or
+the public :func:`kinovsr.api.process_video_file` (pipeline configs).
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ def run_video_command(argv: list[str]) -> int:
         return _run_typed(invocation)
     from kinovsr.api import (
         VideoFileConfig,
-        process_video_file,
+        process_video_options,
         resolve_mlx_cache_limit_gb,
     )
 
@@ -59,7 +60,7 @@ def run_video_command(argv: list[str]) -> int:
     if limit > 0 and not settings.quiet:
         get_console().print(f"MLX cache limit: {limit:g} GB")
 
-    process_video_file(
+    process_video_options(
         VideoFileConfig(settings=settings, options=invocation.options))
     return 0
 
@@ -98,9 +99,9 @@ def _run_typed(invocation) -> int:
         return 2
 
     from kinovsr._harness import sanitize_output_prefix
+    from kinovsr.api import process_video_file, resolve_mlx_cache_limit_gb
     from kinovsr.media import video_reader as _vr
     from kinovsr.media.timespec import resolve_trim
-    from kinovsr.pipeline import run_file
 
     video = Path(options.video)
     try:
@@ -122,7 +123,11 @@ def _run_typed(invocation) -> int:
     out_root.mkdir(parents=True, exist_ok=True)
     output = out_root / f"{stem}_post.mp4"
 
-    result = run_file(
+    limit = resolve_mlx_cache_limit_gb(invocation.settings)
+    if limit > 0 and not invocation.settings.quiet:
+        get_console().print(f"MLX cache limit: {limit:g} GB")
+
+    result = process_video_file(
         invocation.config,
         video=video,
         output=output,
@@ -137,5 +142,5 @@ def _run_typed(invocation) -> int:
     get_console().print(
         f"{result.frames_in} frames in -> {result.frames_out} out "
         f"in {result.elapsed_s:.2f}s", markup=False)
-    get_console().print(f"Post: {result.path}", markup=False)
+    get_console().print(f"Post: {result.post_path}", markup=False)
     return 0

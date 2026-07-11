@@ -30,24 +30,46 @@ the Rich-backed implementation from `kinovsr.ui`.
 
 from __future__ import annotations
 
-# Re-export the main classes. Each submodule imports its own PyObjC bits via
-# native.compat, so importing this package only forces the pyobjc check at the
-# point a class is actually constructed (via require_pyobjc in each ctor).
-from .media.audio import AudioTrack
-from .native.compat import autorelease_pool, require_pyobjc
-from .native.encode import encode_video_videotoolbox
-from .native.temporal import VtfrcSession
-from .native.vsr import VsrSession
-from .native.writer import AVWriter
-from .processors.cut_detect import CutDetector
+from typing import TYPE_CHECKING, Any
 
-__all__ = [
-    "AVWriter",
-    "AudioTrack",
-    "CutDetector",
-    "VsrSession",
-    "VtfrcSession",
-    "autorelease_pool",
-    "encode_video_videotoolbox",
-    "require_pyobjc",
-]
+if TYPE_CHECKING:
+    from .media.audio import AudioTrack
+    from .native.compat import autorelease_pool, require_pyobjc
+    from .native.encode import encode_video_videotoolbox
+    from .native.temporal import VtfrcSession
+    from .native.vsr import VsrSession
+    from .native.writer import AVWriter
+    from .processors.cut_detect import CutDetector
+
+# Re-exports resolve lazily (PEP 562): importing the package loads no
+# PyObjC framework and no MLX, so `import kinovsr` / `kinovsr.api` stay
+# light for hosts and CLI startup. The frameworks load at the first
+# attribute access - typically a session constructor.
+_EXPORTS = {
+    "AVWriter": ("kinovsr.native.writer", "AVWriter"),
+    "AudioTrack": ("kinovsr.media.audio", "AudioTrack"),
+    "CutDetector": ("kinovsr.processors.cut_detect", "CutDetector"),
+    "VsrSession": ("kinovsr.native.vsr", "VsrSession"),
+    "VtfrcSession": ("kinovsr.native.temporal", "VtfrcSession"),
+    "autorelease_pool": ("kinovsr.native.compat", "autorelease_pool"),
+    "encode_video_videotoolbox": ("kinovsr.native.encode",
+                                  "encode_video_videotoolbox"),
+    "require_pyobjc": ("kinovsr.native.compat", "require_pyobjc"),
+}
+
+__all__ = sorted(_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    target = _EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    value = getattr(import_module(target[0]), target[1])
+    globals()[name] = value      # cache: subsequent access skips the hook
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_EXPORTS))

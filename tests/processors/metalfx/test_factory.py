@@ -181,7 +181,7 @@ def test_end_to_end_upscale_through_the_chain(mx):
 def test_harness_end_to_end(tmp_path):
     av = pytest.importorskip("av")
 
-    from kinovsr.api import VideoFileConfig, process_video_file
+    from kinovsr.api import VideoFileConfig, process_video_options
     from kinovsr.cli.args import build_parser, validate_args
     from kinovsr.cli.config import assemble
 
@@ -213,7 +213,7 @@ def test_harness_end_to_end(tmp_path):
     validate_args(parser, args)
     invocation = assemble(args, base=Settings())
     try:
-        result = process_video_file(VideoFileConfig(
+        result = process_video_options(VideoFileConfig(
             settings=invocation.settings, options=invocation.options))
     except MediaError as exc:
         skip_if_unsupported(exc)

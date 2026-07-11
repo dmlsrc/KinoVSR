@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any
 
 from kinovsr.processors.errors import MediaError, PipelineError
-from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
     Domain,
     DurationPolicy,
@@ -39,9 +38,6 @@ from kinovsr.processors.specs import (
 )
 from kinovsr.processors.units import FrameUnit
 from kinovsr.settings import Settings
-
-from .builder import BuildPlan, resolve_pipeline
-from .scheduler import run_plan
 
 # Endpoint-supported payload layouts and the CVPixelBuffer format each
 # decodes through. MLX frames ride RGBAHalf so fp16 precision survives
@@ -342,6 +338,7 @@ def run_file(
     video: Path | str,
     output: Path | str,
     settings: Settings,
+    reporter: Any = None,
     layout: Layout = Layout.MLX_RGB_HWC,
     start: int = 0,
     end: int | None = None,
@@ -354,10 +351,13 @@ def run_file(
 ) -> FileRunResult:
     """Run a composed pipeline config file-to-file through the endpoints.
 
-    Resolution and preflight validation happen against the probed input
-    spec before any frame decodes; the sink verifies the plan's declared
-    output timeline as units arrive.
+    The chain itself is the host session (:mod:`.session`): resolution
+    and preflight validation happen against the probed input spec before
+    any frame decodes, and the sink verifies the declared output
+    timeline as units arrive.
     """
+    from .session import open_pipeline
+
     t0 = time.perf_counter()
     video_path = Path(video).resolve()
     output_path = Path(output).resolve()
@@ -370,17 +370,15 @@ def run_file(
     source = FileSource(
         video, layout=layout, start=start, end=end,
         max_frames=max_frames, chunk_size=chunk_size, reader=reader)
-    plan: BuildPlan = resolve_pipeline(
-        config, input_spec=source.spec, settings=settings)
+    session = open_pipeline(
+        config, source.spec, settings=settings, reporter=reporter)
     track = source.audio_track() if audio else None
     sink = FileSink(
-        output, plan.output_spec, source=source, quality=quality,
+        output, session.output_spec, source=source, quality=quality,
         audio_track=track, audio_codec=audio_codec)
-    context = PipelineContext(settings=settings)
     frames_out = 0
-    run = run_plan(plan, source.units(), context)
     try:
-        with run:
+        with session, session.process(source.units()) as run:
             for unit in run:
                 sink.append(unit)
                 frames_out += 1
@@ -394,7 +392,7 @@ def run_file(
     path = sink.finish()
     return FileRunResult(
         path=path, frames_in=source.frame_count, frames_out=frames_out,
-        output_spec=plan.output_spec,
+        output_spec=session.output_spec,
         elapsed_s=time.perf_counter() - t0)
 
 
