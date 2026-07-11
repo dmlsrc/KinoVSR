@@ -117,10 +117,18 @@ class TestFileSource:
         with pytest.raises(MediaError, match="empty frame window"):
             FileSource(clip, start=N + 5)
 
-    def test_audio_with_offset_window_is_refused(self, clip_with_audio):
-        source = FileSource(clip_with_audio, start=4)
-        with pytest.raises(MediaError, match="audio carry"):
-            source.audio_track()
+    def test_audio_carry_trims_to_the_window(self, clip_with_audio):
+        source = FileSource(clip_with_audio, start=4, max_frames=8)
+        track = source.audio_track()
+        expected = round(8 / FPS * SAMPLE_RATE)
+        assert abs(track.n_samples - expected) <= 2
+
+    def test_run_file_refuses_output_over_input(self, clip_with_audio,
+                                                tmp_path):
+        with pytest.raises(MediaError, match="destroy the source"):
+            run_file({"pipeline": []}, video=clip_with_audio,
+                     output=clip_with_audio, settings=SETTINGS)
+        assert clip_with_audio.exists()
 
 
 def test_passthrough_file_to_file(clip, tmp_path):
@@ -188,3 +196,50 @@ def test_interpolation_preserves_duration_and_carries_audio(
     # synchronization proof; AAC priming allows sub-frame skew).
     assert audio_s is not None, "audio track missing from the output"
     assert abs(audio_s - video_s) < 0.05
+
+
+def test_ntsc_cadence_writes_the_exact_rational_grid(tmp_path):
+    """The writer's index grid quantizes 30000/1001 to a fixed 801-tick
+    frame duration (drifting ~0.2 ticks/frame); the sink must stamp each
+    unit's own validated ticks. Constructed spec, no probe fuzz."""
+    import mlx.core as mx
+
+    from kinovsr.pipeline import FileSink
+    from kinovsr.processors import (
+        FrameUnit,
+        Geometry,
+        StreamSpec,
+        TimelineSpec,
+        frame_spec_for_matrix,
+    )
+
+    cadence = Fraction(30000, 1001)
+    time_base = Fraction(1, 24000)
+    spec = StreamSpec(
+        frame=frame_spec_for_matrix(
+            "bt709", full_range=False, geometry=Geometry(W, H)),
+        timeline=TimelineSpec(time_base=time_base, cadence=cadence))
+    sink = FileSink(tmp_path / "ntsc.mp4", spec)
+
+    def ticks(i: int) -> int:
+        return round(i / cadence / time_base)
+
+    n = 24
+    frame = mx.full((H, W, 3), 0.5, dtype=mx.float32)
+    for i in range(n):
+        sink.append(FrameUnit(payload=frame, pts=ticks(i),
+                              duration=ticks(i + 1) - ticks(i)))
+    path = sink.finish()
+
+    half_tick = Fraction(1, 48000)
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        times = sorted(
+            Fraction(frame.pts) * Fraction(stream.time_base)
+            for frame in container.decode(video=0))
+    assert len(times) == n
+    for i, t in enumerate(times):
+        expected = Fraction(i) / cadence
+        # the sink writes round(i/cadence*24000)/24000; allow that
+        # rounding but not the index-grid quantization drift
+        assert abs(t - expected) <= half_tick, (i, float(t), float(expected))

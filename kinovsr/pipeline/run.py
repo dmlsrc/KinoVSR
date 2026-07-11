@@ -121,6 +121,7 @@ class FileSource:
         if start < 0:
             raise MediaError(f"start must be >= 0, got {start}")
         self.start = start
+        self._total = total
         stop = total if end is None else min(end, total)
         if max_frames is not None:
             stop = min(stop, start + max_frames)
@@ -179,17 +180,17 @@ class FileSource:
     def audio_track(self) -> Any:
         """Read the source's audio for carry, or None when it has none.
 
-        Carry is only coherent when the video window starts at the clip
-        head: the endpoint has no audio-trimming policy yet, and pairing
-        offset video with unoffset audio would desynchronize the output.
+        The carry covers exactly the video window: a windowed run trims
+        the track to [start, end) in seconds, so shortened video never
+        ships beside full-length audio.
         """
-        if self.start != 0:
-            raise MediaError(
-                "audio carry with a nonzero start window is not supported "
-                "by the file endpoints yet; run the full clip or drop audio")
         from kinovsr._harness import _read_audio_track_from_video
 
-        return _read_audio_track_from_video(self.path, self._vr)
+        track = _read_audio_track_from_video(self.path, self._vr)
+        if track is None or (self.start, self.end) == (0, self._total):
+            return track
+        return track.trimmed(self.start / self.source_fps,
+                             self.end / self.source_fps)
 
 
 class FileSink:
@@ -224,6 +225,11 @@ class FileSink:
         if layout not in _DECODE_FORMATS:
             raise MediaError(
                 f"output endpoint cannot encode layout {layout.value!r}")
+        if output_spec.frame.geometry.width % 2:
+            raise MediaError(
+                f"output width {output_spec.frame.geometry.width} is odd; "
+                f"the 4:2:2/4:2:0 encoder paths need even luma widths - "
+                f"crop or pad the chain to an even geometry")
         timeline = output_spec.timeline
         if not isinstance(timeline.cadence, Fraction):
             raise MediaError("output endpoint requires a CFR cadence")
@@ -311,7 +317,10 @@ class FileSink:
                 f"broke its declared timeline")
         payload = (self._mlx_to_buffer(unit.payload)
                    if self._is_mlx else unit.payload)
-        self.writer.append(payload)
+        # The chain's timeline is the validated one: stamp the unit's own
+        # ticks (the writer's index grid quantizes NTSC-family rates).
+        self.writer.append(payload, pts_ticks=unit.pts,
+                           duration_ticks=unit.duration or None)
 
     def finish(self) -> Path:
         self.writer.finish()
@@ -350,6 +359,14 @@ def run_file(
     output timeline as units arrive.
     """
     t0 = time.perf_counter()
+    video_path = Path(video).resolve()
+    output_path = Path(output).resolve()
+    if video_path == output_path or (
+            output_path.exists() and video_path.samefile(output_path)):
+        raise MediaError(
+            f"output {output_path} is the input file; the writer truncates "
+            f"its target before the first decoded frame, which would "
+            f"destroy the source")
     source = FileSource(
         video, layout=layout, start=start, end=end,
         max_frames=max_frames, chunk_size=chunk_size, reader=reader)

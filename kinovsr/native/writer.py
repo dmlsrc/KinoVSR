@@ -127,6 +127,12 @@ class AVWriter:
             hevc_video_settings(width, height, quality, profile, color_props, pixel_aspect),
         )
         video_input.setExpectsMediaDataInRealTime_(False)
+        # Pin the track timescale to the product's tick base. The default
+        # movie scale (600) quantizes CMTime stamps: integer rates divide
+        # 600 and survive, but NTSC-family ticks (e.g. 801/24000) snap to
+        # 20/600 and re-introduce exactly the index-grid drift the
+        # explicit-PTS path exists to avoid.
+        video_input.setMediaTimeScale_(_pb.VIDEO_TIME_SCALE)
         # Carry the source track's rotation/flip as output metadata. The pixels
         # stay in stored orientation through VSR and the encoder; the container
         # transform makes players display them upright - lossless, no rotate.
@@ -187,6 +193,7 @@ class AVWriter:
             writer.addInput_(audio_input)
 
         # Start the writer ---------------------------------------------------
+        writer.setMovieTimeScale_(_pb.VIDEO_TIME_SCALE)
         if not writer.startWriting():
             raise RuntimeError(f"AVAssetWriter.startWriting failed: {writer.error()}")
         writer.startSessionAtSourceTime_(CoreMedia.CMTimeMake(0, _pb.VIDEO_TIME_SCALE))
@@ -199,6 +206,7 @@ class AVWriter:
         self.label = label
         self.path = output_path
         self.frame_count = 0
+        self._explicit_end_ticks: int | None = None
         self.audio_track = audio_track
         self._audio_codec = audio_codec
 
@@ -275,8 +283,16 @@ class AVWriter:
     # Public API
     # ------------------------------------------------------------------------
 
-    def append(self, pb: Any) -> None:
-        """Append one video frame at the next PTS (frame_count/fps)."""
+    def append(self, pb: Any, *, pts_ticks: int | None = None,
+               duration_ticks: int | None = None) -> None:
+        """Append one video frame.
+
+        Default: the next index-grid PTS (frame_count/fps). A caller
+        that owns an exact timeline (the typed pipeline's endpoints)
+        passes ``pts_ticks``/``duration_ticks`` in VIDEO_TIME_SCALE
+        instead - the index grid quantizes NTSC-family rates to a fixed
+        per-frame duration, which drifts ~3.6 s/hour at 59.94 fps
+        against the exact rational grid."""
         self._wait_for_ready(self.video_input, "video")
         if self._yuv_feed:
             rgb = _pb.read_rgbahalf_rgb(pb)
@@ -285,7 +301,12 @@ class AVWriter:
                 raise RuntimeError(f"[{self.label}] YUV pool buffer allocation failed")
             _yuv.rgb_to_yuv422_10(rgb, ybuf, self._yuv_matrix, self._yuv_full)
             pb = ybuf
-        pts = _pb.frame_pts(self.frame_count, self.fps)
+        if pts_ticks is None:
+            pts = _pb.frame_pts(self.frame_count, self.fps)
+        else:
+            pts = CoreMedia.CMTimeMake(int(pts_ticks), _pb.VIDEO_TIME_SCALE)
+            if duration_ticks is not None:
+                self._explicit_end_ticks = int(pts_ticks) + int(duration_ticks)
         if not self.adaptor.appendPixelBuffer_withPresentationTime_(pb, pts):
             raise RuntimeError(
                 f"[{self.label}] appendPixelBuffer failed at frame {self.frame_count}: "
@@ -301,7 +322,12 @@ class AVWriter:
                 f"[{self.label}] audio pump didn't finish (progress="
                 f"{self._audio_progress[0]}/{self.audio_track.n_samples})"
             )
-        self.writer.endSessionAtSourceTime_(_pb.frame_pts(self.frame_count, self.fps))
+        if self._explicit_end_ticks is not None:
+            end = CoreMedia.CMTimeMake(self._explicit_end_ticks,
+                                       _pb.VIDEO_TIME_SCALE)
+        else:
+            end = _pb.frame_pts(self.frame_count, self.fps)
+        self.writer.endSessionAtSourceTime_(end)
         done = threading.Event()
         self.writer.finishWritingWithCompletionHandler_(lambda: done.set())
         done.wait()
