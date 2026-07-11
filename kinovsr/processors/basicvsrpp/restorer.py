@@ -13,7 +13,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.upscaler_base import WindowedUpscaler
+from kinovsr.modeling.upscaler_base import WindowedUpscaler
 
 try:
     from . import net

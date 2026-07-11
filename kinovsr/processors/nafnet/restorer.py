@@ -23,8 +23,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.compile_cache import cached as _cached
-from kinovsr.vsr_blocks import box3
+from kinovsr.modeling.compile_cache import cached as _cached
+from kinovsr.modeling.vsr_blocks import box3
 
 from . import net
 

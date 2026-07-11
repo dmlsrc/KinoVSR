@@ -18,8 +18,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.upscaler_base import to_rgb_batch
-from kinovsr.vsr_blocks import box3, compiled_spynet_flow, flow_warp
+from kinovsr.modeling.upscaler_base import to_rgb_batch
+from kinovsr.modeling.vsr_blocks import box3, compiled_spynet_flow, flow_warp
 
 try:
     from . import net

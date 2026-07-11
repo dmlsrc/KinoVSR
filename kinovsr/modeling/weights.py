@@ -10,6 +10,10 @@ read-only operations the CLI exposes:
   manifest records one; otherwise the report states the provenance chain
   it cannot verify rather than implying a hash check that did not run.
 
+It also owns ``resolve_weights``, the legacy variant-token/path resolver
+every family net uses to turn a short checkpoint token into a concrete
+file under its package ``weights/`` dir.
+
 Nothing here downloads. The registry of first-party manifests is
 explicit, like the processor catalog.
 """
@@ -216,5 +220,36 @@ __all__ = [
     "load_manifest",
     "load_registered",
     "registered_owners",
+    "resolve_weights",
     "verify_manifest",
 ]
+
+
+# Legacy token/path resolution (merged from the root weights module).
+
+def resolve_weights(spec: Any, variants: dict, weights_dir: Path, default: str) -> Path:
+    """Turn a weights spec into a concrete file path.
+
+    - ``None`` / empty  -> the ``default`` variant's file.
+    - a known variant token -> that variant's file (FileNotFoundError if it is missing,
+      e.g. a not-bundled checkpoint that has not been downloaded/converted yet).
+    - an existing path, or a bare filename present in ``weights_dir`` -> that file.
+    - anything else -> FileNotFoundError listing the valid tokens.
+    """
+    if spec is None or spec == "":
+        spec = default
+    spec = str(spec)
+    if spec in variants:
+        vp = weights_dir / variants[spec]
+        if vp.is_file():
+            return vp
+        raise FileNotFoundError(
+            f"weights variant {spec!r} maps to {vp}, which does not exist")
+    p = Path(spec).expanduser()
+    if p.is_file():
+        return p
+    if (weights_dir / spec).is_file():
+        return weights_dir / spec
+    raise FileNotFoundError(
+        f"weights {spec!r}: not a known variant {sorted(variants)} and not an "
+        f"existing file (also looked in {weights_dir})")

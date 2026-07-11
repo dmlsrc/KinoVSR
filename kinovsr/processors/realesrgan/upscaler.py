@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from kinovsr.upscaler_base import to_rgb_batch
+from kinovsr.modeling.upscaler_base import to_rgb_batch
 
 try:
     from . import net

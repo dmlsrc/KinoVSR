@@ -134,7 +134,7 @@ tiny and the cost lives in the qkv convs.
 
 ### Deformable conv: follow the input dtype
 
-The DCNv2 path (`kinovsr/deform_conv.py`) originally forced fp32: three
+The DCNv2 path (`kinovsr/modeling/deform_conv.py`) originally forced fp32: three
 cast-copies plus a `Cin*K*K x N*oH*oW` fp32 columns buffer (~1.9 GB at
 128ch/480p) written by the im2col kernel and re-read by an fp32 GEMM -- 2x the
 necessary traffic for data that only ever had fp16 precision. Running the whole
@@ -198,7 +198,7 @@ All measured, all worth not re-litigating:
 - `mx.compile` every shape-stable forward once, in a module-level cache. Gains:
   1.3-1.4x for dispatch-bound graphs (many small ops), ~1.05x for compute-bound
   ones. Every net here follows the `make_forward` + bounded-cache pattern.
-- Compile caches must be **bounded** (`kinovsr/compile_cache.py`, FIFO cap
+- Compile caches must be **bounded** (`kinovsr/modeling/compile_cache.py`, FIFO cap
   16): entries close over the checkpoint, so an unbounded id(p)-keyed dict
   retains every checkpoint ever constructed in the process. Eviction is safe --
   a params dict can only be collected (and its id recycled) after its entries

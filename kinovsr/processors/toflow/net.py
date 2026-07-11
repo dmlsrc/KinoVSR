@@ -30,7 +30,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.vsr_blocks import _bilinear, resize
+from kinovsr.modeling.vsr_blocks import _bilinear, resize
 
 _LEVELS = 4
 

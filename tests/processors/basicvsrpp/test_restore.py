@@ -8,8 +8,8 @@ issue #24), the geometric transforms, and the 8-way self-ensemble's round-trip.
 """
 import mlx.core as mx
 
+from kinovsr.modeling.upscaler_base import plan_gop_windows
 from kinovsr.processors.basicvsrpp import net
-from kinovsr.upscaler_base import plan_gop_windows
 
 
 def _emit_tiles(windows, n):
@@ -108,7 +108,7 @@ def test_spatial_ensemble_identity_roundtrip():
 
 
 def test_windowed_schedule_mode_emits_every_frame_once():
-    from kinovsr.upscaler_base import WindowedUpscaler
+    from kinovsr.modeling.upscaler_base import WindowedUpscaler
 
     class _Stub(WindowedUpscaler):
         SCALE = 1
@@ -133,7 +133,7 @@ def test_windowed_schedule_mode_emits_every_frame_once():
 
 def test_windowed_no_schedule_unchanged():
     # set_schedule(None) keeps the fixed window/trim path
-    from kinovsr.upscaler_base import WindowedUpscaler
+    from kinovsr.modeling.upscaler_base import WindowedUpscaler
 
     class _Stub(WindowedUpscaler):
         SCALE = 1

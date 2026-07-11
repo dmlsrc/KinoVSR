@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from kinovsr.upscaler_base import WindowedUpscaler
+from kinovsr.modeling.upscaler_base import WindowedUpscaler
 
 try:
     from . import net

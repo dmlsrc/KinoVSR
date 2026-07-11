@@ -12,8 +12,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.compile_cache import cached as _cached
-from kinovsr.vsr_blocks import (
+from kinovsr.modeling.compile_cache import cached as _cached
+from kinovsr.modeling.vsr_blocks import (
     _compute_flows,
     _pixelshuffle_pack,
     _resblocks_with_input,
@@ -25,7 +25,7 @@ from kinovsr.vsr_blocks import (
     pad_spynet_gates,
     resize,
 )
-from kinovsr.weights import resolve_weights as _resolve_weights
+from kinovsr.modeling.weights import resolve_weights as _resolve_weights
 
 # Per-checkpoint compiled step functions (built lazily, keyed by id(p)). The clean
 # step and the forward output step are pure and shape-stable, so mx.compile fuses

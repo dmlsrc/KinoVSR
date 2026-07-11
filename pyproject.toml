@@ -117,7 +117,7 @@ ignore = [
 # OUT of this list. Entries disappear as M4 migrates each family.
 "kinovsr/_harness.py" = ["T20"]
 "kinovsr/processors/basicvsrpp/**" = ["T20"]
-"kinovsr/deform_conv.py" = ["T20"]
+"kinovsr/modeling/deform_conv.py" = ["T20"]
 "kinovsr/eval/models/dover/**" = ["T20"]
 "kinovsr/native/encode.py" = ["T20"]
 "kinovsr/processors/esc/**" = ["T20"]

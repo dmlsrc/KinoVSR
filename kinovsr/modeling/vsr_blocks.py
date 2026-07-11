@@ -333,7 +333,7 @@ _VT_FLOW_CACHE: dict = {}
 def _vt_flow_service(w: int, h: int):
     key = (int(w), int(h))
     if key not in _VT_FLOW_CACHE:
-        from .denoise import McTemporalDenoiser   # noqa: I001  # lazy: pyobjc + VT session
+        from kinovsr.denoise import McTemporalDenoiser   # noqa: I001  # lazy: pyobjc + VT session
         _VT_FLOW_CACHE[key] = McTemporalDenoiser(
             w, h, strength=0.0, window=1, self_test=True)
     return _VT_FLOW_CACHE[key]

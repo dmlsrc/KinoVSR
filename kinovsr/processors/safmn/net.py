@@ -43,10 +43,11 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.compile_cache import cached as _cached
+from kinovsr.modeling.compile_cache import cached as _cached
+from kinovsr.modeling.upsample import bicubic_up as _bicubic_up
+from kinovsr.modeling.vsr_blocks import resize as _resize_bilinear
+from kinovsr.modeling.weights import resolve_weights as _resolve_weights
 from kinovsr.settings import default_settings
-from kinovsr.vsr_blocks import resize as _resize_bilinear
-from kinovsr.weights import resolve_weights as _resolve_weights
 
 _WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 # Not bundled (download + convert; see weights/README.md).
@@ -184,57 +185,6 @@ def _nearest_up(x: Any, r: int) -> Any:
     x = mx.broadcast_to(x[:, :, None, :, None, :], (n, h, r, w, r, c))
     return x.reshape(n, h * r, w * r, c)
 
-
-def _cubic_phases(r: int) -> list:
-    """Per-phase (floor offset, 4 tap weights) for torch bicubic interpolation
-    (Keys kernel, A=-0.75, align_corners=False) at integer upscale r. Output
-    pixel j of each block maps to source coordinate (j + 0.5)/r - 0.5; the four
-    taps sit at floor-1..floor+2."""
-    a = -0.75
-    phases = []
-    for j in range(r):
-        src = (j + 0.5) / r - 0.5
-        f = -1 if src < 0 else 0                        # floor(src) for src in (-0.5, 0.5)
-        t = src - f
-        w_m1 = a * (1 + t) ** 3 - 5 * a * (1 + t) ** 2 + 8 * a * (1 + t) - 4 * a
-        w_0 = (a + 2) * t ** 3 - (a + 3) * t ** 2 + 1
-        w_1 = (a + 2) * (1 - t) ** 3 - (a + 3) * (1 - t) ** 2 + 1
-        w_2 = a * (2 - t) ** 3 - 5 * a * (2 - t) ** 2 + 8 * a * (2 - t) - 4 * a
-        phases.append((f, (w_m1, w_0, w_1, w_2)))
-    return phases
-
-
-def _bicubic_axis_up(x: Any, r: int, axis: int) -> Any:
-    """Bicubic upsample by integer r along axis 1 (H) or 2 (W), matching torch
-    F.interpolate(mode="bicubic", align_corners=False). Edge-replicate padding by 2
-    reproduces torch's tap-index clamping at the borders exactly (taps reach at most
-    2 outside). Each of the r phases is a fixed 4-tap blend of shifted slices."""
-    n = x.shape[1] if axis == 1 else x.shape[2]
-    if axis == 1:
-        edge0, edge1 = x[:, :1], x[:, -1:]
-        xp = mx.concatenate([edge0, edge0, x, edge1, edge1], axis=1)
-    else:
-        edge0, edge1 = x[:, :, :1], x[:, :, -1:]
-        xp = mx.concatenate([edge0, edge0, x, edge1, edge1], axis=2)
-
-    def sl(o):
-        return xp[:, o:o + n] if axis == 1 else xp[:, :, o:o + n]
-
-    phases = []
-    for f, wt in _cubic_phases(r):
-        base = 2 + f - 1                                # first tap of block i is i + f - 1
-        s = (wt[0] * sl(base) + wt[1] * sl(base + 1)
-             + wt[2] * sl(base + 2) + wt[3] * sl(base + 3))
-        phases.append(s)
-    y = mx.stack(phases, axis=axis + 1)                 # (n, N, r, ...) on the chosen axis
-    shape = list(x.shape)
-    shape[axis] = shape[axis] * r
-    return y.reshape(shape)
-
-
-def _bicubic_up(x: Any, r: int) -> Any:
-    """r x r bicubic upsample (torch semantics), separable rows-then-columns."""
-    return _bicubic_axis_up(_bicubic_axis_up(x, r, 1), r, 2)
 
 
 def _pixel_shuffle(x: Any, r: int) -> Any:

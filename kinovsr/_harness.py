@@ -54,6 +54,7 @@ from kinovsr.media import color as _color
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media import video_reader as _native_vr
 from kinovsr.media import yuv as _yuv
+from kinovsr.modeling.vsr_blocks import make_lanczos_plan, resample_width
 from kinovsr.native.vsr import NativePassthrough
 from kinovsr.native.writer import (
     HEVC_PROFILE_MAIN10,
@@ -64,7 +65,6 @@ from kinovsr.processors.fastdvdnet import FastDvdDenoiser
 from kinovsr.processors.toflow import TOFlowDenoiser
 from kinovsr.progress import StackedPhaseBars
 from kinovsr.settings import Settings
-from kinovsr.vsr_blocks import make_lanczos_plan, resample_width
 
 
 def parse_mlx_dtype_name(name: str) -> Any:
@@ -474,7 +474,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
     _read_start = win_start          # gop-align may extend the read back to a keyframe
     _gop_head_skip = 0               # context frames read before --start, output-dropped
     if args.gop_align:
-        from kinovsr.upscaler_base import plan_gop_windows
+        from kinovsr.modeling.upscaler_base import plan_gop_windows
         _win_e = _win_end_abs
         # Anchor the first window on the keyframe enclosing --start: read from
         # it and feed [kf, start) as recurrence context (processed, not output),

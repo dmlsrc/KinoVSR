@@ -27,9 +27,9 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.compile_cache import cached as _cached
+from kinovsr.modeling.compile_cache import cached as _cached
+from kinovsr.modeling.weights import resolve_weights as _resolve_weights
 from kinovsr.settings import default_settings
-from kinovsr.weights import resolve_weights as _resolve_weights
 
 _WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 _TLSC_TRAIN_HW = (256, 256)

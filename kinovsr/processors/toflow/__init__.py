@@ -18,9 +18,9 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.processors.safmn.net import _bicubic_up
-from kinovsr.vsr_blocks import _bilinear, resize
-from kinovsr.weights import resolve_weights as _resolve_weights
+from kinovsr.modeling.upsample import bicubic_up as _bicubic_up
+from kinovsr.modeling.vsr_blocks import _bilinear, resize
+from kinovsr.modeling.weights import resolve_weights as _resolve_weights
 
 _WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 _VARIANTS = {

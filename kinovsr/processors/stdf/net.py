@@ -18,9 +18,9 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.compile_cache import cached as _cached
-from kinovsr.deform_conv import deform_conv2d
-from kinovsr.weights import resolve_weights as _resolve_weights
+from kinovsr.modeling.compile_cache import cached as _cached
+from kinovsr.modeling.deform_conv import deform_conv2d
+from kinovsr.modeling.weights import resolve_weights as _resolve_weights
 
 _WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 # Both bundled checkpoints are R3 (7-frame), Y-only; they differ only in training data.

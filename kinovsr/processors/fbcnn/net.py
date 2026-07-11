@@ -25,9 +25,9 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.compile_cache import cached as _cached
+from kinovsr.modeling.compile_cache import cached as _cached
+from kinovsr.modeling.weights import resolve_weights as _resolve_weights
 from kinovsr.settings import default_settings
-from kinovsr.weights import resolve_weights as _resolve_weights
 
 # The checkpoints are ~287MB each and are NOT bundled in-repo (free-account space); see
 # weights/README.md. fbcnn_color is the RGB one used by FbcnnDeblocker.

@@ -5,10 +5,10 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
+from kinovsr.modeling.vsr_blocks import _compute_flows, box3, history_improve_gate
 from kinovsr.processors.basicvsrpp.upscaler import BasicVsrUpscaler
 from kinovsr.processors.realbasicvsr.upscaler import RealBasicVsrUpscaler
 from kinovsr.processors.realviformer.upscaler import RealViformerUpscaler
-from kinovsr.vsr_blocks import _compute_flows, box3, history_improve_gate
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -1006,7 +1006,7 @@ def test_edge_sanitize_aspect_crop_picks_closest_even_fit():
 
 
 def test_lanczos_resample_plan_properties():
-    from kinovsr.vsr_blocks import make_lanczos_plan, resample_width
+    from kinovsr.modeling.vsr_blocks import make_lanczos_plan, resample_width
 
     # identity when sizes match
     plan = make_lanczos_plan(12, 12)
@@ -1042,7 +1042,7 @@ def test_lanczos_resample_plan_properties():
 
 
 def test_to_rgb_batch_clips_decode_overshoot():
-    from kinovsr.upscaler_base import to_rgb_batch
+    from kinovsr.modeling.upscaler_base import to_rgb_batch
 
     # decoded RGBAHalf carries legal YUV->RGB overshoot; every learned
     # upscaler entry must clip it (measured 56x confetti-speck area unclipped)
