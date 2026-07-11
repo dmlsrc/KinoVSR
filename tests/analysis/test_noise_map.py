@@ -486,7 +486,7 @@ def test_mc_sigma_plane_and_pulse():
     # the flow self-test refuses (unsupported device / too-small buffers).
     import pytest
 
-    from kinovsr.denoise import McTemporalDenoiser
+    from kinovsr.processors.mc import McTemporalDenoiser
     mx.random.seed(9)
     h, w = 240, 320
     base = mx.clip(mx.full((h, w, 3), 0.45) + 0.15 * mx.random.uniform(shape=(h, w, 3)), 0, 1)

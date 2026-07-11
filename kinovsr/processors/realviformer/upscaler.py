@@ -121,7 +121,7 @@ class RealViformerUpscaler:
         the previous feature map at p + flow[p].
         """
         if self._vt_flow is None:
-            from kinovsr.denoise import McTemporalDenoiser
+            from kinovsr.processors.mc import McTemporalDenoiser
 
             _, h, w, _ = curr.shape
             self._vt_flow = McTemporalDenoiser(

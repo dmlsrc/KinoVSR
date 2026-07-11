@@ -26,8 +26,10 @@ _FACTORY_TARGETS: dict[str, str] = {
     "bsvd": "kinovsr.processors.bsvd.factory:FACTORY",
     "cut_detect": "kinovsr.processors.cut_detect:FACTORY",
     "deflicker": "kinovsr.processors.deflicker:FACTORY",
+    "mc": "kinovsr.processors.mc:FACTORY",
     "metalfx": "kinovsr.processors.metalfx:FACTORY",
     "realplksr": "kinovsr.processors.realplksr.factory:FACTORY",
+    "spatial": "kinovsr.processors.spatial:FACTORY",
     "videotoolbox": "kinovsr.processors.videotoolbox:FACTORY",
 }
 

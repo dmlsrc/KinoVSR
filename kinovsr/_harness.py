@@ -34,7 +34,7 @@ from kinovsr import (
 )
 from kinovsr.api import VideoProcessResult
 from kinovsr.comparison import render_comparison
-from kinovsr.denoise import LumaChromaDenoiser, McTemporalDenoiser, SpatialDenoiser
+from kinovsr.denoise import LumaChromaDenoiser
 from kinovsr.edge_sanitize import (
     compute_aspect_crop,
     detect_bars,
@@ -62,6 +62,8 @@ from kinovsr.native.writer import (
 )
 from kinovsr.processors.bsvd import BsvdDenoiser
 from kinovsr.processors.fastdvdnet import FastDvdDenoiser
+from kinovsr.processors.mc import McTemporalDenoiser
+from kinovsr.processors.spatial import SpatialDenoiser
 from kinovsr.processors.toflow import TOFlowDenoiser
 from kinovsr.progress import StackedPhaseBars
 from kinovsr.settings import Settings
