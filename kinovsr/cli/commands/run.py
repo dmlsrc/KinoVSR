@@ -31,6 +31,17 @@ def run_video_command(argv: list[str]) -> int:
     from kinovsr.ui import configure_logging_from_settings
 
     configure_logging_from_settings(settings)
+
+    # --probe-noise analyzes instead of processing; same implementation
+    # as `kinovsr probe noise`.
+    options = invocation.options
+    if getattr(options, "probe_noise", False):
+        from pathlib import Path
+
+        from .probe_noise import probe_noise
+
+        return probe_noise(Path(options.video), start_spec=options.start,
+                           end_spec=options.end, reader=options.reader)
     from kinovsr.api import (
         VideoFileConfig,
         process_video_file,

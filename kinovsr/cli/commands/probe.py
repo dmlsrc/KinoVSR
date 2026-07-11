@@ -6,7 +6,7 @@ script before the M4 command split.
 
 from __future__ import annotations
 
-_SUBCOMMANDS = ("edges", "nafnet")
+_SUBCOMMANDS = ("edges", "nafnet", "noise")
 
 
 def run_probe_command(argv: list[str]) -> int:
@@ -26,6 +26,10 @@ def run_probe_command(argv: list[str]) -> int:
         from .probe_nafnet import run_probe_nafnet
 
         return run_probe_nafnet(rest) or 0
+    if name == "noise":
+        from .probe_noise import run_probe_noise
+
+        return run_probe_noise(rest) or 0
     from kinovsr.ui.console import get_console
 
     get_console().print(
