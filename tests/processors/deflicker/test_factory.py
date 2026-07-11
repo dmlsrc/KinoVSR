@@ -1,4 +1,9 @@
-"""deflicker factory: the centered-window stateful preprocess family."""
+"""deflicker factory: a CENTERED (self-buffered) preprocess family.
+
+CENTERED means the +/-K window's future half is self-buffered and paid
+as output delay, so no source lookahead is demanded and live edges
+remain legal inputs.
+"""
 
 from fractions import Fraction
 
@@ -16,7 +21,6 @@ from kinovsr.processors import (
     get_factory,
 )
 from kinovsr.processors.deflicker import FACTORY, DeflickerStageConfig
-from kinovsr.processors.errors import PipelineError
 from kinovsr.settings import Settings
 
 pytestmark = pytest.mark.unit
@@ -53,14 +57,15 @@ class TestParse:
 
 
 class TestSpec:
-    def test_centered_window_demands_lookahead(self):
+    def test_no_source_lookahead_demanded(self):
+        # The window is self-buffered as output delay, so a source
+        # without lookahead (a live edge) is a legal input.
         from kinovsr.pipeline import resolve_pipeline
 
         config = {"pipeline": ["df"], "df": {"processor": "deflicker"}}
         resolve_pipeline(config, input_spec=stream(), settings=SETTINGS)
-        with pytest.raises(PipelineError, match="lookahead"):
-            resolve_pipeline(config, input_spec=stream(lookahead=False),
-                             settings=SETTINGS)
+        resolve_pipeline(config, input_spec=stream(lookahead=False),
+                         settings=SETTINGS)
 
     def test_temporal_declaration(self):
         spec = FACTORY.capabilities[Capability.PREPROCESS]

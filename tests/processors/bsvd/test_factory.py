@@ -55,9 +55,12 @@ class TestParse:
         with pytest.raises(ValueError, match="did you mean 'strength'"):
             parse({"stregnth": 0.2})
 
-    def test_declares_causal_stateful(self):
+    def test_declares_centered_stateful(self):
+        # Bidirectional within its own buffer: CENTERED per the
+        # taxonomy, with the 16-frame delay as the future reach.
         spec = FACTORY.capabilities[Capability.DENOISE]
-        assert spec.temporal_mode is TemporalMode.CAUSAL
+        assert spec.temporal_mode is TemporalMode.CENTERED
+        assert spec.temporal_radius == 16
         assert spec.stateful
         assert get_factory("bsvd") is FACTORY
 

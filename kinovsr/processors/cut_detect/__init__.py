@@ -125,7 +125,7 @@ class CutDetector:
 
 
 # ===========================================================================
-# Processor family: the HARD_CUT boundary emitter
+# Processor family: a HARD_CUT boundary emitter
 # ===========================================================================
 
 _MODES = ("simple", "hist")

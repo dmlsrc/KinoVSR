@@ -450,7 +450,7 @@ class StaticStateDeflicker:
 
 
 # ===========================================================================
-# Processor family: centered-window flicker suppression
+# Processor family: self-buffered flicker suppression
 # ===========================================================================
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -470,9 +470,10 @@ def _passthrough(spec: StreamSpec, config: object) -> StreamSpec:
 class DeflickerFactory:
     name = "deflicker"
 
-    # temporal_radius carries the DEFAULT window; the builder uses the
-    # CENTERED mode (not the radius value) to demand an input with
-    # lookahead, and the driver buffers its configured window itself.
+    # CENTERED per the taxonomy: the +/-K integration window's future
+    # half is self-buffered and paid as K frames of output delay - no
+    # source lookahead demanded. temporal_radius records the default
+    # delay; the configured window governs the driver.
     capabilities = {
         Capability.PREPROCESS: CapabilitySpec(
             capability=Capability.PREPROCESS,

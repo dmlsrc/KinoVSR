@@ -33,7 +33,6 @@ from kinovsr.processors import (
     StreamConstraint,
     StreamEdgeError,
     StreamSpec,
-    TemporalMode,
     UnknownFamilyError,
     UnknownStageError,
     coherence_violations,
@@ -199,9 +198,6 @@ def resolve_pipeline(
             raise StreamEdgeError(upstream, stage_name, broken,
                                   produced=current)
         violations = list(cap_spec.accepts.violations(current))
-        if (cap_spec.temporal_mode is TemporalMode.CENTERED
-                and not current.lookahead_available):
-            violations.append(_lookahead_violation(cap_spec))
         missing = [k for k in cap_spec.requires_boundaries
                    if k not in provided_boundaries]
         for kind in missing:
@@ -235,13 +231,6 @@ def resolve_pipeline(
 
     return BuildPlan(stages=tuple(stages), input_spec=input_spec,
                      output_spec=current)
-
-
-def _lookahead_violation(cap_spec: CapabilitySpec) -> FieldViolation:
-    return FieldViolation(
-        "lookahead_available",
-        f"true (centered window, radius {cap_spec.temporal_radius})",
-        "false")
 
 
 def _boundary_violation(kind: BoundaryKind) -> FieldViolation:

@@ -53,8 +53,10 @@ class BsvdFactory:
                 dtypes=(DType.FLOAT32, DType.FLOAT16),
                 domains=(Domain.UNIT, Domain.UNIT_SANITIZED),
             ),
-            temporal_mode=TemporalMode.CAUSAL,
-            temporal_radius=16,       # the bidirectional-buffer delay
+            # Bidirectional within its own buffer: future context is
+            # self-buffered and paid as the 16-frame output delay.
+            temporal_mode=TemporalMode.CENTERED,
+            temporal_radius=16,
             stateful=True,
         ),
     }

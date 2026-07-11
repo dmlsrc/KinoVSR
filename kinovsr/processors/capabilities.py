@@ -31,10 +31,18 @@ class Capability(Enum):
 class TemporalMode(Enum):
     # Stateless per-frame function of the current unit only.
     PER_FRAME = "per_frame"
-    # Uses past units only (streaming recurrence); no lookahead needed.
+    # Uses past units only; emits for each unit immediately (zero
+    # output delay).
     CAUSAL = "causal"
-    # Uses past and FUTURE units within temporal_radius; requires a source
-    # with lookahead (a file, a buffered stream), never a live edge.
+    # Uses past and FUTURE units within temporal_radius. The future
+    # context is SELF-BUFFERED: the stage consumes units in arrival
+    # order and pays its lookahead as output delay (emit t once t+radius
+    # arrived; flush drains the tail). It demands nothing of the source,
+    # so live edges are legal inputs - bsvd's bidirectional buffer and
+    # deflicker's +/-K integration window are this shape. A
+    # scheduler-prefetch variant (future units delivered at process time
+    # in exchange for a source-lookahead requirement) is deliberately
+    # NOT modeled until a real stage needs it.
     CENTERED = "centered"
     # Propagates over whole chunks/sequences (bidirectional recurrents);
     # the scheduler hands it framework-owned windows.
@@ -62,7 +70,8 @@ class CapabilitySpec:
     produces: Callable[[StreamSpec, object], StreamSpec] = preserve_stream
     # How many neighbor frames the unit consumes on each side (0 for
     # per-frame). For CAUSAL modes this is the look-back depth; for
-    # CENTERED it is the symmetric radius that lookahead must cover.
+    # CENTERED it is the future reach, which equals the stage's output
+    # delay (self-buffered lookahead).
     temporal_radius: int = 0
     temporal_mode: TemporalMode = TemporalMode.PER_FRAME
     stateful: bool = False

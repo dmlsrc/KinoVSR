@@ -1,4 +1,6 @@
-"""cut_detect factory: the HARD_CUT boundary emitter."""
+"""cut_detect factory: a HARD_CUT boundary emitter (content-difference
+based; other families may emit the same boundary from other signals,
+e.g. keyframe cadence)."""
 
 from fractions import Fraction
 

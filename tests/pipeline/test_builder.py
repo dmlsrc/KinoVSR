@@ -285,8 +285,11 @@ class TestInvalidChains:
             resolve_pipeline(config, input_spec=stream(), settings=SETTINGS)
         assert exc.value.upstream == "input"
 
-    def test_centered_window_rejects_source_without_lookahead(
+    def test_centered_window_is_self_buffered_no_source_demand(
             self, families):
+        # CENTERED pays its future reach as output delay (emit t once
+        # t+radius arrived), so it demands nothing of the source: a
+        # live edge without lookahead is a legal input.
         config = {
             "pipeline": ["centered"],
             "centered": {"processor": "fakecentered"},
@@ -294,12 +297,9 @@ class TestInvalidChains:
         plan = resolve_pipeline(
             config, input_spec=stream(lookahead=True), settings=SETTINGS)
         assert plan.stages[0].capability_spec.temporal_radius == 3
-        with pytest.raises(StreamEdgeError) as exc:
-            resolve_pipeline(
-                config, input_spec=stream(lookahead=False),
-                settings=SETTINGS)
-        assert "lookahead_available" in str(exc.value)
-        assert "radius 3" in str(exc.value)
+        plan = resolve_pipeline(
+            config, input_spec=stream(lookahead=False), settings=SETTINGS)
+        assert plan.stages[0].capability_spec.temporal_radius == 3
 
     def test_boundary_requirement_unmet_is_rejected(self, families):
         config = {
