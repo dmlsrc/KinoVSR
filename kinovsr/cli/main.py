@@ -1,12 +1,11 @@
-"""The installed console entry point: parse, assemble, run, report."""
+"""The installed console entry point: subcommand dispatch only.
+
+Each command owns its argument surface and terminal wiring; this module
+just routes. The flat processing invocation (``kinovsr --video ...``)
+remains the default route and is also reachable as ``kinovsr run``.
+"""
 
 from __future__ import annotations
-
-from kinovsr.config import ConfigError
-from kinovsr.ui.console import get_console
-
-from .args import build_parser, validate_args
-from .config import assemble
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -14,8 +13,6 @@ def main(argv: list[str] | None = None) -> int:
         import sys
 
         argv = sys.argv[1:]
-    # Subcommand surface: the flat processing CLI remains the default
-    # invocation shape until step 6 moves it onto the typed pipeline.
     if argv and argv[0] == "weights":
         from .commands.weights import run_weights_command
 
@@ -33,33 +30,11 @@ def main(argv: list[str] | None = None) -> int:
 
         return run_artifacts_command(argv[1:])
 
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    validate_args(parser, args)
+    from .commands.run import run_video_command
 
-    try:
-        invocation = assemble(args)
-    except ConfigError as exc:
-        get_console().print(f"config error: {exc}", style="bold red")
-        return 2
-
-    settings = invocation.settings
-    from kinovsr.ui import configure_logging_from_settings
-
-    configure_logging_from_settings(settings)
-    from kinovsr.api import (
-        VideoFileConfig,
-        process_video_file,
-        resolve_mlx_cache_limit_gb,
-    )
-
-    limit = resolve_mlx_cache_limit_gb(settings)
-    if limit > 0 and not settings.quiet:
-        get_console().print(f"MLX cache limit: {limit:g} GB")
-
-    process_video_file(
-        VideoFileConfig(settings=settings, options=invocation.options))
-    return 0
+    if argv and argv[0] == "run":
+        return run_video_command(argv[1:])
+    return run_video_command(argv)
 
 
 if __name__ == "__main__":
