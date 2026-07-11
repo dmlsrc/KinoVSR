@@ -24,11 +24,13 @@ from .protocol import ProcessorFactory
 # rest). The name on the left MUST equal the factory's own .name.
 _FACTORY_TARGETS: dict[str, str] = {
     "bsvd": "kinovsr.processors.bsvd.factory:FACTORY",
+    "crop": "kinovsr.processors.crop:FACTORY",
     "cut_detect": "kinovsr.processors.cut_detect:FACTORY",
     "deflicker": "kinovsr.processors.deflicker:FACTORY",
     "mc": "kinovsr.processors.mc:FACTORY",
     "metalfx": "kinovsr.processors.metalfx:FACTORY",
     "realplksr": "kinovsr.processors.realplksr.factory:FACTORY",
+    "sanitize_edges": "kinovsr.processors.sanitize_edges:FACTORY",
     "spatial": "kinovsr.processors.spatial:FACTORY",
     "videotoolbox": "kinovsr.processors.videotoolbox:FACTORY",
 }
