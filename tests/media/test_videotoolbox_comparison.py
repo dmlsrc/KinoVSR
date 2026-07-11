@@ -14,7 +14,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from kinovsr import comparison
+from kinovsr.media import comparison
 from kinovsr.media import pixel_buffers as pb
 
 

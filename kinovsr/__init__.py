@@ -23,7 +23,6 @@ Public surface:
 Submodules expose lower-level helpers:
 
     pixel_buffers   CVPixelBuffer create/read/write, CMTime helpers
-    comparison      Side-by-side composite for `comparison.mp4`
 
 The stacked progress-bar primitives moved to `kinovsr.progress`
 (was previously re-exported here when the bars only had VSR callers).

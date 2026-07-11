@@ -33,7 +33,7 @@ from kinovsr import (
     autorelease_pool,
 )
 from kinovsr.api import VideoProcessResult
-from kinovsr.comparison import render_comparison
+from kinovsr.media.comparison import render_comparison
 from kinovsr.denoise import LumaChromaDenoiser
 from kinovsr.edge_sanitize import (
     compute_aspect_crop,
