@@ -32,10 +32,6 @@ from kinovsr import (
     VtfrcSession,
     autorelease_pool,
 )
-from kinovsr import color as _color
-from kinovsr import pixel_buffers as _pb
-from kinovsr import video_reader as _native_vr
-from kinovsr import yuv as _yuv
 from kinovsr.api import VideoProcessResult
 from kinovsr.bsvd import BsvdDenoiser
 from kinovsr.comparison import render_comparison
@@ -56,15 +52,19 @@ from kinovsr.edge_sanitize import (
     sanitize_rgb as _sanitize_rgb,
 )
 from kinovsr.fastdvdnet import FastDvdDenoiser
-from kinovsr.progress import StackedPhaseBars
-from kinovsr.settings import Settings
-from kinovsr.toflow import TOFlowDenoiser
-from kinovsr.vsr import NativePassthrough
-from kinovsr.vsr_blocks import make_lanczos_plan, resample_width
-from kinovsr.writer import (
+from kinovsr.media import color as _color
+from kinovsr.media import pixel_buffers as _pb
+from kinovsr.media import video_reader as _native_vr
+from kinovsr.media import yuv as _yuv
+from kinovsr.native.vsr import NativePassthrough
+from kinovsr.native.writer import (
     HEVC_PROFILE_MAIN10,
     HEVC_PROFILE_MAIN422_10,
 )
+from kinovsr.progress import StackedPhaseBars
+from kinovsr.settings import Settings
+from kinovsr.toflow import TOFlowDenoiser
+from kinovsr.vsr_blocks import make_lanczos_plan, resample_width
 
 
 def parse_mlx_dtype_name(name: str) -> Any:
@@ -151,7 +151,7 @@ def _read_audio_track_from_video(mp4_path: Path, vr: Any) -> AudioTrack | None:
     float32 MLX array - no ffmpeg, no disk WAV. Returns None if the file has
     no audio track.
     """
-    from kinovsr.audio import read_wav
+    from kinovsr.media.audio import read_wav
 
     if hasattr(vr, "read_audio_track"):
         # ffmpeg compatibility reader: decode audio via the same backend that
@@ -242,7 +242,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
     output_full_range = _resolved_color[3]
 
     # ---- Input source ------------------------------------------------------
-    from kinovsr.vsr import source_format_for_mode
+    from kinovsr.native.vsr import source_format_for_mode
 
     # ---- reader selection: native (AVFoundation) unless forced or refused.
     # The ffmpeg compatibility reader mirrors the native surface for
@@ -251,14 +251,14 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
     # ffmpeg fallback into every later facade call in the same process.
     vr = _native_vr
     if args.reader == "ffmpeg":
-        from kinovsr import ffmpeg_reader
+        from kinovsr.media import ffmpeg_reader
         vr = ffmpeg_reader
         print("[reader] ffmpeg compatibility reader (forced)")
     elif args.reader == "auto":
         try:
             vr.probe_video(Path(args.video))
         except Exception as e:
-            from kinovsr import ffmpeg_reader
+            from kinovsr.media import ffmpeg_reader
             vr = ffmpeg_reader
             print(f"[reader] native reader cannot open this file "
                   f"({type(e).__name__}); using the ffmpeg compatibility reader")
@@ -587,7 +587,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
     safmn_spec = settings.safmn_weights or args.safmn_profile
     esc_spec = settings.esc_weights or args.esc_profile
     realplksr_spec = settings.realplksr_weights or args.realplksr_profile
-    from kinovsr.vsr import scale_for_mode
+    from kinovsr.native.vsr import scale_for_mode
     spatial_scale = 1 if args.upscale == "none" else scale_for_mode(args.upscale)
     if args.upscale == "realesrgan":
         # realesrgan covers 2x (x2plus) as well as 4x models; read the real scale from the
@@ -1764,7 +1764,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
                       f"p95 {float(_s[int(0.95 * (_n - 1))]):.3f}  max {float(_s[-1]):.3f}  "
                       f"({float(mx.mean((_bm > 0.5).astype(mx.float32))) * 100:.0f}% of frame > 0.5)")
                 if args.noise_map_debug and post_writer is not None:
-                    from kinovsr.images import save_image
+                    from kinovsr.media.images import save_image
                     _vp = Path(post_writer.path)
                     _png = _vp.with_name(_vp.stem + "_blockmap.png")
                     _u8 = (mx.clip(_bm[:, :, 0], 0, 1) * 255).astype(mx.uint8)
@@ -1821,7 +1821,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
                           f"median {float(_e[_n // 2]):.4f}  max {float(_e[-1]):.4f}  "
                           f"(floor {_lo:.4f}{f', ceil {_hi:.4f}' if _hi > 0 else ''})")
                 if args.noise_map_debug and post_writer is not None:
-                    from kinovsr.images import save_image
+                    from kinovsr.media.images import save_image
                     _vp = Path(post_writer.path)
                     _png = _vp.with_name(_vp.stem + "_noisemap.png")
                     _u8 = (mx.clip(_nm_src[:, :, 0] / 0.15, 0, 1) * 255).astype(mx.uint8)

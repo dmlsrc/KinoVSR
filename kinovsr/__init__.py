@@ -31,17 +31,17 @@ The stacked progress-bar primitives moved to `kinovsr.progress`
 
 from __future__ import annotations
 
-from ._compat import autorelease_pool, require_pyobjc
+from .cut_detect import CutDetector
 
 # Re-export the main classes. Each submodule imports its own PyObjC bits via
-# _compat, so importing this package only forces the pyobjc check at the
+# native.compat, so importing this package only forces the pyobjc check at the
 # point a class is actually constructed (via require_pyobjc in each ctor).
-from .audio import AudioTrack
-from .cut_detect import CutDetector
-from .encode import encode_video_videotoolbox
-from .temporal import VtfrcSession
-from .vsr import VsrSession
-from .writer import AVWriter
+from .media.audio import AudioTrack
+from .native.compat import autorelease_pool, require_pyobjc
+from .native.encode import encode_video_videotoolbox
+from .native.temporal import VtfrcSession
+from .native.vsr import VsrSession
+from .native.writer import AVWriter
 
 __all__ = [
     "AVWriter",

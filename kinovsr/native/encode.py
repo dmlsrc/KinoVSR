@@ -44,11 +44,12 @@ from typing import Any
 
 import mlx.core as mx
 
-from . import color as _color
-from . import pixel_buffers as _pb
-from ._compat import autorelease_pool, require_pyobjc
-from .audio import AudioTrack
-from .progress import StackedPhaseBars
+from kinovsr.media import color as _color
+from kinovsr.media import pixel_buffers as _pb
+from kinovsr.media.audio import AudioTrack
+from kinovsr.progress import StackedPhaseBars
+
+from .compat import autorelease_pool, require_pyobjc
 from .temporal import VtfrcSession
 from .vsr import VsrSession, scale_for_mode
 from .writer import HEVC_PROFILE_MAIN10, HEVC_PROFILE_MAIN422_10, AVWriter

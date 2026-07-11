@@ -22,10 +22,10 @@ from typing import Any
 
 import mlx.core as mx
 
-from . import pixel_buffers as _pb
-from ._compat import Foundation, Quartz, autorelease_pool, require_pyobjc, vt
+from .media import pixel_buffers as _pb
+from .native.compat import Foundation, Quartz, autorelease_pool, require_pyobjc, vt
+from .native.vsr import _suppress_native_stderr
 from .settings import default_settings
-from .vsr import _suppress_native_stderr
 from .vsr_blocks import compiled_spynet_flow
 
 # Max optical-flow calls in flight at once. Each flow is an ANE/IOKit dispatch

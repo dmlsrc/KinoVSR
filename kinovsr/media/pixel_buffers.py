@@ -13,7 +13,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from ._compat import CoreMedia, Foundation, Quartz, require_pyobjc
+from kinovsr.native.compat import CoreMedia, Foundation, Quartz, require_pyobjc
 
 # FourCC pixel-format constants ----------------------------------------------
 #

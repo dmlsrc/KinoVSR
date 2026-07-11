@@ -18,7 +18,7 @@ The enums are grounded in the foundation's real surfaces:
 - native payloads are CVPixelBuffers in the three formats the readers,
   VideoToolbox sessions, and writers actually exchange (BGRA8, 64RGBAHalf,
   NV12 biplanar video-range);
-- color identity mirrors ``kinovsr.color.resolve``: matrix, primaries,
+- color identity mirrors ``kinovsr.media.color.resolve``: matrix, primaries,
   transfer, and range, with the bt601/bt709/bt2020 token families.
 """
 

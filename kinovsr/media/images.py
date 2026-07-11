@@ -25,7 +25,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from ._compat import Foundation, Quartz, autorelease_pool, require_pyobjc
+from kinovsr.native.compat import Foundation, Quartz, autorelease_pool, require_pyobjc
+
 from .pixel_buffers import ci_context, srgb_colorspace
 
 # RGBX: 4 bytes/pixel, alpha byte ignored. Matches Pillow's convert("RGB")

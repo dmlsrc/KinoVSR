@@ -164,7 +164,7 @@ def fit_model(folder: Path, out: Path, max_images: int = 200,
               sharp_frac: float = 0.75) -> None:
     import mlx.core as mx
 
-    from kinovsr.images import load_image_rgb
+    from kinovsr.media.images import load_image_rgb
     paths = sorted(p for p in folder.rglob("*.png"))
     if len(paths) > max_images:
         paths = paths[:: max(1, len(paths) // max_images)][:max_images]

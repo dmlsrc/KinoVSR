@@ -99,8 +99,8 @@ class FileSource:
             raise MediaError(
                 f"input endpoint cannot produce layout {layout.value!r} "
                 f"(supported: {supported})")
-        from kinovsr import pixel_buffers as _pb
-        from kinovsr import video_reader as _native_vr
+        from kinovsr.media import pixel_buffers as _pb
+        from kinovsr.media import video_reader as _native_vr
 
         self._vr = reader if reader is not None else _native_vr
         self._pb = _pb
@@ -110,7 +110,7 @@ class FileSource:
 
         width, height, fps, total, transform, pixel_aspect = (
             self._vr.probe_video(self.path))
-        from kinovsr import color as _color
+        from kinovsr.media import color as _color
 
         src_color = self._vr.probe_color(self.path)
         self.resolved_color = _color.resolve(src_color, "auto", "auto")
@@ -213,8 +213,8 @@ class FileSink:
         audio_track: Any = None,
         audio_codec: str = "alac",
     ) -> None:
-        from kinovsr import pixel_buffers as _pb
-        from kinovsr.writer import (
+        from kinovsr.media import pixel_buffers as _pb
+        from kinovsr.native.writer import (
             HEVC_PROFILE_MAIN10,
             HEVC_PROFILE_MAIN422_10,
             AVWriter,
@@ -238,7 +238,7 @@ class FileSink:
         geometry = output_spec.frame.geometry
         self._is_mlx = layout is Layout.MLX_RGB_HWC
         resolved = source.resolved_color if source is not None else None
-        from kinovsr import color as _color
+        from kinovsr.media import color as _color
 
         writer_kwargs: dict[str, Any] = {}
         if resolved is not None:

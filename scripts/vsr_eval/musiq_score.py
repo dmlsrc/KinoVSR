@@ -50,7 +50,7 @@ def main() -> int:
     for inp in args.inputs:
         p = Path(inp)
         if p.suffix.lower() in IMAGE_EXTS:
-            from kinovsr.images import load_image_rgb
+            from kinovsr.media.images import load_image_rgb
             frames = [load_image_rgb(p).astype(mx.float32) / 255.0]
         else:
             frames = _read_video_frames(p, args.every)

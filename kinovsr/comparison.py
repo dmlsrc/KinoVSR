@@ -15,8 +15,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from . import pixel_buffers as _pb
-from ._compat import Foundation, Quartz, require_pyobjc
+from .media import pixel_buffers as _pb
+from .native.compat import Foundation, Quartz, require_pyobjc
 
 
 def render_comparison(

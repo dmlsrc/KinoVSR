@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._compat import CoreMedia, Quartz, av
+from kinovsr.native.compat import CoreMedia, Quartz, av
 
 # --- canonical CV constant triples (primaries, transfer, matrix) -------------
 _709 = (Quartz.kCVImageBufferColorPrimaries_ITU_R_709_2,

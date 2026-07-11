@@ -1056,7 +1056,7 @@ def test_to_rgb_batch_clips_decode_overshoot():
 
 
 def test_source_range_resolve_override():
-    from kinovsr import color
+    from kinovsr.media import color
 
     src = {"primaries": None, "transfer": None, "matrix": None,
            "full_range": False, "tagged": False}

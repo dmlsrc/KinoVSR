@@ -15,10 +15,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import pixel_buffers as _pb
-from . import yuv as _yuv
-from ._compat import CoreMedia, Foundation, Quartz, av, libdispatch, require_pyobjc
-from .audio import AudioTrack, audio_writer_settings
+from kinovsr.media import pixel_buffers as _pb
+from kinovsr.media import yuv as _yuv
+from kinovsr.media.audio import AudioTrack, audio_writer_settings
+
+from .compat import CoreMedia, Foundation, Quartz, av, libdispatch, require_pyobjc
 
 # HEVC profile identifiers (Apple-stable strings; not exposed as PyObjC consts)
 HEVC_PROFILE_MAIN10 = "HEVC_Main10_AutoLevel"          # 4:2:0 10-bit

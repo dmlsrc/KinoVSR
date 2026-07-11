@@ -127,5 +127,5 @@ def test_main_runs_legacy_spellings_end_to_end(clip_with_audio, tmp_path):
     # Reader choice is per-run: a forced-ffmpeg run must not rebind the
     # module-level reader that later runs (facade calls) start from.
     import kinovsr._harness as harness
-    import kinovsr.video_reader as native_reader
+    import kinovsr.media.video_reader as native_reader
     assert harness._native_vr is native_reader

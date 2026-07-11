@@ -152,8 +152,8 @@ def _compare_outputs(control_mp4: Path, new_mp4: Path) -> dict:
     """Frame count, geometry, duration, and PSNR between the two outputs."""
     import mlx.core as mx
 
-    from kinovsr import pixel_buffers as _pb
-    from kinovsr import video_reader as vr
+    from kinovsr.media import pixel_buffers as _pb
+    from kinovsr.media import video_reader as vr
 
     info = {}
     probes = {}

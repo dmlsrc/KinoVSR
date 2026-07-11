@@ -23,8 +23,9 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
-from . import pixel_buffers as _pb
-from ._compat import require_pyobjc, vt
+from kinovsr.media import pixel_buffers as _pb
+
+from .compat import require_pyobjc, vt
 
 
 class VtfrcSession:

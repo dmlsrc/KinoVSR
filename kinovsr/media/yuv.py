@@ -23,7 +23,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from ._compat import Quartz, require_pyobjc
+from kinovsr.native.compat import Quartz, require_pyobjc
 
 # 10-bit 4:2:2 biplanar, the format the HEVC 4:2:2 profile consumes directly.
 PIX_422YCBCR10_VIDEO = Quartz.kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange

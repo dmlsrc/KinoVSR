@@ -75,7 +75,7 @@ class TestParseAndSpec:
 
 
 def source_units(n):
-    from kinovsr import pixel_buffers as _pb
+    from kinovsr.media import pixel_buffers as _pb
 
     # VTFrameProcessor requires IOSurface-backed source buffers (the real
     # readers and pools always produce them; a bare CVPixelBuffer crashes

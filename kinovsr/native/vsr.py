@@ -15,9 +15,10 @@ import threading
 from contextlib import contextmanager
 from typing import Any
 
-from . import pixel_buffers as _pb
-from ._compat import Quartz, require_pyobjc, vt
-from .settings import default_settings
+from kinovsr.media import pixel_buffers as _pb
+from kinovsr.settings import default_settings
+
+from .compat import Quartz, require_pyobjc, vt
 
 
 @contextmanager

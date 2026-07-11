@@ -27,8 +27,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from kinovsr.native.compat import CoreMedia, Foundation, Quartz, av, require_pyobjc, vt
+
 from . import pixel_buffers as _pb
-from ._compat import CoreMedia, Foundation, Quartz, av, require_pyobjc, vt
 
 
 def _first_video_track(asset: Any) -> Any:

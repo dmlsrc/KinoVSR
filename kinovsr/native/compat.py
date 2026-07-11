@@ -1,6 +1,6 @@
 """PyObjC framework imports, guarded for environments without the `[vsr]` extra.
 
-All other submodules `from ._compat import av, CoreAudio, ...` and call
+All other submodules `from .compat import av, CoreAudio, ...` and call
 `require_pyobjc()` at the top of any user-facing entry point so the missing
 dependency surfaces as a clean SystemExit instead of an `ImportError` deep
 inside a Metal call.
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-# Sentinel-typed slots so submodules can `from ._compat import av` even when
+# Sentinel-typed slots so submodules can `from .compat import av` even when
 # PyObjC isn't installed - they just get None and need to call
 # `require_pyobjc()` before touching anything.
 av: Any = None

@@ -103,7 +103,7 @@ class VtInterpolateProcessor:
 
     def prepare(self, input_spec: StreamSpec,
                 context: PipelineContext) -> None:
-        from kinovsr.temporal import VtfrcSession
+        from kinovsr.native.temporal import VtfrcSession
 
         cadence = input_spec.timeline.cadence
         geometry = input_spec.frame.geometry

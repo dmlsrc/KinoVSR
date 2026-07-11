@@ -15,12 +15,12 @@ import numpy as np
 import pytest
 
 from kinovsr import comparison
-from kinovsr import pixel_buffers as pb
+from kinovsr.media import pixel_buffers as pb
 
 
 def _have_pyobjc() -> bool:
     try:
-        from kinovsr import _compat
+        from kinovsr.native import compat as _compat
         _compat.require_pyobjc()
         return True
     except Exception:
@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(not _have_pyobjc(), reason="pyobjc / VideoToolbo
 
 
 def _make_buf(fmt, w, h):
-    from kinovsr._compat import Quartz
+    from kinovsr.native.compat import Quartz
     attrs = {
         Quartz.kCVPixelBufferPixelFormatTypeKey: fmt,
         Quartz.kCVPixelBufferWidthKey: w,
