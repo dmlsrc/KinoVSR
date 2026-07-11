@@ -13,7 +13,7 @@ Convert:
 
 ```bash
 curl -L -O https://github.com/m-tassano/fastdvdnet/raw/master/model.pth
-python scripts/pth_to_safetensors.py model.pth \
+kinovsr weights convert model.pth \
   -o kinovsr/processors/fastdvdnet/weights/model.safetensors
 ```
 

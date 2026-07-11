@@ -16,7 +16,7 @@ Convert:
 
 ```bash
 curl -L -O https://download.openmmlab.com/mmediting/restorers/basicvsr_plusplus/basicvsr_plusplus_c64n7_8x1_300k_vimeo90k_bd_20210305-ab315ab1.pth
-python scripts/pth_to_safetensors.py basicvsr_plusplus_c64n7_8x1_300k_vimeo90k_bd_20210305-ab315ab1.pth \
+kinovsr weights convert basicvsr_plusplus_c64n7_8x1_300k_vimeo90k_bd_20210305-ab315ab1.pth \
   -o kinovsr/processors/basicvsrpp/weights/basicvsrpp_vimeo90k_bd.safetensors --strip-prefix 'generator.'
 ```
 

@@ -12,7 +12,7 @@ Convert -- the output name must match `net.py`'s `_VARIANTS`:
 
 ```bash
 curl -L -O https://github.com/dslisleedh/ESC/releases/download/1.0.0/ESC_Real_X4_GAN.pth
-python scripts/pth_to_safetensors.py ESC_Real_X4_GAN.pth --param-key params_ema \
+kinovsr weights convert ESC_Real_X4_GAN.pth --param-key params_ema \
   -o kinovsr/processors/esc/weights/esc_real_x4_gan.safetensors
 ```
 

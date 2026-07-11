@@ -30,7 +30,7 @@ as `.pth` (a plain BasicSR/neosr/traiNNer state dict, not nested under `params`)
 convert it without a param-key unwrap:
 
 ```bash
-python scripts/pth_to_safetensors.py model.pth -o weights/model.safetensors
+kinovsr weights convert model.pth -o weights/model.safetensors
 ```
 
 ## Precision

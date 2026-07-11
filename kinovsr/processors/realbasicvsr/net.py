@@ -95,7 +95,7 @@ def _load_safetensors(path: Path) -> dict:
 def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict:
     """Load RealBasicVSR weights and transpose torch conv kernels for MLX.
 
-    Files converted with ``scripts/pth_to_safetensors.py --only-prefix
+    Files converted with ``kinovsr weights convert --only-prefix
     generator_ema. --strip-prefix generator_ema.`` load directly. For robustness,
     this also accepts safetensors that still contain ``generator_ema.`` or
     ``generator.`` prefixes and chooses EMA when present.

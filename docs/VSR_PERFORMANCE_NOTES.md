@@ -795,7 +795,7 @@ switching to EMA is not a flow fix. Which dict is "the model" varies per repo,
 so read the reference inference:
 SAFMN's loaders (`app.py`, `inference_real_safmn.py`, AIS2024) and
 RealViformer's `inference_realviformer.py` load `['params']`; ESC's
-`scripts/inference.py` loads `['params_ema']`. `pth_to_safetensors.py
+`scripts/inference.py` loads `['params_ema']`. `kinovsr weights convert
 --param-key <key>` pins the choice explicitly; if both dicts exist and no
 `--param-key` is given, the converter refuses to guess. A converter that
 silently picks the wrong dict passes every parity gate you build on the same

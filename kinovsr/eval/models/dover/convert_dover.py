@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert the DOVER-Mobile checkpoint to MLX safetensors.
 
-Layout changes (why the generic pth_to_safetensors.py is not enough):
+Layout changes (why the generic kinovsr weights convert is not enough):
 
 - Conv3d weights go OIDHW -> ODHWI for ``mx.conv3d``'s channels-last
   layout (stem and the three downsample convs).

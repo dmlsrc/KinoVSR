@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert a released MUSIQ checkpoint (.pth) to the MLX safetensors layout.
 
-Net-specific on purpose -- the general scripts/pth_to_safetensors.py would
+Net-specific on purpose -- the general kinovsr weights convert would
 produce a checkpoint that loads but scores garbage, because MUSIQ's
 conversion is not a plain re-serialization:
 

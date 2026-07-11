@@ -17,7 +17,7 @@ mkdir -p weights-src
 curl -L -o weights-src/bsvd-64.pth \
   https://raw.githubusercontent.com/gmlwns2000/sharkshark-4k/master/src/upscale/model/bsvd/bsvd-64.pth
 shasum -a 256 weights-src/bsvd-64.pth
-python scripts/pth_to_safetensors.py \
+kinovsr weights convert \
   weights-src/bsvd-64.pth \
   --param-key params \
   -o kinovsr/processors/bsvd/weights/bsvd_64.safetensors
@@ -25,7 +25,7 @@ python scripts/pth_to_safetensors.py \
 curl -L -o weights-src/bsvd-32.pth \
   https://raw.githubusercontent.com/gmlwns2000/sharkshark-4k/master/src/upscale/model/bsvd/bsvd-32.pth
 shasum -a 256 weights-src/bsvd-32.pth
-python scripts/pth_to_safetensors.py \
+kinovsr weights convert \
   weights-src/bsvd-32.pth \
   --param-key params \
   -o kinovsr/processors/bsvd/weights/bsvd_32.safetensors

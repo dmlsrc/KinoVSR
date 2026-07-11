@@ -340,7 +340,7 @@ def load_bsvd(path: str | Path, dtype: Any = mx.float16) -> tuple[dict[str, Any]
     if wp.suffix in {".pth", ".pt"}:
         raise ValueError(
             f"BSVD weights must be .safetensors, got {wp}. Convert with "
-            "scripts/pth_to_safetensors.py --param-key params first."
+            "kinovsr weights convert --param-key params first."
         )
     w = mx.load(str(wp))
     p0 = _block_prefix(w, 0)
@@ -396,7 +396,7 @@ class BsvdDenoiser:
         if not wp.is_file():
             raise FileNotFoundError(
                 f"BSVD weights not found at {wp}. They are not bundled; convert the "
-                "source .pth with scripts/pth_to_safetensors.py or pass --bsvd-weights."
+                "source .pth with kinovsr weights convert or pass --bsvd-weights."
             )
         self.net = BSVD(wp, dtype=dtype)
         self.sigma = _strength_to_sigma(strength)

@@ -61,7 +61,7 @@ def resolve_weights(spec: Any = None) -> Path:
         raise FileNotFoundError(
             f"{e}\n\nFBCNN weights are not bundled in the repo (~287MB each). Get one:\n"
             f"  curl -L -o fbcnn_color.pth {_DOWNLOAD_URL}\n"
-            f"  python scripts/pth_to_safetensors.py fbcnn_color.pth -o "
+            f"  kinovsr weights convert fbcnn_color.pth -o "
             f"{_WEIGHTS_DIR / _VARIANTS['color']} --strip-prefix ''\n"
             f"or point $FBCNN_WEIGHTS / --deblock-weights at an existing .safetensors."
         ) from None

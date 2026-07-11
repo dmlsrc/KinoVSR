@@ -10,7 +10,7 @@ publishes a single pretrained model (Google Drive only; no direct URL exists):
 Convert -- the output name must match `net.py`'s `_VARIANTS`:
 
 ```bash
-python scripts/pth_to_safetensors.py weights.pth --param-key params \
+kinovsr weights convert weights.pth --param-key params \
   -o kinovsr/processors/realviformer/weights/realviformer_x4.safetensors
 ```
 

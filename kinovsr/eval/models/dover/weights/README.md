@@ -30,5 +30,5 @@ shasum -a 256 kinovsr/eval/models/dover/weights/dover_mobile.safetensors
 Conversion needs torch and is layout-specific (channels-last conv3d
 kernels, per-block depthwise stacks whose temporal extent alternates 1
 and 3, pre-transposed linears, dropped ImageNet classifier heads) --
-the generic `scripts/pth_to_safetensors.py` re-serializer is not
+the generic `kinovsr weights convert` re-serializer is not
 sufficient; use `convert_dover.py`.

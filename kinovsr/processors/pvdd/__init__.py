@@ -77,7 +77,7 @@ def load_pvdd(source: str | Path | dict, dtype: Any = mx.float32) -> tuple[dict,
         if sp.suffix in {".pth", ".pt"}:
             raise ValueError(
                 f"PVDD weights must be .safetensors, got {sp}. Convert with "
-                "scripts/pth_to_safetensors.py first (see weights/README.md)."
+                "kinovsr weights convert first (see weights/README.md)."
             )
         raw = mx.load(str(sp))
     return _to_params(raw, dtype)

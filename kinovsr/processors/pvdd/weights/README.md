@@ -29,7 +29,7 @@ The MLX loader keeps the torch NCHW layout in the file and transposes conv weigh
 to OHWI at load, so no conversion flags are needed.
 
 ```bash
-python scripts/pth_to_safetensors.py \
+kinovsr weights convert \
   weights-src/pvdd_srgb_nolevel.pth \
   -o kinovsr/processors/pvdd/weights/pvdd_srgb_nolevel.safetensors
 # ... repeat for the other five, keeping the filenames in the table above.

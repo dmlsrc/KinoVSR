@@ -62,7 +62,7 @@ def resolve_weights(spec: Any = None) -> Path:
         raise FileNotFoundError(
             f"{e}\n\nNAFNet weights are not bundled in the repo (68-464MB each). Download a\n"
             f"checkpoint from the NAFNet model zoo ({_MODEL_ZOO}) and convert it:\n"
-            f"  python scripts/pth_to_safetensors.py NAFNet-GoPro-width64.pth -o "
+            f"  kinovsr weights convert NAFNet-GoPro-width64.pth -o "
             f"{_WEIGHTS_DIR / _VARIANTS['gopro']} --strip-prefix ''\n"
             f"or point $NAFNET_WEIGHTS / --nafnet-weights at an existing .safetensors."
         ) from None

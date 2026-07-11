@@ -26,7 +26,7 @@ python kinovsr/eval/models/musiq/convert_musiq.py \
 ```
 
 The net-specific converter is used instead of the general
-`scripts/pth_to_safetensors.py` because MUSIQ's conversion is not a plain
+`kinovsr weights convert` because MUSIQ's conversion is not a plain
 re-serialization: the reference applies weight standardization to the conv
 weights at every forward, and since weights are fixed at inference the
 converter folds it in (unbiased std, eps 1e-5) and transposes the conv

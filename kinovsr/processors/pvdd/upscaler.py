@@ -50,7 +50,7 @@ class PvddDenoiser(WindowedUpscaler):
         if isinstance(src, (str, Path)) and not Path(src).is_file():
             raise FileNotFoundError(
                 f"PVDD weights not found at {src}. They are not bundled; convert the "
-                "source .pth with scripts/pth_to_safetensors.py (see weights/README.md) "
+                "source .pth with kinovsr weights convert (see weights/README.md) "
                 "or pass an explicit --pvdd-weights path."
             )
         self.net = PVDD(src, dtype=dtype)

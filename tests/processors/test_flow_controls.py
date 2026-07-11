@@ -199,7 +199,10 @@ def test_pth_converter_refuses_ambiguous_params_dict(tmp_path):
     result = subprocess.run(
         [
             sys.executable,
-            str(ROOT / "scripts" / "pth_to_safetensors.py"),
+            "-m",
+            "kinovsr.cli.main",
+            "weights",
+            "convert",
             str(ckpt),
             "-o",
             str(out),

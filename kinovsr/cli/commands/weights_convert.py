@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Convert a PyTorch .pth/.pt checkpoint to safetensors, directly MLX-loadable.
 
 Safe by construction - nothing in the checkpoint is executed:
@@ -14,10 +13,10 @@ Then it makes the weights MLX-friendly: strips DataParallel 'module.' prefixes,
 demotes float64 -> float32, drops non-tensor entries, and verifies the output
 loads with mlx.core.load().
 
-    scripts/pth_to_safetensors.py model.pth                  # -> model.safetensors
-    scripts/pth_to_safetensors.py model.pth -o weights.safetensors
-    scripts/pth_to_safetensors.py ckpt.pth --strip-prefix "" --keep-fp64
-    scripts/pth_to_safetensors.py ckpt.pth --only-prefix generator_ema. --strip-prefix generator_ema.
+    kinovsr weights convert model.pth                  # -> model.safetensors
+    kinovsr weights convert model.pth -o weights.safetensors
+    kinovsr weights convert ckpt.pth --strip-prefix "" --keep-fp64
+    kinovsr weights convert ckpt.pth --only-prefix generator_ema. --strip-prefix generator_ema.
 """
 
 from __future__ import annotations
@@ -26,6 +25,25 @@ import argparse
 import pickletools
 import sys
 from pathlib import Path
+
+_STDERR_CONSOLE = None
+
+
+def _print(*parts: object, file: object = None) -> None:
+    """Shared-console output; error lines keep their stderr routing."""
+    global _STDERR_CONSOLE
+    if file is sys.stderr:
+        if _STDERR_CONSOLE is None:
+            from rich.console import Console
+
+            _STDERR_CONSOLE = Console(stderr=True)
+        console = _STDERR_CONSOLE
+    else:
+        from kinovsr.ui.console import get_console
+
+        console = get_console()
+    console.print(*parts, markup=False, highlight=False)
+
 
 # Pickle opcodes that push the module/name strings a STACK_GLOBAL then consumes.
 _STR_OPS = {
@@ -83,8 +101,9 @@ def _suspicious(refs: set[str]) -> list[str]:
     return bad
 
 
-def main() -> int:
+def run_convert(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
+        prog="kinovsr weights convert",
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("input", help="Path to the .pth / .pt checkpoint.")
@@ -106,7 +125,7 @@ def main() -> int:
              "inference loads -- they are different weights. If a checkpoint has "
              "both params and params_ema, the converter refuses to guess.",
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     src = Path(args.input)
     if not src.is_file():
@@ -115,30 +134,30 @@ def main() -> int:
 
     # ---- 1. static safety scan (no execution) ------------------------------
     refs = _pickle_globals(src.read_bytes())
-    print(f"[scan] pickle references {len(refs)} global(s):")
+    _print(f"[scan] pickle references {len(refs)} global(s):")
     for r in sorted(refs):
-        print(f"        {r}")
+        _print(f"        {r}")
     bad = _suspicious(refs)
     if bad:
-        print(f"[scan] SUSPICIOUS (outside tensor-rebuild allowlist): {bad}", file=sys.stderr)
+        _print(f"[scan] SUSPICIOUS (outside tensor-rebuild allowlist): {bad}", file=sys.stderr)
         if not args.force:
-            print("[scan] refusing to load. Re-run with --force only if you trust this file "
+            _print("[scan] refusing to load. Re-run with --force only if you trust this file "
                   "(weights_only=True still gates the load).", file=sys.stderr)
             return 2
     else:
-        print("[scan] clean - only tensor-rebuild / container globals.")
+        _print("[scan] clean - only tensor-rebuild / container globals.")
 
     # ---- 2. safe load (restricted unpickler, no code execution) ------------
     try:
         import torch
     except ImportError:
-        print("error: this converter needs PyTorch (a dev dependency) to read .pth files.", file=sys.stderr)
+        _print("error: this converter needs PyTorch (a dev dependency) to read .pth files.", file=sys.stderr)
         return 1
     try:
         obj = torch.load(str(src), map_location="cpu", weights_only=True)
     except Exception as e:
-        print(f"error: torch.load(weights_only=True) refused/failed: {e}", file=sys.stderr)
-        print("       The checkpoint contains non-tensor objects (optimizer state, custom "
+        _print(f"error: torch.load(weights_only=True) refused/failed: {e}", file=sys.stderr)
+        _print("       The checkpoint contains non-tensor objects (optimizer state, custom "
               "classes, ...) the safe loader won't run. Extract just the weights first.", file=sys.stderr)
         return 1
 
@@ -148,11 +167,11 @@ def main() -> int:
         if not (isinstance(obj, dict) and args.param_key in obj
                 and hasattr(obj[args.param_key], "items")):
             have = list(obj.keys()) if isinstance(obj, dict) else type(obj).__name__
-            print(f"error: --param-key '{args.param_key}' not in checkpoint (has: {have})",
+            _print(f"error: --param-key '{args.param_key}' not in checkpoint (has: {have})",
                   file=sys.stderr)
             return 1
         sd = obj[args.param_key]
-        print(f"[load] using nested checkpoint key '{args.param_key}' (explicit)")
+        _print(f"[load] using nested checkpoint key '{args.param_key}' (explicit)")
     elif not (hasattr(sd, "items") and any(torch.is_tensor(v) for v in sd.values())):
         if (
             isinstance(obj, dict)
@@ -161,7 +180,7 @@ def main() -> int:
             and hasattr(obj["params"], "items")
             and hasattr(obj["params_ema"], "items")
         ):
-            print(
+            _print(
                 "error: checkpoint carries BOTH 'params' and 'params_ema'; pass "
                 "--param-key params or --param-key params_ema to match the "
                 "model's reference inference.",
@@ -171,7 +190,7 @@ def main() -> int:
         for key in ("state_dict", "model", "net", "weights", "params", "params_ema"):
             if isinstance(obj, dict) and key in obj and hasattr(obj[key], "items"):
                 sd = obj[key]
-                print(f"[load] using nested checkpoint key '{key}'")
+                _print(f"[load] using nested checkpoint key '{key}'")
                 break
 
     # ---- 4. make MLX-friendly: strip prefix, demote fp64, drop non-tensors -
@@ -192,17 +211,17 @@ def main() -> int:
             t = t.float()
         tensors[nk] = t.clone()
     if not tensors:
-        print("error: no tensors found in the checkpoint.", file=sys.stderr)
+        _print("error: no tensors found in the checkpoint.", file=sys.stderr)
         return 1
     n_params = sum(t.numel() for t in tensors.values())
-    print(f"[convert] {len(tensors)} tensors, {n_params/1e6:.3f}M params, "
+    _print(f"[convert] {len(tensors)} tensors, {n_params/1e6:.3f}M params, "
           f"dtypes={sorted({str(t.dtype) for t in tensors.values()})}")
     if stripped:
-        print(f"[convert] stripped '{prefix}' from {stripped} keys")
+        _print(f"[convert] stripped '{prefix}' from {stripped} keys")
     if filtered:
-        print(f"[convert] filtered out {filtered} tensor keys outside '{only_prefix}'")
+        _print(f"[convert] filtered out {filtered} tensor keys outside '{only_prefix}'")
     if dropped:
-        print(f"[convert] dropped {len(dropped)} non-tensor entries: {dropped[:6]}"
+        _print(f"[convert] dropped {len(dropped)} non-tensor entries: {dropped[:6]}"
               f"{'...' if len(dropped) > 6 else ''}")
 
     # ---- 5. save + verify it loads in MLX ----------------------------------
@@ -214,13 +233,10 @@ def main() -> int:
         loaded = mx.load(str(out))
         ok = len(loaded) == len(tensors)
         sample = next(iter(loaded.items()))
-        print(f"[verify] mlx.core.load OK: {len(loaded)} arrays "
+        _print(f"[verify] mlx.core.load OK: {len(loaded)} arrays "
               f"(e.g. {sample[0]} {tuple(sample[1].shape)} {sample[1].dtype}); match={ok}")
     except ImportError:
-        print("[verify] (mlx not importable here; safetensors written, but MLX load unverified)")
-    print(f"[done] {out}")
+        _print("[verify] (mlx not importable here; safetensors written, but MLX load unverified)")
+    _print(f"[done] {out}")
     return 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())

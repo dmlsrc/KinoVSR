@@ -92,6 +92,13 @@ def _verify(owners: tuple[str, ...]) -> int:
 
 
 def run_weights_command(argv: list[str]) -> int:
+    if argv and argv[0] == "convert":
+        # The torch-checkpoint re-serializer keeps its own parser (it
+        # predates this command and its flags are documented in every
+        # family weights README).
+        from .weights_convert import run_convert
+
+        return run_convert(argv[1:])
     args = _build_parser().parse_args(argv)
     try:
         owners = _select_owners(args.owners)
