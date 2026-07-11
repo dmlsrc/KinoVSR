@@ -117,6 +117,7 @@ def process_video_file(
     end: int | None = None,
     max_frames: int | None = None,
     max_output_frames: int | None = None,
+    max_output_seconds: float | None = None,
     audio: bool = False,
     audio_codec: str = "alac",
     quality: float = 0.65,
@@ -129,9 +130,11 @@ def process_video_file(
     preflight-validated against it before any frame decodes, and the
     sink verifies the declared output timeline as units arrive.
     ``start``/``end``/``max_frames`` window the input in frames;
-    ``max_output_frames`` caps written frames (the output-side cap for
-    cadence-changing chains); ``audio`` carries the source audio track
-    (trimmed to the window).
+    ``max_output_frames`` / ``max_output_seconds`` cap what is written
+    (the output-side cap for cadence-changing chains; the seconds form
+    resolves against the OUTPUT cadence, and carried audio trims to the
+    cap); ``audio`` carries the source audio track (trimmed to the
+    window).
     """
     if settings is None:
         settings = Settings.from_env()
@@ -151,6 +154,7 @@ def process_video_file(
         end=end,
         max_frames=max_frames,
         max_output_frames=max_output_frames,
+        max_output_seconds=max_output_seconds,
         audio=audio,
         audio_codec=audio_codec,
         quality=quality,

@@ -161,13 +161,20 @@ def _run_typed(invocation) -> int:
                 style="bold red", markup=False)
             return 2
     start, end = resolve_trim(options.start, options.end, fps, total)
-    # --max-frames caps OUTPUT frames (a time spec is output duration);
-    # the input window is start/end.
-    max_output_frames = None
+    # --max-frames caps OUTPUT frames; a time spec is OUTPUT duration,
+    # which only the resolved chain's cadence can convert - pass the
+    # seconds form through. The input window is start/end.
+    max_output_frames = max_output_seconds = None
     if options.max_frames is not None:
-        from kinovsr.media.timespec import parse_time_or_frames
+        from kinovsr.media.timespec import parse_frames_or_seconds
 
-        max_output_frames = parse_time_or_frames(options.max_frames, fps)
+        try:
+            max_output_frames, max_output_seconds = parse_frames_or_seconds(
+                options.max_frames)
+        except ValueError as exc:
+            get_console().print(f"error: bad --max-frames value: {exc}",
+                                style="bold red", markup=False)
+            return 2
 
     stem = (f"{sanitize_output_prefix(options.output_prefix)}_"
             f"{datetime.now().strftime('%Y%m%d_%H%M%S')}")
@@ -188,6 +195,7 @@ def _run_typed(invocation) -> int:
             start=start,
             end=end,
             max_output_frames=max_output_frames,
+            max_output_seconds=max_output_seconds,
             audio=options.audio,
             audio_codec=options.audio_codec,
             quality=options.encode_quality,

@@ -217,6 +217,42 @@ def test_max_output_frames_caps_the_interpolated_stream(clip, tmp_path):
     assert frames == 10
 
 
+def test_time_form_cap_resolves_against_the_output_cadence(clip, tmp_path):
+    """A seconds cap means OUTPUT duration: 0.2s of 50fps output is 10
+    frames, not 0.2s of the 25fps input (which would be 5)."""
+    config = {
+        "pipeline": ["fps"],
+        "fps": {"processor": "videotoolbox", "profile": "normal",
+                "target_fps": 50},
+    }
+    result = run_file(
+        config, video=clip, output=tmp_path / "tcap.mp4",
+        settings=SETTINGS, layout=Layout.CV_RGBA_HALF,
+        max_output_seconds=0.2)
+    assert result.frames_out == 10
+
+
+def test_capped_run_trims_the_audio_carry(clip_with_audio, tmp_path):
+    """Capped video must not ship beside full-window audio."""
+    result = run_file(
+        {"pipeline": []}, video=clip_with_audio,
+        output=tmp_path / "acap.mp4", settings=SETTINGS,
+        audio=True, max_output_frames=10)
+    assert result.frames_out == 10
+    video_s, audio_s, frames, _ = _stream_seconds(result.path)
+    assert frames == 10
+    assert audio_s is not None
+    assert abs(audio_s - video_s) < 0.06   # AAC priming skew only
+
+
+def test_zero_output_cap_is_rejected(clip, tmp_path):
+    with pytest.raises(MediaError, match="at least one frame"):
+        run_file({"pipeline": []}, video=clip,
+                 output=tmp_path / "zero.mp4", settings=SETTINGS,
+                 max_output_frames=0)
+    assert not (tmp_path / "zero.mp4").exists()
+
+
 _FBCNN_WEIGHTS = Path(
     "kinovsr/processors/fbcnn/weights/fbcnn_color.safetensors")
 _NAFNET_WEIGHTS = Path(

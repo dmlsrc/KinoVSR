@@ -344,6 +344,7 @@ def run_file(
     end: int | None = None,
     max_frames: int | None = None,
     max_output_frames: int | None = None,
+    max_output_seconds: float | None = None,
     audio: bool = False,
     audio_codec: str = "alac",
     quality: float = 0.65,
@@ -375,7 +376,24 @@ def run_file(
         max_frames=max_frames, chunk_size=chunk_size, reader=reader)
     session = open_pipeline(
         config, source.spec, settings=settings, reporter=reporter)
+    # The output cap resolves against the OUTPUT cadence (a time-form cap
+    # on a cadence-changing chain means output duration, not input).
+    out_cadence = session.output_spec.timeline.cadence
+    if max_output_seconds is not None:
+        if max_output_frames is not None:
+            raise MediaError(
+                "state max_output_frames or max_output_seconds, not both")
+        max_output_frames = round(max_output_seconds * out_cadence)
+    if max_output_frames is not None and max_output_frames < 1:
+        raise MediaError(
+            f"the output cap must be at least one frame; got "
+            f"{max_output_frames}")
     track = source.audio_track() if audio else None
+    if track is not None and max_output_frames is not None:
+        # Capped video must not ship beside longer audio: trim the carry
+        # to the capped output duration (a cap past the natural end is a
+        # no-op; trimmed() clamps).
+        track = track.trimmed(0.0, max_output_frames / float(out_cadence))
     sink = FileSink(
         output, session.output_spec, source=source, quality=quality,
         audio_track=track, audio_codec=audio_codec)
@@ -385,8 +403,7 @@ def run_file(
             for unit in run:
                 sink.append(unit)
                 frames_out += 1
-                if (max_output_frames is not None
-                        and frames_out >= max_output_frames):
+                if frames_out == max_output_frames:
                     # Cancel the chain; cadence-changing stages mean the
                     # output count is not the input count.
                     break

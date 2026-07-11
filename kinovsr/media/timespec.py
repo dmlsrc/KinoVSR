@@ -50,6 +50,40 @@ def parse_time_or_frames(spec: str, fps: float) -> int:
     return int(frames)
 
 
+def parse_frames_or_seconds(spec: str) -> tuple[int | None, float | None]:
+    """Split the shared grammar without an fps: (frames, None) for the
+    bare-integer / Nf forms, (None, seconds) for every time form.
+
+    Callers that only learn the governing rate later (an output cap on a
+    cadence-changing chain) convert the seconds themselves.
+    """
+    s = str(spec).strip().lower()
+    if not s:
+        raise ValueError("empty time/frame spec")
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) == 2:
+            hh, (mm, ss) = "0", parts
+        elif len(parts) == 3:
+            hh, mm, ss = parts
+        else:
+            raise ValueError(f"bad time spec {spec!r} (use mm:ss or hh:mm:ss)")
+        return None, int(hh) * 3600 + int(mm) * 60 + float(ss)
+    if s.endswith("f"):
+        frames = int(s[:-1])
+        if frames < 0:
+            raise ValueError(f"time/frame spec {spec!r} is negative")
+        return frames, None
+    if s.endswith("s"):
+        return None, float(s[:-1])
+    if "." in s:
+        return None, float(s)
+    frames = int(s)
+    if frames < 0:
+        raise ValueError(f"time/frame spec {spec!r} is negative")
+    return frames, None
+
+
 def resolve_trim(
     start_spec: str | None, end_spec: str | None, fps: float, total_frames: int,
 ) -> tuple[int, int | None]:
