@@ -1,5 +1,7 @@
 """Manifest schema validation, registry loading, and verification."""
 
+from pathlib import Path
+
 import pytest
 
 from kinovsr.modeling.weights import (
@@ -87,18 +89,79 @@ class TestSchema:
             load_manifest(write_manifest(tmp_path, body))
 
 
+ALL_OWNERS = (
+    "basicvsrpp", "bsvd", "dover", "esc", "eval", "fastdvdnet", "fbcnn",
+    "musiq", "nafnet", "pvdd", "realbasicvsr", "realesrgan", "realplksr",
+    "realviformer", "safmn", "spynet", "stdf", "toflow",
+)
+
+
 class TestRegistry:
     def test_registered_owners(self):
-        assert registered_owners() == ("bsvd", "realplksr", "spynet")
+        assert registered_owners() == ALL_OWNERS
 
-    @pytest.mark.parametrize("owner", ["bsvd", "realplksr", "spynet"])
+    @pytest.mark.parametrize("owner", ALL_OWNERS)
     def test_every_registered_manifest_loads_and_matches(self, owner):
         manifest = load_registered(owner)
         assert manifest.name == owner
 
     def test_unknown_owner(self):
         with pytest.raises(ManifestError, match="no manifest registered"):
-            load_registered("basicvsrpp")
+            load_registered("nosuchfamily")
+
+
+class TestCoverage:
+    """The M4 acceptance teeth: every weights directory in the package is
+    covered by a registered manifest, and every profile token the CLI can
+    select resolves to a manifest profile."""
+
+    def test_every_weights_dir_has_a_registered_manifest(self):
+        import kinovsr
+
+        package_root = Path(kinovsr.__file__).resolve().parent
+        weight_dirs = {p.parent for p in package_root.rglob("weights")
+                       if p.is_dir() and p.name == "weights"}
+        covered = {load_registered(owner).root
+                   for owner in registered_owners()}
+        missing = sorted(str(d.relative_to(package_root))
+                         for d in weight_dirs - covered)
+        assert not missing, f"weights dirs without a manifest: {missing}"
+
+    def test_every_manifest_asset_names_a_license(self):
+        for owner in registered_owners():
+            for asset in load_registered(owner).weights.values():
+                assert asset.license, f"{owner}:{asset.asset_id} has no license"
+
+    @pytest.mark.parametrize("family,flag_choices", [
+        ("basicvsrpp", ("reds4", "vimeo90k_bi", "vimeo90k_bd", "ntire_vsr")),
+        ("bsvd", ("c64", "c32")),
+        ("esc", ("gan", "mse")),
+        ("fastdvdnet", ("clipped", "standard")),
+        ("nafnet", ("gopro", "gopro32", "sidd", "sidd32", "reds")),
+        ("pvdd", ("pvdd", "crvd", "davis", "pvdd_level", "pvdd_raw",
+                  "pvdd_raw_level")),
+        ("realbasicvsr", ("x4",)),
+        ("realesrgan", ("general", "x4plus", "realesrnet", "bsrnet",
+                        "bsrgan", "x2plus", "anime", "animevideo", "esrgan")),
+        ("realplksr", ("public2x", "public2x-nn", "nomos4x")),
+        ("realviformer", ("x4",)),
+        ("safmn", ("light", "real", "real2x", "purescale", "purescale2x",
+                   "purescale2x-sharp")),
+        ("stdf", ("mfqev2", "vimeo90k")),
+        ("toflow", ("denoise", "deblock")),
+    ])
+    def test_cli_profile_tokens_resolve_through_the_manifest(
+            self, family, flag_choices):
+        profiles = load_registered(family).profiles
+        missing = [c for c in flag_choices if c not in profiles]
+        assert not missing, f"{family} profiles missing: {missing}"
+
+    def test_restore_variants_resolve_through_the_manifest(self):
+        profiles = load_registered("basicvsrpp").profiles
+        for variant in ("decompress_track1", "decompress_track2",
+                        "decompress_track3", "denoise", "deblur_dvd",
+                        "deblur_gopro"):
+            assert variant in profiles
 
 
 class TestVerify:

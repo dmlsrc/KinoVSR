@@ -1,8 +1,17 @@
 # Attribution
 
 `kinovsr/eval/` contains the evaluation helpers for VSR denoiser comparisons. The
-YuNet model weights are redistributed under the upstream license (see `weights/README.md`
-for provenance and hashes).
+YuNet model weights are redistributed under the upstream license (see `README.md`
+in this directory for provenance and hashes).
+
+## NIQE pristine model
+
+`niqe_pristine_reds.safetensors` is a first-party artifact: multivariate-
+Gaussian statistics fitted by this repo's own tool from pristine frames.
+It redistributes no upstream weights. The method is:
+
+Anish Mittal, Rajiv Soundararajan, Alan C. Bovik -- "Making a 'Completely
+Blind' Image Quality Analyzer." IEEE Signal Processing Letters, 2013.
 
 ## YuNet Face Detector
 

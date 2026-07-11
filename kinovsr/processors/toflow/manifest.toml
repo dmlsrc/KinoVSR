@@ -1,0 +1,91 @@
+schema_version = 1
+
+[owner]
+kind = "processor"
+name = "toflow"
+
+# Every checkpoint is a converted Torch7 .t7 plus a same-stem .json static
+# graph; the runtime needs BOTH files of a pair. source_sha256 is the
+# upstream .t7; artifact_sha256 covers each bundled converted file.
+
+[profiles.denoise]
+capabilities = ["denoise"]
+weights = ["denoise", "denoise_graph"]
+
+[profiles.deblock]
+capabilities = ["deblock"]
+weights = ["deblock", "deblock_graph"]
+
+[profiles.sr]
+capabilities = ["upscale"]
+weights = ["sr", "sr_graph"]
+
+# interp is reachable through the TOFlowInterpolator API class only; no
+# CLI flag selects it today.
+[profiles.interp]
+capabilities = ["interpolate"]
+weights = ["interp", "interp_graph"]
+
+[weights.denoise]
+path = "weights/toflow_denoise.safetensors"
+distribution = "bundled"
+artifact_sha256 = "b9c0ff3aeeeb43a3b0a84f144207eb766e48e31fc0fad84b07a23bffec11fb02"
+source = "http://data.csail.mit.edu/tofu/models/denoise.t7"
+source_sha256 = "b53af3b138aa95161a9202d2f7cda07d95e0f9bd9d5278bc02e08087a276bda2"
+license = "MIT"
+
+[weights.denoise_graph]
+path = "weights/toflow_denoise.json"
+distribution = "bundled"
+artifact_sha256 = "20eafbba0d83d80a8b16d123d6c7d77d60033a4610dcf49329dfa02236299c99"
+source = "http://data.csail.mit.edu/tofu/models/denoise.t7"
+source_sha256 = "b53af3b138aa95161a9202d2f7cda07d95e0f9bd9d5278bc02e08087a276bda2"
+license = "MIT"
+
+[weights.deblock]
+path = "weights/toflow_deblock.safetensors"
+distribution = "bundled"
+artifact_sha256 = "f1980809e2270d3857b428fef22848d7573fabc47aff70af012a39cc80bdfe20"
+source = "http://data.csail.mit.edu/tofu/models/deblock.t7"
+source_sha256 = "8129ae76466987fa053ccd514c858b24f9232db85df273165589a1625921e445"
+license = "MIT"
+
+[weights.deblock_graph]
+path = "weights/toflow_deblock.json"
+distribution = "bundled"
+artifact_sha256 = "a5866abb83dae5fe32a8f53754de4abebecdb4d748a7beb51b4b3cd59056f8d6"
+source = "http://data.csail.mit.edu/tofu/models/deblock.t7"
+source_sha256 = "8129ae76466987fa053ccd514c858b24f9232db85df273165589a1625921e445"
+license = "MIT"
+
+[weights.sr]
+path = "weights/toflow_sr.safetensors"
+distribution = "bundled"
+artifact_sha256 = "285faa526feeaa6551c8ee551fc72b503a40c0d331373ea5ddc6bc02b4229bc5"
+source = "http://data.csail.mit.edu/tofu/models/sr.t7"
+source_sha256 = "649cca805790142067f5b838dba30b6bdc5e17bc301b38613908f1983d3391e9"
+license = "MIT"
+
+[weights.sr_graph]
+path = "weights/toflow_sr.json"
+distribution = "bundled"
+artifact_sha256 = "9d379410072abdc413c2eecf13d2f85a22474a800c69b5c0082cc3d1911416f2"
+source = "http://data.csail.mit.edu/tofu/models/sr.t7"
+source_sha256 = "649cca805790142067f5b838dba30b6bdc5e17bc301b38613908f1983d3391e9"
+license = "MIT"
+
+[weights.interp]
+path = "weights/toflow_interp.safetensors"
+distribution = "bundled"
+artifact_sha256 = "6826b2fa09b184cff7af459e327745f9c27949d98674c9f3e9a1972c7f651820"
+source = "http://data.csail.mit.edu/tofu/models/interp.t7"
+source_sha256 = "18989ed88150c846d665abab51cc97e3bf25d2bd913298466587450479741520"
+license = "MIT"
+
+[weights.interp_graph]
+path = "weights/toflow_interp.json"
+distribution = "bundled"
+artifact_sha256 = "7efbc8e3b12ae1e6ca70202e4937e71c975e46a301053b5c3977fe837264f0e9"
+source = "http://data.csail.mit.edu/tofu/models/interp.t7"
+source_sha256 = "18989ed88150c846d665abab51cc97e3bf25d2bd913298466587450479741520"
+license = "MIT"

@@ -1,0 +1,30 @@
+schema_version = 1
+
+[owner]
+kind = "processor"
+name = "esc"
+
+[profiles.gan]
+capabilities = ["upscale"]
+weights = ["gan"]
+
+[profiles.mse]
+capabilities = ["upscale"]
+weights = ["mse"]
+
+# Convert with --param-key params_ema: the checkpoints carry both params
+# and params_ema and they differ (see weights/README.md).
+
+[weights.gan]
+path = "weights/esc_real_x4_gan.safetensors"
+distribution = "external"
+source = "https://github.com/dslisleedh/ESC/releases/download/1.0.0/ESC_Real_X4_GAN.pth"
+source_sha256 = "d6932bd01e29c9335f5f678b0e9b31ede906a42244887ab8888b1d39a8667f2d"
+license = "MIT"
+
+[weights.mse]
+path = "weights/esc_real_x4_mse.safetensors"
+distribution = "external"
+source = "https://github.com/dslisleedh/ESC/releases/download/1.0.0/ESC_Real_X4_MSE.pth"
+source_sha256 = "ba22ae75b5f77382b1046e68634f58a53fc7ff5ffa46714133bfba30811ad943"
+license = "MIT"

@@ -1,0 +1,86 @@
+schema_version = 1
+
+[owner]
+kind = "processor"
+name = "safmn"
+
+# Split licensing inside one family: the stock SAFMN checkpoints are
+# Apache-2.0; the PureScale retrains are CC BY-NC-SA 4.0 (NON-COMMERCIAL
+# use only) and are never redistributed with this repo. Keep "purescale"
+# in converted filenames - the SAFM branch mode is selected from the
+# filename stem.
+
+[profiles.light]
+capabilities = ["upscale"]
+weights = ["light"]
+
+[profiles.real]
+capabilities = ["upscale"]
+weights = ["real"]
+
+[profiles.real2x]
+capabilities = ["upscale"]
+weights = ["real2x"]
+
+[profiles.real2x.defaults]
+scale = 2
+
+[profiles.purescale]
+capabilities = ["upscale"]
+weights = ["purescale"]
+
+[profiles.purescale2x]
+capabilities = ["upscale"]
+weights = ["purescale2x"]
+
+[profiles.purescale2x.defaults]
+scale = 2
+
+[profiles."purescale2x-sharp"]
+capabilities = ["upscale"]
+weights = ["purescale2x-sharp"]
+
+[profiles."purescale2x-sharp".defaults]
+scale = 2
+
+[weights.light]
+path = "weights/light_safmnpp.safetensors"
+distribution = "external"
+source = "https://github.com/sunny2109/SAFMN/raw/main/AIS2024-RTSR/pretrained_model/light_safmnpp.pth"
+source_sha256 = "a542c92072cb25adab1f9cc5209d4f4f4ca8549db084e6703d2e032357cd50a7"
+license = "Apache-2.0"
+
+[weights.real]
+path = "weights/safmn_l_real_lsdir_x4.safetensors"
+distribution = "external"
+source = "https://huggingface.co/Meloo/SAFMN/resolve/main/SAFMN_L_Real_LSDIR_x4.pth"
+source_sha256 = "f1ac0ee3ee143fbbc49aff6584cb7b48b71ba8d1961dfb8ad076b98ca4799ae2"
+license = "Apache-2.0"
+
+[weights.real2x]
+path = "weights/safmn_l_real_lsdir_x2.safetensors"
+distribution = "external"
+source = "https://huggingface.co/Meloo/SAFMN/resolve/main/SAFMN_L_Real_LSDIR_x2.pth"
+source_sha256 = "a0d838b197dcaedb58cb317bcc3bd2704cd4733083e1eb10d7eac56eb2ea6820"
+license = "Apache-2.0"
+
+[weights.purescale]
+path = "weights/safmn_purescale_x4.safetensors"
+distribution = "external"
+source = "https://github.com/limitlesslab/AI-upscaling-models/releases/download/PureScale2/4x_SAFMN_PureScale.pth"
+source_sha256 = "d5e111db1691d128b1e382daa236ee28c74926b391f57f1d3bf02b78a09922ac"
+license = "CC-BY-NC-SA-4.0"
+
+[weights.purescale2x]
+path = "weights/safmn_purescale_x2.safetensors"
+distribution = "external"
+source = "https://github.com/limitlesslab/AI-upscaling-models/releases/download/PureScale2/2x_SAFMN_PureScale.pth"
+source_sha256 = "c8fb698766f502be6409cf3cee1a69d63381c6eebf3ff5de7df6ed87f6c9a5cb"
+license = "CC-BY-NC-SA-4.0"
+
+[weights."purescale2x-sharp"]
+path = "weights/safmn_purescale_sharper_x2.safetensors"
+distribution = "external"
+source = "https://github.com/limitlesslab/AI-upscaling-models/releases/download/PureScale2/2x_SAFMN_PureScale_sharper.pth"
+source_sha256 = "7df285024873bc4d09acbc2eea7926727301e55a84c940c6a92abd7f252649df"
+license = "CC-BY-NC-SA-4.0"

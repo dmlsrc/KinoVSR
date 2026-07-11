@@ -1,0 +1,32 @@
+schema_version = 1
+
+[owner]
+kind = "processor"
+name = "fastdvdnet"
+
+[profiles.clipped]
+capabilities = ["denoise"]
+weights = ["clipped"]
+
+[profiles.standard]
+capabilities = ["denoise"]
+weights = ["standard"]
+
+# source_sha256 is the upstream .pth; artifact_sha256 is the bundled
+# converted safetensors.
+
+[weights.clipped]
+path = "weights/model_clipped_noise.safetensors"
+distribution = "bundled"
+artifact_sha256 = "e701105bd667e33c5b286ee72508158e45ffafd92c765eb1cfa74259b0d0dd01"
+source = "https://github.com/m-tassano/fastdvdnet/raw/master/model_clipped_noise.pth"
+source_sha256 = "8118974ac7defaa5037f73caf87e0cb53efcfa49ae77d55c05ab187f59e55949"
+license = "MIT"
+
+[weights.standard]
+path = "weights/model.safetensors"
+distribution = "bundled"
+artifact_sha256 = "28ea842f0642f0ac743600d2512fbd73c60e2a4be5ae690c1772b40e11f6cf71"
+source = "https://github.com/m-tassano/fastdvdnet/raw/master/model.pth"
+source_sha256 = "9d9d8413c33e3d9d961d07c530237befa1197610b9d60602ff42fd77975d2a17"
+license = "MIT"

@@ -1,0 +1,20 @@
+schema_version = 1
+
+[owner]
+kind = "evaluator"
+name = "musiq"
+
+# Eval-only image-quality scorer; no runtime profiles. Both hashes are
+# documented: source is the IQA-PyTorch koniq checkpoint, artifact is the
+# converted safetensors (conversion must go through convert_musiq.py -
+# it folds weight standardization in; a generic conversion loads but
+# scores garbage). Weight values are the Google Research Apache-2.0
+# MUSIQ release reshaped; see weights/Attribution.md.
+
+[weights.musiq_koniq]
+path = "weights/musiq_koniq.safetensors"
+distribution = "external"
+source = "https://github.com/chaofengc/IQA-PyTorch/releases/download/v0.1-weights/musiq_koniq_ckpt-e95806b9.pth"
+source_sha256 = "e95806b9eae5f3814c410f574ba8e552362bd5bc63d758ed5b97860f5d6185aa"
+artifact_sha256 = "e86f16e456c1ecc119bee6d44b88e7444b21d65629454937cffb9e8f07ccb7e0"
+license = "Apache-2.0"

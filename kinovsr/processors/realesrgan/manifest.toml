@@ -1,0 +1,118 @@
+schema_version = 1
+
+[owner]
+kind = "processor"
+name = "realesrgan"
+
+[profiles.general]
+capabilities = ["upscale"]
+weights = ["general"]
+
+[profiles.x4plus]
+capabilities = ["upscale"]
+weights = ["x4plus"]
+
+[profiles.realesrnet]
+capabilities = ["upscale"]
+weights = ["realesrnet"]
+
+[profiles.bsrgan]
+capabilities = ["upscale"]
+weights = ["bsrgan"]
+
+[profiles.bsrnet]
+capabilities = ["upscale"]
+weights = ["bsrnet"]
+
+[profiles.x2plus]
+capabilities = ["upscale"]
+weights = ["x2plus"]
+
+[profiles.x2plus.defaults]
+scale = 2
+
+[profiles.anime]
+capabilities = ["upscale"]
+weights = ["anime"]
+
+[profiles.animevideo]
+capabilities = ["upscale"]
+weights = ["animevideo"]
+
+[profiles.esrgan]
+capabilities = ["upscale"]
+weights = ["esrgan"]
+
+[weights.general]
+path = "weights/realesr_general_x4v3.safetensors"
+distribution = "bundled"
+artifact_sha256 = "ee54500e7d2665c7efaffdc7d739749f25f1ca2425f57e1351595db8c11859b1"
+source = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
+source_sha256 = "8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292"
+license = "BSD-3-Clause"
+
+# The wdn companion is not a selectable profile: --realesrgan-denoise-strength
+# blends it against the general checkpoint (dni), locating it by filename.
+[weights.general-wdn]
+path = "weights/realesr_general_wdn_x4v3.safetensors"
+distribution = "bundled"
+artifact_sha256 = "c164dd6e95bf17e6fe124a8fa2b9c49d45731a3452102aafcbb2c55e86083147"
+source = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth"
+source_sha256 = "1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca"
+license = "BSD-3-Clause"
+
+[weights.x4plus]
+path = "weights/realesrgan_x4plus.safetensors"
+distribution = "external"
+source = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+source_sha256 = "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1"
+license = "BSD-3-Clause"
+
+[weights.realesrnet]
+path = "weights/realesrnet_x4plus.safetensors"
+distribution = "external"
+source = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.1/RealESRNet_x4plus.pth"
+source_sha256 = "a820b9bde89a874d7599d545567308ce6c128fc8754a53208eda016d40aa81df"
+license = "BSD-3-Clause"
+
+[weights.bsrgan]
+path = "weights/bsrgan_x4.safetensors"
+distribution = "external"
+source = "https://github.com/cszn/KAIR/releases/download/v1.0/BSRGAN.pth"
+source_sha256 = "5d505a0766160921e0388d76e1ddf08cb114303990f9080432bf2b1c988b1c54"
+license = "Apache-2.0"
+
+[weights.bsrnet]
+path = "weights/bsrnet_x4.safetensors"
+distribution = "external"
+source = "https://github.com/cszn/KAIR/releases/download/v1.0/BSRNet.pth"
+source_sha256 = "fa633d80ff4db5a546740ae8e3baebe925fc84d3c03e3e9002493acc5e88c3ec"
+license = "Apache-2.0"
+
+[weights.x2plus]
+path = "weights/realesrgan_x2plus.safetensors"
+distribution = "external"
+source = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
+source_sha256 = "49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb"
+license = "BSD-3-Clause"
+
+[weights.anime]
+path = "weights/realesrgan_x4plus_anime_6b.safetensors"
+distribution = "external"
+source = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
+source_sha256 = "f872d837d3c90ed2e05227bed711af5671a6fd1c9f7d7e91c911a61f155e99da"
+license = "BSD-3-Clause"
+
+[weights.animevideo]
+path = "weights/realesr_animevideov3.safetensors"
+distribution = "external"
+source = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth"
+source_sha256 = "b8a8376811077954d82ca3fcf476f1ac3da3e8a68a4f4d71363008000a18b75d"
+license = "BSD-3-Clause"
+
+[weights.esrgan]
+path = "weights/esrgan_x4.safetensors"
+distribution = "external"
+source = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.1/ESRGAN_SRx4_DF2KOST_official-ff704c30.pth"
+source_sha256 = "ff704c30ff560305e48ed1f4db895e525ab6bc81a46fafe80c0094a271c806d9"
+license = "BSD-3-Clause"

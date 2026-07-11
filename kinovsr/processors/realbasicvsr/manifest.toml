@@ -1,0 +1,21 @@
+schema_version = 1
+
+[owner]
+kind = "processor"
+name = "realbasicvsr"
+
+[profiles.x4]
+capabilities = ["upscale"]
+weights = ["x4"]
+
+# The mmediting checkpoint carries generator. and generator_ema. copies
+# with identical names and different values; the bundled artifact is the
+# EMA set (see weights/README.md).
+
+[weights.x4]
+path = "weights/realbasicvsr_x4.safetensors"
+distribution = "bundled"
+artifact_sha256 = "48f3d4cbd957b1f0b548133374de13a71c8f946d85fb7b7da15ecef0ce5ec54c"
+source = "https://download.openmmlab.com/mmediting/restorers/real_basicvsr/realbasicvsr_c64b20_1x30x8_lr5e-5_150k_reds_20211104-52f77c2c.pth"
+source_sha256 = "52f77c2c835aaa3fe675b3959b2f85010a6c6f63f77f7e279394646e55a4e376"
+license = "Apache-2.0"

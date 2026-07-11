@@ -12,10 +12,15 @@ Convert:
 ```bash
 curl -L -O https://download.openmmlab.com/mmediting/restorers/real_basicvsr/realbasicvsr_c64b20_1x30x8_lr5e-5_150k_reds_20211104-52f77c2c.pth
 kinovsr weights convert realbasicvsr_c64b20_1x30x8_lr5e-5_150k_reds_20211104-52f77c2c.pth \
-  -o kinovsr/processors/realbasicvsr/weights/realbasicvsr_x4.safetensors --strip-prefix 'generator.'
+  -o kinovsr/processors/realbasicvsr/weights/realbasicvsr_x4.safetensors \
+  --only-prefix 'generator_ema.' --strip-prefix 'generator_ema.'
 ```
 
-The mmediting checkpoint nests under `state_dict` and prefixes keys with `generator.`.
+The mmediting checkpoint nests under `state_dict` and carries BOTH
+`generator.` and `generator_ema.` copies of every parameter with the same
+names but different values; the bundled artifact is the EMA set (verified
+tensor-for-tensor against the source). Converting with
+`--strip-prefix 'generator.'` would silently produce the non-EMA model.
 
 Source: Chan et al., "Investigating Tradeoffs in Real-World Video Super-Resolution"
 (CVPR 2022) -- https://github.com/ckkelvinchan/RealBasicVSR

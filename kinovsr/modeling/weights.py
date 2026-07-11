@@ -29,11 +29,28 @@ from typing import Any
 _KINDS = ("processor", "component", "evaluator")
 
 # Explicit first-party manifest registry: owner name -> manifest path
-# relative to the kinovsr package root. Extended as families migrate.
+# relative to the kinovsr package root. One manifest covers each weights
+# directory: every processor family with weights, the shared modeling
+# components, the eval scorers, and the eval toolkit's shared assets.
 MANIFESTS = {
+    "basicvsrpp": "processors/basicvsrpp/manifest.toml",
     "bsvd": "processors/bsvd/manifest.toml",
+    "dover": "eval/models/dover/manifest.toml",
+    "esc": "processors/esc/manifest.toml",
+    "eval": "eval/manifest.toml",
+    "fastdvdnet": "processors/fastdvdnet/manifest.toml",
+    "fbcnn": "processors/fbcnn/manifest.toml",
+    "musiq": "eval/models/musiq/manifest.toml",
+    "nafnet": "processors/nafnet/manifest.toml",
+    "pvdd": "processors/pvdd/manifest.toml",
+    "realbasicvsr": "processors/realbasicvsr/manifest.toml",
+    "realesrgan": "processors/realesrgan/manifest.toml",
     "realplksr": "processors/realplksr/manifest.toml",
+    "realviformer": "processors/realviformer/manifest.toml",
+    "safmn": "processors/safmn/manifest.toml",
     "spynet": "modeling/spynet/manifest.toml",
+    "stdf": "processors/stdf/manifest.toml",
+    "toflow": "processors/toflow/manifest.toml",
 }
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]

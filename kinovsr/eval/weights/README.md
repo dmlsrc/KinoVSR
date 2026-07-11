@@ -1,4 +1,6 @@
-# YuNet Face Detector Weights
+# Eval Toolkit Weights
+
+## YuNet face detector
 
 `face_detection_yunet_2023mar.onnx` is bundled for
 `kinovsr metrics faces`. It is small (~227 KB) and MIT
@@ -9,7 +11,22 @@ for face-region denoiser evaluation.
 | --- | --- | --- | --- | --- |
 | face_detection_yunet_2023mar.onnx | https://huggingface.co/opencv/opencv_zoo/blob/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx | `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4` | `d3fbb6028fc86125755b70f69f428ebbf39fbb01cfa5df3e3dbe1563148ae349` | MIT |
 
-The license text and attribution are in `../ATTRIBUTION.md`.
+The license text and attribution are in `Attribution.md`.
+
+## NIQE pristine model
+
+`niqe_pristine_reds.safetensors` (~5 KB) is a first-party artifact for
+`kinovsr metrics niqe`: the fitted MVG statistics of pristine natural
+images (NIQE, Mittal et al. 2013). It was fitted locally from clean REDS
+sharp frames with the tool's own fit mode - there is no upstream download:
+
+```bash
+kinovsr metrics niqe --fit <folder-of-pristine-images> --out niqe_pristine_reds.safetensors
+```
+
+| file | source | sha256 | license |
+| --- | --- | --- | --- |
+| niqe_pristine_reds.safetensors | first-party (fitted from REDS sharp frames) | `d0850ab291a1c74bfe89d27a3e03a75f6991d3970b77800b51e2bdbaf5bad0f3` | first-party fitted statistics |
 
 Source: OpenCV Zoo `models/face_detection_yunet`; upstream model source is
 https://github.com/ShiqiYu/libfacedetection.train.
