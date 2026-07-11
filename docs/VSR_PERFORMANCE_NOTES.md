@@ -117,7 +117,7 @@ copies per block x 69 blocks) disappear. RRDBNet (bsrgan / x4plus / esrgan /
 realesrnet / bsrnet / anime / x2plus): **1.54x**, output parity 65.5 dB. The
 recombination sums must run in fp32: the split rounds each partial conv output
 to fp16 where the original GEMM accumulated all of K in fp32. See
-`kinovsr/realesrgan/net.py:_restack_rdb_weights` and `_rdb`.
+`kinovsr/processors/realesrgan/net.py:_restack_rdb_weights` and `_rdb`.
 
 ### Window attention is intrinsically expensive on M1
 
@@ -421,7 +421,7 @@ gracefully on hard out-of-distribution frame edges (a junk half-dark border
 row becomes a near-scale thin line rather than a thick smeared band with
 blotches above it). CAUTION: unlike every other checkpoint in this table, the
 PureScale weights are CC BY-NC-SA 4.0 -- NON-COMMERCIAL use only (see
-`kinovsr/safmn/ATTRIBUTION.md`).
+`kinovsr/processors/safmn/ATTRIBUTION.md`).
 
 Two SAFM dials expose what is and is not swappable at inference.
 `--safmn-safm-up auto|nearest|bicubic`: the upsampler is a mild shape-only

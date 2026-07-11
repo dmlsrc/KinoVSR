@@ -20,8 +20,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from ..compile_cache import cached as _cached
-from ..weights import resolve_weights as _resolve_weights
+from kinovsr.compile_cache import cached as _cached
+from kinovsr.weights import resolve_weights as _resolve_weights
 
 _WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 _IN_CH_TO_SCALE = {3: 4, 12: 2, 48: 1}   # conv_first in-channels -> output scale

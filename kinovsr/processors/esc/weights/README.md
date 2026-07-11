@@ -13,7 +13,7 @@ Convert -- the output name must match `net.py`'s `_VARIANTS`:
 ```bash
 curl -L -O https://github.com/dslisleedh/ESC/releases/download/1.0.0/ESC_Real_X4_GAN.pth
 python scripts/pth_to_safetensors.py ESC_Real_X4_GAN.pth --param-key params_ema \
-  -o kinovsr/esc/weights/esc_real_x4_gan.safetensors
+  -o kinovsr/processors/esc/weights/esc_real_x4_gan.safetensors
 ```
 
 `--param-key params_ema` matters: the checkpoints carry BOTH `params` and

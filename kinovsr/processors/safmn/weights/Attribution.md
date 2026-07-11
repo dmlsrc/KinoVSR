@@ -1,9 +1,9 @@
 # Attribution
 
-`kinovsr/safmn/` is an independent MLX reimplementation of the SAFMN
+`kinovsr/processors/safmn/` is an independent MLX reimplementation of the SAFMN
 super-resolution family, written from the published architectures as a spec -- no
 upstream code is bundled. The model weights are the upstream project's,
-redistributed under its license (see `weights/README.md` for the downloads).
+redistributed under its license (see `README.md` beside this file for the downloads).
 
 ## SAFMN
 
@@ -50,4 +50,4 @@ https://creativecommons.org/licenses/by-nc-sa/4.0/
   must carry the same license.
 
 The weights are not distributed with this repository; users download them from
-the author's release and convert locally (see `weights/README.md`).
+the author's release and convert locally (see `README.md` beside this file).

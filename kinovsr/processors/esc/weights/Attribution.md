@@ -1,8 +1,8 @@
 # Attribution
 
-`kinovsr/esc/` is an independent MLX reimplementation of ESC-Real, written from
+`kinovsr/processors/esc/` is an independent MLX reimplementation of ESC-Real, written from
 the published architecture as a spec -- no upstream code is bundled. The model weights
-are the upstream project's, redistributed under its license (see `weights/README.md`
+are the upstream project's, redistributed under its license (see `README.md` beside this file
 for the downloads).
 
 ## ESC

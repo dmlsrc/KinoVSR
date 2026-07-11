@@ -592,14 +592,14 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
     if args.upscale == "realesrgan":
         # realesrgan covers 2x (x2plus) as well as 4x models; read the real scale from the
         # checkpoint instead of assuming 4x, so output dims + encoder match the frames.
-        from kinovsr.realesrgan import net as _rnet
+        from kinovsr.processors.realesrgan import net as _rnet
         spatial_scale = _rnet.scale_of(_rnet.load_params(
             _rnet.resolve_weights(realesrgan_spec)))
     elif args.upscale == "safmn":
-        from kinovsr.safmn import net as _snet
+        from kinovsr.processors.safmn import net as _snet
         spatial_scale = _snet._config(_snet.load_params(safmn_spec))[3]
     elif args.upscale == "esc":
-        from kinovsr.esc import net as _enet
+        from kinovsr.processors.esc import net as _enet
         spatial_scale = _enet._config(_enet.load_params(esc_spec))[6]
     elif args.upscale == "realplksr":
         # realplksr covers 2x (public2x) and 4x (nomos4x); read the scale from the
@@ -1224,17 +1224,17 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
                 history_gate=args.realbasicvsr_history_gate,
             )
         elif args.upscale == "realesrgan":
-            from kinovsr.realesrgan.upscaler import RealEsrganUpscaler
+            from kinovsr.processors.realesrgan.upscaler import RealEsrganUpscaler
             up = RealEsrganUpscaler(
                 realesrgan_spec,
                 denoise_strength=args.realesrgan_denoise_strength,
             )
         elif args.upscale == "safmn":
-            from kinovsr.safmn import SafmnUpscaler
+            from kinovsr.processors.safmn import SafmnUpscaler
             up = SafmnUpscaler(safmn_spec, safm_up=args.safmn_safm_up,
                                pool_clamp=args.safmn_pool_clamp)
         elif args.upscale == "esc":
-            from kinovsr.esc import EscUpscaler
+            from kinovsr.processors.esc import EscUpscaler
             up = EscUpscaler(esc_spec)
         elif args.upscale == "realplksr":
             from kinovsr.processors.realplksr import RealPlksrUpscaler

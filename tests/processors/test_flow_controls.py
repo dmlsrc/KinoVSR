@@ -681,7 +681,7 @@ def test_nafnet_local_avg_pool_matches_reference_padding():
 
 
 def test_safmn_bicubic_up_matches_torch_reference():
-    from kinovsr.safmn.net import _bicubic_up
+    from kinovsr.processors.safmn.net import _bicubic_up
 
     # Reference computed once with torch F.interpolate(scale_factor=2,
     # mode="bicubic", align_corners=False) on this exact input.
@@ -704,7 +704,7 @@ def test_safmn_bicubic_up_matches_torch_reference():
 
 
 def test_safmn_bicubic_up_reproduces_constants_and_ramps():
-    from kinovsr.safmn.net import _bicubic_up
+    from kinovsr.processors.safmn.net import _bicubic_up
 
     # Weights sum to 1 -> constants reproduce exactly, including at the
     # replicate-padded borders.
@@ -727,7 +727,7 @@ def test_safmn_bicubic_up_reproduces_constants_and_ramps():
 
 
 def test_safmn_safm_mode_inferred_from_filename():
-    from kinovsr.safmn.net import _VARIANTS, _safm_mode_for
+    from kinovsr.processors.safmn.net import _VARIANTS, _safm_mode_for
 
     assert _safm_mode_for("safmn_purescale_x4.safetensors") == "fixed"
     assert _safm_mode_for("/a/b/Safmn_PureScale_sharper_x2.safetensors") == "fixed"
@@ -741,7 +741,7 @@ def test_safmn_safm_mode_inferred_from_filename():
 
 
 def test_safmn_config_carries_safm_mode_and_trained_upsampler():
-    from kinovsr.safmn.net import _config
+    from kinovsr.processors.safmn.net import _config
 
     p = {
         "to_feat.weight": mx.zeros((128, 3, 3, 3)),
@@ -755,7 +755,7 @@ def test_safmn_config_carries_safm_mode_and_trained_upsampler():
 
 
 def test_safmn_upscaler_validates_args_before_loading_weights():
-    from kinovsr.safmn.upscaler import SafmnUpscaler
+    from kinovsr.processors.safmn.upscaler import SafmnUpscaler
 
     with pytest.raises(ValueError, match="safm_up"):
         SafmnUpscaler(safm_up="bogus")
@@ -764,7 +764,7 @@ def test_safmn_upscaler_validates_args_before_loading_weights():
 
 
 def test_safmn_pool_clamp_touches_only_interior_outliers():
-    from kinovsr.safmn.net import _pool_clamp
+    from kinovsr.processors.safmn.net import _pool_clamp
 
     mx.random.seed(4)
     s = mx.random.normal(shape=(1, 12, 16, 4)) * 0.1

@@ -18,7 +18,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from ..safmn.net import _bicubic_up
+from kinovsr.processors.safmn.net import _bicubic_up
+
 from ..vsr_blocks import _bilinear, resize
 from ..weights import resolve_weights as _resolve_weights
 
