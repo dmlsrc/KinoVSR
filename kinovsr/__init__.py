@@ -24,8 +24,8 @@ Submodules expose lower-level helpers:
 
     pixel_buffers   CVPixelBuffer create/read/write, CMTime helpers
 
-The stacked progress-bar primitives moved to `kinovsr.progress`
-(was previously re-exported here when the bars only had VSR callers).
+Progress is published through `kinovsr.reporting.Reporter`; the CLI wires
+the Rich-backed implementation from `kinovsr.ui`.
 """
 
 from __future__ import annotations

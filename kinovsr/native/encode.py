@@ -34,9 +34,8 @@ consumed lazily so a streaming source doesn't have to materialize.
 
 from __future__ import annotations
 
-import contextlib
-import io
 import itertools
+import logging
 import time
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
@@ -47,12 +46,14 @@ import mlx.core as mx
 from kinovsr.media import color as _color
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media.audio import AudioTrack
-from kinovsr.progress import StackedPhaseBars
+from kinovsr.reporting import NullReporter, Reporter
 
 from .compat import autorelease_pool, require_pyobjc
 from .temporal import VtfrcSession
 from .vsr import VsrSession, scale_for_mode
 from .writer import HEVC_PROFILE_MAIN10, HEVC_PROFILE_MAIN422_10, AVWriter
+
+_log = logging.getLogger(__name__)
 
 
 def _human_size(n: float) -> str:
@@ -159,11 +160,15 @@ def encode_video_videotoolbox(
     encode_quality: float = 0.65,
     encode_chroma: str = "auto",
     n_source_frames: int | None = None,
-    progress_stack: StackedPhaseBars | None = None,
+    reporter: Reporter | None = None,
     audio_codec: str = "alac",
-    verbose: bool = True,
 ) -> Path:
     """Encode frames into an HEVC mp4 via AVAssetWriter (no ffmpeg).
+
+    Progress is published through ``reporter``
+    (:class:`kinovsr.reporting.Reporter`; default: none) and status lines
+    go to the ``kinovsr.native.encode`` logger - configure
+    :mod:`kinovsr.ui.logging` (or attach any stdlib handler) to see them.
 
     Returns the actual output path; rewrites the extension to .mp4 if the
     caller supplied something else (matches encode_video_ffmpeg() behavior for
@@ -204,6 +209,8 @@ def encode_video_videotoolbox(
     the second encode is largely parallel to the primary.
     """
     require_pyobjc()
+    if reporter is None:
+        reporter = NullReporter()
     output_path = Path(output_path)
     if output_path.suffix.lower() != ".mp4":
         output_path = output_path.with_suffix(".mp4")
@@ -239,210 +246,169 @@ def encode_video_videotoolbox(
     profile = _pick_hevc_profile(vsr_spatial_mode, encode_chroma)
 
     # ---- Setup phase ------------------------------------------------------
-    # VsrSession / VtfrcSession / AVWriter constructors each print to stdout
-    # unconditionally ("VSR session ready ...", "Temporal session ready ...",
-    # "[encode] AVAssetWriter -> ..."), plus we add the chain description
-    # and the optional audio sidecar line.  When `progress_stack` is alive,
-    # those raw prints would stomp on the bar row.  Redirect them through a StringIO and
-    # emit the captured block via `progress_stack.write()` so the lines
-    # land cleanly above the bars (scroll-message-above-bars style); when no stack is
-    # supplied, the prints flow normally to stdout.
-    _setup_buf: io.StringIO | None = None
-    if progress_stack is not None:
-        _setup_buf = io.StringIO()
-        _setup_ctx = contextlib.redirect_stdout(_setup_buf)
+    # Session/writer constructors print their status lines to stdout; the
+    # progress phase has not started yet, so they cannot collide with a
+    # live display.
+    # VSR session
+    vsr: VsrSession | None = None
+    if do_vsr:
+        vsr = VsrSession(in_w, in_h, mode=vsr_spatial_mode, fps=fps)
+
+    # VTFRC session
+    vtfrc: VtfrcSession | None = None
+    if do_temporal:
+        vtfrc = VtfrcSession(
+            out_w, out_h,
+            source_fps=fps, target_fps=target_fps,
+            mode=vsr_temporal_mode,
+        )
+
+    # Audio track
+    audio_track: AudioTrack | None = None
+    if audio_waveform is not None:
+        if audio_sample_rate is None:
+            raise ValueError(
+                "audio_sample_rate is required when audio_waveform is provided"
+            )
+        # Sequence-start onset mitigation.  Runs before the AudioTrack
+        # build while the generated waveform can still stay MLX-native;
+        # `_normalize_audio_for_track` is the final NumPy byte-boundary
+        # adapter for CoreMedia.  See
+        # docs/AUDIO_ISSUES.md -> "Sequence-Start Audio Spike".
+        from .audio import DEFAULT_TRIM_MS, mitigate_onset
+
+        onset_trim_ms = (
+            audio_onset_trim_ms
+            if audio_onset_trim_ms is not None
+            else DEFAULT_TRIM_MS
+        )
+        onset_result = mitigate_onset(
+            audio_waveform, int(audio_sample_rate),
+            mode=audio_onset_trim_mode, trim_ms=onset_trim_ms,
+        )
+        arr = _normalize_audio_for_track(onset_result.samples)
+        if onset_result.applied:
+            _log.info(f"audio onset: {onset_result.detail}")
+        audio_track = AudioTrack(arr, sample_rate=int(audio_sample_rate))
+
+    # Pick writer source format.  When VSR or VTFRC is active, the
+    # writer source = the last stage's dst.  When neither is active,
+    # the writer source = NV12 and we upload through CoreImage (keeps
+    # the encoder's RGB->YUV cost in one place).
+    if vtfrc is not None:
+        writer_src_fmt = _pb.resolve_pixel_format(vtfrc.dst_attrs)
+    elif vsr is not None:
+        writer_src_fmt = _pb.resolve_pixel_format(vsr.dst_attrs)
     else:
-        _setup_ctx = contextlib.nullcontext()
+        writer_src_fmt = _pb.PIX_NV12
 
-    with _setup_ctx:
-        # VSR session
-        vsr: VsrSession | None = None
-        if do_vsr:
-            vsr = VsrSession(in_w, in_h, mode=vsr_spatial_mode, fps=fps)
+    resolved_color = _color.resolve({"full_range": False}, "bt709")
+    color_props = _color.av_color_properties(resolved_color)
+    cv_color = _color.cv_triple(resolved_color)
+    writer_yuv_feed = writer_src_fmt == _pb.PIX_RGBAHALF
 
-        # VTFRC session
-        vtfrc: VtfrcSession | None = None
-        if do_temporal:
-            vtfrc = VtfrcSession(
-                out_w, out_h,
-                source_fps=fps, target_fps=target_fps,
-                mode=vsr_temporal_mode,
-            )
+    # Writer + pool wiring.  Zero-copy hookups: VTFRC writes into the
+    # writer's adaptor pool when active; VSR writes into its own dst
+    # pool when VTFRC is between (a copy at the VT call boundary), or
+    # directly into the writer's adaptor pool when there is no VTFRC.
+    # If the writer is doing the explicit RGBAHalf->YUV conversion, its
+    # adaptor pool is YUV; keep the producer on its own RGBAHalf pool.
+    writer = AVWriter(
+        output_path,
+        width=out_w, height=out_h, fps=target_fps,
+        source_pixel_format=writer_src_fmt,
+        profile=profile,
+        quality=encode_quality,
+        label="encode",
+        color_props=color_props,
+        cv_color=cv_color if writer_yuv_feed else None,
+        full_range=False,
+        audio_track=audio_track,
+        audio_codec=audio_codec,
+    )
+    if vtfrc is not None and not writer_yuv_feed:
+        vtfrc.use_dst_pool(writer.adaptor.pixelBufferPool())
+    elif vsr is not None and not writer_yuv_feed:
+        vsr.use_dst_pool(writer.adaptor.pixelBufferPool())
 
-        # Audio track
-        audio_track: AudioTrack | None = None
-        if audio_waveform is not None:
-            if audio_sample_rate is None:
-                raise ValueError(
-                    "audio_sample_rate is required when audio_waveform is provided"
-                )
-            # Sequence-start onset mitigation.  Runs before the AudioTrack
-            # build while the generated waveform can still stay MLX-native;
-            # `_normalize_audio_for_track` is the final NumPy byte-boundary
-            # adapter for CoreMedia.  See
-            # docs/AUDIO_ISSUES.md -> "Sequence-Start Audio Spike".
-            from .audio import DEFAULT_TRIM_MS, mitigate_onset
-
-            onset_trim_ms = (
-                audio_onset_trim_ms
-                if audio_onset_trim_ms is not None
-                else DEFAULT_TRIM_MS
-            )
-            onset_result = mitigate_onset(
-                audio_waveform, int(audio_sample_rate),
-                mode=audio_onset_trim_mode, trim_ms=onset_trim_ms,
-            )
-            arr = _normalize_audio_for_track(onset_result.samples)
-            if verbose and onset_result.applied:
-                print(f"  audio onset: {onset_result.detail}")
-            audio_track = AudioTrack(arr, sample_rate=int(audio_sample_rate))
-
-        # Pick writer source format.  When VSR or VTFRC is active, the
-        # writer source = the last stage's dst.  When neither is active,
-        # the writer source = NV12 and we upload through CoreImage (keeps
-        # the encoder's RGB->YUV cost in one place).
-        if vtfrc is not None:
-            writer_src_fmt = _pb.resolve_pixel_format(vtfrc.dst_attrs)
-        elif vsr is not None:
-            writer_src_fmt = _pb.resolve_pixel_format(vsr.dst_attrs)
+    # Optional "save the un-processed original alongside the VSR/VTFRC
+    # result" companion writer.  Only meaningful when some VT post-
+    # processing is engaged; otherwise the primary writer IS the
+    # original and a duplicate adds zero value.  Shares the same
+    # AudioTrack - CMSampleBuffer is fresh per make_sample_buffer()
+    # call so two GCD pumps on the same track are safe.
+    #
+    # Source format + HEVC profile mirror the primary writer's
+    # precision envelope (`_pick_hevc_profile`): when the user opted
+    # into VSR HQ (balanced / image), the primary is RGBAHalf source
+    # -> HEVC Main42210 (4:2:2 10-bit) and the original should match
+    # so the A/B comparison isn't a precision-floor mismatch.  For
+    # VSR fast and VTFRC-only the primary is NV12 -> Main10 (4:2:0
+    # 10-bit); the original matches that too - upgrading the
+    # original's source format past what its companion uses adds
+    # bits the encoder would just throw away.  When the input frames
+    # are fp16 RGBA from a native decoder or host engine, RGBAHalf
+    # preserves them all the way to the encoder's internal 4:2:2 conversion;
+    # uint8 RGB input goes through upload_frame_to_buffer's RGBA
+    # promotion path with no loss vs. the NV12 alternative.
+    writer_orig: AVWriter | None = None
+    orig_path: Path | None = None
+    do_save_original = vsr_save_original and (vsr is not None or vtfrc is not None)
+    if do_save_original:
+        orig_path = output_path.with_name(
+            f"{output_path.stem}_orig{output_path.suffix}"
+        )
+        if vsr_spatial_mode in ("balanced", "image"):
+            orig_src_fmt = _pb.PIX_RGBAHALF
+            orig_profile = HEVC_PROFILE_MAIN422_10
         else:
-            writer_src_fmt = _pb.PIX_NV12
-
-        resolved_color = _color.resolve({"full_range": False}, "bt709")
-        color_props = _color.av_color_properties(resolved_color)
-        cv_color = _color.cv_triple(resolved_color)
-        writer_yuv_feed = writer_src_fmt == _pb.PIX_RGBAHALF
-
-        # Writer + pool wiring.  Zero-copy hookups: VTFRC writes into the
-        # writer's adaptor pool when active; VSR writes into its own dst
-        # pool when VTFRC is between (a copy at the VT call boundary), or
-        # directly into the writer's adaptor pool when there is no VTFRC.
-        # If the writer is doing the explicit RGBAHalf->YUV conversion, its
-        # adaptor pool is YUV; keep the producer on its own RGBAHalf pool.
-        writer = AVWriter(
-            output_path,
-            width=out_w, height=out_h, fps=target_fps,
-            source_pixel_format=writer_src_fmt,
-            profile=profile,
+            orig_src_fmt = _pb.PIX_NV12
+            orig_profile = HEVC_PROFILE_MAIN10
+        orig_yuv_feed = orig_src_fmt == _pb.PIX_RGBAHALF
+        writer_orig = AVWriter(
+            orig_path,
+            width=in_w, height=in_h, fps=fps,
+            source_pixel_format=orig_src_fmt,
+            profile=orig_profile,
             quality=encode_quality,
-            label="encode",
+            label="encode_orig",
             color_props=color_props,
-            cv_color=cv_color if writer_yuv_feed else None,
+            cv_color=cv_color if orig_yuv_feed else None,
             full_range=False,
             audio_track=audio_track,
             audio_codec=audio_codec,
         )
-        if vtfrc is not None and not writer_yuv_feed:
-            vtfrc.use_dst_pool(writer.adaptor.pixelBufferPool())
-        elif vsr is not None and not writer_yuv_feed:
-            vsr.use_dst_pool(writer.adaptor.pixelBufferPool())
+    else:
+        orig_yuv_feed = False
 
-        # Optional "save the un-processed original alongside the VSR/VTFRC
-        # result" companion writer.  Only meaningful when some VT post-
-        # processing is engaged; otherwise the primary writer IS the
-        # original and a duplicate adds zero value.  Shares the same
-        # AudioTrack - CMSampleBuffer is fresh per make_sample_buffer()
-        # call so two GCD pumps on the same track are safe.
-        #
-        # Source format + HEVC profile mirror the primary writer's
-        # precision envelope (`_pick_hevc_profile`): when the user opted
-        # into VSR HQ (balanced / image), the primary is RGBAHalf source
-        # -> HEVC Main42210 (4:2:2 10-bit) and the original should match
-        # so the A/B comparison isn't a precision-floor mismatch.  For
-        # VSR fast and VTFRC-only the primary is NV12 -> Main10 (4:2:0
-        # 10-bit); the original matches that too - upgrading the
-        # original's source format past what its companion uses adds
-        # bits the encoder would just throw away.  When the input frames
-        # are fp16 RGBA from a native decoder or host engine, RGBAHalf
-        # preserves them all the way to the encoder's internal 4:2:2 conversion;
-        # uint8 RGB input goes through upload_frame_to_buffer's RGBA
-        # promotion path with no loss vs. the NV12 alternative.
-        writer_orig: AVWriter | None = None
-        orig_path: Path | None = None
-        do_save_original = vsr_save_original and (vsr is not None or vtfrc is not None)
-        if do_save_original:
-            orig_path = output_path.with_name(
-                f"{output_path.stem}_orig{output_path.suffix}"
-            )
-            if vsr_spatial_mode in ("balanced", "image"):
-                orig_src_fmt = _pb.PIX_RGBAHALF
-                orig_profile = HEVC_PROFILE_MAIN422_10
-            else:
-                orig_src_fmt = _pb.PIX_NV12
-                orig_profile = HEVC_PROFILE_MAIN10
-            orig_yuv_feed = orig_src_fmt == _pb.PIX_RGBAHALF
-            writer_orig = AVWriter(
-                orig_path,
-                width=in_w, height=in_h, fps=fps,
-                source_pixel_format=orig_src_fmt,
-                profile=orig_profile,
-                quality=encode_quality,
-                label="encode_orig",
-                color_props=color_props,
-                cv_color=cv_color if orig_yuv_feed else None,
-                full_range=False,
-                audio_track=audio_track,
-                audio_codec=audio_codec,
-            )
-        else:
-            orig_yuv_feed = False
-
-        # Optional audio sidecar WAV.
-        sidecar_path: Path | None = None
-        if audio_track is not None and save_audio_sidecar:
-            sidecar_path = output_path.with_suffix(".wav")
-            audio_track.save_wav(sidecar_path)
-            if verbose:
-                print(
-                    f"  audio sidecar: {sidecar_path}  "
-                    f"({audio_bit_depth}, {audio_track.sample_rate} Hz)"
-                )
-
-        # Chain description (above the encode bar so users see what's running).
-        stages: list[str] = []
-        if vsr is not None:
-            stages.append(f"VSR={vsr_spatial_mode}({scale}x)")
-        if vtfrc is not None:
-            stages.append(f"VTFRC={fps:g}->{target_fps:g}fps")
-        chain = " + ".join(stages) if stages else "passthrough"
-        if verbose:
-            print(f"  encode (videotoolbox): {chain} -> HEVC {profile}")
-            print(f"  -> {output_path}")
-            if writer_orig is not None:
-                print(
-                    f"  + original passthrough -> HEVC {orig_profile} "
-                    f"-> {orig_path}"
-                )
-
-    # If we captured the setup output, route it above the caller's bar
-    # stack now - single bars.write() call so the bars stay coherent.
-    if _setup_buf is not None:
-        _setup_msg = _setup_buf.getvalue().rstrip("\n")
-        if _setup_msg:
-            progress_stack.write(_setup_msg)
-
-    # PhaseBar gives a stable, fixed-column progress display.  Total is
-    # known for list / ndarray inputs; iterators get an indeterminate bar
-    # (count-only, no ETA).  Suppress entirely when verbose=False.
-    #
-    # When `progress_stack` is provided, the encoder shares the caller's
-    # stack so upstream decode/restoration and the encoder can render in one
-    # cohesive display.
-    # The caller owns close() in that mode; we just add our row.
-    bars: StackedPhaseBars | None = None
-    owns_bars = False
-    pbar = None
-    if verbose:
-        if progress_stack is not None:
-            bars = progress_stack
-        else:
-            bars = StackedPhaseBars()
-            owns_bars = True
-        pbar = bars.add(
-            total=n_source_frames,
-            desc="VT encode",
-            unit="frame",
+    # Optional audio sidecar WAV.
+    sidecar_path: Path | None = None
+    if audio_track is not None and save_audio_sidecar:
+        sidecar_path = output_path.with_suffix(".wav")
+        audio_track.save_wav(sidecar_path)
+        _log.info(
+            f"audio sidecar: {sidecar_path}  "
+            f"({audio_bit_depth}, {audio_track.sample_rate} Hz)"
         )
+
+    # Chain description (logged before the encode phase starts).
+    stages: list[str] = []
+    if vsr is not None:
+        stages.append(f"VSR={vsr_spatial_mode}({scale}x)")
+    if vtfrc is not None:
+        stages.append(f"VTFRC={fps:g}->{target_fps:g}fps")
+    chain = " + ".join(stages) if stages else "passthrough"
+    _log.info(f"encode (videotoolbox): {chain} -> HEVC {profile}")
+    _log.info(f"-> {output_path}")
+    if writer_orig is not None:
+        _log.info(
+            f"+ original passthrough -> HEVC {orig_profile} -> {orig_path}"
+        )
+
+    # Total is known for list / ndarray inputs; iterators get an
+    # indeterminate phase (count-only, no ETA).
+    _phase = "VT encode"
+    reporter.phase_start(_phase, total=n_source_frames, unit="frame")
 
     started = time.perf_counter()
     n_in = 0
@@ -488,8 +454,7 @@ def encode_video_videotoolbox(
                     n_out += 1
                 del src_pb
             n_in += 1
-            if pbar is not None:
-                pbar.update(1)
+            reporter.phase_advance(_phase)
             # Periodic janitorial work: CIContext caches + src pool drain.
             if n_in % 64 == 0:
                 _pb.clear_ci_caches()
@@ -502,8 +467,7 @@ def encode_video_videotoolbox(
                 n_out += 1
                 del out_pb
     finally:
-        if bars is not None and owns_bars:
-            bars.close()
+        reporter.phase_end(_phase)
         writer.finish()
         if writer_orig is not None:
             writer_orig.finish()
@@ -512,32 +476,19 @@ def encode_video_videotoolbox(
         if vsr is not None:
             vsr.close()
 
-    if verbose:
-        elapsed = time.perf_counter() - started
-        size = output_path.stat().st_size
-        orig_part = ""
-        if writer_orig is not None and orig_path is not None:
-            orig_size = orig_path.stat().st_size
-            orig_part = (
-                f" + original {_human_size(orig_size)} "
-                f"({n_orig} src frame{'s' if n_orig != 1 else ''})"
-            )
-        done_msg = (
-            f"  done: {_human_size(size)} in {elapsed:.1f}s "
-            f"({n_in} src frame{'s' if n_in != 1 else ''}, "
-            f"{n_out} written){orig_part}"
+    elapsed = time.perf_counter() - started
+    size = output_path.stat().st_size
+    orig_part = ""
+    if writer_orig is not None and orig_path is not None:
+        orig_size = orig_path.stat().st_size
+        orig_part = (
+            f" + original {_human_size(orig_size)} "
+            f"({n_orig} src frame{'s' if n_orig != 1 else ''})"
         )
-        # In caller-managed-stack mode the bars are still alive at this
-        # point (the caller closes them after we return), so a raw print
-        # would stomp on the bottom bar's row.  Route through bars.write()
-        # with position="below" so the visual order in the persisted
-        # scrollback is "bars (frozen at 100%) -> done summary".  The
-        # stack is reset by that call; the caller's `with` cleanup is
-        # a safe no-op afterwards (StackedPhaseBars.close early-returns
-        # when _bars is empty).
-        if progress_stack is not None and not owns_bars:
-            progress_stack.write(done_msg, position="below")
-        else:
-            print(done_msg)
+    _log.info(
+        f"done: {_human_size(size)} in {elapsed:.1f}s "
+        f"({n_in} src frame{'s' if n_in != 1 else ''}, "
+        f"{n_out} written){orig_part}"
+    )
 
     return output_path

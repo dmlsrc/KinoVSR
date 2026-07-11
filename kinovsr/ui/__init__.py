@@ -6,9 +6,6 @@ bars, so they interleave cleanly. Runtime modules emit via their own
 ``logging.getLogger(__name__)`` and report progress through a
 :class:`kinovsr.reporting.Reporter`; only the CLI imports this package to
 wire the terminal implementations up.
-
-The inherited ``kinovsr.progress`` stacked bars remain the harness's
-surface until its output migrates here; new code targets this package.
 """
 
 from .console import get_console

@@ -44,6 +44,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     settings = invocation.settings
+    from kinovsr.ui import configure_logging_from_settings
+
+    configure_logging_from_settings(settings)
     from kinovsr.api import (
         VideoFileConfig,
         process_video_file,

@@ -6,8 +6,8 @@ ETA columns, and the ``with Progress() as p:`` context all come for free.
 One custom column adds math-consistent wall-clock pace.
 
 **Redraw discipline matters.** macOS hardware-accelerates the terminal -
-every redraw burns Terminal and WindowServer GPU cycles. The inherited
-``StackedPhaseBars`` throttles to 1 Hz; we match that by default via
+every redraw burns Terminal and WindowServer GPU cycles. The retired
+stacked-bars implementation throttled to 1 Hz; we keep that default via
 ``refresh_per_second=1.0`` rather than rich's default of 10 Hz. Long clips
 run thousands of frames; 1 Hz keeps the redraw cost invisible next to the
 per-frame work.

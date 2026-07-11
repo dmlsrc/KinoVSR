@@ -16,6 +16,7 @@ directly.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import time
 from datetime import datetime
@@ -33,7 +34,6 @@ from kinovsr import (
     autorelease_pool,
 )
 from kinovsr.api import VideoProcessResult
-from kinovsr.media.comparison import render_comparison
 from kinovsr.denoise import LumaChromaDenoiser
 from kinovsr.edge_sanitize import (
     compute_aspect_crop,
@@ -54,6 +54,7 @@ from kinovsr.media import color as _color
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media import video_reader as _native_vr
 from kinovsr.media import yuv as _yuv
+from kinovsr.media.comparison import render_comparison
 from kinovsr.modeling.vsr_blocks import make_lanczos_plan, resample_width
 from kinovsr.native.vsr import NativePassthrough
 from kinovsr.native.writer import (
@@ -65,8 +66,9 @@ from kinovsr.processors.fastdvdnet import FastDvdDenoiser
 from kinovsr.processors.mc import McTemporalDenoiser
 from kinovsr.processors.spatial import SpatialDenoiser
 from kinovsr.processors.toflow import TOFlowDenoiser
-from kinovsr.progress import StackedPhaseBars
 from kinovsr.settings import Settings
+from kinovsr.ui.console import get_console
+from kinovsr.ui.progress import RichReporter
 
 
 def parse_mlx_dtype_name(name: str) -> Any:
@@ -1383,10 +1385,10 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
             + (f", log={args.cut_log}" if args.cut_log else "")
         )
 
-    # ---- Progress bars (stacked, deferred-start, median-window rate) -------
-    # PhaseBar's clock starts at the first update() and the displayed pace
-    # is the median of the last-N inter-tick intervals; see kinovsr.progress
-    # for the rationale.
+    # ---- Progress (Rich bars on the shared stderr console) -----------------
+    # Status lines written while the bar is live must go through the same
+    # console (`_say`) so Rich renders them above the live row instead of
+    # letting a raw stdout write stomp it.
     target_frame_total = total_frames
     if target_frame_total and do_temporal:
         target_frame_total = int(round(total_frames * (target_fps / source_fps)))
@@ -1395,12 +1397,13 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
         if (target_frame_total and max_frames is not None) else
         (max_frames or target_frame_total or None)
     )
-    bars = StackedPhaseBars()
-    out_pbar = bars.add(
-        total=pbar_total,
-        desc="OUT frames" if do_temporal else "VSR frames",
-        unit="frame",
-    )
+    def _say(message: str) -> None:
+        get_console().print(message, markup=False, highlight=False)
+
+    out_phase = "OUT frames" if do_temporal else "VSR frames"
+    _ui = contextlib.ExitStack()
+    reporter = _ui.enter_context(RichReporter())
+    reporter.phase_start(out_phase, total=pbar_total, unit="frame")
 
     # ---- Pipeline loop -----------------------------------------------------
     processed = 0          # source frames upscaled
@@ -1459,7 +1462,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
                 del comp_pb
             del out_pb
             appended += 1
-            out_pbar.update(1)
+            reporter.phase_advance(out_phase)
         del vsr_pb, out_iter
         processed += 1
 
@@ -1554,19 +1557,18 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
             # Lazy init of the processing pipeline after the first chunk keeps
             # the VSR HQ model + AVWriter pixel pool out of memory until frames
             # are actually available. _build_post_pipeline() prints status from VsrSession / AVWriter
-            # constructors; route those through bars.write() so they appear
-            # above the live progress bars instead of stomping mid-line.
+            # constructors; route those through _say() so they appear above
+            # the live progress bar instead of stomping mid-line.
             if session is None:
-                import contextlib
                 import io as _io
                 _buf = _io.StringIO()
                 with contextlib.redirect_stdout(_buf):
                     session, vtfrc, post_writer, comparison_writer, deblocker, denoiser, upscaler, nafnet, restorer, deflicker_stage = _build_post_pipeline()
                 msg = _buf.getvalue().rstrip("\n")
                 if msg:
-                    bars.write(msg)
+                    _say(msg)
                 if nafnet is not None and hasattr(nafnet, "set_progress_message"):
-                    nafnet.set_progress_message(bars.write)
+                    nafnet.set_progress_message(_say)
                 # Drive every recurrent stage from the one GOP-aligned schedule.
                 # Per-frame stages lack the method and are skipped.
                 if gop_schedule is not None:
@@ -1714,9 +1716,10 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
                     post_writer.append(out_pb)
                 del out_pb
                 appended += 1
-                out_pbar.update(1)
+                reporter.phase_advance(out_phase)
     finally:
-        bars.close()
+        reporter.phase_end(out_phase)
+        _ui.close()
         if vtfrc is not None:
             vtfrc.close()
         if session is not None:
