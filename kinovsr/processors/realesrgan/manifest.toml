@@ -8,21 +8,36 @@ name = "realesrgan"
 capabilities = ["upscale"]
 weights = ["general"]
 
+[profiles.general.defaults]
+scale = 4
+
 [profiles.x4plus]
 capabilities = ["upscale"]
 weights = ["x4plus"]
+
+[profiles.x4plus.defaults]
+scale = 4
 
 [profiles.realesrnet]
 capabilities = ["upscale"]
 weights = ["realesrnet"]
 
+[profiles.realesrnet.defaults]
+scale = 4
+
 [profiles.bsrgan]
 capabilities = ["upscale"]
 weights = ["bsrgan"]
 
+[profiles.bsrgan.defaults]
+scale = 4
+
 [profiles.bsrnet]
 capabilities = ["upscale"]
 weights = ["bsrnet"]
+
+[profiles.bsrnet.defaults]
+scale = 4
 
 [profiles.x2plus]
 capabilities = ["upscale"]
@@ -35,13 +50,22 @@ scale = 2
 capabilities = ["upscale"]
 weights = ["anime"]
 
+[profiles.anime.defaults]
+scale = 4
+
 [profiles.animevideo]
 capabilities = ["upscale"]
 weights = ["animevideo"]
 
+[profiles.animevideo.defaults]
+scale = 4
+
 [profiles.esrgan]
 capabilities = ["upscale"]
 weights = ["esrgan"]
+
+[profiles.esrgan.defaults]
+scale = 4
 
 [weights.general]
 path = "weights/realesr_general_x4v3.safetensors"

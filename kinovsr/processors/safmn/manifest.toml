@@ -14,9 +14,15 @@ name = "safmn"
 capabilities = ["upscale"]
 weights = ["light"]
 
+[profiles.light.defaults]
+scale = 4
+
 [profiles.real]
 capabilities = ["upscale"]
 weights = ["real"]
+
+[profiles.real.defaults]
+scale = 4
 
 [profiles.real2x]
 capabilities = ["upscale"]
@@ -28,6 +34,9 @@ scale = 2
 [profiles.purescale]
 capabilities = ["upscale"]
 weights = ["purescale"]
+
+[profiles.purescale.defaults]
+scale = 4
 
 [profiles.purescale2x]
 capabilities = ["upscale"]

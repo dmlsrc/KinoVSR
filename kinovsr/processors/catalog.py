@@ -20,18 +20,29 @@ from .errors import PipelineError
 from .protocol import ProcessorFactory
 
 # family name -> "module:attribute" of its ProcessorFactory instance.
-# Populated as families gain factories (M3 proves three; M4 migrates the
-# rest). The name on the left MUST equal the factory's own .name.
+# The name on the left MUST equal the factory's own .name.
 _FACTORY_TARGETS: dict[str, str] = {
+    "basicvsrpp": "kinovsr.processors.basicvsrpp.factory:FACTORY",
     "bsvd": "kinovsr.processors.bsvd.factory:FACTORY",
     "crop": "kinovsr.processors.crop:FACTORY",
     "cut_detect": "kinovsr.processors.cut_detect:FACTORY",
     "deflicker": "kinovsr.processors.deflicker:FACTORY",
+    "esc": "kinovsr.processors.esc.factory:FACTORY",
+    "fastdvdnet": "kinovsr.processors.fastdvdnet.factory:FACTORY",
+    "fbcnn": "kinovsr.processors.fbcnn.factory:FACTORY",
     "mc": "kinovsr.processors.mc:FACTORY",
     "metalfx": "kinovsr.processors.metalfx:FACTORY",
+    "nafnet": "kinovsr.processors.nafnet.factory:FACTORY",
+    "pvdd": "kinovsr.processors.pvdd.factory:FACTORY",
+    "realbasicvsr": "kinovsr.processors.realbasicvsr.factory:FACTORY",
+    "realesrgan": "kinovsr.processors.realesrgan.factory:FACTORY",
     "realplksr": "kinovsr.processors.realplksr.factory:FACTORY",
+    "realviformer": "kinovsr.processors.realviformer.factory:FACTORY",
+    "safmn": "kinovsr.processors.safmn.factory:FACTORY",
     "sanitize_edges": "kinovsr.processors.sanitize_edges:FACTORY",
     "spatial": "kinovsr.processors.spatial:FACTORY",
+    "stdf": "kinovsr.processors.stdf.factory:FACTORY",
+    "toflow": "kinovsr.processors.toflow.factory:FACTORY",
     "videotoolbox": "kinovsr.processors.videotoolbox:FACTORY",
 }
 

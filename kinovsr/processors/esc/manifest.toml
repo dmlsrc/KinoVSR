@@ -8,9 +8,15 @@ name = "esc"
 capabilities = ["upscale"]
 weights = ["gan"]
 
+[profiles.gan.defaults]
+scale = 4
+
 [profiles.mse]
 capabilities = ["upscale"]
 weights = ["mse"]
+
+[profiles.mse.defaults]
+scale = 4
 
 # Convert with --param-key params_ema: the checkpoints carry both params
 # and params_ema and they differ (see weights/README.md).
