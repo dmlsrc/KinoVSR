@@ -131,10 +131,13 @@ def _mc_pair_medians(y: Any, ia: list, ib: list, B: int = 32) -> tuple[Any, Any]
     median, matching the flat floor's convention) and (P, nb) block lumas.
     """
     H, W = int(y.shape[1]), int(y.shape[2])
+    if min(H, W) < 2:
+        raise ValueError(
+            f"mc floor needs frames of at least 2x2, got {W}x{H}")
     # Frames smaller than the block still get a valid (noisier) floor:
     # shrink the block to fit instead of producing a zero-block grid,
     # which crashed downstream on any dimension under B.
-    B = max(2, min(B, H, W))
+    B = min(B, H, W)
     S = B // 2                                   # half-overlap: model granularity
     ny, nx = (H - B) // S + 1, (W - B) // S + 1
     nb = ny * nx
