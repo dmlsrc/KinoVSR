@@ -7,7 +7,7 @@ across space.
 """
 import mlx.core as mx
 
-from kinovsr.deflicker import StaticStateDeflicker
+from kinovsr.processors.deflicker import StaticStateDeflicker
 
 H, W, T = 192, 256, 24
 

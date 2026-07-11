@@ -12,7 +12,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from kinovsr.cut_detect import (
+from kinovsr.processors.cut_detect import (
     CutDetector,
     _frame_histogram,
     _frame_thumbnail,

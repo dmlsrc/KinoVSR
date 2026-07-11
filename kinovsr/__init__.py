@@ -31,8 +31,6 @@ The stacked progress-bar primitives moved to `kinovsr.progress`
 
 from __future__ import annotations
 
-from .cut_detect import CutDetector
-
 # Re-export the main classes. Each submodule imports its own PyObjC bits via
 # native.compat, so importing this package only forces the pyobjc check at the
 # point a class is actually constructed (via require_pyobjc in each ctor).
@@ -42,6 +40,7 @@ from .native.encode import encode_video_videotoolbox
 from .native.temporal import VtfrcSession
 from .native.vsr import VsrSession
 from .native.writer import AVWriter
+from .processors.cut_detect import CutDetector
 
 __all__ = [
     "AVWriter",

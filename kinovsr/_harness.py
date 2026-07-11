@@ -1119,7 +1119,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
 
         defl: Any = None
         if args.deflicker == "on":
-            from kinovsr.deflicker import StaticStateDeflicker
+            from kinovsr.processors.deflicker import StaticStateDeflicker
             defl = StaticStateDeflicker(window=args.deflicker_window,
                                         band=args.deflicker_band,
                                         strength=args.deflicker_strength,

@@ -51,11 +51,29 @@ never fires.
 """
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Mapping
 from typing import Any
 
 import mlx.core as mx
 
 from kinovsr.analysis.noise.estimate import _to_luma_2d
+from kinovsr.config.helpers import reject_unknown_keys, typed_value
+from kinovsr.processors.capabilities import (
+    Capability,
+    CapabilitySpec,
+    TemporalMode,
+)
+from kinovsr.processors.feed_driver import FeedFlushProcessor
+from kinovsr.processors.protocol import PipelineContext
+from kinovsr.processors.specs import (
+    Domain,
+    DType,
+    Layout,
+    StreamConstraint,
+    StreamSpec,
+)
+from kinovsr.settings import Settings
 
 _PI = 3.141592653589793
 
@@ -429,3 +447,81 @@ class StaticStateDeflicker:
             out.append(self._emit_one(last))
         self._reset_state()
         return out
+
+
+# ===========================================================================
+# Processor family: centered-window flicker suppression
+# ===========================================================================
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DeflickerStageConfig:
+    window: int
+    band: float
+    frac: float
+    max_fix: float
+    jitter: bool
+    strength: float
+
+
+def _passthrough(spec: StreamSpec, config: object) -> StreamSpec:
+    return spec
+
+
+class DeflickerFactory:
+    name = "deflicker"
+
+    # temporal_radius carries the DEFAULT window; the builder uses the
+    # CENTERED mode (not the radius value) to demand an input with
+    # lookahead, and the driver buffers its configured window itself.
+    capabilities = {
+        Capability.PREPROCESS: CapabilitySpec(
+            capability=Capability.PREPROCESS,
+            profiles=(),
+            accepts=StreamConstraint(
+                layouts=(Layout.MLX_RGB_HWC,),
+                dtypes=(DType.FLOAT32,),
+                domains=(Domain.UNIT, Domain.UNIT_SANITIZED),
+            ),
+            produces=_passthrough,
+            temporal_mode=TemporalMode.CENTERED,
+            temporal_radius=8,
+            stateful=True,
+        ),
+    }
+
+    def parse_config(
+        self,
+        raw: Mapping[str, object],
+        *,
+        capability: Capability,
+        profile: str | None,
+        settings: Settings,
+    ) -> DeflickerStageConfig:
+        reject_unknown_keys(
+            raw, ("window", "band", "frac", "max_fix", "jitter", "strength"))
+        window = typed_value(raw, "window", int, 8)
+        if window < 1:
+            raise ValueError("window must be >= 1")
+        band = typed_value(raw, "band", float, 0.1)
+        frac = typed_value(raw, "frac", float, 0.5)
+        max_fix = typed_value(raw, "max_fix", float, 0.25)
+        jitter = typed_value(raw, "jitter", bool, False)
+        strength = typed_value(raw, "strength", float, 1.0)
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError("strength must be in [0, 1]")
+        return DeflickerStageConfig(
+            window=window, band=band, frac=frac, max_fix=max_fix,
+            jitter=jitter, strength=strength)
+
+    def build(self, config: DeflickerStageConfig, *,
+              context: PipelineContext) -> FeedFlushProcessor:
+        def make_driver() -> StaticStateDeflicker:
+            return StaticStateDeflicker(
+                window=config.window, band=config.band, frac=config.frac,
+                max_fix=config.max_fix, jitter=config.jitter,
+                strength=config.strength)
+
+        return FeedFlushProcessor(make_driver)
+
+
+FACTORY = DeflickerFactory()
