@@ -56,7 +56,8 @@ def _load_numpy() -> Any:
     return np
 
 
-REPO = Path(__file__).resolve().parents[2]
+# scripts/dev/vsr_artifacts/ -> repo root is three levels up.
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 

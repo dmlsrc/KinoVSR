@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 TOOL_DIR = Path(__file__).resolve().parent
-REPO_ROOT = TOOL_DIR.parents[1]
+# scripts/dev/vsr_artifacts/ -> repo root is two parents above TOOL_DIR.
+REPO_ROOT = TOOL_DIR.parents[2]
 DEFAULT_CONFIG_CANDIDATES = (
     TOOL_DIR / "vsr_artifacts.local.toml",
     TOOL_DIR / "vsr_artifacts.local.json",
