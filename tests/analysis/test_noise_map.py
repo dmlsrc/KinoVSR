@@ -759,3 +759,18 @@ def test_static_grain_floor_separates_from_temporal_noise():
              for _ in range(T)]
     cstats = analyze_noise(clean)
     assert cstats["static_grain_sigma"] < 0.012
+
+
+def test_mc_floor_handles_frames_smaller_than_the_block():
+    # The MC floor's 32px block must shrink to fit small frames instead
+    # of building a zero-block grid (crashed on any dimension under 32).
+    from kinovsr.analysis.noise.estimate import estimate_sigma_map
+
+    mx.random.seed(0)
+    for h, w in ((24, 64), (64, 24), (24, 24), (8, 8)):
+        frames = [mx.random.uniform(shape=(h, w, 3)).astype(mx.float32)
+                  for _ in range(6)]
+        result = estimate_sigma_map(frames)
+        sig = result[0] if isinstance(result, tuple) else result
+        assert sig.shape == (h, w, 1)
+        assert bool(mx.all(mx.isfinite(sig)))
