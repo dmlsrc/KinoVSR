@@ -78,6 +78,35 @@ _STAGE_SELECTORS = (
 )
 
 
+def _source_layout(config):
+    """The file-source layout the FIRST stage accepts (MLX preferred).
+
+    The input endpoint must decode into a payload the chain's head can
+    consume; native families (videotoolbox) accept only CVPixelBuffer
+    layouts. Unknown families fall back to the default so the builder
+    reports the real error.
+    """
+    from kinovsr.processors import Layout, get_factory
+
+    pipeline = config.get("pipeline") or []
+    if not pipeline:
+        return Layout.MLX_RGB_HWC
+    head = config.get(pipeline[0]) or {}
+    try:
+        factory = get_factory(head.get("processor"))
+    except Exception:
+        return Layout.MLX_RGB_HWC
+    accepted: set = set()
+    for spec in factory.capabilities.values():
+        accepted.update(spec.accepts.layouts or (Layout.MLX_RGB_HWC,))
+    if Layout.MLX_RGB_HWC in accepted:
+        return Layout.MLX_RGB_HWC
+    for candidate in (Layout.CV_RGBA_HALF, Layout.CV_NV12, Layout.CV_BGRA):
+        if candidate in accepted:
+            return candidate
+    return Layout.MLX_RGB_HWC
+
+
 def _run_typed(invocation) -> int:
     """Run a [pipeline] config file-to-file through the typed pipeline."""
     from datetime import datetime
@@ -100,22 +129,45 @@ def _run_typed(invocation) -> int:
 
     from kinovsr._harness import sanitize_output_prefix
     from kinovsr.api import process_video_file, resolve_mlx_cache_limit_gb
+    from kinovsr.config import ConfigError
     from kinovsr.media import video_reader as _vr
     from kinovsr.media.timespec import resolve_trim
+    from kinovsr.processors.errors import MediaError, PipelineError
 
+    # Reader selection matches the flag surface: ffmpeg = forced, auto =
+    # native with fallback, native = never fall back. The module that
+    # probes is the module the run decodes with.
     video = Path(options.video)
-    try:
-        _w, _h, fps, total, _tf, _par = _vr.probe_video(video)
-    except Exception:
+    reader = None
+    if options.reader == "ffmpeg":
         from kinovsr.media import ffmpeg_reader
 
-        _w, _h, fps, total, _tf, _par = ffmpeg_reader.probe_video(video)
+        reader = ffmpeg_reader
+    try:
+        _w, _h, fps, total, _tf, _par = (reader or _vr).probe_video(video)
+    except Exception as exc:
+        if options.reader != "auto":
+            get_console().print(f"error: cannot open {video}: {exc}",
+                                style="bold red", markup=False)
+            return 2
+        from kinovsr.media import ffmpeg_reader
+
+        reader = ffmpeg_reader
+        try:
+            _w, _h, fps, total, _tf, _par = reader.probe_video(video)
+        except Exception as fallback_exc:
+            get_console().print(
+                f"error: cannot open {video}: {fallback_exc}",
+                style="bold red", markup=False)
+            return 2
     start, end = resolve_trim(options.start, options.end, fps, total)
-    max_frames = None
+    # --max-frames caps OUTPUT frames (a time spec is output duration);
+    # the input window is start/end.
+    max_output_frames = None
     if options.max_frames is not None:
         from kinovsr.media.timespec import parse_time_or_frames
 
-        max_frames = parse_time_or_frames(options.max_frames, fps)
+        max_output_frames = parse_time_or_frames(options.max_frames, fps)
 
     stem = (f"{sanitize_output_prefix(options.output_prefix)}_"
             f"{datetime.now().strftime('%Y%m%d_%H%M%S')}")
@@ -127,18 +179,24 @@ def _run_typed(invocation) -> int:
     if limit > 0 and not invocation.settings.quiet:
         get_console().print(f"MLX cache limit: {limit:g} GB")
 
-    result = process_video_file(
-        invocation.config,
-        video=video,
-        output=output,
-        settings=invocation.settings,
-        start=start,
-        end=end,
-        max_frames=max_frames,
-        audio=options.audio,
-        audio_codec=options.audio_codec,
-        quality=options.encode_quality,
-    )
+    try:
+        result = process_video_file(
+            invocation.config,
+            video=video,
+            output=output,
+            settings=invocation.settings,
+            start=start,
+            end=end,
+            max_output_frames=max_output_frames,
+            audio=options.audio,
+            audio_codec=options.audio_codec,
+            quality=options.encode_quality,
+            layout=_source_layout(invocation.config),
+            reader=reader,
+        )
+    except (ConfigError, MediaError, PipelineError) as exc:
+        get_console().print(f"error: {exc}", style="bold red", markup=False)
+        return 2
     get_console().print(
         f"{result.frames_in} frames in -> {result.frames_out} out "
         f"in {result.elapsed_s:.2f}s", markup=False)

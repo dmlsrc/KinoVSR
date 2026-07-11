@@ -181,3 +181,34 @@ class TestDeblockWeightsCompat:
         inv = assemble(args, base=Settings())
         assert inv.settings.stdf_weights == "/w/legacy.st"
         assert inv.settings.fbcnn_weights is None
+
+
+class TestTypedSourceLayout:
+    """The typed route decodes into a layout the chain's head accepts."""
+
+    def _pick(self, config):
+        from kinovsr.cli.commands.run import _source_layout
+
+        return _source_layout(config)
+
+    def test_native_head_gets_a_cv_layout(self):
+        from kinovsr.processors import Layout
+
+        config = {"pipeline": ["fps"],
+                  "fps": {"processor": "videotoolbox", "profile": "normal",
+                          "target_fps": 50}}
+        assert self._pick(config) is Layout.CV_RGBA_HALF
+
+    def test_mlx_head_keeps_the_default(self):
+        from kinovsr.processors import Layout
+
+        config = {"pipeline": ["up"],
+                  "up": {"processor": "metalfx", "scale": 2}}
+        assert self._pick(config) is Layout.MLX_RGB_HWC
+
+    def test_empty_and_unknown_fall_back(self):
+        from kinovsr.processors import Layout
+
+        assert self._pick({"pipeline": []}) is Layout.MLX_RGB_HWC
+        assert self._pick({"pipeline": ["x"],
+                           "x": {"processor": "nosuch"}}) is Layout.MLX_RGB_HWC

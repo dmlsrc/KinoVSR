@@ -31,18 +31,15 @@ it reaches typed-pipeline parity; hosts should not target it.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+from kinovsr.pipeline import PipelineSession
+from kinovsr.processors import StreamSpec
+from kinovsr.reporting import Reporter
 from kinovsr.settings import Settings
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-    from kinovsr.pipeline import PipelineSession
-    from kinovsr.processors import StreamSpec
-    from kinovsr.reporting import Reporter
 
 
 @dataclass(frozen=True)
@@ -119,6 +116,7 @@ def process_video_file(
     start: int = 0,
     end: int | None = None,
     max_frames: int | None = None,
+    max_output_frames: int | None = None,
     audio: bool = False,
     audio_codec: str = "alac",
     quality: float = 0.65,
@@ -131,7 +129,9 @@ def process_video_file(
     preflight-validated against it before any frame decodes, and the
     sink verifies the declared output timeline as units arrive.
     ``start``/``end``/``max_frames`` window the input in frames;
-    ``audio`` carries the source audio track (trimmed to the window).
+    ``max_output_frames`` caps written frames (the output-side cap for
+    cadence-changing chains); ``audio`` carries the source audio track
+    (trimmed to the window).
     """
     if settings is None:
         settings = Settings.from_env()
@@ -150,6 +150,7 @@ def process_video_file(
         start=start,
         end=end,
         max_frames=max_frames,
+        max_output_frames=max_output_frames,
         audio=audio,
         audio_codec=audio_codec,
         quality=quality,
@@ -186,13 +187,3 @@ __all__ = [
     "process_video_options",
     "resolve_mlx_cache_limit_gb",
 ]
-
-
-def __getattr__(name: str) -> Any:
-    # PipelineSession is exported for isinstance/typing without forcing
-    # the pipeline import at module load.
-    if name == "PipelineSession":
-        from kinovsr.pipeline import PipelineSession
-
-        return PipelineSession
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

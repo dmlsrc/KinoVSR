@@ -118,8 +118,12 @@ class BasicVsrppFactory:
         if gate not in _GATES:
             raise ValueError(f"history_gate must be one of {_GATES}")
         strength = typed_value(raw, "strength", float, 1.0) if restore else 1.0
-        if strength < 0.0:
-            raise ValueError("strength must be >= 0")
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError("strength must be in [0, 1]")
+        history_strength = (typed_value(raw, "history_strength", float, 1.0)
+                            if not restore else 1.0)
+        if history_strength < 0.0:
+            raise ValueError("history_strength must be >= 0")
         if restore:
             weights = (typed_value(raw, "weights", str)
                        or settings.basicvsrpp_restore_weights
@@ -135,8 +139,7 @@ class BasicVsrppFactory:
             trim=trim,
             strength=strength,
             flow=flow,
-            history_strength=(typed_value(raw, "history_strength", float, 1.0)
-                              if not restore else 1.0),
+            history_strength=history_strength,
             history_gate=gate,
             ensemble=typed_value(raw, "ensemble", bool, False),
         )

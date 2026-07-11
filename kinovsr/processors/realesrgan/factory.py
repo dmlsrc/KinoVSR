@@ -83,6 +83,13 @@ class RealEsrganFactory:
         denoise_strength = typed_value(raw, "denoise_strength", float, 1.0)
         if not 0.0 <= denoise_strength <= 1.0:
             raise ValueError("denoise_strength must be in [0, 1]")
+        if denoise_strength < 1.0:
+            token = weights or profile or _DEFAULT_PROFILE
+            if token != "general" and "general_x4v3" not in str(token):
+                raise ValueError(
+                    "denoise_strength is the dni dial of the general "
+                    "profile only (it blends against the wdn companion "
+                    "weight); other checkpoints have none")
         scale = typed_value(raw, "scale", int)
         scales = _profile_scales()
         token = profile or (weights if weights in scales else None)

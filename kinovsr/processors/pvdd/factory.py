@@ -30,8 +30,10 @@ from kinovsr.processors.specs import (
 )
 from kinovsr.settings import Settings
 
-_PROFILES = ("pvdd", "crvd", "davis", "pvdd_level", "pvdd_raw",
-             "pvdd_raw_level")
+# The raw variants (pvdd_raw, pvdd_raw_level) expect packed-Bayer input
+# (num_in=4); no accepted layout can feed them, so they stay manifest
+# documented but off the runtime surface until a raw layout exists.
+_PROFILES = ("pvdd", "crvd", "davis", "pvdd_level")
 _DTYPES = {"float16", "float32"}
 _PRESETS = ("off", "S", "M", "L")
 

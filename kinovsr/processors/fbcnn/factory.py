@@ -95,13 +95,15 @@ class FbcnnFactory:
     def build(self, config: FbcnnStageConfig, *,
               context: PipelineContext) -> FeedFlushProcessor:
         def make_driver() -> Any:
+            from kinovsr.processors.feed_driver import PerFrameDriver
+
             from . import FbcnnDeblocker
 
-            return FbcnnDeblocker(
+            return PerFrameDriver(FbcnnDeblocker(
                 config.weights_path,
                 quality=config.quality,
                 strength=config.strength,
-                quality_fallback=config.quality_fallback)
+                quality_fallback=config.quality_fallback))
 
         return FeedFlushProcessor(make_driver)
 

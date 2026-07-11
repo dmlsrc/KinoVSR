@@ -93,6 +93,11 @@ class RealBasicVsrFactory:
         trim = typed_value(raw, "trim", int, 0)
         if trim < 0:
             raise ValueError("trim must be >= 0")
+        if trim and window <= 2 * trim:
+            raise ValueError(
+                "window must be greater than 2*trim so each window can "
+                "emit interior frames (trim = 0 for reference-like "
+                "non-overlapping chunks)")
         clean_iters = typed_value(raw, "clean_iters", int, 3)
         if clean_iters < 0:
             raise ValueError("clean_iters must be >= 0")
@@ -105,6 +110,9 @@ class RealBasicVsrFactory:
         gate = typed_value(raw, "history_gate", str, "off")
         if gate not in _GATES:
             raise ValueError(f"history_gate must be one of {_GATES}")
+        history_strength = typed_value(raw, "history_strength", float, 1.0)
+        if history_strength < 0.0:
+            raise ValueError("history_strength must be >= 0")
         return RealBasicVsrStageConfig(
             weights_spec=typed_value(raw, "weights", str)
             or settings.realbasicvsr_weights or profile or "x4",
@@ -115,7 +123,7 @@ class RealBasicVsrFactory:
             residual_strength=typed_value(raw, "residual_strength", float, 1.0),
             flow_consistency=flow_consistency,
             flow=flow,
-            history_strength=typed_value(raw, "history_strength", float, 1.0),
+            history_strength=history_strength,
             history_gate=gate,
         )
 

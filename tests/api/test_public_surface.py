@@ -50,6 +50,19 @@ def test_api_import_is_light():
     assert out.stdout.strip() == "LIGHT", out.stdout
 
 
+def test_annotations_resolve_at_runtime():
+    """Host tooling introspects the API; postponed annotations must
+    resolve without TYPE_CHECKING-only names."""
+    import typing
+
+    import kinovsr.api as api
+
+    for func in (api.open_pipeline, api.process_video_file,
+                 api.process_video_options):
+        hints = typing.get_type_hints(func)
+        assert hints, func.__name__
+
+
 def test_open_pipeline_is_the_session_constructor():
     from fractions import Fraction
 

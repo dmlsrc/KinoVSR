@@ -343,6 +343,7 @@ def run_file(
     start: int = 0,
     end: int | None = None,
     max_frames: int | None = None,
+    max_output_frames: int | None = None,
     audio: bool = False,
     audio_codec: str = "alac",
     quality: float = 0.65,
@@ -354,7 +355,9 @@ def run_file(
     The chain itself is the host session (:mod:`.session`): resolution
     and preflight validation happen against the probed input spec before
     any frame decodes, and the sink verifies the declared output
-    timeline as units arrive.
+    timeline as units arrive. ``max_frames`` windows the INPUT;
+    ``max_output_frames`` caps what the sink writes (the distinction
+    matters for cadence-changing chains).
     """
     from .session import open_pipeline
 
@@ -382,6 +385,11 @@ def run_file(
             for unit in run:
                 sink.append(unit)
                 frames_out += 1
+                if (max_output_frames is not None
+                        and frames_out >= max_output_frames):
+                    # Cancel the chain; cadence-changing stages mean the
+                    # output count is not the input count.
+                    break
     except BaseException:
         # Release writer resources without masking the chain's error; the
         # partial output is not a deliverable, so a finalize failure here

@@ -201,6 +201,55 @@ class TestParseDetails:
             profile=None, settings=SETTINGS)
         assert off.noise_variance is None
 
+    def test_bounds_mirror_the_constructors(self):
+        """Invalid stage config fails at parse (open time), not first pull."""
+        cases = [
+            ("basicvsrpp", Capability.RESTORE, {"strength": 1.5}, "strength"),
+            ("basicvsrpp", Capability.UPSCALE,
+             {"history_strength": -0.1}, "history_strength"),
+            ("realbasicvsr", Capability.UPSCALE,
+             {"window": 4, "trim": 2}, r"2\*trim"),
+            ("realbasicvsr", Capability.UPSCALE,
+             {"history_strength": -1.0}, "history_strength"),
+            ("realviformer", Capability.UPSCALE,
+             {"history_cleanup": 1.5}, "history_cleanup"),
+            ("realviformer", Capability.UPSCALE,
+             {"history_gate_drop": -0.2}, "history_gate_drop"),
+            ("realviformer", Capability.UPSCALE,
+             {"history_static_cap": 2.0}, "history_static_cap"),
+            ("realesrgan", Capability.UPSCALE,
+             {"denoise_strength": 0.5, "weights": "x4plus"}, "dni dial"),
+        ]
+        for family, capability, raw, match in cases:
+            factory = get_factory(family)
+            with pytest.raises(ValueError, match=match):
+                factory.parse_config(raw, capability=capability,
+                                     profile=None, settings=SETTINGS)
+
+    def test_realesrgan_dni_allowed_on_general(self):
+        factory = get_factory("realesrgan")
+        config = factory.parse_config(
+            {"denoise_strength": 0.5}, capability=Capability.UPSCALE,
+            profile=None, settings=SETTINGS)
+        assert config.denoise_strength == 0.5
+
+    def test_pvdd_raw_profiles_are_off_the_runtime_surface(self):
+        profiles = get_factory("pvdd").capabilities[Capability.DENOISE].profiles
+        assert "pvdd_raw" not in profiles
+        assert "pvdd_raw_level" not in profiles
+
+    def test_per_frame_families_get_the_driver_adapter(self):
+        """fbcnn and nafnet drivers speak denoise(), not feed/flush; the
+        factories must wrap them (the protocol break only surfaced at the
+        first pumped frame, past every deferred-build test)."""
+        import inspect
+
+        from kinovsr.processors.fbcnn.factory import FbcnnFactory
+        from kinovsr.processors.nafnet.factory import NafnetFactory
+
+        for cls in (FbcnnFactory, NafnetFactory):
+            assert "PerFrameDriver" in inspect.getsource(cls.build)
+
     def test_pvdd_trim_bound(self):
         factory = get_factory("pvdd")
         with pytest.raises(ValueError, match="trim"):

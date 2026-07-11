@@ -103,18 +103,30 @@ class RealViformerFactory:
         risk_decay = typed_value(raw, "history_risk_decay", float, 0.8)
         if not 0.0 <= risk_decay < 1.0:
             raise ValueError("history_risk_decay must be in [0, 1)")
+        history_strength = typed_value(raw, "history_strength", float, 1.0)
+        if history_strength < 0.0:
+            raise ValueError("history_strength must be >= 0")
+        cleanup = typed_value(raw, "history_cleanup", float, 0.25)
+        if not 0.0 <= cleanup <= 1.0:
+            raise ValueError("history_cleanup must be in [0, 1]")
+        gate_drop = typed_value(raw, "history_gate_drop", float, 0.85)
+        if not 0.0 <= gate_drop <= 1.0:
+            raise ValueError("history_gate_drop must be in [0, 1]")
+        static_cap = typed_value(raw, "history_static_cap", float, 0.0)
+        if not 0.0 <= static_cap <= 1.0:
+            raise ValueError("history_static_cap must be in [0, 1]")
         return RealViformerStageConfig(
             weights_spec=typed_value(raw, "weights", str)
             or settings.realviformer_weights or profile or "x4",
             window=window,
             dtype=dtype,
             flow=flow,
-            history_strength=typed_value(raw, "history_strength", float, 1.0),
+            history_strength=history_strength,
             history_gate=gate,
-            history_cleanup=typed_value(raw, "history_cleanup", float, 0.25),
-            history_gate_drop=typed_value(raw, "history_gate_drop", float, 0.85),
+            history_cleanup=cleanup,
+            history_gate_drop=gate_drop,
             history_risk_decay=risk_decay,
-            history_static_cap=typed_value(raw, "history_static_cap", float, 0.0),
+            history_static_cap=static_cap,
         )
 
     def build(self, config: RealViformerStageConfig, *,

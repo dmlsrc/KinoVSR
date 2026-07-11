@@ -8,6 +8,7 @@ video and audio timelines must agree.
 """
 
 import math
+from pathlib import Path
 
 import pytest
 
@@ -196,6 +197,59 @@ def test_interpolation_preserves_duration_and_carries_audio(
     # synchronization proof; AAC priming allows sub-frame skew).
     assert audio_s is not None, "audio track missing from the output"
     assert abs(audio_s - video_s) < 0.05
+
+
+def test_max_output_frames_caps_the_interpolated_stream(clip, tmp_path):
+    """--max-frames semantics: the cap counts OUTPUT frames, so a
+    cadence-doubling chain stops at the cap instead of emitting
+    2x the capped input."""
+    config = {
+        "pipeline": ["fps"],
+        "fps": {"processor": "videotoolbox", "profile": "normal",
+                "target_fps": 50},
+    }
+    result = run_file(
+        {"pipeline": []} | config, video=clip, output=tmp_path / "cap.mp4",
+        settings=SETTINGS, layout=Layout.CV_RGBA_HALF,
+        max_output_frames=10)
+    assert result.frames_out == 10
+    _, _, frames, _ = _stream_seconds(result.path)
+    assert frames == 10
+
+
+_FBCNN_WEIGHTS = Path(
+    "kinovsr/processors/fbcnn/weights/fbcnn_color.safetensors")
+_NAFNET_WEIGHTS = Path(
+    "kinovsr/processors/nafnet/weights/nafnet_gopro_width32.safetensors")
+
+
+@pytest.mark.skipif(not _FBCNN_WEIGHTS.is_file(),
+                    reason="fbcnn weights not installed")
+def test_fbcnn_runs_through_the_typed_pipeline(clip, tmp_path):
+    """The per-frame driver adapter: fbcnn speaks denoise(), and the
+    factory must wrap it - the first pumped frame proves the protocol."""
+    config = {
+        "pipeline": ["db"],
+        "db": {"processor": "fbcnn", "quality": "35", "strength": 0.5},
+    }
+    result = run_file(
+        config, video=clip, output=tmp_path / "fbcnn.mp4",
+        settings=SETTINGS, max_frames=3)
+    assert result.frames_out == 3
+
+
+@pytest.mark.skipif(not _NAFNET_WEIGHTS.is_file(),
+                    reason="nafnet weights not installed")
+def test_nafnet_runs_through_the_typed_pipeline(clip, tmp_path):
+    config = {
+        "pipeline": ["rs"],
+        "rs": {"processor": "nafnet", "capability": "deblur",
+               "profile": "gopro32", "strength": 0.5},
+    }
+    result = run_file(
+        config, video=clip, output=tmp_path / "nafnet.mp4",
+        settings=SETTINGS, max_frames=3)
+    assert result.frames_out == 3
 
 
 def test_ntsc_cadence_writes_the_exact_rational_grid(tmp_path):

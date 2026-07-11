@@ -31,6 +31,35 @@ class FeedFlushDriver(Protocol):
     def reset(self) -> None: ...
 
 
+class PerFrameDriver:
+    """feed()/flush() shape over a per-frame engine (``denoise(x) -> x``).
+
+    Several single-image families expose ``denoise``/``reset``/``close``
+    without the streaming dialect; this adapter gives them the driver
+    shape :class:`FeedFlushProcessor` pumps, with reset/close passing
+    through when the engine has them.
+    """
+
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+
+    def feed(self, frame: Any, token: Any = None) -> list:
+        return [(self._engine.denoise(frame), token)]
+
+    def flush(self) -> list:
+        return []
+
+    def reset(self) -> None:
+        reset = getattr(self._engine, "reset", None)
+        if callable(reset):
+            reset()
+
+    def close(self) -> None:
+        close = getattr(self._engine, "close", None)
+        if callable(close):
+            close()
+
+
 class FeedFlushProcessor:
     """Wrap a feed/flush family driver as a pipeline Processor.
 
@@ -72,4 +101,4 @@ class FeedFlushProcessor:
                 close()
 
 
-__all__ = ["FeedFlushDriver", "FeedFlushProcessor"]
+__all__ = ["FeedFlushDriver", "FeedFlushProcessor", "PerFrameDriver"]

@@ -129,9 +129,11 @@ class NafnetFactory:
     def build(self, config: NafnetStageConfig, *,
               context: PipelineContext) -> FeedFlushProcessor:
         def make_driver() -> Any:
+            from kinovsr.processors.feed_driver import PerFrameDriver
+
             from . import NafnetRestorer
 
-            return NafnetRestorer(
+            return PerFrameDriver(NafnetRestorer(
                 config.weights_spec,
                 strength=config.strength,
                 pool_mode=config.pool,
@@ -141,7 +143,7 @@ class NafnetFactory:
                 guard_fast_fraction=config.guard_fast_fraction,
                 guard_lockout_frames=config.guard_lockout,
                 guard_ramp_frames=config.guard_ramp,
-                guard_fall_frames=config.guard_fall)
+                guard_fall_frames=config.guard_fall))
 
         return FeedFlushProcessor(make_driver)
 
