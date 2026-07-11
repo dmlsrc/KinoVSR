@@ -105,3 +105,11 @@ def test_recursive_denoise_through_the_chain():
     def err(x):
         return float(mx.mean(mx.abs(x - base)))
     assert err(out[-1].payload) < err(frames[-1]) * 0.9
+
+
+def test_settings_spynet_weights_reach_the_config():
+    settings = Settings(spynet_weights="/w/custom_spynet.safetensors")
+    config = FACTORY.parse_config(
+        {"flow": "spynet"}, capability=Capability.DENOISE, profile=None,
+        settings=settings)
+    assert config.flow_weights == "/w/custom_spynet.safetensors"

@@ -85,3 +85,19 @@ def test_crop_through_the_chain():
     import math
     assert math.isclose(float(out[0].payload[0, 0, 0]), 60 / 479,
                         rel_tol=1e-4)
+
+
+def test_display_aspect_folds_pixel_aspect():
+    # 720x480 with PAR 32/27 already displays as 16:9: an aspect="16:9"
+    # crop must be a no-op, not a storage-domain 16:9 window.
+    from fractions import Fraction
+
+    spec = FACTORY.capabilities[Capability.PREPROCESS]
+    anamorphic = StreamSpec(
+        frame=frame_spec_for_matrix(
+            "bt709", full_range=False,
+            geometry=Geometry(720, 480, Fraction(32, 27))),
+        timeline=TimelineSpec(
+            time_base=Fraction(1, 24000), cadence=Fraction(25)))
+    out = spec.produces(anamorphic, parse({"aspect": "16:9"}))
+    assert out.frame.geometry == Geometry(720, 480, Fraction(32, 27))

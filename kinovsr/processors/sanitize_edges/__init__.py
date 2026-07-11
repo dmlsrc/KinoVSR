@@ -41,7 +41,16 @@ class SanitizeEdgesStageConfig:
     edges: tuple[int, int, int, int]    # (top, bottom, left, right)
 
 
-def _passthrough(spec: StreamSpec, config: object) -> StreamSpec:
+def _produces(spec: StreamSpec, config: object) -> StreamSpec:
+    # Geometry is known at resolve time: bands that consume an entire
+    # axis fail preflight instead of after processing begins.
+    assert isinstance(config, SanitizeEdgesStageConfig)
+    top, bottom, left, right = config.edges
+    geometry = spec.frame.geometry
+    if top + bottom >= geometry.height or left + right >= geometry.width:
+        raise ValueError(
+            f"edge bands {config.edges} leave no interior in a "
+            f"{geometry.width}x{geometry.height} stream")
     return spec
 
 
@@ -71,7 +80,7 @@ class SanitizeEdgesFactory:
                 dtypes=(DType.FLOAT32, DType.FLOAT16),
                 domains=(Domain.UNIT, Domain.UNIT_SANITIZED),
             ),
-            produces=_passthrough,
+            produces=_produces,
         ),
     }
 

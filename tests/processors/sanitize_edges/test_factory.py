@@ -75,3 +75,14 @@ def test_bands_replicate_and_geometry_is_untouched():
     assert bool(mx.array_equal(result[0], result[2]))
     assert bool(mx.array_equal(result[1], result[2]))
     assert float(result[0, 0, 0]) != 1.0
+
+
+def test_full_axis_bands_fail_preflight():
+    from kinovsr.pipeline import resolve_pipeline
+
+    config = {
+        "pipeline": ["san"],
+        "san": {"processor": "sanitize_edges", "edges": "48,0,0,0"},
+    }
+    with pytest.raises(ValueError, match="leave no interior"):
+        resolve_pipeline(config, input_spec=stream(), settings=SETTINGS)

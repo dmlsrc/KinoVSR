@@ -200,10 +200,13 @@ class McTemporalDenoiser:
         if self.flow_source == "spynet":
             path = flow_weights or default_settings().spynet_weights
             if not path:
-                # stock weights ship with the package (5.5 MB)
+                # The stock checkpoint ships as the shared modeling
+                # component (5.5 MB); the family package carries none.
                 from pathlib import Path as _P
-                path = (_P(__file__).parent / "spynet" / "weights"
-                        / "spynet_stock_20210409.safetensors")
+
+                import kinovsr.modeling as _modeling
+                path = (_P(_modeling.__file__).parent / "spynet"
+                        / "weights" / "spynet_stock_20210409.safetensors")
             self._spynet_p = dict(mx.load(str(path)))
             self._prev = None
             self._hist = []
@@ -654,7 +657,8 @@ class McFactory:
             occlusion=typed_value(raw, "occlusion", bool, False),
             confidence=typed_value(raw, "confidence", bool, False),
             flow=flow,
-            flow_weights=typed_value(raw, "flow_weights", str))
+            flow_weights=(typed_value(raw, "flow_weights", str)
+                          or settings.spynet_weights))
 
     def build(self, config: McStageConfig, *,
               context: PipelineContext) -> FeedFlushProcessor:

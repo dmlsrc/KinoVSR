@@ -45,17 +45,26 @@ class CropStageConfig:
     offset: tuple[int, int]             # (dx, dy), right/down positive
 
 
-def _combined_crop(width: int, height: int,
+def _combined_crop(width: int, height: int, pixel_aspect,
                    config: CropStageConfig) -> tuple[int, int, int, int]:
-    """Total (top, bottom, left, right) crop for a frame of WxH."""
+    """Total (top, bottom, left, right) crop for a frame of WxH.
+
+    ``aspect`` is a DISPLAY aspect; on anamorphic sources the pixel
+    aspect folds into the storage-domain target (display = storage *
+    PAR), so 16:9 means 16:9 on screen regardless of storage shape.
+    """
+    from fractions import Fraction as _F
+
     t, b, left, r = config.bars
     inner_w, inner_h = width - left - r, height - t - b
     if inner_w < 2 or inner_h < 2:
         raise ValueError(
             f"bar crop {config.bars} leaves no picture in {width}x{height}")
     if config.aspect is not None:
+        storage = (_F(config.aspect[0], config.aspect[1])
+                   / _F(pixel_aspect))
         at, ab, al, ar = compute_aspect_crop(
-            inner_w, inner_h, config.aspect[0], config.aspect[1],
+            inner_w, inner_h, storage.numerator, storage.denominator,
             dx=config.offset[0], dy=config.offset[1], anchor=config.anchor)
         return (t + at, b + ab, left + al, r + ar)
     return (t, b, left, r)
@@ -64,7 +73,8 @@ def _combined_crop(width: int, height: int,
 def _produces(spec: StreamSpec, config: object) -> StreamSpec:
     assert isinstance(config, CropStageConfig)
     geometry = spec.frame.geometry
-    t, b, left, r = _combined_crop(geometry.width, geometry.height, config)
+    t, b, left, r = _combined_crop(
+        geometry.width, geometry.height, geometry.pixel_aspect, config)
     frame = dataclasses.replace(
         spec.frame,
         geometry=Geometry(geometry.width - left - r,
@@ -150,7 +160,8 @@ class CropFactory:
                         context: PipelineContext) -> None:
                 geometry = input_spec.frame.geometry
                 holder["crop"] = _combined_crop(
-                    geometry.width, geometry.height, config)
+                    geometry.width, geometry.height,
+                    geometry.pixel_aspect, config)
                 super().prepare(input_spec, context)
 
         return _Processor(lambda: _CropDriver(holder["crop"]))
