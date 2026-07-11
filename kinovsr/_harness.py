@@ -623,13 +623,13 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
         raise SystemExit(f"bad --max-frames value: {e}") from None
 
     if getattr(args, "probe_noise", False) and args.video:
-        from kinovsr.noise_map import (
-            analyze_noise,
-            classify_noise_analysis,
-            detect_grid_period,
-            estimate_blockiness_map,
-        )
-        from kinovsr.quant_comb import estimate_qf
+        from kinovsr.analysis.noise import (
+    analyze_noise,
+    classify_noise_analysis,
+    detect_grid_period,
+    estimate_blockiness_map,
+)
+        from kinovsr.analysis.quant_comb import estimate_qf
         _pw_end = win_end if win_end is not None else total_frames
         _span = max(1, _pw_end - win_start)
         _starts = sorted({win_start + int(f * max(0, _span - 12)) for f in (0.1, 0.5, 0.9)})
@@ -945,14 +945,14 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
             tr = pu = None
             if _stage_map_capable(n):
                 if args.noise_map == "auto":
-                    from kinovsr.noise_map import NoiseMapTracker
+                    from kinovsr.analysis.noise import NoiseMapTracker
                     tr = NoiseMapTracker(gain=args.noise_map_gain,
                                          motion_cap=args.noise_map_motion_cap,
                                          masking=args.noise_map_masking,
                                          pulse_robust=args.noise_map_pulse,
                                          floor_mode=args.noise_map_floor_mode)
                 if args.noise_map_pulse:
-                    from kinovsr.noise_map import PulseGain
+                    from kinovsr.analysis.noise import PulseGain
                     pu = PulseGain()
             return tr, pu
 
@@ -1111,10 +1111,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
             nonlocal blk_tracker
             if args.deblock_map != "auto":
                 return None
-            from kinovsr.noise_map import (
-                NoiseMapTracker,
-                estimate_blockiness_map,
-            )
+            from kinovsr.analysis.noise import NoiseMapTracker, estimate_blockiness_map
             tr = NoiseMapTracker(gain=args.deblock_map_gain, min_frames=1,
                                  estimator=estimate_blockiness_map)
             blk_tracker = tr             # last one wins for the debug report

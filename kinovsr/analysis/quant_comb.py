@@ -40,7 +40,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from .noise_map import _to_luma_2d
+from .noise.estimate import _to_luma_2d
 
 
 def _lum(frame: Any) -> Any:

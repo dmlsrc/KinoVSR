@@ -8,7 +8,7 @@ import math
 
 import mlx.core as mx
 
-from kinovsr.noise_map import (
+from kinovsr.analysis.noise import (
     NoiseMapTracker,
     PulseGain,
     analyze_noise,
@@ -178,7 +178,7 @@ def test_sparse_flicker_registers():
 
 
 def test_probe_classifier_resolves_dense_motion_via_mc_floor():
-    from kinovsr.noise_map import analyze_noise
+    from kinovsr.analysis.noise import analyze_noise
 
     # rolling white-noise texture: statistically identical to per-frame noise
     # for every unaligned statistic (the old classifier said "ambiguous"),
@@ -280,7 +280,7 @@ def test_tracker_holds_map_on_degenerate_window():
 
 
 def test_select_runs_spread_and_adjacent():
-    from kinovsr.noise_map import _select_runs
+    from kinovsr.analysis.noise.estimate import _select_runs
     # short windows: one consecutive run, unchanged behavior
     assert _select_runs(8, 12) == [list(range(8))]
     # long windows: runs of consecutive indices spread across the whole span
@@ -328,7 +328,7 @@ def _blockify(img, size=8):
 
 
 def test_blockiness_map_localizes_and_rejects():
-    from kinovsr.noise_map import estimate_blockiness_map
+    from kinovsr.analysis.noise import estimate_blockiness_map
     mx.random.seed(10)
     base = _bcontent()
     # half blocked, half clean: mask lights the blocked half only
@@ -361,7 +361,7 @@ def test_blockiness_map_localizes_and_rejects():
 
 
 def test_blockiness_grid_phase_offset_detected():
-    from kinovsr.noise_map import estimate_blockiness_map
+    from kinovsr.analysis.noise import estimate_blockiness_map
     mx.random.seed(11)
     base = _bcontent()
     # blocking on a grid shifted by 3px must still be found
@@ -377,7 +377,7 @@ def test_blockiness_grid_phase_offset_detected():
 
 
 def test_blockiness_global_saturation_is_tempered():
-    from kinovsr.noise_map import estimate_blockiness_map
+    from kinovsr.analysis.noise import estimate_blockiness_map
     mx.random.seed(13)
     base = _bcontent()
     blocked = _blockify(base)
@@ -668,7 +668,7 @@ def _bilinear_up(img, s=1.5):
 def test_blockiness_auto_detects_resized_grid():
     # compressed-then-resized: an 8-grid upscaled 1.5x lives at period 12,
     # invisible to the 8-locked legacy detector but found by period="auto"
-    from kinovsr.noise_map import estimate_blockiness_map
+    from kinovsr.analysis.noise import estimate_blockiness_map
 
     mx.random.seed(21)
     base = _bcontent()

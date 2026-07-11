@@ -33,8 +33,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.noise_map import _box_blur_full, _to_luma_2d
-from kinovsr.quant_comb import estimate_qf_map
+from kinovsr.analysis.noise.estimate import _box_blur_full, _to_luma_2d
+from kinovsr.analysis.quant_comb import estimate_qf_map
 
 from . import net
 

@@ -55,7 +55,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from .noise_map import _to_luma_2d
+from kinovsr.analysis.noise.estimate import _to_luma_2d
 
 _PI = 3.141592653589793
 
