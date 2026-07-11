@@ -55,7 +55,8 @@ def _load_numpy() -> Any:
     return np
 
 
-REPO = Path(__file__).resolve().parents[2]
+# scripts/dev/vsr_artifacts/ -> repo root is three levels up.
+REPO = Path(__file__).resolve().parents[3]
 
 DEFAULT_BASE_FLAGS = [
     "--spatial-mode", "none",
@@ -407,7 +408,7 @@ def run_cases(args: argparse.Namespace) -> dict[str, Any]:
         if man and aut and Path(man).exists() and Path(aut).exists():
             cmp_dir = case_dir / "compare_manual_auto"
             cmp_cmd = [
-                "scripts/compare_vsr_artifacts.py",
+                "-m", "kinovsr.cli.main", "artifacts", "compare",
                 "--reference", man,
                 "--candidate", aut,
                 "--output-dir", str(cmp_dir),

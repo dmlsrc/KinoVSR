@@ -60,9 +60,25 @@ from kinovsr.ui.console import get_console
 
 from .niqe import _luma_of, score_lumas  # noqa: E402
 
+_STDERR_CONSOLE = None
 
-def _print(*parts: object) -> None:
-    get_console().print(*parts, markup=False, highlight=False)
+
+def _print(*parts: object, file: object = None, flush: bool = False) -> None:
+    """Shared-console output; error lines keep their stderr routing and
+    the console flushes on every print, so ``flush`` is accepted and
+    ignored."""
+    global _STDERR_CONSOLE
+    import sys as _sys
+
+    if file is _sys.stderr:
+        if _STDERR_CONSOLE is None:
+            from rich.console import Console
+
+            _STDERR_CONSOLE = Console(stderr=True)
+        console = _STDERR_CONSOLE
+    else:
+        console = get_console()
+    console.print(*parts, markup=False, highlight=False)
 
 ALL_METRICS = ("musiq", "dover", "niqe", "flicker", "vmaf")
 STATIC_THRESHOLD = 0.01          # source luma |diff| below this = static

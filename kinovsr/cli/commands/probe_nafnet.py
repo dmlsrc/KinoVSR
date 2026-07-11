@@ -72,9 +72,15 @@ def _read_frames(video: Path, wanted: list[int]) -> dict[int, mx.array]:
         stream = container.streams.video[0]
         for i, frame in enumerate(container.decode(stream)):
             if i in wanted_set:
-                # PyAV hands back numpy; hoist to MLX at the boundary.
-                rgb = mx.array(frame.to_rgb().to_ndarray()
-                               ).astype(mx.float32) / 255.0
+                # to_ndarray() needs numpy, which the ffmpeg extra does
+                # not carry; read the rgb24 plane through the buffer
+                # protocol instead (rows are line_size-strided).
+                plane = frame.reformat(format="rgb24").planes[0]
+                width, height = frame.width, frame.height
+                rows = mx.array(memoryview(plane)).reshape(
+                    height, plane.line_size)[:, : width * 3]
+                rgb = mx.contiguous(rows).reshape(
+                    height, width, 3).astype(mx.float32) / 255.0
                 frames[i] = rgb
                 if len(frames) == len(wanted_set):
                     break
