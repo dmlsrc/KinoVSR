@@ -9,7 +9,7 @@ or the net surface as score drift.
 import mlx.core as mx
 import pytest
 
-from kinovsr.musiq import WEIGHTS_PATH, Musiq
+from kinovsr.eval.models.musiq import WEIGHTS_PATH, Musiq
 
 pytestmark = pytest.mark.skipif(
     not WEIGHTS_PATH.is_file(), reason="MUSIQ weights not converted"

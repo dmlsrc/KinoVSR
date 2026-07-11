@@ -21,9 +21,9 @@ shasum -a 256 DOVER-Mobile.pth   # expect 81b487be2aa4...
 ## Convert
 
 ```bash
-python kinovsr/dover/convert_dover.py DOVER-Mobile.pth
+python kinovsr/eval/models/dover/convert_dover.py DOVER-Mobile.pth
 # writes dover_mobile.safetensors into this directory
-shasum -a 256 kinovsr/dover/weights/dover_mobile.safetensors
+shasum -a 256 kinovsr/eval/models/dover/weights/dover_mobile.safetensors
 # expect 9d8f65fd9f28...
 ```
 

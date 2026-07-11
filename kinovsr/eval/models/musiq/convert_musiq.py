@@ -35,7 +35,7 @@ CONV_KEYS = {
 
 
 def main() -> int:
-    require_numpy("kinovsr/musiq/convert_musiq.py")
+    require_numpy("kinovsr/eval/models/musiq/convert_musiq.py")
     src = Path(sys.argv[1])
     dst = Path(sys.argv[2]) if len(sys.argv) > 2 else (
         Path(__file__).resolve().parent / "weights" / "musiq_koniq.safetensors")

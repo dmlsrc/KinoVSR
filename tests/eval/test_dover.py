@@ -16,7 +16,7 @@ import math
 import mlx.core as mx
 import pytest
 
-from kinovsr.dover import WEIGHTS_PATH, DoverMobile
+from kinovsr.eval.models.dover import WEIGHTS_PATH, DoverMobile
 
 pytestmark = pytest.mark.skipif(
     not WEIGHTS_PATH.is_file(), reason="DOVER-Mobile weights not converted"

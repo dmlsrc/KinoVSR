@@ -32,7 +32,7 @@ from kinovsr._optional import require_numpy
 
 
 def main() -> int:
-    require_numpy("kinovsr/dover/convert_dover.py")
+    require_numpy("kinovsr/eval/models/dover/convert_dover.py")
     src = Path(sys.argv[1])
     dst = Path(sys.argv[2]) if len(sys.argv) > 2 else (
         Path(__file__).parent / "weights" / "dover_mobile.safetensors")

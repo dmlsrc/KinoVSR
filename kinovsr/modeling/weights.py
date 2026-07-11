@@ -29,7 +29,7 @@ _KINDS = ("processor", "component", "evaluator")
 MANIFESTS = {
     "bsvd": "processors/bsvd/manifest.toml",
     "realplksr": "processors/realplksr/manifest.toml",
-    "spynet": "spynet/manifest.toml",
+    "spynet": "modeling/spynet/manifest.toml",
 }
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]

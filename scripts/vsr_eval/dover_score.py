@@ -18,7 +18,7 @@ from pathlib import Path
 import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from kinovsr.dover import DoverMobile  # noqa: E402
+from kinovsr.eval.models.dover import DoverMobile  # noqa: E402
 
 
 def _read_video(path: Path, max_frames: int) -> mx.array:
