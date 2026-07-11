@@ -40,10 +40,10 @@ from typing import Any
 
 import mlx.core as mx
 
-from ..compile_cache import cached as _cached
-from ..settings import default_settings
-from ..vsr_blocks import _bilinear
-from ..weights import resolve_weights as _resolve_weights
+from kinovsr.compile_cache import cached as _cached
+from kinovsr.settings import default_settings
+from kinovsr.vsr_blocks import _bilinear
+from kinovsr.weights import resolve_weights as _resolve_weights
 
 _WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 # Not bundled (download + convert; see weights/README.md).

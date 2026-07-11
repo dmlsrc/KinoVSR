@@ -28,7 +28,7 @@ _KINDS = ("processor", "component", "evaluator")
 # relative to the kinovsr package root. Extended as families migrate.
 MANIFESTS = {
     "bsvd": "processors/bsvd/manifest.toml",
-    "realplksr": "realplksr/manifest.toml",
+    "realplksr": "processors/realplksr/manifest.toml",
     "spynet": "spynet/manifest.toml",
 }
 

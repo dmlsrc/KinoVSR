@@ -604,7 +604,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
     elif args.upscale == "realplksr":
         # realplksr covers 2x (public2x) and 4x (nomos4x); read the scale from the
         # checkpoint so output dims + encoder match the frames.
-        from kinovsr.realplksr import net as _pnet
+        from kinovsr.processors.realplksr import net as _pnet
         spatial_scale = _pnet._config(_pnet.load_params(realplksr_spec))[4]
     elif args.upscale == "metalfx":
         spatial_scale = args.metalfx_scale
@@ -1237,7 +1237,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
             from kinovsr.esc import EscUpscaler
             up = EscUpscaler(esc_spec)
         elif args.upscale == "realplksr":
-            from kinovsr.realplksr import RealPlksrUpscaler
+            from kinovsr.processors.realplksr import RealPlksrUpscaler
             up = RealPlksrUpscaler(realplksr_spec,
                                    dtype=parse_mlx_dtype_name(args.realplksr_dtype))
         elif args.upscale == "realviformer":

@@ -10,7 +10,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from ..upscaler_base import to_rgb_batch
+from kinovsr.upscaler_base import to_rgb_batch
 
 try:
     from . import net

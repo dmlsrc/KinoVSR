@@ -14,7 +14,7 @@ from kinovsr.processors import (
     frame_spec_for_matrix,
     get_factory,
 )
-from kinovsr.realplksr.factory import FACTORY, RealPlksrStageConfig
+from kinovsr.processors.realplksr.factory import FACTORY, RealPlksrStageConfig
 from kinovsr.settings import Settings
 
 pytestmark = pytest.mark.unit

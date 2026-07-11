@@ -34,7 +34,7 @@ def test_factory_profiles_match_their_manifests():
     from kinovsr.modeling.weights import load_registered
     from kinovsr.processors.bsvd.factory import FACTORY as bsvd_factory
     from kinovsr.processors.capabilities import Capability
-    from kinovsr.realplksr.factory import FACTORY as realplksr_factory
+    from kinovsr.processors.realplksr.factory import FACTORY as realplksr_factory
 
     bsvd_profiles = bsvd_factory.capabilities[Capability.DENOISE].profiles
     assert set(bsvd_profiles) == set(load_registered("bsvd").profiles)

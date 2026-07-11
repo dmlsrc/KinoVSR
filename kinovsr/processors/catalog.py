@@ -25,7 +25,7 @@ from .protocol import ProcessorFactory
 _FACTORY_TARGETS: dict[str, str] = {
     "bsvd": "kinovsr.processors.bsvd.factory:FACTORY",
     "metalfx": "kinovsr.processors.metalfx:FACTORY",
-    "realplksr": "kinovsr.realplksr.factory:FACTORY",
+    "realplksr": "kinovsr.processors.realplksr.factory:FACTORY",
     "videotoolbox": "kinovsr.processors.videotoolbox:FACTORY",
 }
 

@@ -1,9 +1,9 @@
 # Attribution
 
-`kinovsr/realplksr/` is an independent MLX reimplementation of RealPLKSR,
+`kinovsr/processors/realplksr/` is an independent MLX reimplementation of RealPLKSR,
 written from the spandrel reference architecture as a spec -- no upstream code is
 bundled. The model weights are the upstream project's, redistributed under their
-licenses (see `weights/README.md` for the downloads).
+licenses (see `README.md` beside this file for the downloads).
 
 ## PLKSR / RealPLKSR
 
@@ -30,5 +30,5 @@ Trained and released by Philip Hofmann (Phhofm), https://github.com/Phhofm/model
 - `nomos4x` (4xNomosWebPhoto_RealPLKSR): Creative Commons Attribution 4.0
   International (SPDX: CC-BY-4.0). Attribution: Philip Hofmann.
 
-The weights are downloaded, not bundled (see `weights/README.md`). Both licenses
+The weights are downloaded, not bundled (see `README.md` beside this file). Both licenses
 permit commercial use with attribution; retain this file and the upstream credit.

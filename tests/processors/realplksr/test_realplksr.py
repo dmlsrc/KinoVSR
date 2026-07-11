@@ -14,7 +14,7 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from kinovsr.realplksr import net
+from kinovsr.processors.realplksr import net
 
 
 def _synth(path, *, scale, layer_norm, dysample, dim=8, n_blocks=2, ks=3):

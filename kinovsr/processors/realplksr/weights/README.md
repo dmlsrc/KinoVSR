@@ -18,7 +18,7 @@ directly on his releases, so no `.pth` conversion is needed -- download the
 Download -- the output name must match `net.py`'s `_VARIANTS`:
 
 ```bash
-curl -L -o kinovsr/realplksr/weights/2xpublic_realplksr_dysample_layernorm_real.safetensors \
+curl -L -o kinovsr/processors/realplksr/weights/2xpublic_realplksr_dysample_layernorm_real.safetensors \
   https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.safetensors
 ```
 

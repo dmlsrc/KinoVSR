@@ -88,7 +88,7 @@ ms/frame (1.38x). The reduction stays fp32 (load-bearing: refine-out activations
 reach ~370, so both `mean(x)` and `mean(x^2)` overflow an fp16 accumulator);
 use the two-pass form (mu, then `(x-mu)^2`) rather than `E[x^2]-E[x]^2` so the
 variance cannot go negative from cancellation. See
-`kinovsr/realplksr/net.py:_groupnorm`.
+`kinovsr/processors/realplksr/net.py:_groupnorm`.
 
 Corollary from the same audit: a numerically stable softplus Mish
 (`max(x,0)+log1p(exp(-|x|))`, `exp(-|x|)` <= 1 so no fp16 overflow) needs no
