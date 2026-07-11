@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from config import (
+from kinovsr.eval.config import (
     as_str_list,
     config_get,
     config_section,

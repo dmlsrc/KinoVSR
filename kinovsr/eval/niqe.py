@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """NIQE: no-reference perceptual quality (natural-scene statistics).
 
 Mittal, Soundararajan, Bovik -- "Making a 'Completely Blind' Image Quality
@@ -41,6 +40,12 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+
+from kinovsr.ui.console import get_console
+
+
+def _print(*parts: object) -> None:
+    get_console().print(*parts, markup=False, highlight=False)
 
 MODEL_PATH = Path(__file__).resolve().parent / "weights" / "niqe_pristine_reds.safetensors"
 PATCH = 96
@@ -198,7 +203,7 @@ def fit_model(folder: Path, out: Path, max_images: int = 200,
         "cov": cov.astype(mx.float32),
         "n": mx.array([int(allf.shape[0])], dtype=mx.int32),
     })
-    print(f"pristine model: {int(allf.shape[0])} patches from {len(paths)} images -> {out}")
+    _print(f"pristine model: {int(allf.shape[0])} patches from {len(paths)} images -> {out}")
 
 
 def _read_video_lumas(path: Path, every: int = 1) -> list[Any]:
@@ -231,15 +236,17 @@ def score_lumas(lumas: list[Any], model: Path = MODEL_PATH) -> float:
     return float(mx.sqrt(mx.maximum(d @ pinv @ d, 0.0)))
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def run_niqe(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="kinovsr metrics niqe",
+        description=__doc__.splitlines()[0])
     ap.add_argument("inputs", nargs="*", help="videos (or images) to score")
     ap.add_argument("--fit", metavar="FOLDER",
                     help="fit the pristine model (safetensors) from images")
     ap.add_argument("--model", default=str(MODEL_PATH))
     ap.add_argument("--out", default=str(MODEL_PATH))
     ap.add_argument("--every", type=int, default=3, help="score every Nth frame")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.fit:
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         fit_model(Path(args.fit), Path(args.out))
@@ -248,10 +255,7 @@ def main() -> int:
     for inp in args.inputs:
         lumas = _read_video_lumas(Path(inp), every=args.every)
         rows[inp] = score_lumas(lumas, Path(args.model))
-        print(f"{rows[inp]:7.3f}  {inp}")
-    print(json.dumps(rows))
+        _print(f"{rows[inp]:7.3f}  {inp}")
+    _print(json.dumps(rows))
     return 0
 
-
-if __name__ == "__main__":
-    sys.exit(main())

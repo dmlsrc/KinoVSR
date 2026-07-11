@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """DOVER-Mobile video scorer -- human-opinion-trained *video* quality.
 
 Prints technical (fragments), aesthetic (resize), and fused scores per
@@ -19,6 +18,11 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from kinovsr.eval.models.dover import DoverMobile  # noqa: E402
+from kinovsr.ui.console import get_console
+
+
+def _print(*parts: object) -> None:
+    get_console().print(*parts, markup=False, highlight=False)
 
 
 def _read_video(path: Path, max_frames: int) -> mx.array:
@@ -36,14 +40,16 @@ def _read_video(path: Path, max_frames: int) -> mx.array:
     return mx.stack(out)
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+def run_dover(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="kinovsr metrics dover",
+        description=__doc__)
     ap.add_argument("videos", nargs="+", type=Path)
     ap.add_argument("--max-frames", type=int, default=0,
                     help="cap decoded frames (0 = whole video)")
     ap.add_argument("--weights", type=Path, default=None)
     ap.add_argument("--json", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     model = DoverMobile(weights=args.weights)
     results = {}
@@ -51,12 +57,9 @@ def main() -> int:
         s = model.score(_read_video(vp, args.max_frames))
         results[str(vp)] = s
         if not args.json:
-            print(f"tech {s['tech']:8.4f}  aes {s['aes']:8.4f}  "
+            _print(f"tech {s['tech']:8.4f}  aes {s['aes']:8.4f}  "
                   f"fused {s['fused']:6.4f}  {vp}")
     if args.json:
-        print(json.dumps(results, indent=2))
+        _print(json.dumps(results, indent=2))
     return 0
 
-
-if __name__ == "__main__":
-    sys.exit(main())

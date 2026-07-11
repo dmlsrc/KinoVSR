@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import json
-import os
 import tomllib
 from pathlib import Path
 from typing import Any
 
 TOOL_DIR = Path(__file__).resolve().parent
-REPO_ROOT = TOOL_DIR.parents[1]
 DEFAULT_CONFIG_CANDIDATES = (
     TOOL_DIR / "vsr_eval.local.toml",
     TOOL_DIR / "vsr_eval.local.json",
@@ -16,9 +14,11 @@ DEFAULT_CONFIG_CANDIDATES = (
 
 
 def default_shared_temp() -> Path:
-    if value := os.environ.get("SHARED_TEMP_DIR"):
-        return Path(value).expanduser()
-    return REPO_ROOT / "tmp"
+    # Settings is the package's only environment reader; its
+    # shared_temp_dir carries the SHARED_TEMP_DIR convention.
+    from kinovsr.settings import default_settings
+
+    return default_settings().shared_temp_dir
 
 
 def load_config(path: Path | None) -> tuple[dict[str, Any], Path | None]:

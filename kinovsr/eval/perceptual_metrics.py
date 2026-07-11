@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Perceptual metric table for a manifest of processed VSR variants.
 
 Scores every variant video (and optionally the source) with:
@@ -55,10 +54,15 @@ from pathlib import Path
 import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from niqe import _luma_of, score_lumas  # noqa: E402
-
 from kinovsr.eval.models.dover import DoverMobile  # noqa: E402
 from kinovsr.eval.models.musiq import Musiq  # noqa: E402
+from kinovsr.ui.console import get_console
+
+from .niqe import _luma_of, score_lumas  # noqa: E402
+
+
+def _print(*parts: object) -> None:
+    get_console().print(*parts, markup=False, highlight=False)
 
 ALL_METRICS = ("musiq", "dover", "niqe", "flicker", "vmaf")
 STATIC_THRESHOLD = 0.01          # source luma |diff| below this = static
@@ -67,7 +71,7 @@ EDGE_SKIP = (3, 2)               # frames dropped at clip head/tail
 
 
 def _note(msg: str) -> None:
-    print(f"[perceptual] {msg}", file=sys.stderr, flush=True)
+    _print(f"[perceptual] {msg}", file=sys.stderr, flush=True)
 
 
 def read_frames(path: Path, max_frames: int) -> mx.array:
@@ -155,8 +159,10 @@ def vmaf_src(cand: Path, ref: Path, log_path: Path) -> float | None:
     return float(data["pooled_metrics"]["vmaf"]["mean"])
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def run_perceptual(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="kinovsr metrics perceptual",
+        description=__doc__.splitlines()[0])
     ap.add_argument("--variants-json", type=Path, required=True,
                     help="JSON mapping variant name -> video path")
     ap.add_argument("--source", type=Path,
@@ -168,7 +174,7 @@ def main() -> int:
                     help="score every Nth frame with MUSIQ")
     ap.add_argument("--metrics", default=",".join(ALL_METRICS),
                     help=f"comma subset of {','.join(ALL_METRICS)}")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     want = {m.strip() for m in args.metrics.split(",") if m.strip()}
     if unknown := want - set(ALL_METRICS):
@@ -229,7 +235,7 @@ def main() -> int:
             row["vmaf_src"] = (100.0 if name == "source" else vmaf_src(
                 vp, args.source, args.out_dir / f"vmaf_{name}.json"))
         rows.append(row)
-        print(json.dumps(row), flush=True)
+        _print(json.dumps(row), flush=True)
 
     (args.out_dir / "perceptual_metrics.json").write_text(
         json.dumps(rows, indent=2) + "\n", encoding="utf-8")
@@ -250,7 +256,7 @@ def main() -> int:
     present = [(k, fmt, max(12, len(k) + 2))
                for k, fmt in cols if any(k in r for r in rows)]
     name_w = max(20, max(len(str(r["variant"])) for r in rows) + 2)
-    print(f"\n{'variant':{name_w}s}"
+    _print(f"\n{'variant':{name_w}s}"
           + "".join(f"{k:>{w}s}" for k, _, w in present))
     for r in sorted(rows, key=sort_key):
         line = f"{r['variant']:{name_w}s}"
@@ -258,12 +264,9 @@ def main() -> int:
             v = r.get(k)
             cell = fmt.format(v) if isinstance(v, (int, float)) else "-"
             line += cell.rjust(w)
-        print(line)
-    print("\nhigher better: musiq, dover_fused; lower better: niqe "
+        _print(line)
+    _print("\nhigher better: musiq, dover_fused; lower better: niqe "
           "(tripwire only), flicker_e3, moving_dev_e3 (content-erasure "
           "guard); vmaf_src = fidelity anchor")
     return 0
 
-
-if __name__ == "__main__":
-    sys.exit(main())

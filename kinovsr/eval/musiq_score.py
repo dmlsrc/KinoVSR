@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """MUSIQ (koniq) video/image scorer -- human-opinion-trained quality.
 
 Higher is better (roughly 0-100). Per-frame spatial metric: pair it with a
@@ -20,6 +19,11 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from kinovsr.eval.models.musiq import Musiq  # noqa: E402
+from kinovsr.ui.console import get_console
+
+
+def _print(*parts: object) -> None:
+    get_console().print(*parts, markup=False, highlight=False)
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -39,12 +43,14 @@ def _read_video_frames(path: Path, every: int) -> list:
     return out
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def run_musiq(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="kinovsr metrics musiq",
+        description=__doc__.splitlines()[0])
     ap.add_argument("inputs", nargs="+")
     ap.add_argument("--every", type=int, default=5, help="score every Nth frame")
     ap.add_argument("--weights", default=None)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     m = Musiq(args.weights)
     rows = {}
     for inp in args.inputs:
@@ -56,10 +62,7 @@ def main() -> int:
             frames = _read_video_frames(p, args.every)
         scores = m.score_frames(frames)
         rows[inp] = sum(scores) / len(scores)
-        print(f"{rows[inp]:7.2f}  {inp}")
-    print(json.dumps(rows))
+        _print(f"{rows[inp]:7.2f}  {inp}")
+    _print(json.dumps(rows))
     return 0
 
-
-if __name__ == "__main__":
-    sys.exit(main())

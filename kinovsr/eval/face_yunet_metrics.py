@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Score VSR/denoiser variants on detected face regions.
 
 This is a developer evaluation tool. Local video paths belong in
@@ -25,13 +24,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import cv2 as cv
-from config import (
+
+from kinovsr.ui.console import get_console
+
+from .config import (
     config_get,
     config_section,
     default_shared_temp,
     load_config,
     resolve_path,
 )
+
+
+def _print(*parts: object) -> None:
+    get_console().print(*parts, markup=False, highlight=False)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -446,7 +452,7 @@ def load_variants(section: dict[str, Any], variants_json: Path | None, config_ba
     raise SystemExit("provide --variants-json or [face_eval.variants] in local config")
 
 
-def _normalise_config(args: argparse.Namespace) -> argparse.Namespace:
+def _normalize_config(args: argparse.Namespace) -> argparse.Namespace:
     config, config_path = load_config(args.config)
     face_eval = config_section(config, "face_eval")
     config_base = config_path.parent if config_path is not None else None
@@ -518,13 +524,13 @@ def run_eval(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.contact_sheet:
         make_contact_sheet(args.out_dir / "face_yunet_contact_sheet.png", frames_by_variant, observations, list(variants))
 
-    print(f"tracks={len(tracks)} samples={len(observations)}")
+    _print(f"tracks={len(tracks)} samples={len(observations)}")
     for row in sorted(
         [r for r in rows if r["variant"] != args.baseline],
         key=lambda r: r["face_score"],
         reverse=True,
     ):
-        print(
+        _print(
             f"{row['variant']:28s} score={row['face_score']:7.2f} "
             f"ssim={row['ssim_luma']:.4f} gradR={row['grad_ratio']:.3f} "
             f"gradC={row['grad_corr']:.3f} hfR={row['hf_luma_ratio']:.3f} "
@@ -532,12 +538,13 @@ def run_eval(args: argparse.Namespace) -> list[dict[str, Any]]:
             f"tempR={row['temporal_hf_diff_ratio']:.3f} "
             f"mae={row['mae_luma']:.4f} cdrift={row['chroma_drift']:.4f}"
         )
-    print(args.out_dir)
+    _print(args.out_dir)
     return rows
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        prog="kinovsr metrics faces",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -551,13 +558,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-side", type=int, help="ignore detected faces smaller than this side length")
     parser.add_argument("--min-track-frames", type=int, help="ignore tracks shorter than this many detected frames")
     parser.add_argument("--no-contact-sheet", action="store_true", help="skip contact sheet image")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    run_eval(_normalise_config(parse_args()))
+def run_faces(argv: list[str] | None = None) -> int:
+    run_eval(_normalize_config(parse_args(argv)))
     return 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -250,7 +250,7 @@ def run_shimmer(argv: list[str] | None = None) -> int:
     _print(f"  min:  {diff_patches.min():+.4f} at row {mn_idx[0]}, col {mn_idx[1]}")
 
 
-_SUBCOMMANDS = ("shimmer",)
+_SUBCOMMANDS = ("shimmer", "perceptual", "niqe", "faces", "dover", "musiq")
 
 
 def run_metrics_command(argv: list[str]) -> int:
@@ -260,6 +260,26 @@ def run_metrics_command(argv: list[str]) -> int:
     name, rest = argv[0], argv[1:]
     if name == "shimmer":
         return run_shimmer(rest) or 0
+    if name == "perceptual":
+        from kinovsr.eval.perceptual_metrics import run_perceptual
+
+        return run_perceptual(rest) or 0
+    if name == "niqe":
+        from kinovsr.eval.niqe import run_niqe
+
+        return run_niqe(rest) or 0
+    if name == "faces":
+        from kinovsr.eval.face_yunet_metrics import run_faces
+
+        return run_faces(rest) or 0
+    if name == "dover":
+        from kinovsr.eval.dover_score import run_dover
+
+        return run_dover(rest) or 0
+    if name == "musiq":
+        from kinovsr.eval.musiq_score import run_musiq
+
+        return run_musiq(rest) or 0
     _print(f"unknown metrics subcommand {name!r} "
            f"(available: {', '.join(_SUBCOMMANDS)})")
     return 2
