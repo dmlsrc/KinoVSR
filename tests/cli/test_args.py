@@ -148,12 +148,13 @@ class TestSettingsTrifecta:
         with pytest.raises(ConfigError, match="boolean"):
             assemble(args, base=Settings())
 
-    def test_stage_tables_are_m3(self, parser, tmp_path: Path):
+    def test_stage_tables_ride_the_invocation(self, parser, tmp_path: Path):
         toml = tmp_path / "p.toml"
         toml.write_text('pipeline = ["denoise"]\n[denoise]\nprocessor = "bsvd"\n')
         args = parser.parse_args([*BASE, "--config", str(toml)])
-        with pytest.raises(ConfigError, match="M3"):
-            assemble(args, base=Settings())
+        inv = assemble(args, base=Settings())
+        assert inv.config["pipeline"] == ["denoise"]
+        assert inv.config["denoise"]["processor"] == "bsvd"
 
 
 class TestDeblockWeightsCompat:

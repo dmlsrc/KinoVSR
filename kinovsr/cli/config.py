@@ -40,15 +40,17 @@ _DEBLOCK_WEIGHT_FAMILIES = ("stdf", "fbcnn", "toflow")
 
 @dataclass(frozen=True)
 class Invocation:
-    """A fully resolved CLI invocation: global settings + stage options.
+    """A fully resolved CLI invocation: settings, stage options, config.
 
-    ``options`` is the transitional M2 shape: a flat namespace of canonical
-    option destinations consumed by the inherited orchestration. M3 replaces
-    it with typed stage configs resolved through the pipeline builder.
+    ``options`` is the transitional flat namespace of canonical option
+    destinations consumed by the inherited orchestration. ``config`` is
+    the composed TOML document; when it declares a ``pipeline`` list the
+    run routes through the typed pipeline instead.
     """
 
     settings: Settings
     options: argparse.Namespace
+    config: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 def normalize_chain(value: str) -> str:
@@ -93,14 +95,15 @@ def _settings_from_table(base: Settings, table: dict[str, Any]) -> Settings:
 
 def assemble(args: argparse.Namespace,
              base: Settings | None = None) -> Invocation:
-    """Resolve one invocation from parsed args and config files."""
+    """Resolve one invocation from parsed args and config files.
+
+    A config that declares a ``pipeline`` list is a typed-pipeline run:
+    the stage tables are structurally validated here and resolved by the
+    pipeline builder at run time (the run command routes it through
+    :func:`kinovsr.pipeline.run_file`).
+    """
     config = compose_config(args.base_config, args.config)
     validate_config(config)
-    unsupported = sorted(k for k in config if k != "settings")
-    if unsupported:
-        raise ConfigError(
-            f"config keys {unsupported} require the M3 pipeline builder; "
-            f"in M2 only the [settings] table is consumed")
 
     # Chain-token family aliases.
     args.denoise = normalize_chain(args.denoise)
@@ -118,4 +121,4 @@ def assemble(args: argparse.Namespace,
     settings = base if base is not None else Settings.from_env()
     settings = _settings_from_table(settings, config.get("settings", {}))
     settings = settings_from_args(args, settings)
-    return Invocation(settings=settings, options=args)
+    return Invocation(settings=settings, options=args, config=config)

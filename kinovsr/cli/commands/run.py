@@ -24,7 +24,8 @@ def run_video_command(argv: list[str]) -> int:
     try:
         invocation = assemble(args)
     except ConfigError as exc:
-        get_console().print(f"config error: {exc}", style="bold red")
+        get_console().print(f"config error: {exc}", style="bold red",
+                            markup=False)
         return 2
 
     settings = invocation.settings
@@ -42,6 +43,12 @@ def run_video_command(argv: list[str]) -> int:
 
         return probe_noise(Path(options.video), start_spec=options.start,
                            end_spec=options.end, reader=options.reader)
+
+    # A config that declares a pipeline list runs through the typed
+    # pipeline; the flag-driven stage surface stays on the inherited
+    # orchestration until it reaches feature parity.
+    if invocation.config.get("pipeline") is not None:
+        return _run_typed(invocation)
     from kinovsr.api import (
         VideoFileConfig,
         process_video_file,
@@ -54,4 +61,81 @@ def run_video_command(argv: list[str]) -> int:
 
     process_video_file(
         VideoFileConfig(settings=settings, options=invocation.options))
+    return 0
+
+
+# Flags that select stages on the flag-driven surface; a [pipeline]
+# config owns stage composition, so these cannot be combined with it.
+_STAGE_SELECTORS = (
+    ("upscale", "balanced"),
+    ("denoise", "off"),
+    ("deblock", "off"),
+    ("restore", "off"),
+    ("nafnet", "off"),
+    ("deflicker", "off"),
+    ("cut_detect", "off"),
+)
+
+
+def _run_typed(invocation) -> int:
+    """Run a [pipeline] config file-to-file through the typed pipeline."""
+    from datetime import datetime
+    from pathlib import Path
+
+    options = invocation.options
+    selected = [name for name, default in _STAGE_SELECTORS
+                if getattr(options, name, default) != default]
+    if selected:
+        flags = ", ".join("--" + n.replace("_", "-") for n in selected)
+        get_console().print(
+            f"config error: a [pipeline] config owns stage composition; "
+            f"drop the stage flags ({flags}) or the pipeline table",
+            style="bold red", markup=False)
+        return 2
+    if not options.output_dir:
+        get_console().print("config error: --output-dir is required",
+                            style="bold red", markup=False)
+        return 2
+
+    from kinovsr._harness import sanitize_output_prefix
+    from kinovsr.media import video_reader as _vr
+    from kinovsr.media.timespec import resolve_trim
+    from kinovsr.pipeline import run_file
+
+    video = Path(options.video)
+    try:
+        _w, _h, fps, total, _tf, _par = _vr.probe_video(video)
+    except Exception:
+        from kinovsr.media import ffmpeg_reader
+
+        _w, _h, fps, total, _tf, _par = ffmpeg_reader.probe_video(video)
+    start, end = resolve_trim(options.start, options.end, fps, total)
+    max_frames = None
+    if options.max_frames is not None:
+        from kinovsr.media.timespec import parse_time_or_frames
+
+        max_frames = parse_time_or_frames(options.max_frames, fps)
+
+    stem = (f"{sanitize_output_prefix(options.output_prefix)}_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    out_root = Path(options.output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    output = out_root / f"{stem}_post.mp4"
+
+    result = run_file(
+        invocation.config,
+        video=video,
+        output=output,
+        settings=invocation.settings,
+        start=start,
+        end=end,
+        max_frames=max_frames,
+        audio=options.audio,
+        audio_codec=options.audio_codec,
+        quality=options.encode_quality,
+    )
+    get_console().print(
+        f"{result.frames_in} frames in -> {result.frames_out} out "
+        f"in {result.elapsed_s:.2f}s", markup=False)
+    get_console().print(f"Post: {result.path}", markup=False)
     return 0
