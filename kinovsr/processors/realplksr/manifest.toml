@@ -29,16 +29,19 @@ scale = 4
 path = "weights/2xpublic_realplksr_dysample_layernorm_real.safetensors"
 distribution = "external"
 source = "https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.safetensors"
+source_sha256 = "5eb81e8c3e21d57b0ea2aa7931910c97c263c1f23ef9b35fabbd46e98471cd44"
 license = "Apache-2.0"
 
 [weights.public2x-nn]
 path = "weights/2xpublic_realplksr_dysample_layernorm_real_nn.safetensors"
 distribution = "external"
 source = "https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real_nn/2xPublic_realplksr_dysample_layernorm_real_nn.safetensors"
+source_sha256 = "636407b37702f0cd2c93b1f5f7e509b376f02637f2145d3e1d66999ce1d3797c"
 license = "Apache-2.0"
 
 [weights.nomos4x]
 path = "weights/4xnomoswebphoto_realplksr.safetensors"
 distribution = "external"
 source = "https://github.com/Phhofm/models/releases/download/4xNomosWebPhoto_RealPLKSR/4xNomosWebPhoto_RealPLKSR.safetensors"
+source_sha256 = "9be0228f98156a100d6636d99b373ed2785b999723f9adc4cca504329ab157f2"
 license = "CC-BY-4.0"

@@ -70,7 +70,7 @@ scale = 4
 [weights.general]
 path = "weights/realesr_general_x4v3.safetensors"
 distribution = "bundled"
-artifact_sha256 = "ee54500e7d2665c7efaffdc7d739749f25f1ca2425f57e1351595db8c11859b1"
+artifact_sha256 = "3cc6f5b25d4cdd075c1f2fb5294ddbccfbe7133c7be6823d9e8106b039b38675"
 source = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
 source_sha256 = "8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292"
 license = "BSD-3-Clause"
@@ -80,7 +80,7 @@ license = "BSD-3-Clause"
 [weights.general-wdn]
 path = "weights/realesr_general_wdn_x4v3.safetensors"
 distribution = "bundled"
-artifact_sha256 = "c164dd6e95bf17e6fe124a8fa2b9c49d45731a3452102aafcbb2c55e86083147"
+artifact_sha256 = "8ae0b45cf3533fe2cf0dd7e549d7dd8a75d5058cfa4e7d9a695560ccc2a249c2"
 source = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth"
 source_sha256 = "1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca"
 license = "BSD-3-Clause"

@@ -20,7 +20,7 @@ weights = ["vimeo90k"]
 [weights.mfqev2]
 path = "weights/stdf_mfqev2_r3.safetensors"
 distribution = "bundled"
-artifact_sha256 = "42986d5fb9ace72d60b720ea84c06537e60a8ab4e748e15f97f6d627e72fc4d1"
+artifact_sha256 = "aa80e9468580d7e6b4266ce9e4dc371bc35d1d9451f49c8b1b275d14b813c83e"
 source = "https://github.com/ryanxingql/stdf-pytorch/releases/download/v1.0.0/exp.zip (exp/MFQEv2_R3_enlarge300x/ckp_290000.pt)"
 source_sha256 = "d28e0b30082ecbbaeb7b8436968079875c97d882101cc4a79114d33eca2e1ec7"
 license = "Apache-2.0"
@@ -28,7 +28,7 @@ license = "Apache-2.0"
 [weights.vimeo90k]
 path = "weights/stdf_vimeo90k_r3.safetensors"
 distribution = "bundled"
-artifact_sha256 = "997b484d97c6fa8005eca549f2c7fff6a63c2e87ab4120b48ed3e8c8a5904449"
+artifact_sha256 = "6acf97d28a236e128eb5f5f77d4453c078e24f9c9473a828168de22e8cbe0559"
 source = "https://github.com/ryanxingql/stdf-pytorch/releases/download/v1.0.0/exp.zip (exp/Vimeo90K_R3_enlarge300x/ckp_300000.pt)"
 source_sha256 = "03b20836c7ed38ad3fdce0cec0360523cfade02673bd9e7b8e236e6e6826d708"
 license = "Apache-2.0"

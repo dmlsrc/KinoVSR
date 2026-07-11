@@ -126,6 +126,7 @@ ignore = [
 "kinovsr/_harness.py" = ["T20"]
 "kinovsr/processors/basicvsrpp/**" = ["T20"]
 "kinovsr/modeling/deform_conv.py" = ["T20"]
+"kinovsr/modeling/spynet/convert_spynet.py" = ["T20"]
 "kinovsr/eval/models/dover/**" = ["T20"]
 "kinovsr/processors/esc/**" = ["T20"]
 "kinovsr/processors/fbcnn/**" = ["T20"]

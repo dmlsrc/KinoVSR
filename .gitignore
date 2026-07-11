@@ -239,3 +239,8 @@ __marimo__/
 !kinovsr/processors/realesrgan/weights/realesr_general_wdn_x4v3.safetensors
 !kinovsr/eval/weights/face_detection_yunet_2023mar.onnx
 !kinovsr/eval/weights/niqe_pristine_reds.safetensors
+
+# Collected upstream source checkpoints (weights-src/README.md is the
+# map); multi-GB payloads stay untracked regardless of extension.
+weights-src/*
+!weights-src/README.md

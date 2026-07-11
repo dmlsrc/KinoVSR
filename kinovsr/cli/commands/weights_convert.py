@@ -330,6 +330,35 @@ def _is_tensor(value: Any) -> bool:
     return isinstance(value, mx.array)
 
 
+def _resolve_source(spec: str) -> Path | None:
+    """Resolve the input checkpoint, looking in weights-src/ first.
+
+    Order: the literal path; then ``weights-src/<spec>``; then a unique
+    ``weights-src/**/<basename>`` match. weights-src/ is the repo-root
+    folder of collected upstream sources (see its README), resolved
+    relative to the working directory. An ambiguous basename lists the
+    candidates instead of guessing.
+    """
+    literal = Path(spec)
+    if literal.is_file():
+        return literal
+    root = Path("weights-src")
+    direct = root / spec
+    if direct.is_file():
+        _print(f"[src] resolved from the source collection: {direct}")
+        return direct
+    if root.is_dir() and "/" not in spec:
+        matches = sorted(p for p in root.rglob(spec) if p.is_file())
+        if len(matches) == 1:
+            _print(f"[src] resolved from the source collection: {matches[0]}")
+            return matches[0]
+        if matches:
+            raise SystemExit(
+                f"{spec!r} is ambiguous in weights-src/: "
+                + ", ".join(str(m) for m in matches))
+    return None
+
+
 def run_convert(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="kinovsr weights convert",
@@ -359,15 +388,24 @@ def run_convert(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    src = Path(args.input)
-    if not src.is_file():
-        ap.error(f"no such file: {src}")
+    src = _resolve_source(args.input)
+    if src is None:
+        ap.error(
+            f"no such file: {args.input} (also looked under weights-src/)")
     if args.keep_fp64:
         _print("error: --keep-fp64 cannot be honored - MLX has no float64 dtype, "
                "and the output exists to be MLX-loadable. float64 demotes to "
                "float32.", file=sys.stderr)
         return 2
-    out = Path(args.output) if args.output else src.with_suffix(".safetensors")
+    if args.output:
+        out = Path(args.output)
+    elif src.parts[:1] == ("weights-src",):
+        _print("error: state -o when converting from weights-src/ - the "
+               "default output would land inside the source collection.",
+               file=sys.stderr)
+        return 2
+    else:
+        out = src.with_suffix(".safetensors")
 
     # ---- 1. static safety scan (no execution) ------------------------------
     refs = _pickle_globals(src.read_bytes())
