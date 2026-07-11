@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run config-driven denoiser sweeps; score faces and perceptual metrics.
 
-This wraps `scripts/vsr_harness.py` for repeatable local experiments. Checked-in
+This wraps the kinovsr processing CLI for repeatable local experiments. Checked-in
 logic is generic; machine-specific clips, output roots, and artifact paths live
 in `scripts/dev/vsr_eval_sweep/vsr_eval.local.toml`.
 """
@@ -207,7 +207,7 @@ def run_harness(args: argparse.Namespace, clip: dict[str, Any], variant: dict[st
 
     cmd = [
         str(args.python),
-        "scripts/vsr_harness.py",
+        "-m", "kinovsr.cli.main",
         *args.base_flags,
         "--video", str(clip["video"]),
         "--output-dir", str(out_dir),
@@ -241,7 +241,7 @@ def run_harness(args: argparse.Namespace, clip: dict[str, Any], variant: dict[st
     log_path.write_text(proc.stdout, encoding="utf-8")
     row.update(parse_run_log(proc.stdout))
     if proc.returncode != 0:
-        row["error"] = f"vsr_harness returned {proc.returncode}"
+        row["error"] = f"kinovsr returned {proc.returncode}"
     print(f"[done] {label}:{name} rc={proc.returncode} {row['seconds']:.1f}s", flush=True)
     return row
 

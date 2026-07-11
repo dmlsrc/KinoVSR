@@ -119,7 +119,6 @@ ignore = [
 # there. The inherited harness also has source-checkout import setup before
 # package imports.
 "scripts/**" = ["T20"]
-"scripts/vsr_harness.py" = ["E402", "T20"]
 # Transitional: inherited runtime modules still emit CLI/progress/demo
 # output with bare print. New package modules (cli, ui, config, api,
 # settings, reporting) use logging or the reporter instead - keep them

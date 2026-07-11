@@ -221,7 +221,7 @@ class AVWriter:
         self._audio_progress = [0]
         if audio_track is not None:
             self._audio_queue = libdispatch.dispatch_queue_create(
-                f"vsr_harness.audio.{label}".encode(), None,
+                f"kinovsr.audio.{label}".encode(), None,
             )
             n_samples = audio_track.n_samples
             chunk_frames = max(4096, audio_track.sample_rate // 4)  # ~250 ms

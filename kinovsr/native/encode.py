@@ -460,7 +460,7 @@ def encode_video_videotoolbox(
                 _pb.clear_ci_caches()
                 if vsr is not None:
                     vsr.flush_pools()
-        # VTFRC drain (no-op today; kept for symmetry with vsr_harness).
+        # VTFRC drain (no-op today; kept for symmetry with the run path).
         if vtfrc is not None:
             for out_pb in vtfrc.drain():
                 writer.append(out_pb)

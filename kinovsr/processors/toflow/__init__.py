@@ -513,7 +513,7 @@ class TOFlow:
 
 
 class TOFlowDenoiser:
-    """Streaming seven-frame TOFlow denoise/deblock stage for vsr_harness.
+    """Streaming seven-frame TOFlow denoise/deblock stage for the processing chain.
 
     passes > 1 runs an internal cascade (each pass consumes the previous
     pass's stream, like chaining the stage against itself) but computes the
@@ -639,7 +639,7 @@ class TOFlowDenoiser:
 
 
 class TOFlowSrUpscaler:
-    """Streaming seven-frame TOFlow SR stage for vsr_harness."""
+    """Streaming seven-frame TOFlow SR stage for the processing chain."""
 
     SCALE = 4
 

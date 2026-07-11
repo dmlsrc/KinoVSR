@@ -365,7 +365,7 @@ def run_cases(args: argparse.Namespace) -> dict[str, Any]:
         case: dict[str, Any] = {"label": label, "video": str(video), "runs": {}}
 
         probe_cmd = [
-            "scripts/vsr_harness.py",
+            "-m", "kinovsr.cli.main",
             *args.base_flags,
             "--video", str(video),
             "--probe-noise",
@@ -378,7 +378,7 @@ def run_cases(args: argparse.Namespace) -> dict[str, Any]:
             run_dir = case_dir / mode
             run_dir.mkdir(parents=True, exist_ok=True)
             cmd = [
-                "scripts/vsr_harness.py",
+                "-m", "kinovsr.cli.main",
                 *args.base_flags,
                 "--video", str(video),
                 "--output-dir", str(run_dir),

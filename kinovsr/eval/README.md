@@ -16,7 +16,7 @@ names stay out of git.
   column catches them), and VMAF-vs-source, printing one ranked table
   and writing CSV/JSON. The module docstring says what each column
   means and which are ranking columns versus tripwires/anchors.
-- `run_denoise_sweep.py`: runs `scripts/vsr_harness.py` across configured clips
+- `run_denoise_sweep.py`: runs the kinovsr processing CLI across configured clips
   and variants, writes per-run logs/manifests, then optionally invokes the face
   and perceptual evaluators and aggregates the metrics.
 - `musiq_score.py`, `dover_score.py`, `niqe.py`: the individual metric CLIs
