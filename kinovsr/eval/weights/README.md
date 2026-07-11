@@ -1,7 +1,7 @@
 # YuNet Face Detector Weights
 
 `face_detection_yunet_2023mar.onnx` is bundled for
-`scripts/vsr_eval/face_yunet_metrics.py`. It is small (~227 KB) and MIT
+`kinovsr metrics faces`. It is small (~227 KB) and MIT
 licensed, so keeping it in the repo avoids a local Hugging Face cache dependency
 for face-region denoiser evaluation.
 

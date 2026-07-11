@@ -1,14 +1,14 @@
 """Score VSR/denoiser variants on detected face regions.
 
 This is a developer evaluation tool. Local video paths belong in
-`scripts/vsr_eval/vsr_eval.local.toml`; the checked-in defaults and examples
+`vsr_eval.local.toml` (working directory or scripts/dev/vsr_eval_sweep/); the checked-in defaults and examples
 stay machine-neutral.
 
 Examples:
-    scripts/vsr_eval/face_yunet_metrics.py \\
-        --config scripts/vsr_eval/vsr_eval.local.toml
+    kinovsr metrics faces \\
+        --config scripts/dev/vsr_eval_sweep/vsr_eval.local.toml
 
-    scripts/vsr_eval/face_yunet_metrics.py \\
+    kinovsr metrics faces \\
         --variants-json "$SHARED_TEMP_DIR/run/variants.json" \\
         --out-dir "$SHARED_TEMP_DIR/run/face_eval"
 """
@@ -52,7 +52,7 @@ def _load_numpy() -> Any:
             import numpy as _np
         except ModuleNotFoundError as exc:
             raise SystemExit(
-                "NumPy is required for scripts/vsr_eval/face_yunet_metrics.py. "
+                "NumPy is required for kinovsr metrics faces. "
                 "Install the developer extras for evaluation tools."
             ) from exc
         np = _np
@@ -147,7 +147,7 @@ def detect_faces(frames: list[np.ndarray], model: Path, threshold: float, min_si
     if not model.exists():
         raise SystemExit(
             f"missing YuNet model: {model}\n"
-            "Use --model or set face_eval.model in scripts/vsr_eval/vsr_eval.local.toml."
+            "Use --model or set face_eval.model in vsr_eval.local.toml."
         )
 
     h, w = frames[0].shape[:2]
@@ -548,7 +548,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config", type=Path, help="TOML/JSON config; defaults to scripts/vsr_eval/vsr_eval.local.{toml,json} if present")
+    parser.add_argument("--config", type=Path, help="TOML/JSON config; without it, discovery checks the working directory then scripts/dev/vsr_eval_sweep/ for vsr_eval.local.{toml,json}")
     parser.add_argument("--variants-json", type=Path, help="JSON object mapping variant names to video paths")
     parser.add_argument("--baseline", help="baseline variant name, usually none or orig")
     parser.add_argument("--out-dir", help="output directory for CSV/JSON/contact sheet")

@@ -6,10 +6,16 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-TOOL_DIR = Path(__file__).resolve().parent
+# Local configs are user files: discovered in the working directory and
+# beside the sweep under scripts/dev/vsr_eval_sweep/ (where the example
+# lives) - never inside the installed package.
+_SWEEP_DIR = (Path(__file__).resolve().parents[2]
+              / "scripts" / "dev" / "vsr_eval_sweep")
 DEFAULT_CONFIG_CANDIDATES = (
-    TOOL_DIR / "vsr_eval.local.toml",
-    TOOL_DIR / "vsr_eval.local.json",
+    Path.cwd() / "vsr_eval.local.toml",
+    Path.cwd() / "vsr_eval.local.json",
+    _SWEEP_DIR / "vsr_eval.local.toml",
+    _SWEEP_DIR / "vsr_eval.local.json",
 )
 
 

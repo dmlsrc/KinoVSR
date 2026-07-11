@@ -1,6 +1,6 @@
 # Attribution
 
-`scripts/vsr_eval/` contains developer evaluation helpers for VSR denoiser comparisons. The
+`kinovsr/eval/` contains the evaluation helpers for VSR denoiser comparisons. The
 YuNet model weights are redistributed under the upstream license (see `weights/README.md`
 for provenance and hashes).
 

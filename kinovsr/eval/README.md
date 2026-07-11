@@ -28,20 +28,23 @@ Copy `vsr_eval.example.toml` to `vsr_eval.local.toml` and put machine-local
 paths there:
 
 ```bash
-cp scripts/vsr_eval/vsr_eval.example.toml scripts/vsr_eval/vsr_eval.local.toml
+cp scripts/dev/vsr_eval_sweep/vsr_eval.example.toml scripts/dev/vsr_eval_sweep/vsr_eval.local.toml
 ```
 
 Then run:
 
 ```bash
-scripts/vsr_eval/run_denoise_sweep.py --config scripts/vsr_eval/vsr_eval.local.toml
+python scripts/dev/vsr_eval_sweep/run_denoise_sweep.py --config scripts/dev/vsr_eval_sweep/vsr_eval.local.toml
 ```
+
+Without --config, discovery checks the working directory and then the
+sweep directory for `vsr_eval.local.{toml,json}`.
 
 For standalone face scoring, set `[face_eval.variants]` or
 `face_eval.variants_json` in the local config and run:
 
 ```bash
-scripts/vsr_eval/face_yunet_metrics.py --config scripts/vsr_eval/vsr_eval.local.toml
+kinovsr metrics faces --config scripts/dev/vsr_eval_sweep/vsr_eval.local.toml
 ```
 
 ## Weights

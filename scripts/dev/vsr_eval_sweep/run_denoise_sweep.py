@@ -3,7 +3,7 @@
 
 This wraps `scripts/vsr_harness.py` for repeatable local experiments. Checked-in
 logic is generic; machine-specific clips, output roots, and artifact paths live
-in `scripts/vsr_eval/vsr_eval.local.toml`.
+in `scripts/dev/vsr_eval_sweep/vsr_eval.local.toml`.
 """
 from __future__ import annotations
 
@@ -342,7 +342,7 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config", type=Path, help="TOML/JSON config; defaults to scripts/vsr_eval/vsr_eval.local.{toml,json} if present")
+    parser.add_argument("--config", type=Path, help="TOML/JSON config; without it, discovery checks the working directory then scripts/dev/vsr_eval_sweep/ for vsr_eval.local.{toml,json}")
     parser.add_argument("--clips", help="comma-separated subset of sweep.clips labels")
     parser.add_argument("--variants", help="comma-separated subset of sweep.variants names")
     parser.add_argument("--output-root", help="output directory for run logs/videos/summaries")

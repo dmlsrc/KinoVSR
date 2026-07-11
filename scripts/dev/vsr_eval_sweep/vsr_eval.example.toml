@@ -1,4 +1,4 @@
-# Copy to scripts/vsr_eval/vsr_eval.local.toml and adjust paths for your
+# Copy to scripts/dev/vsr_eval_sweep/vsr_eval.local.toml and adjust paths for your
 # machine. Relative paths are resolved from this config file's directory.
 
 [sweep]
