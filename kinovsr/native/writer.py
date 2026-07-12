@@ -19,7 +19,15 @@ from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media import yuv as _yuv
 from kinovsr.media.audio import AudioTrack, audio_writer_settings
 
-from .compat import CoreMedia, Foundation, Quartz, av, libdispatch, require_pyobjc
+from .compat import (
+    CoreMedia,
+    Foundation,
+    Quartz,
+    autorelease_pool,
+    av,
+    libdispatch,
+    require_pyobjc,
+)
 
 # HEVC profile identifiers (Apple-stable strings; not exposed as PyObjC consts)
 HEVC_PROFILE_MAIN10 = "HEVC_Main10_AutoLevel"          # 4:2:0 10-bit
@@ -111,6 +119,43 @@ class AVWriter:
         full_range: bool = False,
     ):
         require_pyobjc()
+        # Every AVFoundation-touching phase of a writer's life (construction,
+        # append, finish) leaves autoreleased objects behind that hold the
+        # hardware-encoder session. A long-lived host process without a
+        # draining run loop (the API use case, pytest, the typed pipeline)
+        # never releases them, and after ~32 writers the encoder falls back
+        # to a software capability set without the 4:2:2 profile - writer
+        # creation then fails. Each phase drains its own pool.
+        with autorelease_pool():
+            self._construct(
+                output_path, width, height, fps,
+                source_pixel_format=source_pixel_format, profile=profile,
+                quality=quality, label=label, audio_track=audio_track,
+                audio_codec=audio_codec, transform=transform,
+                source_attrs=source_attrs, color_props=color_props,
+                pixel_aspect=pixel_aspect, cv_color=cv_color,
+                full_range=full_range)
+
+    def _construct(
+        self,
+        output_path: Path,
+        width: int,
+        height: int,
+        fps: float,
+        *,
+        source_pixel_format: int,
+        profile: str,
+        quality: float,
+        label: str,
+        audio_track: AudioTrack | None,
+        audio_codec: str,
+        transform: Any,
+        source_attrs: dict | None,
+        color_props: dict | None,
+        pixel_aspect: tuple[int, int] | None,
+        cv_color: tuple | None,
+        full_range: bool,
+    ) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists():
             output_path.unlink()
@@ -293,46 +338,48 @@ class AVWriter:
         instead - the index grid quantizes NTSC-family rates to a fixed
         per-frame duration, which drifts ~3.6 s/hour at 59.94 fps
         against the exact rational grid."""
-        self._wait_for_ready(self.video_input, "video")
-        if self._yuv_feed:
-            rgb = _pb.read_rgbahalf_rgb(pb)
-            ybuf = _pb.pool_create_buffer(self.adaptor.pixelBufferPool())
-            if ybuf is None:
-                raise RuntimeError(f"[{self.label}] YUV pool buffer allocation failed")
-            _yuv.rgb_to_yuv422_10(rgb, ybuf, self._yuv_matrix, self._yuv_full)
-            pb = ybuf
-        if pts_ticks is None:
-            pts = _pb.frame_pts(self.frame_count, self.fps)
-        else:
-            pts = CoreMedia.CMTimeMake(int(pts_ticks), _pb.VIDEO_TIME_SCALE)
-            if duration_ticks is not None:
-                self._explicit_end_ticks = int(pts_ticks) + int(duration_ticks)
-        if not self.adaptor.appendPixelBuffer_withPresentationTime_(pb, pts):
-            raise RuntimeError(
-                f"[{self.label}] appendPixelBuffer failed at frame {self.frame_count}: "
-                f"status={self.writer.status()} error={self.writer.error()}"
-            )
-        self.frame_count += 1
+        with autorelease_pool():
+            self._wait_for_ready(self.video_input, "video")
+            if self._yuv_feed:
+                rgb = _pb.read_rgbahalf_rgb(pb)
+                ybuf = _pb.pool_create_buffer(self.adaptor.pixelBufferPool())
+                if ybuf is None:
+                    raise RuntimeError(f"[{self.label}] YUV pool buffer allocation failed")
+                _yuv.rgb_to_yuv422_10(rgb, ybuf, self._yuv_matrix, self._yuv_full)
+                pb = ybuf
+            if pts_ticks is None:
+                pts = _pb.frame_pts(self.frame_count, self.fps)
+            else:
+                pts = CoreMedia.CMTimeMake(int(pts_ticks), _pb.VIDEO_TIME_SCALE)
+                if duration_ticks is not None:
+                    self._explicit_end_ticks = int(pts_ticks) + int(duration_ticks)
+            if not self.adaptor.appendPixelBuffer_withPresentationTime_(pb, pts):
+                raise RuntimeError(
+                    f"[{self.label}] appendPixelBuffer failed at frame {self.frame_count}: "
+                    f"status={self.writer.status()} error={self.writer.error()}"
+                )
+            self.frame_count += 1
 
     def finish(self) -> None:
         """Mark inputs finished, drain audio, end session, finishWriting."""
-        self.video_input.markAsFinished()
-        if self.audio_input is not None and not self._audio_done.wait(timeout=120.0):
-            raise RuntimeError(
-                f"[{self.label}] audio pump didn't finish (progress="
-                f"{self._audio_progress[0]}/{self.audio_track.n_samples})"
-            )
-        if self._explicit_end_ticks is not None:
-            end = CoreMedia.CMTimeMake(self._explicit_end_ticks,
-                                       _pb.VIDEO_TIME_SCALE)
-        else:
-            end = _pb.frame_pts(self.frame_count, self.fps)
-        self.writer.endSessionAtSourceTime_(end)
-        done = threading.Event()
-        self.writer.finishWritingWithCompletionHandler_(lambda: done.set())
-        done.wait()
-        if self.writer.status() != 2:  # AVAssetWriterStatusCompleted = 2
-            raise RuntimeError(
-                f"[{self.label}] AVAssetWriter finished with status "
-                f"{self.writer.status()}: {self.writer.error()}"
-            )
+        with autorelease_pool():
+            self.video_input.markAsFinished()
+            if self.audio_input is not None and not self._audio_done.wait(timeout=120.0):
+                raise RuntimeError(
+                    f"[{self.label}] audio pump didn't finish (progress="
+                    f"{self._audio_progress[0]}/{self.audio_track.n_samples})"
+                )
+            if self._explicit_end_ticks is not None:
+                end = CoreMedia.CMTimeMake(self._explicit_end_ticks,
+                                           _pb.VIDEO_TIME_SCALE)
+            else:
+                end = _pb.frame_pts(self.frame_count, self.fps)
+            self.writer.endSessionAtSourceTime_(end)
+            done = threading.Event()
+            self.writer.finishWritingWithCompletionHandler_(lambda: done.set())
+            done.wait()
+            if self.writer.status() != 2:  # AVAssetWriterStatusCompleted = 2
+                raise RuntimeError(
+                    f"[{self.label}] AVAssetWriter finished with status "
+                    f"{self.writer.status()}: {self.writer.error()}"
+                )
