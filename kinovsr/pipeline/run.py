@@ -363,13 +363,21 @@ class FileSink:
         """Abandon the run: release the writer and delete the partial temp
         file WITHOUT publishing, leaving any pre-existing output untouched.
         Safe to call after a failure at any point, and a no-op once finish()
-        has already published."""
+        has already published.
+
+        Cleanup is BaseException-safe and never raises: the temp is unlinked
+        in a ``finally`` even if the writer finalization is interrupted
+        (KeyboardInterrupt/SystemExit), and discard swallows that interrupt so
+        it cannot mask the original processing failure the caller re-raises."""
         if self._published:
             return
-        with contextlib.suppress(Exception):
+        try:
             self.writer.finish()
-        with contextlib.suppress(Exception):
-            self._temp_path.unlink()
+        except BaseException:  # noqa: BLE001 - best-effort; must not mask the original
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                self._temp_path.unlink()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

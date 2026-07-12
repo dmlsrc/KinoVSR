@@ -297,6 +297,7 @@ def build_processors(
     already-built instance is closed before the original error propagates,
     so a failing chain never leaks native sessions or weights."""
     built: list[tuple[ResolvedStage, Processor]] = []
+    to_raise: BaseException | None = None
     try:
         for stage in plan.stages:
             stage_context = context.for_stage(stage.name)
@@ -304,7 +305,7 @@ def build_processors(
                 (stage,
                  stage.factory.build(stage.config, context=stage_context)))
     except BaseException as build_error:
-        interrupt: BaseException | None = None
+        interrupts: list[BaseException] = []
         close_errors: list[BaseException] = []
         for stage, processor in built:
             try:
@@ -313,17 +314,21 @@ def build_processors(
                 # Ordinary close failures lose to the build error but ride its
                 # context chain so a leaked-resource failure is still visible.
                 close_errors.append(_wrap_stage_error(stage, exc))
-            except BaseException as exc:
-                # KeyboardInterrupt/SystemExit during cleanup: finish
-                # closing the remaining stages first, then deliver it
-                # (chained onto the build error).
-                if interrupt is None:
-                    interrupt = exc
-        if interrupt is not None:
-            _append_context(interrupt, close_errors)
-            raise interrupt from build_error
-        _append_context(build_error, close_errors)
-        raise
+            except BaseException as exc:  # noqa: BLE001 - collected like _close_all
+                # KeyboardInterrupt/SystemExit during rollback: keep closing
+                # the remaining stages, then deliver EVERY one (first wins).
+                interrupts.append(exc)
+        if interrupts:
+            to_raise = interrupts[0]
+            _append_context(
+                to_raise, [build_error, *close_errors, *interrupts[1:]])
+        else:
+            _append_context(build_error, close_errors)
+            to_raise = build_error
+    # Raise OUTSIDE the except so Python does not clobber the winner's
+    # __context__ chain with the build error just handled.
+    if to_raise is not None:
+        raise to_raise
     return tuple(built)
 
 

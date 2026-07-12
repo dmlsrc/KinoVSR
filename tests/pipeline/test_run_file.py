@@ -333,6 +333,27 @@ def test_rename_failure_leaves_no_orphan_temp(clip, tmp_path):
     assert not list(tmp_path.glob(".out.mp4.*"))   # no partial temp left
 
 
+def test_discard_unlinks_temp_even_if_finalize_is_interrupted(tmp_path):
+    """discard() must remove its partial temp even if writer finalization
+    raises a BaseException (interrupt), and must not itself raise - so it
+    cannot mask the original failure the caller re-raises (re-review #3)."""
+    from kinovsr.pipeline.run import FileSink
+
+    temp = tmp_path / ".out.mp4.partial"
+    temp.write_bytes(b"partial encode")
+    sink = FileSink.__new__(FileSink)   # bypass the heavy native __init__
+    sink._published = False
+    sink._temp_path = temp
+
+    class _InterruptingWriter:
+        def finish(self):
+            raise KeyboardInterrupt("during-discard")
+
+    sink.writer = _InterruptingWriter()
+    sink.discard()                       # must not raise
+    assert not temp.exists()             # temp cleaned despite the interrupt
+
+
 _FBCNN_WEIGHTS = Path(
     "kinovsr/processors/fbcnn/weights/fbcnn_color.safetensors")
 _NAFNET_WEIGHTS = Path(
