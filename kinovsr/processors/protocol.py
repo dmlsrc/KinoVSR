@@ -126,7 +126,9 @@ class BracketFactory(Protocol):
     calls ``build_bracket`` instead of ``build`` and gets back both halves
     at once, so they can share state (a PTS-keyed capture buffer). The
     builder places ``pre`` at the stage's declared position and ``post`` at
-    the chain end. A family only implements this when one of its
+    the last point the stream stays in the pre-pass's layout (for the
+    MLX-domain restore, before any native-CV stage; the chain end if all
+    stages keep that layout). A family only implements this when one of its
     capabilities declares a companion.
     """
 

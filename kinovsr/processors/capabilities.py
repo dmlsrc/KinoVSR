@@ -59,14 +59,17 @@ def preserve_stream(spec: StreamSpec, config: object = None) -> StreamSpec:
 class CompanionSpec:
     """A paired post-processor the builder appends at the chain end.
 
-    Some stages bracket the whole chain: they run a pre-pass at their
-    declared position and a matching post-pass at output geometry (edge
-    sanitize's restore composites the ORIGINAL border back over the
-    processed frame). The pre-stage declares this companion; the builder
-    resolves it as a synthetic stage at the very end and builds the two
-    halves together (``ProcessorFactory.build_bracket``) so they can share
-    state - typically a frame buffer keyed by PTS, which pairs a post-pass
-    output with the pre-pass input even through a windowed stage's delay.
+    Some stages bracket the chain: they run a pre-pass at their declared
+    position and a matching post-pass later (edge sanitize's restore
+    composites the ORIGINAL border back over the processed frame). The
+    pre-stage declares this companion; the builder resolves it as a
+    synthetic stage placed at the last point the stream is still in the
+    pre-pass's layout - for the MLX-domain sanitize that is the last MLX
+    frame before any native-CV stage, or the chain end when every stage
+    stays MLX - and builds the two halves together
+    (``BracketFactory.build_bracket``) so they can share state, typically a
+    frame buffer keyed by PTS, which pairs a post-pass output with the
+    pre-pass input even through a windowed stage's delay.
 
     ``accepts``/``produces`` are the companion's own stream contract at the
     chain end; ``produces`` is usually identity (the post-pass rewrites
@@ -111,10 +114,11 @@ class CapabilitySpec:
     # Boundary kinds this stage is INCORRECT without (not merely improved
     # by). The builder rejects a chain where no upstream provider exists.
     requires_boundaries: tuple[BoundaryKind, ...] = ()
-    # Given this stage's parsed config, return a CompanionSpec to append a
-    # paired post-stage at the chain end, or None (the default) for stages
-    # that do not bracket the chain. Config-driven so one capability can be
-    # a plain pre-pass or a bracket depending on its settings.
+    # Given this stage's parsed config, return a CompanionSpec to place a
+    # paired post-stage later in the chain (at the last layout-compatible
+    # point), or None (the default) for stages that do not bracket the
+    # chain. Config-driven so one capability can be a plain pre-pass or a
+    # bracket depending on its settings.
     companion: Callable[[object], CompanionSpec | None] = _no_companion
 
 

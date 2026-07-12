@@ -16,7 +16,7 @@ Resolution is pure: it reads values and returns values (the effectful
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from kinovsr.config import validate_config
@@ -29,6 +29,7 @@ from kinovsr.processors import (
     Cardinality,
     CompanionSpec,
     FieldViolation,
+    Layout,
     PipelineContext,
     PipelineError,
     PipelineRuntimeError,
@@ -234,35 +235,51 @@ def resolve_pipeline(
         current = produced
         upstream = stage_name
 
-    # Append each bracketing stage's companion post-pass at the chain end,
-    # threaded from the final spec. The post-pass pairs its output back to
-    # the pre-pass input by PTS, which only holds on a 1:1 timeline, so a
-    # cardinality-changing chain (interpolation) is rejected here.
+    # Place each bracketing stage's companion post-pass at the last point its
+    # payload is still MLX: right before the first stage that produces a
+    # non-MLX (native CV) frame, or at the chain end when every stage stays
+    # MLX. That mirrors the inherited harness, which composites restore on
+    # the last MLX frame before a native upscale - the companion's MLX
+    # compute cannot run on a CV buffer, and restore_borders wants whatever
+    # (possibly upscaled) geometry the chain produced up to that point. The
+    # post-pass is identity on the stream, so splicing it in changes no
+    # downstream spec. It pairs its output back to the pre-pass input by PTS,
+    # which only holds on a 1:1 timeline, so a cardinality change upstream of
+    # the placement point (nothing to pair against) is rejected there.
     for pre_stage, companion in companions:
-        if current.timeline.cardinality is not Cardinality.ONE_TO_ONE:
+        insert_at = next(
+            (i for i, s in enumerate(stages)
+             if s.output_spec.frame.layout is not Layout.MLX_RGB_HWC),
+            len(stages))
+        boundary = (stages[insert_at].input_spec if insert_at < len(stages)
+                    else current)
+        post_name = f"{pre_stage.name}:post"
+        up_name = stages[insert_at - 1].name if insert_at > 0 else INPUT_ENDPOINT
+        if boundary.timeline.cardinality is not Cardinality.ONE_TO_ONE:
             raise StreamEdgeError(
-                upstream, f"{pre_stage.name}:post",
+                up_name, post_name,
                 (FieldViolation(
                     "timeline.cardinality", Cardinality.ONE_TO_ONE.value,
-                    current.timeline.cardinality.value),),
-                produced=current)
-        violations = companion.accepts.violations(current)
+                    boundary.timeline.cardinality.value),),
+                produced=boundary)
+        violations = companion.accepts.violations(boundary)
         if violations:
-            raise StreamEdgeError(upstream, f"{pre_stage.name}:post",
-                                  violations, produced=current)
-        produced = companion.produces(current, pre_stage.config)
-        stages.append(ResolvedStage(
-            name=f"{pre_stage.name}:post", position=len(stages),
+            raise StreamEdgeError(up_name, post_name, violations,
+                                  produced=boundary)
+        stages.insert(insert_at, ResolvedStage(
+            name=post_name, position=insert_at,
             family=pre_stage.family, factory=pre_stage.factory,
             capability=pre_stage.capability,
             capability_spec=CapabilitySpec(
                 capability=pre_stage.capability, profiles=(),
                 accepts=companion.accepts, produces=companion.produces),
             profile=pre_stage.profile, config=pre_stage.config,
-            input_spec=current, output_spec=produced,
+            input_spec=boundary,
+            output_spec=companion.produces(boundary, pre_stage.config),
             companion_of=pre_stage.name))
-        current = produced
-        upstream = f"{pre_stage.name}:post"
+    # Renumber to the final list order after any splices (position is
+    # informational, but keep it contiguous).
+    stages = [replace(s, position=i) for i, s in enumerate(stages)]
 
     broken = coherence_violations(current)
     if broken:

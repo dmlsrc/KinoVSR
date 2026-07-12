@@ -7,14 +7,17 @@ rows, stabilization edges). The replicated content reaches the output;
 geometry is untouched.
 
 ``fill = "restore"``: the nets still see the extended frame, but the
-ORIGINAL border is composited back over the processed output at output
-geometry, feathered into the content - the border stays exactly as
-quiet/static/dark as the source. This BRACKETS the chain: the extend
-pre-pass captures each original frame, and a companion post-pass that the
-builder appends at the chain end restores it (planning 05's companion
-mechanism). The two halves share a PTS-keyed buffer, so a windowed stage's
-delay does not desynchronize them; ``restore_borders`` nearest-upscales the
-captured band to whatever geometry the chain produced.
+ORIGINAL border is composited back over the processed output, feathered
+into the content - the border stays exactly as quiet/static/dark as the
+source. This BRACKETS the chain: the extend pre-pass captures each original
+frame, and a companion post-pass restores it (planning 05's companion
+mechanism). Because the composite runs in MLX, the builder places the
+companion at the last MLX point - after the learned/native-MLX upscalers
+but before any native-CV stage, or the chain end when every stage stays
+MLX - which is exactly where the inherited harness restores. The two halves
+share a PTS-keyed buffer, so a windowed stage's delay does not desynchronize
+them; ``restore_borders`` nearest-upscales the captured band to whatever
+geometry the chain produced up to that point.
 
 The bands are declared, not detected - junk DETECTION is probe-time, like
 crop's bar detection. ``trim`` (crop the junk off) is the crop family's
