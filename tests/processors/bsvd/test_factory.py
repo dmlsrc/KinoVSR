@@ -113,3 +113,25 @@ class TestStreaming:
                    if any(b.kind is BoundaryKind.HARD_CUT
                           for b in u.boundaries)]
         assert flagged == [3 * 960]
+
+    def test_luma_chroma_split_reweights_the_output(self):
+        # End to end through the real scheduler and denoiser: the same input
+        # frames run with and without the split must stay frame-aligned but
+        # differ, since keeping most of the original luma (luma_strength=0.2)
+        # is exactly what a single joint sigma cannot do.
+        import mlx.core as mx
+
+        units = [
+            FrameUnit(
+                payload=mx.random.uniform(shape=(48, 64, 3)).astype(mx.float32)
+                * 0.5 + 0.25,
+                pts=i * 960, duration=960)
+            for i in range(5)]
+        full = self.run(list(units))
+        split = self.run(
+            list(units),
+            config={"luma_strength": 0.2, "chroma_strength": 1.0})
+        assert [u.pts for u in full] == [u.pts for u in split]
+        deltas = [float(mx.max(mx.abs(f.payload - s.payload)).item())
+                  for f, s in zip(full, split, strict=True)]
+        assert max(deltas) > 1e-3

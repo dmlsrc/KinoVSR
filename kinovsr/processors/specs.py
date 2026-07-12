@@ -68,6 +68,21 @@ class ColorMatrix(Enum):
     BT2020 = "bt2020"
 
 
+# ITU-R (Kr, Kb) luma coefficients per stream color matrix. The single
+# source of truth for families that split RGB into luma/chroma from the
+# input StreamSpec (stdf's Y-only deblock, the denoise luma/chroma blend).
+_LUMA_COEFFICIENTS: dict[ColorMatrix, tuple[float, float]] = {
+    ColorMatrix.BT601: (0.299, 0.114),
+    ColorMatrix.BT709: (0.2126, 0.0722),
+    ColorMatrix.BT2020: (0.2627, 0.0593),
+}
+
+
+def luma_coefficients(color_matrix: ColorMatrix) -> tuple[float, float]:
+    """ITU-R (Kr, Kb) luma coefficients for a stream color matrix."""
+    return _LUMA_COEFFICIENTS[color_matrix]
+
+
 class ColorPrimaries(Enum):
     SMPTE_C = "smpte_c"    # NTSC 601 primaries
     BT709 = "bt709"
@@ -348,4 +363,5 @@ __all__ = [
     "coherence_violations",
     "describe_spec",
     "frame_spec_for_matrix",
+    "luma_coefficients",
 ]

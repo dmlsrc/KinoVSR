@@ -39,6 +39,36 @@ def coef_for_matrix(matrix: Any) -> tuple[float, float]:
     return 0.299, 0.114  # ITU-R BT.601
 
 
+def luma_chroma_blend(orig: Any, new: Any, a_luma: float, a_chroma: float,
+                      kr: float = 0.299, kb: float = 0.114) -> Any:
+    """Recombine `orig` and `new` (both (H,W,3) RGB in [0,1]) with separate blend
+    strengths for luma and chroma: the output luma is lerp(orig, new, a_luma) and the
+    chroma is lerp(orig, new, a_chroma). a=1 takes the new (denoised) value, a=0 keeps the
+    original; a_luma=a_chroma=1 returns `new` exactly. (kr, kb) are the ITU-R luma
+    coefficients (default BT.601); pass the source matrix's so the split matches the clip's
+    color space -- though they only affect the result when a_luma != a_chroma (otherwise
+    the YCbCr basis cancels out of the lerp). Computed in float32 -- the chroma-scale
+    divisions coarsen in fp16."""
+    kg = 1.0 - kr - kb
+    cb_s, cr_s = 2.0 * (1.0 - kb), 2.0 * (1.0 - kr)
+    o = orig.astype(mx.float32)
+    n = new.astype(mx.float32)
+
+    def _yc(x):
+        y = kr * x[..., 0:1] + kg * x[..., 1:2] + kb * x[..., 2:3]
+        return y, (x[..., 2:3] - y) / cb_s, (x[..., 0:1] - y) / cr_s     # y, cb, cr
+
+    yo, cbo, cro = _yc(o)
+    yn, cbn, crn = _yc(n)
+    y = yo + a_luma * (yn - yo)
+    cb = cbo + a_chroma * (cbn - cbo)
+    cr = cro + a_chroma * (crn - cro)
+    r = y + cr_s * cr
+    b = y + cb_s * cb
+    g = (y - kr * r - kb * b) / kg
+    return mx.clip(mx.concatenate([r, g, b], axis=-1), 0.0, 1.0)
+
+
 def pixel_format(full_range: bool) -> int:
     return PIX_422YCBCR10_FULL if full_range else PIX_422YCBCR10_VIDEO
 

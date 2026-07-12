@@ -18,7 +18,11 @@ from kinovsr.processors.capabilities import (
     CapabilitySpec,
     TemporalMode,
 )
-from kinovsr.processors.feed_driver import FeedFlushProcessor
+from kinovsr.processors.feed_driver import (
+    LUMA_CHROMA_KEYS,
+    FeedFlushProcessor,
+    parse_luma_chroma,
+)
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
     Domain,
@@ -36,6 +40,8 @@ class FastDvdStageConfig:
     weights_path: str | None
     variant: str
     strength: float
+    luma_strength: float
+    chroma_strength: float
 
 
 class FastDvdFactory:
@@ -64,15 +70,18 @@ class FastDvdFactory:
         profile: str | None,
         settings: Settings,
     ) -> FastDvdStageConfig:
-        reject_unknown_keys(raw, ("weights", "strength"))
+        reject_unknown_keys(raw, ("weights", "strength", *LUMA_CHROMA_KEYS))
         strength = typed_value(raw, "strength", float, 0.5)
         if not 0.0 <= strength <= 1.0:
             raise ValueError("strength must be in [0, 1]")
+        luma_strength, chroma_strength = parse_luma_chroma(raw)
         return FastDvdStageConfig(
             weights_path=typed_value(raw, "weights", str)
             or settings.fastdvdnet_weights,
             variant=profile or "clipped",
             strength=strength,
+            luma_strength=luma_strength,
+            chroma_strength=chroma_strength,
         )
 
     def build(self, config: FastDvdStageConfig, *,
@@ -85,7 +94,10 @@ class FastDvdFactory:
                 variant=config.variant,
                 strength=config.strength)
 
-        return FeedFlushProcessor(make_driver)
+        return FeedFlushProcessor(
+            make_driver,
+            luma_strength=config.luma_strength,
+            chroma_strength=config.chroma_strength)
 
 
 FACTORY = FastDvdFactory()

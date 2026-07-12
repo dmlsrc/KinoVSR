@@ -20,7 +20,11 @@ from kinovsr.processors.capabilities import (
     CapabilitySpec,
     TemporalMode,
 )
-from kinovsr.processors.feed_driver import FeedFlushProcessor
+from kinovsr.processors.feed_driver import (
+    LUMA_CHROMA_KEYS,
+    FeedFlushProcessor,
+    parse_luma_chroma,
+)
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
     Domain,
@@ -46,6 +50,8 @@ class PvddStageConfig:
     trim: int
     noise_variance: float | None
     dtype: str
+    luma_strength: float
+    chroma_strength: float
 
 
 class PvddFactory:
@@ -76,7 +82,7 @@ class PvddFactory:
     ) -> PvddStageConfig:
         reject_unknown_keys(
             raw, ("weights", "window", "trim", "noise_preset",
-                  "noise_variance", "dtype"))
+                  "noise_variance", "dtype", *LUMA_CHROMA_KEYS))
         window = typed_value(raw, "window", int, 10)
         if window < 2:
             raise ValueError("window must be >= 2")
@@ -94,6 +100,7 @@ class PvddFactory:
             from . import LEVEL_PRESETS
 
             noise_variance = LEVEL_PRESETS[preset]
+        luma_strength, chroma_strength = parse_luma_chroma(raw)
         return PvddStageConfig(
             weights_path=typed_value(raw, "weights", str)
             or settings.pvdd_weights,
@@ -102,6 +109,8 @@ class PvddFactory:
             trim=trim,
             noise_variance=noise_variance,
             dtype=dtype,
+            luma_strength=luma_strength,
+            chroma_strength=chroma_strength,
         )
 
     def build(self, config: PvddStageConfig, *,
@@ -120,7 +129,10 @@ class PvddFactory:
                 noise_variance=config.noise_variance,
                 dtype=dtype)
 
-        return FeedFlushProcessor(make_driver)
+        return FeedFlushProcessor(
+            make_driver,
+            luma_strength=config.luma_strength,
+            chroma_strength=config.chroma_strength)
 
 
 FACTORY = PvddFactory()

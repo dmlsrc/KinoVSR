@@ -325,3 +325,56 @@ class TestOpenTimeValidation:
                  "up": {"processor": "realviformer", "profile": "x4",
                         "flow": "zero"}},
                 tiny, settings=SETTINGS)
+
+
+# Every family reachable in the --denoise slot carries the shared
+# luma/chroma split keys (planning 07); the harness's LumaChromaDenoiser
+# wrapping is now typed stage config threaded through FeedFlushProcessor.
+DENOISE_FAMILIES = ("bsvd", "fastdvdnet", "pvdd", "toflow", "mc", "spatial")
+
+
+class TestLumaChromaKeys:
+    @pytest.mark.parametrize("family", DENOISE_FAMILIES)
+    def test_denoise_families_accept_the_split_keys(self, family):
+        config = get_factory(family).parse_config(
+            {"luma_strength": 0.4, "chroma_strength": 0.9},
+            capability=Capability.DENOISE, profile=None, settings=SETTINGS)
+        assert config.luma_strength == 0.4
+        assert config.chroma_strength == 0.9
+
+    @pytest.mark.parametrize("family", DENOISE_FAMILIES)
+    def test_default_is_full_effect(self, family):
+        config = get_factory(family).parse_config(
+            {}, capability=Capability.DENOISE, profile=None, settings=SETTINGS)
+        assert (config.luma_strength, config.chroma_strength) == (1.0, 1.0)
+
+    def test_overdrive_is_not_clamped(self):
+        # The CLI documents >1 over-drive, so parsing must not range-limit.
+        config = get_factory("bsvd").parse_config(
+            {"luma_strength": 1.5}, capability=Capability.DENOISE,
+            profile=None, settings=SETTINGS)
+        assert config.luma_strength == 1.5
+
+    @pytest.mark.parametrize("family", DENOISE_FAMILIES)
+    def test_build_threads_strengths_into_the_adapter(self, family):
+        # The stage-table -> parse -> build path lands the strengths on the
+        # FeedFlushProcessor that owns the recombination (no weights loaded).
+        from kinovsr.processors import PipelineContext
+
+        factory = get_factory(family)
+        config = factory.parse_config(
+            {"luma_strength": 0.4, "chroma_strength": 0.9},
+            capability=Capability.DENOISE, profile=None, settings=SETTINGS)
+        processor = factory.build(config, context=PipelineContext(SETTINGS))
+        assert processor._luma_strength == 0.4
+        assert processor._chroma_strength == 0.9
+
+    def test_toflow_non_denoise_capabilities_reject_the_keys(self):
+        # The split is a denoise-slot dial; toflow's deblock/upscale graphs
+        # do not accept it.
+        factory = get_factory("toflow")
+        for capability in (Capability.DEBLOCK, Capability.UPSCALE):
+            with pytest.raises(ValueError, match="unknown"):
+                factory.parse_config(
+                    {"luma_strength": 0.5}, capability=capability,
+                    profile=None, settings=SETTINGS)

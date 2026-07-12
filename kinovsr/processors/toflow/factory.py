@@ -20,7 +20,11 @@ from kinovsr.processors.capabilities import (
     CapabilitySpec,
     TemporalMode,
 )
-from kinovsr.processors.feed_driver import FeedFlushProcessor
+from kinovsr.processors.feed_driver import (
+    LUMA_CHROMA_KEYS,
+    FeedFlushProcessor,
+    parse_luma_chroma,
+)
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
     Domain,
@@ -51,6 +55,8 @@ class ToflowStageConfig:
     passes: int
     flow_scale: str
     dtype: str
+    luma_strength: float
+    chroma_strength: float
 
 
 def _produces_sr(spec: StreamSpec, config: object) -> StreamSpec:
@@ -99,6 +105,9 @@ class ToflowFactory:
         profile: str | None,
         settings: Settings,
     ) -> ToflowStageConfig:
+        # The luma/chroma split is a denoise-slot dial; it applies only to
+        # toflow's denoise capability, not its deblock or upscale graphs.
+        luma_strength = chroma_strength = 1.0
         if capability is Capability.UPSCALE:
             reject_unknown_keys(raw, ("weights", "graph", "dtype"))
             weights = (typed_value(raw, "weights", str)
@@ -107,9 +116,11 @@ class ToflowFactory:
             strength, passes, flow_scale = 1.0, 1, "full"
             dtype = typed_value(raw, "dtype", str, "float32")
         else:
-            reject_unknown_keys(
-                raw, ("weights", "graph", "strength", "passes", "flow_scale",
-                      "dtype"))
+            allowed = ("weights", "graph", "strength", "passes", "flow_scale",
+                       "dtype")
+            if capability is Capability.DENOISE:
+                allowed = (*allowed, *LUMA_CHROMA_KEYS)
+            reject_unknown_keys(raw, allowed)
             weights = (typed_value(raw, "weights", str)
                        or settings.toflow_weights)
             graph = typed_value(raw, "graph", str) or settings.toflow_graph
@@ -123,6 +134,8 @@ class ToflowFactory:
             if flow_scale not in _FLOW_SCALES:
                 raise ValueError(f"flow_scale must be one of {_FLOW_SCALES}")
             dtype = typed_value(raw, "dtype", str, "float32")
+            if capability is Capability.DENOISE:
+                luma_strength, chroma_strength = parse_luma_chroma(raw)
         if dtype not in _DTYPES:
             raise ValueError(f"dtype must be one of {sorted(_DTYPES)}")
         return ToflowStageConfig(
@@ -133,6 +146,8 @@ class ToflowFactory:
             passes=passes,
             flow_scale=flow_scale,
             dtype=dtype,
+            luma_strength=luma_strength,
+            chroma_strength=chroma_strength,
         )
 
     def build(self, config: ToflowStageConfig, *,
@@ -159,7 +174,10 @@ class ToflowFactory:
                 strength=config.strength,
                 dtype=dtype)
 
-        return FeedFlushProcessor(make_driver)
+        return FeedFlushProcessor(
+            make_driver,
+            luma_strength=config.luma_strength,
+            chroma_strength=config.chroma_strength)
 
 
 FACTORY = ToflowFactory()

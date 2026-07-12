@@ -19,7 +19,11 @@ from kinovsr.processors.capabilities import (
     CapabilitySpec,
     TemporalMode,
 )
-from kinovsr.processors.feed_driver import FeedFlushProcessor
+from kinovsr.processors.feed_driver import (
+    LUMA_CHROMA_KEYS,
+    FeedFlushProcessor,
+    parse_luma_chroma,
+)
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
     Domain,
@@ -39,6 +43,8 @@ class BsvdStageConfig:
     variant: str
     strength: float
     dtype: str
+    luma_strength: float
+    chroma_strength: float
 
 
 class BsvdFactory:
@@ -69,19 +75,22 @@ class BsvdFactory:
         profile: str | None,
         settings: Settings,
     ) -> BsvdStageConfig:
-        reject_unknown_keys(raw, ("weights", "strength", "dtype"))
+        reject_unknown_keys(raw, ("weights", "strength", "dtype", *LUMA_CHROMA_KEYS))
         strength = typed_value(raw, "strength", float, 0.5)
         if not 0.0 <= strength <= 1.0:
             raise ValueError("strength must be in [0, 1]")
         dtype = typed_value(raw, "dtype", str, "float16")
         if dtype not in _DTYPES:
             raise ValueError(f"dtype must be one of {sorted(_DTYPES)}")
+        luma_strength, chroma_strength = parse_luma_chroma(raw)
         return BsvdStageConfig(
             weights_path=typed_value(raw, "weights", str)
             or settings.bsvd_weights,
             variant=profile or "c64",
             strength=strength,
             dtype=dtype,
+            luma_strength=luma_strength,
+            chroma_strength=chroma_strength,
         )
 
     def build(self, config: BsvdStageConfig, *,
@@ -96,7 +105,10 @@ class BsvdFactory:
                 config.weights_path, variant=config.variant,
                 strength=config.strength, dtype=dtype)
 
-        return FeedFlushProcessor(make_driver)
+        return FeedFlushProcessor(
+            make_driver,
+            luma_strength=config.luma_strength,
+            chroma_strength=config.chroma_strength)
 
 
 FACTORY = BsvdFactory()

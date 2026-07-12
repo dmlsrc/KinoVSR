@@ -26,7 +26,11 @@ from kinovsr.processors.capabilities import (
     CapabilitySpec,
     TemporalMode,
 )
-from kinovsr.processors.feed_driver import FeedFlushProcessor
+from kinovsr.processors.feed_driver import (
+    LUMA_CHROMA_KEYS,
+    FeedFlushProcessor,
+    parse_luma_chroma,
+)
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
     Domain,
@@ -560,6 +564,8 @@ class McStageConfig:
     confidence: bool
     flow: str
     flow_weights: str | None
+    luma_strength: float = 1.0
+    chroma_strength: float = 1.0
 
 
 def _passthrough(spec: StreamSpec, config: object) -> StreamSpec:
@@ -635,7 +641,8 @@ class McFactory:
     ) -> McStageConfig:
         reject_unknown_keys(
             raw, ("strength", "window", "sigma", "gate", "clamp",
-                  "occlusion", "confidence", "flow", "flow_weights"))
+                  "occlusion", "confidence", "flow", "flow_weights",
+                  *LUMA_CHROMA_KEYS))
         strength = typed_value(raw, "strength", float, 0.5)
         if not 0.0 <= strength <= 1.0:
             raise ValueError("strength must be in [0, 1]")
@@ -651,6 +658,7 @@ class McFactory:
         flow = typed_value(raw, "flow", str, "vt")
         if flow not in _FLOW_ENGINES:
             raise ValueError(f"flow must be one of {_FLOW_ENGINES}")
+        luma_strength, chroma_strength = parse_luma_chroma(raw)
         return McStageConfig(
             strength=strength, window=window, sigma=sigma, gate=gate,
             clamp=typed_value(raw, "clamp", bool, False),
@@ -658,11 +666,16 @@ class McFactory:
             confidence=typed_value(raw, "confidence", bool, False),
             flow=flow,
             flow_weights=(typed_value(raw, "flow_weights", str)
-                          or settings.spynet_weights))
+                          or settings.spynet_weights),
+            luma_strength=luma_strength,
+            chroma_strength=chroma_strength)
 
     def build(self, config: McStageConfig, *,
               context: PipelineContext) -> FeedFlushProcessor:
-        return FeedFlushProcessor(lambda: _McDriver(config))
+        return FeedFlushProcessor(
+            lambda: _McDriver(config),
+            luma_strength=config.luma_strength,
+            chroma_strength=config.chroma_strength)
 
 
 FACTORY = McFactory()

@@ -21,23 +21,16 @@ from kinovsr.processors.capabilities import (
 from kinovsr.processors.feed_driver import FeedFlushProcessor
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
-    ColorMatrix,
     Domain,
     DType,
     Layout,
     StreamConstraint,
     StreamSpec,
+    luma_coefficients,
 )
 from kinovsr.settings import Settings
 
 _PROFILES = ("mfqev2", "vimeo90k")
-
-# ITU-R (Kr, Kb) luma coefficients per stream color matrix.
-_LUMA_COEF = {
-    ColorMatrix.BT601: (0.299, 0.114),
-    ColorMatrix.BT709: (0.2126, 0.0722),
-    ColorMatrix.BT2020: (0.2627, 0.0593),
-}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -96,7 +89,7 @@ class StdfFactory:
         class _Processor(FeedFlushProcessor):
             def prepare(self, input_spec: StreamSpec,
                         context: PipelineContext) -> None:
-                holder["coef"] = _LUMA_COEF[input_spec.frame.color_matrix]
+                holder["coef"] = luma_coefficients(input_spec.frame.color_matrix)
                 super().prepare(input_spec, context)
 
         return _Processor(make_driver)

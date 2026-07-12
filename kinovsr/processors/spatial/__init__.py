@@ -17,7 +17,11 @@ from kinovsr.config.helpers import reject_unknown_keys, typed_value
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.native.compat import Foundation, Quartz, require_pyobjc
 from kinovsr.processors.capabilities import Capability, CapabilitySpec
-from kinovsr.processors.feed_driver import FeedFlushProcessor
+from kinovsr.processors.feed_driver import (
+    LUMA_CHROMA_KEYS,
+    FeedFlushProcessor,
+    parse_luma_chroma,
+)
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
     Domain,
@@ -78,6 +82,8 @@ class SpatialDenoiser:
 @dataclasses.dataclass(frozen=True, slots=True)
 class SpatialStageConfig:
     strength: float
+    luma_strength: float = 1.0
+    chroma_strength: float = 1.0
 
 
 def _passthrough(spec: StreamSpec, config: object) -> StreamSpec:
@@ -127,15 +133,21 @@ class SpatialFactory:
         profile: str | None,
         settings: Settings,
     ) -> SpatialStageConfig:
-        reject_unknown_keys(raw, ("strength",))
+        reject_unknown_keys(raw, ("strength", *LUMA_CHROMA_KEYS))
         strength = typed_value(raw, "strength", float, 0.5)
         if not 0.0 <= strength <= 1.0:
             raise ValueError("strength must be in [0, 1]")
-        return SpatialStageConfig(strength=strength)
+        luma_strength, chroma_strength = parse_luma_chroma(raw)
+        return SpatialStageConfig(strength=strength,
+                                  luma_strength=luma_strength,
+                                  chroma_strength=chroma_strength)
 
     def build(self, config: SpatialStageConfig, *,
               context: PipelineContext) -> FeedFlushProcessor:
-        return FeedFlushProcessor(lambda: _SpatialDriver(config))
+        return FeedFlushProcessor(
+            lambda: _SpatialDriver(config),
+            luma_strength=config.luma_strength,
+            chroma_strength=config.chroma_strength)
 
 
 FACTORY = SpatialFactory()
