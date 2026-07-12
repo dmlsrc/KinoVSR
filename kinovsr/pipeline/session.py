@@ -77,6 +77,7 @@ class PipelineSession:
         self._context = context
         self._run: ChainRun | None = None
         self._consumed = False
+        self._built: tuple = ()
 
     @property
     def plan(self) -> BuildPlan:
@@ -118,11 +119,29 @@ class PipelineSession:
                 "for the next stream (stage state is never reused)")
         self._consumed = True
         built = build_processors(self._plan, self._context)
+        self._built = built
         run = run_chain(built, units, self._context)
         self._run = run
         if retain_outputs and self._plan.output_spec.frame.layout in _CV_LAYOUTS:
             return _OwnedCvOutputs(run)
         return run
+
+    def stage_diagnostics(self) -> list[str]:
+        """End-of-run diagnostic lines from the stages that ran.
+
+        Each stage may expose ``run_diagnostics() -> list[str]`` (the
+        family owns its own reporting - noise-map stats, gate openness,
+        auto-QF reports - exactly the lines the inherited harness printed
+        at end of run); stages without the hook contribute nothing. Call
+        AFTER draining :meth:`process` and BEFORE the session closes -
+        a closed stage has released the state the report reads.
+        """
+        lines: list[str] = []
+        for _stage, processor in self._built:
+            hook = getattr(processor, "run_diagnostics", None)
+            if callable(hook):
+                lines.extend(hook())
+        return lines
 
     def close(self) -> None:
         """Cancel the active run (if any); safe to call repeatedly."""

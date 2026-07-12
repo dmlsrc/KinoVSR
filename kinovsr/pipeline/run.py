@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import logging
 import os
 import tempfile
 import time
@@ -41,6 +42,8 @@ from kinovsr.processors.specs import (
 )
 from kinovsr.processors.units import FrameUnit
 from kinovsr.settings import Settings
+
+_log = logging.getLogger(__name__)
 
 # Endpoint-supported payload layouts and the CVPixelBuffer format each
 # decodes through. MLX frames ride RGBAHalf so fp16 precision survives
@@ -813,6 +816,10 @@ def run_file(
                 if tee is not None:
                     tee.emit(pending)
                 frames_out += 1
+            # Stage state is still live here (drained, not yet closed):
+            # collect the families' end-of-run reports - the harness's
+            # inline diagnostics, family-owned on the typed path.
+            diagnostics = session.stage_diagnostics()
     except BaseException:
         # The partial output is not a deliverable; drop the temp files and
         # leave any pre-existing files untouched.
@@ -821,6 +828,8 @@ def run_file(
         if tee is not None:
             tee.sink.discard()
         raise
+    for line in diagnostics:
+        _log.info("%s", line)
     path = sink.finish() if sink is not None else None
     comparison_path = tee.sink.finish() if tee is not None else None
     return FileRunResult(

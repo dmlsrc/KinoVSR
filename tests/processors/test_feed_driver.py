@@ -218,3 +218,26 @@ class TestWindowing:
         driver = self._SchedDriver()
         FeedFlushProcessor(lambda: driver).prepare(stream(), CTX)
         assert driver.schedule is None
+
+
+class TestRunDiagnostics:
+    """The end-of-run diagnostics hook: family-owned lines, forwarded by the
+    adapter, collected by the session after the stream drains."""
+
+    class _Reporting(_HalveDelayDriver):
+        def run_diagnostics(self):
+            return ["[fake] processed everything"]
+
+    def test_forwards_the_driver_report(self):
+        proc = FeedFlushProcessor(lambda: self._Reporting(0))
+        run(proc, stream(), [gray_unit(0.4, 0)])
+        assert proc.run_diagnostics() == ["[fake] processed everything"]
+
+    def test_silent_driver_reports_nothing(self):
+        proc = FeedFlushProcessor(lambda: _HalveDelayDriver(0))
+        run(proc, stream(), [gray_unit(0.4, 0)])
+        assert proc.run_diagnostics() == []
+
+    def test_unprepared_processor_reports_nothing(self):
+        assert FeedFlushProcessor(lambda: self._Reporting(0)
+                                  ).run_diagnostics() == []

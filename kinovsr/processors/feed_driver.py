@@ -151,6 +151,13 @@ class FeedFlushProcessor:
                 out = self._blend(token.payload, out)
             yield token.with_payload(out)
 
+    def run_diagnostics(self) -> list[str]:
+        """End-of-run diagnostic lines from the wrapped driver, when the
+        family implements ``run_diagnostics()`` (the session collects
+        these after the stream drains)."""
+        hook = getattr(self._driver, "run_diagnostics", None)
+        return list(hook()) if callable(hook) else []
+
     def close(self, context: PipelineContext) -> None:
         driver, self._driver = self._driver, None
         if driver is not None:
