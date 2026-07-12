@@ -182,9 +182,9 @@ class FileSource:
         the track to [start, end) in seconds, so shortened video never
         ships beside full-length audio.
         """
-        from kinovsr._harness import _read_audio_track_from_video
+        from kinovsr.media.audio import read_audio_track_from_video
 
-        track = _read_audio_track_from_video(self.path, self._vr)
+        track = read_audio_track_from_video(self.path, self._vr)
         if track is None or (self.start, self.end) == (0, self._total):
             return track
         return track.trimmed(self.start / self.source_fps,

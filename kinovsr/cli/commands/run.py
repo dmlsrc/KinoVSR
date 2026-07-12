@@ -127,10 +127,10 @@ def _run_typed(invocation) -> int:
                             style="bold red", markup=False)
         return 2
 
-    from kinovsr._harness import sanitize_output_prefix
     from kinovsr.api import process_video_file, resolve_mlx_cache_limit_gb
     from kinovsr.config import ConfigError
     from kinovsr.media import video_reader as _vr
+    from kinovsr.media.naming import sanitize_output_prefix
     from kinovsr.media.timespec import resolve_trim
     from kinovsr.processors.errors import MediaError, PipelineError
 

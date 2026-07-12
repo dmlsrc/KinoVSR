@@ -54,7 +54,9 @@ from kinovsr.media import color as _color
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media import video_reader as _native_vr
 from kinovsr.media import yuv as _yuv
+from kinovsr.media.audio import read_audio_track_from_video
 from kinovsr.media.comparison import render_comparison
+from kinovsr.media.naming import sanitize_output_prefix
 from kinovsr.media.timespec import parse_time_or_frames, resolve_trim
 from kinovsr.modeling.vsr_blocks import make_lanczos_plan, resample_width
 from kinovsr.native.vsr import NativePassthrough
@@ -79,40 +81,6 @@ def parse_mlx_dtype_name(name: str) -> Any:
         raise ValueError(f"unknown MLX dtype {name!r}") from None
 
 
-
-
-def _read_audio_track_from_video(mp4_path: Path, vr: Any) -> AudioTrack | None:
-    """Read the audio track of an MP4/MOV into an in-memory AudioTrack.
-
-    Uses AVFoundation's AVAudioFile (via videotoolbox.audio.read_wav), which
-    decodes the container's audio stream straight into a (channels, frames)
-    float32 MLX array - no ffmpeg, no disk WAV. Returns None if the file has
-    no audio track.
-    """
-    from kinovsr.media.audio import read_wav
-
-    if hasattr(vr, "read_audio_track"):
-        # ffmpeg compatibility reader: decode audio via the same backend that
-        # reads the video (the native audio path cannot open these containers).
-        print(f"[setup] reading audio track from {mp4_path} (ffmpeg)")
-        try:
-            return vr.read_audio_track(mp4_path)
-        except Exception as e:
-            print(f"[setup] audio decode failed ({type(e).__name__}); continuing without audio")
-            return None
-
-    print(f"[setup] reading audio track from {mp4_path}")
-    try:
-        sample_rate, samples = read_wav(mp4_path)
-    except Exception as e:
-        # No audio track (or an unsupported audio format) - carry on silent.
-        print(f"[setup] no usable audio track ({type(e).__name__}: {e}); output will be silent")
-        return None
-    track = AudioTrack(samples, sample_rate=int(sample_rate))
-    print(f"  audio: {track.channels}ch, {track.sample_rate} Hz, {track.n_samples} samples")
-    return track
-
-
 # ---------------------------------------------------------------------------
 # HEVC profile selection
 # ---------------------------------------------------------------------------
@@ -134,20 +102,6 @@ def _pick_hevc_profile(spatial_mode: str, encode_chroma: str) -> str:
 # Preprocess slots in default execution order (the CLI's pp_order type in
 # kinovsr.cli.options validates --preprocess-order against the same names).
 _PP_STAGE_NAMES = ("restore", "deflicker", "deblock", "denoise", "nafnet")
-
-
-def sanitize_output_prefix(prefix: str | None) -> str:
-    """Keep generated filenames shell-friendly while preserving readable prefixes."""
-    prefix = (prefix or "kinovsr").strip()
-    if not prefix:
-        prefix = "kinovsr"
-    sanitized = []
-    for char in prefix:
-        if char.isalnum() or char in ("-", "_", "."):
-            sanitized.append(char)
-        else:
-            sanitized.append("_")
-    return "".join(sanitized).strip("._") or "kinovsr"
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +449,7 @@ def run(args: argparse.Namespace, *, settings: Settings) -> VideoProcessResult:
         )
     # Carry the source file's audio through to the output MP4.
     if args.audio:
-        audio_track = _read_audio_track_from_video(Path(args.video), vr)
+        audio_track = read_audio_track_from_video(Path(args.video), vr)
 
     # ---- Audio trim + sidecar ----------------------------------------------
     # When --start/--end trim the video, trim the audio to the same window so

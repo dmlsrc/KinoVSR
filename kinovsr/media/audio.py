@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,8 @@ from kinovsr.native.compat import CoreAudio, CoreMedia, require_pyobjc
 AUDIO_FORMAT_LPCM = 1819304813     # 'lpcm' kAudioFormatLinearPCM
 AUDIO_FORMAT_AAC = 1633772320      # 'aac ' kAudioFormatMPEG4AAC
 AUDIO_FORMAT_ALAC = 1634492771     # 'alac' kAudioFormatAppleLossless
+
+_log = logging.getLogger(__name__)
 
 
 class AudioTrack:
@@ -156,6 +159,36 @@ def read_wav(path: Any) -> tuple[int, mx.array]:
     ]
     samples = chans[0][None, :] if channels == 1 else mx.stack(chans, axis=0)
     return int(fmt.sampleRate()), samples
+
+
+def read_audio_track_from_video(path: Path, reader: Any) -> AudioTrack | None:
+    """Read the audio track of an MP4/MOV into an in-memory :class:`AudioTrack`.
+
+    Uses AVFoundation's AVAudioFile (via :func:`read_wav`), which decodes the
+    container's audio stream straight into a (channels, frames) float32 MLX
+    array - no ffmpeg, no disk WAV. When ``reader`` is the ffmpeg compatibility
+    reader (it exposes ``read_audio_track``), audio is decoded through the same
+    backend that reads the video, because the native audio path cannot open
+    those containers. Returns ``None`` when the file has no usable audio track.
+    """
+    if hasattr(reader, "read_audio_track"):
+        _log.info("reading audio track from %s (ffmpeg)", path)
+        try:
+            return reader.read_audio_track(path)
+        except Exception as e:
+            _log.warning("audio decode failed (%s); continuing without audio", type(e).__name__)
+            return None
+
+    _log.info("reading audio track from %s", path)
+    try:
+        sample_rate, samples = read_wav(path)
+    except Exception as e:
+        # No audio track (or an unsupported audio format) - carry on silent.
+        _log.warning("no usable audio track (%s: %s); output will be silent", type(e).__name__, e)
+        return None
+    track = AudioTrack(samples, sample_rate=int(sample_rate))
+    _log.info("audio: %sch, %s Hz, %s samples", track.channels, track.sample_rate, track.n_samples)
+    return track
 
 
 def _write_wav(samples: Any, path: Any, sample_rate: int, *, float32: bool) -> None:
