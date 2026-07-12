@@ -137,6 +137,8 @@ def process_video_file(
     gop_align: bool = False,
     gop_min_window: int = 16,
     gop_max_window: int = 96,
+    cut_log: Path | str | None = None,
+    skip_post_mp4: bool = False,
     layout: Any = None,
     reader: Any = None,
 ) -> VideoProcessResult:
@@ -186,6 +188,8 @@ def process_video_file(
         gop_align=gop_align,
         gop_min_window=gop_min_window,
         gop_max_window=gop_max_window,
+        cut_log=cut_log,
+        skip_post_mp4=skip_post_mp4,
         reader=reader,
     )
     return VideoProcessResult(

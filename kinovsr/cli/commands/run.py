@@ -246,6 +246,8 @@ def _run_typed(invocation) -> int:
             gop_align=options.gop_align,
             gop_min_window=options.gop_min_window,
             gop_max_window=options.gop_max_window,
+            cut_log=options.cut_log,
+            skip_post_mp4=options.skip_post_mp4,
             layout=_source_layout(invocation.config),
             reader=reader,
         )
@@ -255,7 +257,8 @@ def _run_typed(invocation) -> int:
     get_console().print(
         f"{result.frames_in} frames in -> {result.frames_out} out "
         f"in {result.elapsed_s:.2f}s", markup=False)
-    get_console().print(f"Post: {result.post_path}", markup=False)
+    if result.post_path is not None:
+        get_console().print(f"Post: {result.post_path}", markup=False)
     if result.comparison_path is not None:
         get_console().print(f"Comparison: {result.comparison_path}",
                             markup=False)

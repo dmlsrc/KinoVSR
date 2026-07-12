@@ -28,6 +28,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from kinovsr.processors.boundaries import BoundaryKind
 from kinovsr.processors.errors import MediaError, PipelineError
 from kinovsr.processors.specs import (
     Domain,
@@ -436,7 +437,7 @@ class FileSink:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class FileRunResult:
-    path: Path
+    path: Path | None
     frames_in: int
     frames_out: int
     output_spec: StreamSpec
@@ -604,6 +605,8 @@ def run_file(
     gop_align: bool = False,
     gop_min_window: int = 16,
     gop_max_window: int = 96,
+    cut_log: Path | str | None = None,
+    skip_post_mp4: bool = False,
     reader: Any = None,
 ) -> FileRunResult:
     """Run a composed pipeline config file-to-file through the endpoints.
@@ -682,10 +685,21 @@ def run_file(
     if save_audio_sidecar and track is not None:
         # A WAV sidecar of the (trimmed) carried track, beside the output.
         track.save_wav(output_path.with_name(f"{output_path.stem}_audio.wav"))
-    sink = FileSink(
+    # --skip-post-mp4 parity: process the chain (frame dumps, comparison,
+    # sidecar still apply) without writing the post MP4.
+    sink = None if skip_post_mp4 else FileSink(
         output, session.output_spec, source=source, quality=quality,
         audio_track=track, audio_codec=audio_codec,
         encode_chroma=encode_chroma)
+
+    # --cut-log parity: detected cuts' source-frame indices, one per line,
+    # truncated at run start like the harness. The cut_detect stage stamps
+    # source_index on the HARD_CUT boundary and the scheduler carries it
+    # downstream on the first post-cut unit.
+    cut_log_path = Path(cut_log) if cut_log else None
+    if cut_log_path is not None:
+        cut_log_path.parent.mkdir(parents=True, exist_ok=True)
+        cut_log_path.write_text("", encoding="utf-8")
 
     # Optional per-frame PNG dumps: pre = the SOURCE frames (before the chain),
     # post = the encoded output frames (after it). Debug taps, not chain
@@ -746,6 +760,11 @@ def run_file(
         with session, session.process(
                 source_units, retain_outputs=False) as run:
             for unit in run:
+                if cut_log_path is not None and unit.boundaries:
+                    with cut_log_path.open("a", encoding="utf-8") as log:
+                        for boundary in unit.boundaries:
+                            if boundary.kind is BoundaryKind.HARD_CUT:
+                                log.write(f"{boundary.source_index}\n")
                 if unit.pts < 0:
                     # gop-align context frames: fed to the stages as
                     # recurrence warmup, dropped here after every stage
@@ -756,7 +775,8 @@ def run_file(
                                     post_index, _pbmod)
                     post_index += 1
                 if pending is not None:
-                    sink.append(pending)
+                    if sink is not None:
+                        sink.append(pending)
                     if tee is not None:
                         tee.emit(pending)
                     frames_out += 1
@@ -779,18 +799,20 @@ def run_file(
                                       pending.pts + pending.duration)
                     pending = pending.retimed(
                         pending.pts, max(1, clamped_end - pending.pts))
-                sink.append(pending)
+                if sink is not None:
+                    sink.append(pending)
                 if tee is not None:
                     tee.emit(pending)
                 frames_out += 1
     except BaseException:
         # The partial output is not a deliverable; drop the temp files and
         # leave any pre-existing files untouched.
-        sink.discard()
+        if sink is not None:
+            sink.discard()
         if tee is not None:
             tee.sink.discard()
         raise
-    path = sink.finish()
+    path = sink.finish() if sink is not None else None
     comparison_path = tee.sink.finish() if tee is not None else None
     return FileRunResult(
         path=path, frames_in=source.frame_count, frames_out=frames_out,

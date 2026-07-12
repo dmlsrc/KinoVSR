@@ -289,6 +289,48 @@ class TestComparison:
         assert res.comparison_path is None
 
 
+@pytest.fixture(scope="module")
+def cut_clip(tmp_path_factory):
+    # Two flat scenes, hard cut at frame 8.
+    path = tmp_path_factory.mktemp("cuts") / "cuts.mp4"
+    out = av.open(str(path), "w")
+    vs = out.add_stream("mpeg4", rate=FPS)
+    vs.width, vs.height, vs.pix_fmt = W, H, "yuv420p"
+    vs.options = {"g": "8", "bf": "0", "qscale": "2"}
+    for i in range(16):
+        frame = av.VideoFrame(W, H, "gray")
+        frame.planes[0].update(bytes([30 if i < 8 else 220]) * (W * H))
+        for pkt in vs.encode(frame.reformat(format="yuv420p")):
+            out.mux(pkt)
+    for pkt in vs.encode():
+        out.mux(pkt)
+    out.close()
+    return path
+
+
+class TestCutLogAndSkipPost:
+    def test_cut_log_records_source_indices(self, cut_clip, tmp_path):
+        # Harness format: one detected-cut source index per line, file
+        # truncated at run start.
+        log = tmp_path / "cuts.txt"
+        log.write_text("stale\n", encoding="utf-8")
+        run_file({"pipeline": ["cd"], "cd": {"processor": "cut_detect"}},
+                 video=cut_clip, output=tmp_path / "o.mp4",
+                 settings=SETTINGS, cut_log=log)
+        assert log.read_text(encoding="utf-8") == "8\n"
+
+    def test_skip_post_mp4_processes_without_writing(self, cut_clip, tmp_path):
+        post = tmp_path / "png"
+        res = run_file(
+            {"pipeline": []}, video=cut_clip, output=tmp_path / "o.mp4",
+            settings=SETTINGS, skip_post_mp4=True, save_post_frames=post)
+        assert res.path is None
+        assert not (tmp_path / "o.mp4").exists()
+        # the run still processed: dumps and counts are real
+        assert res.frames_out == 16
+        assert len(list(post.glob("frame_*.png"))) == 16
+
+
 class TestGopAlign:
     """--snap-start / --gop-align parity: keyframe windowing on the typed
     endpoints. The clip fixture encodes g=8, so keyframes sit at 0, 8, 16."""
