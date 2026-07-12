@@ -64,6 +64,22 @@ class TestParse:
         assert spec.stateful
         assert get_factory("bsvd") is FACTORY
 
+    def test_noise_map_defaults_to_a_constant_no_op(self):
+        from kinovsr.processors.conditioning import NoiseMapConfig
+
+        assert parse({}).noise_map == NoiseMapConfig()
+
+    def test_noise_map_keys_parse_onto_the_config(self):
+        config = parse({"noise_map": "auto", "noise_map_gain": 1.2,
+                        "noise_map_pulse": True})
+        assert config.noise_map.mode == "auto"
+        assert config.noise_map.gain == 1.2
+        assert config.noise_map.pulse is True
+
+    def test_bad_noise_map_value_is_rejected_at_parse(self):
+        with pytest.raises(ValueError, match="noise_map must"):
+            parse({"noise_map": "blur"})
+
 
 @pytest.mark.requires_weights
 @pytest.mark.integration
@@ -134,4 +150,24 @@ class TestStreaming:
         assert [u.pts for u in full] == [u.pts for u in split]
         deltas = [float(mx.max(mx.abs(f.payload - s.payload)).item())
                   for f, s in zip(full, split, strict=True)]
+        assert max(deltas) > 1e-3
+
+    def test_noise_map_auto_conditions_the_output(self):
+        # End to end: the estimated per-pixel sigma map replaces the constant
+        # sigma, so an auto run diverges from the constant run on the same
+        # frames while staying frame-aligned. The c64 checkpoint is 4-channel,
+        # so it accepts a map; 16 frames clears the tracker's warm-up.
+        import mlx.core as mx
+
+        units = [
+            FrameUnit(
+                payload=mx.random.uniform(shape=(48, 64, 3)).astype(mx.float32)
+                * 0.5 + 0.25,
+                pts=i * 960, duration=960)
+            for i in range(16)]
+        constant = self.run(list(units))
+        auto = self.run(list(units), config={"noise_map": "auto"})
+        assert [u.pts for u in constant] == [u.pts for u in auto]
+        deltas = [float(mx.max(mx.abs(c.payload - a.payload)).item())
+                  for c, a in zip(constant, auto, strict=True)]
         assert max(deltas) > 1e-3

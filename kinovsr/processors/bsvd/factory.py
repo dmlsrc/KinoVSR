@@ -3,8 +3,9 @@
 The network carries a 16-step bidirectional-buffer delay; the driver's
 token plumbing pairs each delayed output with the input it was computed
 from, so the FeedFlush adapter emits units on their true timestamps.
-Noise-map conditioning stays harness-level until the family migration
-(M4) brings the tracker along.
+Noise-map conditioning is typed stage config (M6): the shared
+kinovsr.processors.conditioning helper turns the noise_map* keys into the
+tracker/pulse the engine consumes.
 """
 
 from __future__ import annotations
@@ -18,6 +19,12 @@ from kinovsr.processors.capabilities import (
     Capability,
     CapabilitySpec,
     TemporalMode,
+)
+from kinovsr.processors.conditioning import (
+    NOISE_MAP_KEYS,
+    NoiseMapConfig,
+    build_conditioning,
+    parse_noise_map,
 )
 from kinovsr.processors.feed_driver import (
     LUMA_CHROMA_KEYS,
@@ -45,6 +52,7 @@ class BsvdStageConfig:
     dtype: str
     luma_strength: float
     chroma_strength: float
+    noise_map: NoiseMapConfig
 
 
 class BsvdFactory:
@@ -75,7 +83,9 @@ class BsvdFactory:
         profile: str | None,
         settings: Settings,
     ) -> BsvdStageConfig:
-        reject_unknown_keys(raw, ("weights", "strength", "dtype", *LUMA_CHROMA_KEYS))
+        reject_unknown_keys(
+            raw, ("weights", "strength", "dtype", *LUMA_CHROMA_KEYS,
+                  *NOISE_MAP_KEYS))
         strength = typed_value(raw, "strength", float, 0.5)
         if not 0.0 <= strength <= 1.0:
             raise ValueError("strength must be in [0, 1]")
@@ -91,6 +101,7 @@ class BsvdFactory:
             dtype=dtype,
             luma_strength=luma_strength,
             chroma_strength=chroma_strength,
+            noise_map=parse_noise_map(raw),
         )
 
     def build(self, config: BsvdStageConfig, *,
@@ -101,9 +112,12 @@ class BsvdFactory:
             from . import BsvdDenoiser
 
             dtype = mx.float16 if config.dtype == "float16" else mx.float32
+            tracker, pulse = build_conditioning(config.noise_map)
             return BsvdDenoiser(
                 config.weights_path, variant=config.variant,
-                strength=config.strength, dtype=dtype)
+                strength=config.strength, dtype=dtype,
+                noise_map=tracker, map_refresh=config.noise_map.refresh,
+                pulse=pulse, map_floor=config.noise_map.floor)
 
         return FeedFlushProcessor(
             make_driver,
