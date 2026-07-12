@@ -222,6 +222,28 @@ def test_interpolation_noninteger_ratio_stays_in_sync(
     assert abs(audio_s - video_s) < 0.03
 
 
+def test_cap_equal_to_natural_count_still_syncs_audio(
+        clip_with_audio, tmp_path):
+    """max_output_frames set to the non-integer rewrite's natural output
+    count (25->40 fps emits 39) must still clamp the final frame - the
+    earlier hit_cap skip left this case drifting (re-review #2)."""
+    config = {
+        "pipeline": ["fps"],
+        "fps": {"processor": "videotoolbox", "profile": "normal",
+                "target_fps": 40},
+    }
+    result = run_file(
+        config, video=clip_with_audio, output=tmp_path / "capnat.mp4",
+        settings=SETTINGS, layout=Layout.CV_RGBA_HALF, audio=True,
+        max_output_frames=39)
+    source_seconds = N / FPS   # 0.96s
+    video_s, audio_s, frames, _ = _stream_seconds(result.path)
+    assert frames == 39
+    assert abs(video_s - source_seconds) < 0.008
+    assert audio_s is not None
+    assert abs(audio_s - video_s) < 0.03
+
+
 def test_max_output_frames_caps_the_interpolated_stream(clip, tmp_path):
     """--max-frames semantics: the cap counts OUTPUT frames, so a
     cadence-doubling chain stops at the cap instead of emitting
@@ -296,6 +318,19 @@ def test_failed_run_preserves_existing_output(clip, tmp_path):
                  max_frames=4)
     assert out.read_bytes() == original            # original intact
     assert not list(tmp_path.glob(".keep.mp4.*"))  # no partial temp left
+
+
+def test_rename_failure_leaves_no_orphan_temp(clip, tmp_path):
+    """A publish that can't land (the output path is an existing directory,
+    so the atomic rename fails at finish) must still clean up the partial
+    temp instead of orphaning it (re-review #3)."""
+    outdir = tmp_path / "out.mp4"
+    outdir.mkdir()
+    with pytest.raises(Exception):  # noqa: B017 - IsADirectoryError/OSError
+        run_file({"pipeline": []}, video=clip, output=outdir,
+                 settings=SETTINGS)
+    assert outdir.is_dir()                         # the directory is untouched
+    assert not list(tmp_path.glob(".out.mp4.*"))   # no partial temp left
 
 
 _FBCNN_WEIGHTS = Path(

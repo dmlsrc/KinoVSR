@@ -289,9 +289,18 @@ class TestOpenTimeValidation:
 
     def test_realesrgan_rejects_scale_contradicting_the_profile(self):
         factory = get_factory("realesrgan")
-        with pytest.raises(ValueError, match="contradicts"):
+        with pytest.raises(ValueError, match="contradictory"):
             factory.parse_config(
                 {"scale": 2}, capability=Capability.UPSCALE,
+                profile="x4plus", settings=SETTINGS)
+
+    def test_realesrgan_rejects_profile_weights_scale_disagreement(self):
+        # profile=x4plus (4x) with a profile-named weights=x2plus (2x) and no
+        # explicit scale: both are scale-bearing and disagree (re-review #5).
+        factory = get_factory("realesrgan")
+        with pytest.raises(ValueError, match="contradictory"):
+            factory.parse_config(
+                {"weights": "x2plus"}, capability=Capability.UPSCALE,
                 profile="x4plus", settings=SETTINGS)
 
     def test_realesrgan_rejects_nonpositive_scale(self):

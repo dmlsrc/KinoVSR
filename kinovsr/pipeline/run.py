@@ -269,26 +269,35 @@ class FileSink:
             prefix=f".{self._final_path.name}.", suffix=".partial")
         os.close(fd)
         self._temp_path = Path(tmp)
+        self._published = False
 
-        profile = (HEVC_PROFILE_MAIN10 if layout is Layout.CV_NV12
-                   else HEVC_PROFILE_MAIN422_10)
-        self.writer = AVWriter(
-            self._temp_path,
-            width=geometry.width, height=geometry.height,
-            fps=float(timeline.cadence),
-            source_pixel_format=getattr(_pb, _DECODE_FORMATS[layout]),
-            profile=profile, quality=quality, label=label,
-            audio_track=audio_track, audio_codec=audio_codec,
-            **writer_kwargs)
+        # Everything below can fail (AVWriter construction, pool creation);
+        # drop the just-created temp so a failed construction leaves nothing
+        # behind (and never touches the requested output).
+        try:
+            profile = (HEVC_PROFILE_MAIN10 if layout is Layout.CV_NV12
+                       else HEVC_PROFILE_MAIN422_10)
+            self.writer = AVWriter(
+                self._temp_path,
+                width=geometry.width, height=geometry.height,
+                fps=float(timeline.cadence),
+                source_pixel_format=getattr(_pb, _DECODE_FORMATS[layout]),
+                profile=profile, quality=quality, label=label,
+                audio_track=audio_track, audio_codec=audio_codec,
+                **writer_kwargs)
 
-        self._pool = None
-        if self._is_mlx:
-            self._pool = _pb.make_pool_from_attrs({
-                "PixelFormatType": _pb.PIX_RGBAHALF,
-                "Width": geometry.width, "Height": geometry.height,
-                "IOSurfaceProperties": {},
-                "MetalCompatibility": True,
-            })
+            self._pool = None
+            if self._is_mlx:
+                self._pool = _pb.make_pool_from_attrs({
+                    "PixelFormatType": _pb.PIX_RGBAHALF,
+                    "Width": geometry.width, "Height": geometry.height,
+                    "IOSurfaceProperties": {},
+                    "MetalCompatibility": True,
+                })
+        except BaseException:
+            with contextlib.suppress(Exception):
+                self._temp_path.unlink()
+            raise
 
     def _grid_ticks(self, index: int) -> int:
         timeline = self.spec.timeline
@@ -335,15 +344,28 @@ class FileSink:
 
     def finish(self) -> Path:
         """Finalize the encode and publish it atomically to the requested
-        output path (Path.replace is atomic on the same filesystem)."""
-        self.writer.finish()
-        self._temp_path.replace(self._final_path)
+        output path (Path.replace is atomic on the same filesystem). On ANY
+        failure - a writer-finalization error, or a rename that cannot land
+        (e.g. the output path is an existing directory, or a full disk) -
+        the partial temp is removed and the requested output is left
+        untouched."""
+        try:
+            self.writer.finish()
+            self._temp_path.replace(self._final_path)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                self._temp_path.unlink()
+            raise
+        self._published = True
         return self._final_path
 
     def discard(self) -> None:
         """Abandon the run: release the writer and delete the partial temp
         file WITHOUT publishing, leaving any pre-existing output untouched.
-        Safe to call after a failure at any point."""
+        Safe to call after a failure at any point, and a no-op once finish()
+        has already published."""
+        if self._published:
+            return
         with contextlib.suppress(Exception):
             self.writer.finish()
         with contextlib.suppress(Exception):
@@ -436,7 +458,6 @@ def run_file(
         / session.output_spec.timeline.time_base)
     frames_out = 0
     pending: FrameUnit | None = None
-    hit_cap = False
     try:
         # retain_outputs=False: the sink consumes each unit into the encoder
         # synchronously, so outputs need not be copied for retention. A
@@ -453,12 +474,20 @@ def run_file(
                         and frames_out + 1 == max_output_frames):
                     # The staged unit is the capped final frame; stop pulling
                     # (cadence-changing stages mean output count != input).
-                    hit_cap = True
                     break
             if pending is not None:
-                if not hit_cap and preserve_duration:
+                if preserve_duration:
+                    # End exactly at the source-window duration: interpolation's
+                    # regenerated grid can round the final unit past it. Clamp
+                    # to min(source end, natural end) - an interior or capped
+                    # frame that already lands earlier is untouched, and only a
+                    # true tail overshoot is trimmed. This also covers a cap set
+                    # to the natural output count, where the final frame IS the
+                    # overshoot (the earlier hit_cap skip missed that).
+                    clamped_end = min(source_end_ticks,
+                                      pending.pts + pending.duration)
                     pending = pending.retimed(
-                        pending.pts, max(1, source_end_ticks - pending.pts))
+                        pending.pts, max(1, clamped_end - pending.pts))
                 sink.append(pending)
                 frames_out += 1
     except BaseException:

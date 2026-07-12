@@ -252,28 +252,35 @@ def _wrap_stage_error(stage: ResolvedStage, exc: Exception) -> Exception:
 
 def _append_context(winner: BaseException,
                     losers: Iterable[BaseException | None]) -> None:
-    """Append each loser (and its own ``__context__`` chain) to the END of
-    the winner's chain, exactly once, preserving any existing cause/context
-    and never forming a cycle.
+    """Relink the winner and every outranked error into ONE strict, acyclic
+    ``__context__`` chain: winner first, then its existing context nodes,
+    then each loser and its context nodes - each object exactly once.
 
-    This lets a raised winner keep the documented precedence while still
-    carrying every outranked error - cleanup failures ride the chain, never
-    silently dropped.
+    Collecting by identity and relinking linearly is what guarantees no
+    cycle. A loser's existing chain can already point back at the winner
+    (Python auto-sets ``__context__`` to the exception being handled when an
+    error is raised mid-handling), which a naive append would close into a
+    loop; flattening by id and terminating at ``None`` breaks it. The winner
+    keeps its documented precedence; every outranked error stays reachable,
+    none silently dropped.
     """
-    seen: set[int] = {id(winner)}
-    tail = winner
-    while tail.__context__ is not None and id(tail.__context__) not in seen:
-        tail = tail.__context__
-        seen.add(id(tail))
+    ordered: list[BaseException] = []
+    seen: set[int] = set()
+
+    def collect(exc: BaseException | None) -> None:
+        node = exc
+        while node is not None and id(node) not in seen:
+            seen.add(id(node))
+            ordered.append(node)
+            node = node.__context__
+
+    collect(winner)
     for loser in losers:
-        if loser is None or id(loser) in seen:
-            continue
-        tail.__context__ = loser
-        tail = loser
-        seen.add(id(tail))
-        while tail.__context__ is not None and id(tail.__context__) not in seen:
-            tail = tail.__context__
-            seen.add(id(tail))
+        collect(loser)
+    # Pairwise adjacent (n-1 pairs); the lengths differ by one by design.
+    for earlier, later in zip(ordered, ordered[1:], strict=False):
+        earlier.__context__ = later
+    ordered[-1].__context__ = None
 
 
 def build_processors(

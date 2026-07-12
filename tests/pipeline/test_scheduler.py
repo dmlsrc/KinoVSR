@@ -144,6 +144,21 @@ def _context_chain(exc):
     return out
 
 
+def _context_is_acyclic(exc):
+    """True if the __context__ chain terminates at None with no repeated
+    object - a naive walker would loop forever on a cycle."""
+    seen, node, steps = set(), exc, 0
+    while node is not None:
+        if id(node) in seen:
+            return False
+        seen.add(id(node))
+        node = node.__context__
+        steps += 1
+        if steps > 10_000:
+            return False
+    return True
+
+
 class TestLifecycle:
     def test_order_prepare_reset_process_flush_close(self):
         log = []
@@ -514,6 +529,24 @@ class TestCleanupPrecedence:
         context = exc.value.__context__
         assert isinstance(context, RuntimeError)
         assert "stream-close failed" in str(context)
+        # Python auto-links the cleanup error's __context__ back to the body
+        # error; the delivered chain must still be acyclic (re-review #7).
+        assert _context_is_acyclic(exc.value)
+
+    def test_all_close_interrupts_are_preserved(self):
+        # Two stages raise interrupts on close: the first wins precedence, and
+        # the second is still reachable on the chain (re-review #7).
+        class InterruptClose(Recorder):
+            def close(self, context):
+                super().close(context)
+                raise KeyboardInterrupt(f"{self.name}-interrupt")
+
+        a, b = InterruptClose("a"), InterruptClose("b")
+        with pytest.raises(KeyboardInterrupt, match="a-interrupt") as exc:
+            list(run_chain(chain(a, b), units(2), CONTEXT))
+        assert _context_is_acyclic(exc.value)
+        assert any("b-interrupt" in str(c)
+                   for c in _context_chain(exc.value))
 
     def test_first_cleanup_failure_wins_on_explicit_close(self):
         class BadClose(Recorder):

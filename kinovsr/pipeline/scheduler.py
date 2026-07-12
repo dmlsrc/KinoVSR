@@ -192,20 +192,20 @@ class ChainRun:
         ``active`` is the stage/body error in flight, or None on the
         stream-exhausted success path.
         """
-        close_errors, interrupt = self._close_all()
+        close_errors, interrupts = self._close_all()
         if active is None:
-            ordered = [c for c in (*close_errors, interrupt) if c is not None]
+            ordered = [*close_errors, *interrupts]
             if not ordered:
                 return None
-            winner = next((c for c in ordered if self._is_interrupt(c)),
-                          ordered[0])
+            winner = interrupts[0] if interrupts else ordered[0]
             _append_context(winner, [c for c in ordered if c is not winner])
             return winner
-        if interrupt is not None:
-            # an interrupt outranks the active error, which (with any close
-            # failures) stays on the delivered chain
-            _append_context(interrupt, [active, *close_errors])
-            return interrupt
+        if interrupts:
+            # an interrupt outranks the active error; the active error and
+            # every close failure and later interrupt stay on the chain
+            winner = interrupts[0]
+            _append_context(winner, [active, *close_errors, *interrupts[1:]])
+            return winner
         # the active error wins; ordinary close failures ride its context
         # chain instead of being dropped
         _append_context(active, close_errors)
@@ -230,11 +230,11 @@ class ChainRun:
                 stream.close()
             except BaseException as exc:  # noqa: BLE001 - re-delivered below
                 stream_error = exc
-        close_errors, interrupt = self._close_all()
+        close_errors, interrupts = self._close_all()
         # Chronological order: the stream closed before the processors.
         # The first interrupt wins; failing that, the first failure wins.
         # Every other error is preserved on the winner's context chain.
-        ordered = [c for c in (stream_error, *close_errors, interrupt)
+        ordered = [c for c in (stream_error, *close_errors, *interrupts)
                    if c is not None]
         if not ordered:
             return None
@@ -270,27 +270,27 @@ class ChainRun:
         with contextlib.suppress(BaseException):
             self.close()
 
-    def _close_all(self) -> tuple[list[Exception], BaseException | None]:
+    def _close_all(self) -> tuple[list[Exception], list[BaseException]]:
         """Close every stage exactly once; report failures instead of
         raising so callers own delivery precedence. Returns EVERY ordinary
-        close error (wrapped, in chain order) and the first interrupt - no
-        stage's failure is dropped when a later stage also fails."""
+        close error and EVERY cleanup interrupt (both wrapped/collected in
+        chain order) - no stage's failure is dropped when a later stage also
+        fails, and the first interrupt still wins precedence downstream."""
         if self._closed:
-            return [], None
+            return [], []
         self._closed = True
         close_errors: list[Exception] = []
-        interrupt: BaseException | None = None
+        interrupts: list[BaseException] = []
         for stage, processor in self._built:
             try:
                 processor.close(self._context.for_stage(stage.name))
             except Exception as exc:  # noqa: BLE001 - collected, not lost
                 close_errors.append(_wrap_stage_error(stage, exc))
             except BaseException as exc:
-                # KeyboardInterrupt/SystemExit mid-cleanup: keep closing
-                # the remaining stages, then deliver it.
-                if interrupt is None:
-                    interrupt = exc
-        return close_errors, interrupt
+                # KeyboardInterrupt/SystemExit mid-cleanup: keep closing the
+                # remaining stages, then deliver every one (first wins).
+                interrupts.append(exc)
+        return close_errors, interrupts
 
 
 def run_chain(

@@ -92,24 +92,34 @@ class RealEsrganFactory:
                     "weight); other checkpoints have none")
         scale = typed_value(raw, "scale", int)
         scales = _profile_scales()
-        token = profile or (weights if weights in scales else None)
+        # Every scale-bearing selector must agree: the profile, a
+        # profile-named weights token, and an explicit scale. Validating only
+        # one let profile='x4plus' + weights='x2plus' pass open and then fail
+        # when the runtime loaded the 2x checkpoint against the advertised 4x.
+        implied: dict[str, int] = {}
+        if profile in scales:
+            implied["profile"] = scales[profile]
+        if weights in scales:
+            implied["weights"] = scales[weights]
+        if scale is not None:
+            if scale <= 0:
+                raise ValueError("scale must be a positive integer")
+            implied["scale"] = scale
+        distinct = set(implied.values())
+        if len(distinct) > 1:
+            parts = ", ".join(f"{k}={v}x" for k, v in sorted(implied.items()))
+            raise ValueError(
+                f"contradictory scales ({parts}); the profile, weights, and "
+                f"scale that resolve must agree on one")
         if scale is None:
-            if token is None and weights is not None:
+            if distinct:
+                scale = distinct.pop()
+            elif weights is not None:
                 raise ValueError(
                     "state scale when weights is an explicit path "
                     "(profiles declare it)")
-            scale = scales[token or _DEFAULT_PROFILE]
-        else:
-            if scale <= 0:
-                raise ValueError("scale must be a positive integer")
-            # A profile (or a profile-named weight) fixes the scale via the
-            # manifest; reject a contradicting explicit scale at open rather
-            # than advertising it and failing when the checkpoint loads.
-            if token is not None and token in scales and scale != scales[token]:
-                raise ValueError(
-                    f"scale {scale} contradicts the {token!r} profile's fixed "
-                    f"{scales[token]}x; drop the scale override or select a "
-                    f"profile/checkpoint with that scale")
+            else:
+                scale = scales[_DEFAULT_PROFILE]
         return RealEsrganStageConfig(
             weights_spec=weights or profile or _DEFAULT_PROFILE,
             scale=scale, denoise_strength=denoise_strength)
