@@ -58,6 +58,15 @@ _UPSCALE_MODE = {
     "image":    (4, Layout.CV_RGBA_HALF, DType.FLOAT16,  Domain.UNIT,   1920, 1080),
 }
 
+# The CVPixelBuffer layout each mode's VSR session consumes as its SOURCE
+# (source_format_for_mode). A source already decoded in this layout feeds
+# upscale_buffer_to_buffer zero-copy, the harness's mainstream path.
+_UPSCALE_NATIVE_SRC = {
+    "fast": Layout.CV_NV12,
+    "balanced": Layout.CV_RGBA_HALF,
+    "image": Layout.CV_RGBA_HALF,
+}
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class VtInterpolateConfig:
@@ -188,6 +197,15 @@ def _upscale_produces(spec: StreamSpec, config: object) -> StreamSpec:
         raise ValueError(
             f"videotoolbox {config.mode} upscale accepts input up to "
             f"{max_w}x{max_h}; got {g.width}x{g.height}")
+    # A CV source must be the mode's own session format (zero-copy path);
+    # the layout<->mode pairing is mode-dependent, so it is checked here
+    # like the size cap rather than as a StreamConstraint bound.
+    native = _UPSCALE_NATIVE_SRC[config.mode]
+    if spec.frame.layout is not Layout.MLX_RGB_HWC and (
+            spec.frame.layout is not native):
+        raise ValueError(
+            f"videotoolbox {config.mode} upscale takes MLX frames or its "
+            f"native {native.value} source; got {spec.frame.layout.value}")
     frame = dataclasses.replace(
         spec.frame, layout=dst_layout, dtype=dst_dtype, domain=dst_domain,
         geometry=g.scaled(scale))
@@ -211,6 +229,7 @@ class VtUpscaleProcessor:
         self._session: Any = None
         self._mx: Any = None
         self._index = 0
+        self._cv_input = False
 
     def prepare(self, input_spec: StreamSpec,
                 context: PipelineContext) -> None:
@@ -219,6 +238,10 @@ class VtUpscaleProcessor:
         from kinovsr.native.vsr import VsrSession
 
         self._mx = mx
+        # A CV source is already in the session's source format (validated
+        # at resolve): feed it zero-copy via upscale_buffer_to_buffer, the
+        # harness's mainstream decode->VSR path. MLX frames upload.
+        self._cv_input = input_spec.frame.layout is not Layout.MLX_RGB_HWC
         g = input_spec.frame.geometry
         try:
             self._session = VsrSession(
@@ -230,6 +253,12 @@ class VtUpscaleProcessor:
 
     def process(self, unit: FrameUnit,
                 context: PipelineContext) -> Iterable[FrameUnit]:
+        if self._cv_input:
+            out = self._session.upscale_buffer_to_buffer(
+                unit.payload, self._index)
+            self._index += 1
+            yield unit.with_payload(out)
+            return
         mx = self._mx
         rgb = unit.payload
         rgba = mx.concatenate(
@@ -271,12 +300,15 @@ class VideoToolboxFactory:
         Capability.UPSCALE: CapabilitySpec(
             capability=Capability.UPSCALE,
             profiles=_UPSCALE_PROFILES,
-            # MLX in, native CV out - the bridge. (The zero-copy CV->CV
-            # source path is a follow-up; see the module docstring.)
+            # MLX in (the bridge) or the mode's own CV source format
+            # (zero-copy decode->VSR, the harness's mainstream path). The
+            # mode<->CV-layout pairing is enforced in _upscale_produces at
+            # resolve time, like the size cap.
             accepts=StreamConstraint(
-                layouts=(Layout.MLX_RGB_HWC,),
-                dtypes=(DType.FLOAT32, DType.FLOAT16),
-                domains=(Domain.UNIT, Domain.UNIT_SANITIZED),
+                layouts=(Layout.MLX_RGB_HWC, Layout.CV_RGBA_HALF,
+                         Layout.CV_NV12),
+                dtypes=(DType.FLOAT32, DType.FLOAT16, DType.UINT8),
+                domains=(Domain.UNIT, Domain.UNIT_SANITIZED, Domain.CODED),
                 cadences=(Fraction,),      # CFR sources only
             ),
             produces=_upscale_produces,
@@ -316,6 +348,17 @@ class VideoToolboxFactory:
         if isinstance(config, VtUpscaleConfig):
             return VtUpscaleProcessor(config)
         return VtInterpolateProcessor(config)
+
+    def preferred_source_layout(self, *, capability: Capability,
+                                profile: str | None) -> Layout | None:
+        """The source layout a HEAD stage of this capability decodes best
+        from (the optional-hook shape of ``profile_defaults``). An upscale
+        head wants its mode's own session format so the decode feeds the
+        scaler zero-copy; every other case defers to the caller's default
+        preference."""
+        if capability is Capability.UPSCALE:
+            return _UPSCALE_NATIVE_SRC[profile or "balanced"]
+        return None
 
 
 FACTORY = VideoToolboxFactory()

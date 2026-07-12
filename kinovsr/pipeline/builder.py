@@ -217,7 +217,14 @@ def resolve_pipeline(
             raise StreamEdgeError(upstream, stage_name, tuple(violations),
                                   produced=current)
 
-        produced = cap_spec.produces(current, cfg)
+        try:
+            produced = cap_spec.produces(current, cfg)
+        except (TypeError, ValueError, KeyError) as exc:
+            # produces raises plain ValueError for open-time checks a
+            # StreamConstraint cannot express (size caps, mode<->layout
+            # pairings); surface it as the documented typed error instead
+            # of letting it escape raw.
+            raise StageConfigError(stage_name, str(exc)) from exc
         if cap_spec.is_tap and produced != current:
             raise StageConfigError(
                 stage_name, f"family {factory.name!r} declares a tap but "

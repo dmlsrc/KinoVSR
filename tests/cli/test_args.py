@@ -199,12 +199,28 @@ class TestTypedSourceLayout:
                           "target_fps": 50}}
         assert self._pick(config) is Layout.CV_RGBA_HALF
 
-    def test_same_family_different_capability_different_layout(self):
-        # videotoolbox interpolate is CV-in, but its upscale is the MLX->CV
-        # bridge - so the head's SPECIFIC capability decides the layout.
+    def test_bare_upscale_head_decodes_zero_copy(self):
+        # A bare videotoolbox-upscale head prefers its mode's own session
+        # format so the decode feeds the scaler zero-copy - the harness's
+        # mainstream path. fast is NV12, balanced/image are RGBAHalf.
         from kinovsr.processors import Layout
 
-        config = {"pipeline": ["up"],
+        balanced = {"pipeline": ["up"],
+                    "up": {"processor": "videotoolbox",
+                           "capability": "upscale", "profile": "balanced"}}
+        fast = {"pipeline": ["up"],
+                "up": {"processor": "videotoolbox",
+                       "capability": "upscale", "profile": "fast"}}
+        assert self._pick(balanced) is Layout.CV_RGBA_HALF
+        assert self._pick(fast) is Layout.CV_NV12
+
+    def test_preprocessed_upscale_head_stays_mlx(self):
+        # With an MLX stage ahead of the upscale, the head is that stage:
+        # the decode goes MLX and the upscale takes the bridge.
+        from kinovsr.processors import Layout
+
+        config = {"pipeline": ["c", "up"],
+                  "c": {"processor": "crop", "bars": "16,16,0,0"},
                   "up": {"processor": "videotoolbox", "capability": "upscale",
                          "profile": "balanced"}}
         assert self._pick(config) is Layout.MLX_RGB_HWC

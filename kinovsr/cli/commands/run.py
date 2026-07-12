@@ -125,6 +125,15 @@ def _source_layout(config):
         factory = get_factory(head.get("processor"))
         capability = _resolve_capability(
             pipeline[0], factory, head.get("capability"), head.get("profile"))
+        # A family may prefer a specific decode layout for its head position
+        # (videotoolbox upscale wants its mode's own session format so the
+        # decode feeds the scaler zero-copy - the harness's mainstream path).
+        preferred = getattr(factory, "preferred_source_layout", None)
+        if callable(preferred):
+            layout = preferred(capability=capability,
+                               profile=head.get("profile"))
+            if layout is not None:
+                return layout
         layouts = factory.capabilities[capability].accepts.layouts
     except Exception:
         return Layout.MLX_RGB_HWC

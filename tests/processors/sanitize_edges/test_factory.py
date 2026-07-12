@@ -91,12 +91,15 @@ def test_bands_replicate_and_geometry_is_untouched():
 
 def test_full_axis_bands_fail_preflight():
     from kinovsr.pipeline import resolve_pipeline
+    from kinovsr.processors.errors import StageConfigError
 
     config = {
         "pipeline": ["san"],
         "san": {"processor": "sanitize_edges", "edges": "48,0,0,0"},
     }
-    with pytest.raises(ValueError, match="leave no interior"):
+    # produces' open-time check surfaces as the documented typed error,
+    # stage-named, not a raw ValueError.
+    with pytest.raises(StageConfigError, match="leave no interior"):
         resolve_pipeline(config, input_spec=stream(), settings=SETTINGS)
 
 
