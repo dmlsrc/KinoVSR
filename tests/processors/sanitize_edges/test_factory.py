@@ -163,56 +163,21 @@ class TestRestore:
             assert float(u.payload[0, 0, 0]) == pytest.approx(0.1 * (i + 1),
                                                               abs=2e-3)
 
-    def test_companion_sits_before_the_first_native_cv_stage(self, monkeypatch):
+    def test_companion_sits_before_the_first_native_cv_stage(self):
         # The restore post-pass runs on MLX, so when a later stage produces a
-        # native CV frame (the spatial upscale in the harness's fast/balanced
-        # modes), the companion must sit at the last MLX point - right before
-        # that stage - not at the absolute end where it could not run.
-        # Exercised with a stand-in MLX->CV upscaler, since none ship yet.
-        import dataclasses
-
+        # native CV frame (the videotoolbox spatial upscale), the companion
+        # must sit at the last MLX point - right before that stage - not at
+        # the absolute end where it could not run. Proven against the real
+        # MLX->CV upscaler (resolve-only, no native session created).
         from kinovsr.pipeline import resolve_pipeline
-        from kinovsr.processors import (
-            Capability,
-            CapabilitySpec,
-            Domain,
-            DType,
-            Layout,
-            StreamConstraint,
-        )
-        from kinovsr.processors.catalog import _loaded
+        from kinovsr.processors import Layout
 
-        def _to_cv(spec, config):
-            # cv_rgba_half implies float16 (a coherence rule); a stand-in
-            # native scaler emits exactly that.
-            return dataclasses.replace(
-                spec, frame=dataclasses.replace(
-                    spec.frame, layout=Layout.CV_RGBA_HALF,
-                    dtype=DType.FLOAT16))
-
-        class _FakeCvUpscaler:
-            name = "fake_cv_upscaler"
-            capabilities = {
-                Capability.UPSCALE: CapabilitySpec(
-                    capability=Capability.UPSCALE, profiles=(),
-                    accepts=StreamConstraint(
-                        layouts=(Layout.MLX_RGB_HWC,),
-                        dtypes=(DType.FLOAT32, DType.FLOAT16),
-                        domains=(Domain.UNIT, Domain.UNIT_SANITIZED)),
-                    produces=_to_cv)}
-
-            def parse_config(self, raw, *, capability, profile, settings):
-                return object()
-
-            def build(self, config, *, context):
-                raise AssertionError("resolve-only test")
-
-        monkeypatch.setitem(_loaded, "fake_cv_upscaler", _FakeCvUpscaler())
         plan = resolve_pipeline(
             {"pipeline": ["san", "up"],
              "san": {"processor": "sanitize_edges", "edges": "2,0,0,0",
                      "fill": "restore"},
-             "up": {"processor": "fake_cv_upscaler"}},
+             "up": {"processor": "videotoolbox", "capability": "upscale",
+                    "profile": "balanced"}},
             input_spec=stream(), settings=SETTINGS)
         # companion spliced BEFORE the CV-producing upscaler, not at the end
         assert [s.name for s in plan.stages] == ["san", "san:post", "up"]

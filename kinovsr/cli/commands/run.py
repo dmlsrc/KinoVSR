@@ -86,19 +86,24 @@ def _source_layout(config):
     layouts. Unknown families fall back to the default so the builder
     reports the real error.
     """
+    from kinovsr.pipeline.builder import _resolve_capability
     from kinovsr.processors import Layout, get_factory
 
     pipeline = config.get("pipeline") or []
     if not pipeline:
         return Layout.MLX_RGB_HWC
     head = config.get(pipeline[0]) or {}
+    # Resolve the head's SPECIFIC capability (not a union over the family):
+    # videotoolbox offers both an MLX-in upscale and a CV-in interpolate, so
+    # the layout depends on which one the head selected.
     try:
         factory = get_factory(head.get("processor"))
+        capability = _resolve_capability(
+            pipeline[0], factory, head.get("capability"), head.get("profile"))
+        layouts = factory.capabilities[capability].accepts.layouts
     except Exception:
         return Layout.MLX_RGB_HWC
-    accepted: set = set()
-    for spec in factory.capabilities.values():
-        accepted.update(spec.accepts.layouts or (Layout.MLX_RGB_HWC,))
+    accepted = set(layouts or (Layout.MLX_RGB_HWC,))
     if Layout.MLX_RGB_HWC in accepted:
         return Layout.MLX_RGB_HWC
     for candidate in (Layout.CV_RGBA_HALF, Layout.CV_NV12, Layout.CV_BGRA):

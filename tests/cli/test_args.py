@@ -199,6 +199,16 @@ class TestTypedSourceLayout:
                           "target_fps": 50}}
         assert self._pick(config) is Layout.CV_RGBA_HALF
 
+    def test_same_family_different_capability_different_layout(self):
+        # videotoolbox interpolate is CV-in, but its upscale is the MLX->CV
+        # bridge - so the head's SPECIFIC capability decides the layout.
+        from kinovsr.processors import Layout
+
+        config = {"pipeline": ["up"],
+                  "up": {"processor": "videotoolbox", "capability": "upscale",
+                         "profile": "balanced"}}
+        assert self._pick(config) is Layout.MLX_RGB_HWC
+
     def test_mlx_head_keeps_the_default(self):
         from kinovsr.processors import Layout
 

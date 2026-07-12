@@ -1,11 +1,19 @@
 """VideoToolbox as a processor family: the native-session prover.
 
-M3 exposes the interpolate capability (VTFrameRateConversion). It is the
-capability that exercises everything the typed pipeline exists for: a
-native session with real lifecycle, one-to-many unit emission, a
-rewritten cadence with regenerated timestamps, and preserved clip
-duration - which is what keeps copied audio synchronized. Spatial VT
-scaling migrates here in M4.
+Two capabilities, both wrapping native VTFrameProcessor sessions:
+
+- INTERPOLATE (VTFrameRateConversion): a native session with real
+  lifecycle, one-to-many unit emission, a rewritten cadence with
+  regenerated timestamps, and preserved clip duration - which is what
+  keeps copied audio synchronized.
+- UPSCALE (VTSuperResolutionScaler / VTLowLatencySuperResolutionScaler):
+  the harness's `--upscale fast|balanced|image` spatial modes. This is
+  also the pipeline's MLX->CV bridge: it accepts an MLX RGB frame (the
+  output of any MLX preprocessing chain) and produces a native CV buffer,
+  which is exactly the harness's "MLX denoise -> native upscale" shape.
+  The zero-copy CV->CV path (decoding the source straight into the VSR
+  source format, no MLX round-trip) is a perf follow-up; today the family
+  bridges from MLX, so a pure-upscale chain round-trips through MLX once.
 """
 
 from __future__ import annotations
@@ -17,11 +25,17 @@ from typing import Any
 
 from kinovsr.config.helpers import reject_unknown_keys
 from kinovsr.processors.boundaries import Boundary
-from kinovsr.processors.capabilities import Capability, CapabilitySpec
+from kinovsr.processors.capabilities import (
+    Capability,
+    CapabilitySpec,
+    TemporalMode,
+)
 from kinovsr.processors.errors import MediaError
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
     Cardinality,
+    Domain,
+    DType,
     Layout,
     StreamConstraint,
     StreamSpec,
@@ -31,6 +45,18 @@ from kinovsr.processors.units import FrameUnit
 from kinovsr.settings import Settings
 
 _PROFILES = ("normal", "high")
+
+# Spatial modes = profiles. Each couples scale, output CV layout, dtype,
+# domain, and the input size cap VideoToolbox enforces (native/vsr.py:
+# HQ 1920x1080, LowLatency 960x960). balanced is temporal (prev-frame
+# chain); fast/image are per-frame.
+_UPSCALE_PROFILES = ("fast", "balanced", "image")
+_UPSCALE_MODE = {
+    #        scale, dst layout,          dtype,          domain,        max_w, max_h
+    "fast":     (2, Layout.CV_NV12,      DType.UINT8,    Domain.CODED,   960,  960),
+    "balanced": (4, Layout.CV_RGBA_HALF, DType.FLOAT16,  Domain.UNIT,   1920, 1080),
+    "image":    (4, Layout.CV_RGBA_HALF, DType.FLOAT16,  Domain.UNIT,   1920, 1080),
+}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -146,6 +172,87 @@ class VtInterpolateProcessor:
             session.close()
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class VtUpscaleConfig:
+    mode: str    # "fast" | "balanced" | "image"
+
+
+def _upscale_produces(spec: StreamSpec, config: object) -> StreamSpec:
+    assert isinstance(config, VtUpscaleConfig)
+    scale, dst_layout, dst_dtype, dst_domain, max_w, max_h = (
+        _UPSCALE_MODE[config.mode])
+    g = spec.frame.geometry
+    # The size cap is a VideoToolbox hard limit and mode-dependent, so it is
+    # checked here (open time) rather than as a StreamConstraint bound.
+    if g.width > max_w or g.height > max_h:
+        raise ValueError(
+            f"videotoolbox {config.mode} upscale accepts input up to "
+            f"{max_w}x{max_h}; got {g.width}x{g.height}")
+    frame = dataclasses.replace(
+        spec.frame, layout=dst_layout, dtype=dst_dtype, domain=dst_domain,
+        geometry=g.scaled(scale))
+    return dataclasses.replace(spec, frame=frame)
+
+
+class VtUpscaleProcessor:
+    """Wrap VsrSession as an MLX->CV spatial upscaler.
+
+    Accepts the typed MLX RGB frame (float32/float16, HWC) and uploads it
+    to the scaler as fp16 RGBA, deferring the 8/10-bit quantization into the
+    scaler's output the same way the harness's ``den_rgba`` path does. The
+    output is a native CV buffer at ``scale x`` (RGBAHalf for the HQ modes,
+    NV12 for fast). balanced threads a prev-frame chain inside the session;
+    a hard cut resets it (``reset_temporal_context``). Spatial: timeline and
+    PTS are preserved, so audio and any restore companion stay in sync.
+    """
+
+    def __init__(self, config: VtUpscaleConfig) -> None:
+        self._config = config
+        self._session: Any = None
+        self._mx: Any = None
+        self._index = 0
+
+    def prepare(self, input_spec: StreamSpec,
+                context: PipelineContext) -> None:
+        import mlx.core as mx
+
+        from kinovsr.native.vsr import VsrSession
+
+        self._mx = mx
+        g = input_spec.frame.geometry
+        try:
+            self._session = VsrSession(
+                g.width, g.height, mode=self._config.mode,
+                fps=float(input_spec.timeline.cadence))
+        except (RuntimeError, SystemExit, ValueError) as exc:
+            raise MediaError(
+                f"VideoToolbox VSR session unavailable: {exc}") from exc
+
+    def process(self, unit: FrameUnit,
+                context: PipelineContext) -> Iterable[FrameUnit]:
+        mx = self._mx
+        rgb = unit.payload
+        rgba = mx.concatenate(
+            [rgb.astype(mx.float16),
+             mx.ones((*rgb.shape[:2], 1), mx.float16)], axis=-1)
+        out = self._session.upscale_to_buffer(rgba, self._index)
+        self._index += 1
+        yield unit.with_payload(out)
+
+    def reset(self, boundary: Boundary,
+              context: PipelineContext) -> None:
+        if self._session is not None:
+            self._session.reset_temporal_context()
+
+    def flush(self, context: PipelineContext) -> Iterable[FrameUnit]:
+        return ()
+
+    def close(self, context: PipelineContext) -> None:
+        session, self._session = self._session, None
+        if session is not None:
+            session.close()
+
+
 class VideoToolboxFactory:
     name = "videotoolbox"
 
@@ -161,6 +268,24 @@ class VideoToolboxFactory:
             produces=_produces,
             stateful=True,
         ),
+        Capability.UPSCALE: CapabilitySpec(
+            capability=Capability.UPSCALE,
+            profiles=_UPSCALE_PROFILES,
+            # MLX in, native CV out - the bridge. (The zero-copy CV->CV
+            # source path is a follow-up; see the module docstring.)
+            accepts=StreamConstraint(
+                layouts=(Layout.MLX_RGB_HWC,),
+                dtypes=(DType.FLOAT32, DType.FLOAT16),
+                domains=(Domain.UNIT, Domain.UNIT_SANITIZED),
+                cadences=(Fraction,),      # CFR sources only
+            ),
+            produces=_upscale_produces,
+            # balanced threads one prev frame; declared for all three modes
+            # so the scheduler resets the temporal chain on a hard cut.
+            temporal_mode=TemporalMode.CAUSAL,
+            temporal_radius=1,
+            stateful=True,
+        ),
     }
 
     def parse_config(
@@ -170,7 +295,15 @@ class VideoToolboxFactory:
         capability: Capability,
         profile: str | None,
         settings: Settings,
-    ) -> VtInterpolateConfig:
+    ) -> VtInterpolateConfig | VtUpscaleConfig:
+        if capability is Capability.UPSCALE:
+            reject_unknown_keys(raw, ())
+            mode = profile or "balanced"
+            if mode not in _UPSCALE_PROFILES:
+                raise ValueError(
+                    f"videotoolbox upscale profile must be one of "
+                    f"{list(_UPSCALE_PROFILES)}")
+            return VtUpscaleConfig(mode=mode)
         reject_unknown_keys(raw, ("target_fps",))
         if "target_fps" not in raw:
             raise ValueError("target_fps is required for interpolation")
@@ -178,8 +311,10 @@ class VideoToolboxFactory:
             target_fps=_parse_fps(raw["target_fps"]),
             mode=profile or "normal")
 
-    def build(self, config: VtInterpolateConfig, *,
-              context: PipelineContext) -> VtInterpolateProcessor:
+    def build(self, config: VtInterpolateConfig | VtUpscaleConfig, *,
+              context: PipelineContext) -> VtInterpolateProcessor | VtUpscaleProcessor:
+        if isinstance(config, VtUpscaleConfig):
+            return VtUpscaleProcessor(config)
         return VtInterpolateProcessor(config)
 
 
@@ -190,4 +325,6 @@ __all__ = [
     "VideoToolboxFactory",
     "VtInterpolateConfig",
     "VtInterpolateProcessor",
+    "VtUpscaleConfig",
+    "VtUpscaleProcessor",
 ]
