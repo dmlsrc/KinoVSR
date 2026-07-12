@@ -421,3 +421,27 @@ class TestNoiseMapKeys:
                 factory.parse_config(
                     {key: 1}, capability=Capability.DENOISE,
                     profile="pvdd_level", settings=SETTINGS)
+
+
+class TestDeblockMapKeys:
+    # The mask-capable deblockers take the blockiness-map conditioning; toflow
+    # deblock does not (registry: "--deblock-map does not apply").
+    @pytest.mark.parametrize("family", ["stdf", "fbcnn"])
+    def test_deblockers_accept_the_keys_and_default_off(self, family):
+        from kinovsr.processors.conditioning import DeblockMapConfig
+
+        factory = get_factory(family)
+        default = factory.parse_config(
+            {}, capability=Capability.DEBLOCK, profile=None, settings=SETTINGS)
+        assert default.deblock_map == DeblockMapConfig()  # constant
+        conditioned = factory.parse_config(
+            {"deblock_map": "auto", "deblock_map_gain": 1.2},
+            capability=Capability.DEBLOCK, profile=None, settings=SETTINGS)
+        assert conditioned.deblock_map.mode == "auto"
+        assert conditioned.deblock_map.gain == 1.2
+
+    def test_toflow_deblock_rejects_the_keys(self):
+        with pytest.raises(ValueError, match="unknown"):
+            get_factory("toflow").parse_config(
+                {"deblock_map": "auto"}, capability=Capability.DEBLOCK,
+                profile=None, settings=SETTINGS)

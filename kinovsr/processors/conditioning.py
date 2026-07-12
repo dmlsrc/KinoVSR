@@ -119,11 +119,50 @@ def build_conditioning(config: NoiseMapConfig) -> tuple[Any | None, Any | None]:
     return tracker, pulse
 
 
+# The deblock-map keys condition stdf/fbcnn the way noise-map conditions the
+# denoisers: a per-pixel blockiness mask that gates the correction. It reuses
+# NoiseMapTracker with the blockiness estimator (min_frames=1, a spatial
+# estimate needs no temporal warm-up), so it is a smaller surface - just the
+# mode and a gain.
+DEBLOCK_MAP_KEYS = ("deblock_map", "deblock_map_gain")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DeblockMapConfig:
+    mode: str = "constant"    # "constant" = no mask; "auto" = estimate one
+    gain: float = 1.0
+
+
+def parse_deblock_map(raw: Mapping[str, Any]) -> DeblockMapConfig:
+    """Parse the flat ``deblock_map``/``deblock_map_gain`` keys."""
+    mode = typed_value(raw, "deblock_map", str, "constant")
+    if mode not in _MODES:
+        raise ValueError(f"deblock_map must be one of {list(_MODES)}")
+    gain = typed_value(raw, "deblock_map_gain", float, 1.0)
+    if gain <= 0.0:
+        raise ValueError("deblock_map_gain must be > 0")
+    return DeblockMapConfig(mode=mode, gain=gain)
+
+
+def build_blockiness_tracker(config: DeblockMapConfig) -> Any | None:
+    """Build the blockiness tracker for a deblocker, or None for constant."""
+    if config.mode != "auto":
+        return None
+    from kinovsr.analysis.noise import NoiseMapTracker, estimate_blockiness_map
+
+    return NoiseMapTracker(gain=config.gain, min_frames=1,
+                           estimator=estimate_blockiness_map)
+
+
 __all__ = [
+    "DEBLOCK_MAP_KEYS",
     "NOISE_MAP_KEYS",
     "NOISE_MAP_STREAM_KEYS",
     "NOISE_MAP_TRACKER_KEYS",
+    "DeblockMapConfig",
     "NoiseMapConfig",
+    "build_blockiness_tracker",
     "build_conditioning",
+    "parse_deblock_map",
     "parse_noise_map",
 ]

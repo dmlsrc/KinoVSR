@@ -18,6 +18,12 @@ from kinovsr.processors.capabilities import (
     CapabilitySpec,
     TemporalMode,
 )
+from kinovsr.processors.conditioning import (
+    DEBLOCK_MAP_KEYS,
+    DeblockMapConfig,
+    build_blockiness_tracker,
+    parse_deblock_map,
+)
 from kinovsr.processors.feed_driver import FeedFlushProcessor
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
@@ -37,6 +43,7 @@ _PROFILES = ("mfqev2", "vimeo90k")
 class StdfStageConfig:
     weights_spec: str
     strength: float
+    deblock_map: DeblockMapConfig
 
 
 class StdfFactory:
@@ -65,7 +72,7 @@ class StdfFactory:
         profile: str | None,
         settings: Settings,
     ) -> StdfStageConfig:
-        reject_unknown_keys(raw, ("weights", "strength"))
+        reject_unknown_keys(raw, ("weights", "strength", *DEBLOCK_MAP_KEYS))
         strength = typed_value(raw, "strength", float, 1.0)
         if strength < 0.0:
             raise ValueError("strength must be >= 0")
@@ -73,6 +80,7 @@ class StdfFactory:
             weights_spec=typed_value(raw, "weights", str)
             or settings.stdf_weights or profile or "mfqev2",
             strength=strength,
+            deblock_map=parse_deblock_map(raw),
         )
 
     def build(self, config: StdfStageConfig, *,
@@ -83,8 +91,9 @@ class StdfFactory:
             from .deblocker import StdfDeblocker
 
             kr, kb = holder["coef"]
-            return StdfDeblocker(config.weights_spec,
-                                 strength=config.strength, kr=kr, kb=kb)
+            return StdfDeblocker(
+                config.weights_spec, strength=config.strength, kr=kr, kb=kb,
+                blockiness_map=build_blockiness_tracker(config.deblock_map))
 
         class _Processor(FeedFlushProcessor):
             def prepare(self, input_spec: StreamSpec,

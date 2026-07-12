@@ -3,8 +3,8 @@
 ``quality`` mirrors the flag grammar: "auto" (per-tile comb measurement
 with ``quality_fallback`` where the comb declines), "blind" (the net's
 own estimator), or a number 1-100 pinning one global QF. Blockiness-map
-conditioning stays harness-wired until conditioning becomes stage
-config.
+conditioning is typed stage config (the shared kinovsr.processors.conditioning
+helper builds the tracker the deblocker consumes).
 """
 
 from __future__ import annotations
@@ -15,6 +15,12 @@ from typing import Any
 
 from kinovsr.config.helpers import reject_unknown_keys, typed_value
 from kinovsr.processors.capabilities import Capability, CapabilitySpec
+from kinovsr.processors.conditioning import (
+    DEBLOCK_MAP_KEYS,
+    DeblockMapConfig,
+    build_blockiness_tracker,
+    parse_deblock_map,
+)
 from kinovsr.processors.feed_driver import FeedFlushProcessor
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
@@ -51,6 +57,7 @@ class FbcnnStageConfig:
     quality: Any                 # "auto" | None (blind) | float QF
     quality_fallback: float
     strength: float
+    deblock_map: DeblockMapConfig
 
 
 class FbcnnFactory:
@@ -77,7 +84,8 @@ class FbcnnFactory:
         settings: Settings,
     ) -> FbcnnStageConfig:
         reject_unknown_keys(
-            raw, ("weights", "strength", "quality", "quality_fallback"))
+            raw, ("weights", "strength", "quality", "quality_fallback",
+                  *DEBLOCK_MAP_KEYS))
         strength = typed_value(raw, "strength", float, 1.0)
         if strength < 0.0:
             raise ValueError("strength must be >= 0")
@@ -90,6 +98,7 @@ class FbcnnFactory:
             quality=_parse_quality(typed_value(raw, "quality", str, "auto")),
             quality_fallback=quality_fallback,
             strength=strength,
+            deblock_map=parse_deblock_map(raw),
         )
 
     def build(self, config: FbcnnStageConfig, *,
@@ -103,7 +112,8 @@ class FbcnnFactory:
                 config.weights_path,
                 quality=config.quality,
                 strength=config.strength,
-                quality_fallback=config.quality_fallback))
+                quality_fallback=config.quality_fallback,
+                blockiness_map=build_blockiness_tracker(config.deblock_map)))
 
         return FeedFlushProcessor(make_driver)
 
