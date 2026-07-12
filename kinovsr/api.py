@@ -120,7 +120,9 @@ def process_video_file(
     max_output_seconds: float | None = None,
     audio: bool = False,
     audio_codec: str = "alac",
+    save_audio_sidecar: bool = False,
     quality: float = 0.65,
+    chunk_size: int = 8,
     layout: Any = None,
     reader: Any = None,
 ) -> VideoProcessResult:
@@ -157,7 +159,9 @@ def process_video_file(
         max_output_seconds=max_output_seconds,
         audio=audio,
         audio_codec=audio_codec,
+        save_audio_sidecar=save_audio_sidecar,
         quality=quality,
+        chunk_size=chunk_size,
         reader=reader,
     )
     return VideoProcessResult(

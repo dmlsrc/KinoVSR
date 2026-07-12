@@ -226,7 +226,9 @@ def _run_typed(invocation) -> int:
             max_output_seconds=max_output_seconds,
             audio=options.audio,
             audio_codec=options.audio_codec,
+            save_audio_sidecar=options.save_audio_sidecar,
             quality=options.encode_quality,
+            chunk_size=options.video_chunk_size,
             layout=_source_layout(invocation.config),
             reader=reader,
         )

@@ -152,6 +152,21 @@ def test_windowed_run(clip, tmp_path):
     assert frames == 8
 
 
+def test_audio_sidecar_written_beside_the_output(clip_with_audio, tmp_path):
+    from kinovsr.media.audio import read_wav
+
+    out = tmp_path / "out.mp4"
+    run_file(
+        {"pipeline": []}, video=clip_with_audio, output=out, settings=SETTINGS,
+        audio=True, save_audio_sidecar=True)
+    sidecar = out.resolve().with_name("out_audio.wav")
+    assert sidecar.exists()
+    # a real WAV the audio reader round-trips at the source rate
+    rate, samples = read_wav(sidecar)
+    assert rate == SAMPLE_RATE
+    assert samples.shape[0] >= 1
+
+
 def test_learned_chain_through_endpoints(clip, tmp_path):
     config = {
         "pipeline": ["up"],

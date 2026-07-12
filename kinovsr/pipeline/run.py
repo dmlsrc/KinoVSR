@@ -406,6 +406,7 @@ def run_file(
     max_output_seconds: float | None = None,
     audio: bool = False,
     audio_codec: str = "alac",
+    save_audio_sidecar: bool = False,
     quality: float = 0.65,
     chunk_size: int = 8,
     reader: Any = None,
@@ -453,6 +454,9 @@ def run_file(
         # to the capped output duration (a cap past the natural end is a
         # no-op; trimmed() clamps).
         track = track.trimmed(0.0, max_output_frames / float(out_cadence))
+    if save_audio_sidecar and track is not None:
+        # A WAV sidecar of the (trimmed) carried track, beside the output.
+        track.save_wav(output_path.with_name(f"{output_path.stem}_audio.wav"))
     sink = FileSink(
         output, session.output_spec, source=source, quality=quality,
         audio_track=track, audio_codec=audio_codec)
