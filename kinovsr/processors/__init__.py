@@ -10,7 +10,13 @@ Importing this package imports no processor family and no MLX model code.
 """
 
 from .boundaries import Boundary, BoundaryKind
-from .capabilities import Capability, CapabilitySpec, TemporalMode, preserve_stream
+from .capabilities import (
+    Capability,
+    CapabilitySpec,
+    CompanionSpec,
+    TemporalMode,
+    preserve_stream,
+)
 from .catalog import UnknownFamilyError, available_families, get_factory, register
 from .errors import (
     MediaError,
@@ -22,7 +28,12 @@ from .errors import (
     UnknownStageError,
     WeightsError,
 )
-from .protocol import PipelineContext, Processor, ProcessorFactory
+from .protocol import (
+    BracketFactory,
+    PipelineContext,
+    Processor,
+    ProcessorFactory,
+)
 from .specs import (
     Cardinality,
     ColorMatrix,
@@ -50,9 +61,11 @@ from .units import FrameUnit
 __all__ = [
     "Boundary",
     "BoundaryKind",
+    "BracketFactory",
     "Capability",
     "CapabilitySpec",
     "Cardinality",
+    "CompanionSpec",
     "ColorMatrix",
     "ColorPrimaries",
     "ColorRange",

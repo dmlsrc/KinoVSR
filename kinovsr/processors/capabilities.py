@@ -56,6 +56,32 @@ def preserve_stream(spec: StreamSpec, config: object = None) -> StreamSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class CompanionSpec:
+    """A paired post-processor the builder appends at the chain end.
+
+    Some stages bracket the whole chain: they run a pre-pass at their
+    declared position and a matching post-pass at output geometry (edge
+    sanitize's restore composites the ORIGINAL border back over the
+    processed frame). The pre-stage declares this companion; the builder
+    resolves it as a synthetic stage at the very end and builds the two
+    halves together (``ProcessorFactory.build_bracket``) so they can share
+    state - typically a frame buffer keyed by PTS, which pairs a post-pass
+    output with the pre-pass input even through a windowed stage's delay.
+
+    ``accepts``/``produces`` are the companion's own stream contract at the
+    chain end; ``produces`` is usually identity (the post-pass rewrites
+    pixels, not geometry).
+    """
+
+    accepts: StreamConstraint
+    produces: Callable[[StreamSpec, object], StreamSpec] = preserve_stream
+
+
+def _no_companion(config: object) -> CompanionSpec | None:
+    return None
+
+
+@dataclass(frozen=True, slots=True)
 class CapabilitySpec:
     capability: Capability
     # Profile names this family advertises for the capability, in the
@@ -85,11 +111,17 @@ class CapabilitySpec:
     # Boundary kinds this stage is INCORRECT without (not merely improved
     # by). The builder rejects a chain where no upstream provider exists.
     requires_boundaries: tuple[BoundaryKind, ...] = ()
+    # Given this stage's parsed config, return a CompanionSpec to append a
+    # paired post-stage at the chain end, or None (the default) for stages
+    # that do not bracket the chain. Config-driven so one capability can be
+    # a plain pre-pass or a bracket depending on its settings.
+    companion: Callable[[object], CompanionSpec | None] = _no_companion
 
 
 __all__ = [
     "Capability",
     "CapabilitySpec",
+    "CompanionSpec",
     "TemporalMode",
     "preserve_stream",
 ]

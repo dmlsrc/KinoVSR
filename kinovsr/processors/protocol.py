@@ -118,7 +118,26 @@ class ProcessorFactory(Protocol):
         ...
 
 
+@runtime_checkable
+class BracketFactory(Protocol):
+    """A factory whose config can bracket the chain with a companion.
+
+    When a capability's ``companion(config)`` returns a spec, the builder
+    calls ``build_bracket`` instead of ``build`` and gets back both halves
+    at once, so they can share state (a PTS-keyed capture buffer). The
+    builder places ``pre`` at the stage's declared position and ``post`` at
+    the chain end. A family only implements this when one of its
+    capabilities declares a companion.
+    """
+
+    def build_bracket(
+        self, config: object, *, context: PipelineContext,
+    ) -> tuple[Processor, Processor]:
+        """Return ``(pre, post)`` sharing state; ``post`` runs at the end."""
+
+
 __all__ = [
+    "BracketFactory",
     "PipelineContext",
     "Processor",
     "ProcessorFactory",

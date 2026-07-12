@@ -23,8 +23,11 @@ from kinovsr.config import validate_config
 from kinovsr.config.merge import resolve_stage_config, split_stage_table
 from kinovsr.processors import (
     BoundaryKind,
+    BracketFactory,
     Capability,
     CapabilitySpec,
+    Cardinality,
+    CompanionSpec,
     FieldViolation,
     PipelineContext,
     PipelineError,
@@ -72,6 +75,10 @@ class ResolvedStage:
     config: object                 # the family's typed config
     input_spec: StreamSpec
     output_spec: StreamSpec
+    # Set on the synthetic post-stage the builder appends for a bracketing
+    # stage: the name of the pre-stage it pairs with (whose build_bracket
+    # produced it). None for ordinary stages.
+    companion_of: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +194,7 @@ def resolve_pipeline(
     pipeline: list[str] = list(config.get("pipeline", []))
 
     stages: list[ResolvedStage] = []
+    companions: list[tuple[ResolvedStage, CompanionSpec]] = []
     current = input_spec
     upstream = INPUT_ENDPOINT
     provided_boundaries: set[BoundaryKind] = {BoundaryKind.STREAM_START}
@@ -220,8 +228,41 @@ def resolve_pipeline(
             factory=factory, capability=capability,
             capability_spec=cap_spec, profile=profile, config=cfg,
             input_spec=current, output_spec=produced))
+        companion = cap_spec.companion(cfg)
+        if companion is not None:
+            companions.append((stages[-1], companion))
         current = produced
         upstream = stage_name
+
+    # Append each bracketing stage's companion post-pass at the chain end,
+    # threaded from the final spec. The post-pass pairs its output back to
+    # the pre-pass input by PTS, which only holds on a 1:1 timeline, so a
+    # cardinality-changing chain (interpolation) is rejected here.
+    for pre_stage, companion in companions:
+        if current.timeline.cardinality is not Cardinality.ONE_TO_ONE:
+            raise StreamEdgeError(
+                upstream, f"{pre_stage.name}:post",
+                (FieldViolation(
+                    "timeline.cardinality", Cardinality.ONE_TO_ONE.value,
+                    current.timeline.cardinality.value),),
+                produced=current)
+        violations = companion.accepts.violations(current)
+        if violations:
+            raise StreamEdgeError(upstream, f"{pre_stage.name}:post",
+                                  violations, produced=current)
+        produced = companion.produces(current, pre_stage.config)
+        stages.append(ResolvedStage(
+            name=f"{pre_stage.name}:post", position=len(stages),
+            family=pre_stage.family, factory=pre_stage.factory,
+            capability=pre_stage.capability,
+            capability_spec=CapabilitySpec(
+                capability=pre_stage.capability, profiles=(),
+                accepts=companion.accepts, produces=companion.produces),
+            profile=pre_stage.profile, config=pre_stage.config,
+            input_spec=current, output_spec=produced,
+            companion_of=pre_stage.name))
+        current = produced
+        upstream = f"{pre_stage.name}:post"
 
     broken = coherence_violations(current)
     if broken:
@@ -297,23 +338,46 @@ def build_processors(
     already-built instance is closed before the original error propagates,
     so a failing chain never leaks native sessions or weights."""
     built: list[tuple[ResolvedStage, Processor]] = []
+    # A bracketing stage's build_bracket returns both halves at once; the
+    # post half waits here (keyed by the pre-stage name) until the loop
+    # reaches its synthetic companion stage at the chain end.
+    pending_posts: dict[str, Processor] = {}
     to_raise: BaseException | None = None
     try:
         for stage in plan.stages:
             stage_context = context.for_stage(stage.name)
-            built.append(
-                (stage,
-                 stage.factory.build(stage.config, context=stage_context)))
+            if stage.companion_of is not None:
+                processor = pending_posts.pop(stage.companion_of)
+            elif stage.capability_spec.companion(stage.config) is not None:
+                if not isinstance(stage.factory, BracketFactory):
+                    raise PipelineError(
+                        f"family {stage.family!r} declares a companion but "
+                        f"provides no build_bracket")
+                pre, post = stage.factory.build_bracket(
+                    stage.config, context=stage_context)
+                pending_posts[stage.name] = post
+                processor = pre
+            else:
+                processor = stage.factory.build(
+                    stage.config, context=stage_context)
+            built.append((stage, processor))
     except BaseException as build_error:
         interrupts: list[BaseException] = []
         close_errors: list[BaseException] = []
-        for stage, processor in built:
+        # Close built stages AND any post half not yet placed, so a failure
+        # between a bracket's two halves leaks neither.
+        closables = [(s.name, p) for s, p in built]
+        closables += [(f"{n}:post", p) for n, p in pending_posts.items()]
+        for stage_name, processor in closables:
             try:
-                processor.close(context.for_stage(stage.name))
+                processor.close(context.for_stage(stage_name))
             except Exception as exc:  # noqa: BLE001 - collected, chained below
                 # Ordinary close failures lose to the build error but ride its
                 # context chain so a leaked-resource failure is still visible.
-                close_errors.append(_wrap_stage_error(stage, exc))
+                close_errors.append(
+                    exc if isinstance(exc, PipelineError)
+                    else PipelineRuntimeError(
+                        stage_name, f"{type(exc).__name__}: {exc}"))
             except BaseException as exc:  # noqa: BLE001 - collected like _close_all
                 # KeyboardInterrupt/SystemExit during rollback: keep closing
                 # the remaining stages, then deliver EVERY one (first wins).
