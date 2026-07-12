@@ -213,6 +213,8 @@ def _run_typed(invocation) -> int:
     # matching the harness naming (the _post dir sits beside _post.mp4).
     save_pre = out_root / f"{stem}_pre" if options.save_pre_frames else None
     save_post = out_root / f"{stem}_post" if options.save_post_frames else None
+    comparison = (out_root / f"{stem}_comparison.mp4"
+                  if options.comparison else None)
 
     limit = resolve_mlx_cache_limit_gb(invocation.settings)
     if limit > 0 and not invocation.settings.quiet:
@@ -238,6 +240,7 @@ def _run_typed(invocation) -> int:
             encode_chroma=options.encode_chroma,
             save_pre_frames=save_pre,
             save_post_frames=save_post,
+            comparison=comparison,
             layout=_source_layout(invocation.config),
             reader=reader,
         )
@@ -248,4 +251,7 @@ def _run_typed(invocation) -> int:
         f"{result.frames_in} frames in -> {result.frames_out} out "
         f"in {result.elapsed_s:.2f}s", markup=False)
     get_console().print(f"Post: {result.post_path}", markup=False)
+    if result.comparison_path is not None:
+        get_console().print(f"Comparison: {result.comparison_path}",
+                            markup=False)
     return 0

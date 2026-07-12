@@ -234,6 +234,61 @@ class TestSaveFrames:
         assert list(tmp_path.rglob("frame_*.png")) == []
 
 
+class TestComparison:
+    def test_writes_the_side_by_side(self, clip, tmp_path):
+        res = run_file(
+            {"pipeline": []}, video=clip, output=tmp_path / "o.mp4",
+            settings=SETTINGS, comparison=tmp_path / "cmp.mp4")
+        assert res.comparison_path == tmp_path / "cmp.mp4"
+        with av.open(str(res.comparison_path)) as container:
+            codec = container.streams.video[0].codec_context
+            assert (codec.width, codec.height) == (2 * W, H)
+            decoded = [f.to_ndarray(format="rgb24")
+                       for f in container.decode(video=0)]
+        assert len(decoded) == res.frames_out == N
+        # An empty chain: pre (left) and post (right) are the same frame at
+        # scale 1, so the halves differ only by encode noise.
+        first = decoded[0].astype("f4")
+        halves_diff = abs(first[:, :W] - first[:, W:]).mean()
+        assert halves_diff < 8.0
+
+    def test_carries_audio_like_the_post(self, clip_with_audio, tmp_path):
+        # The harness fed the same audio kwargs to both writers; the tee's
+        # sink carries the same (trimmed) track.
+        res = run_file(
+            {"pipeline": []}, video=clip_with_audio,
+            output=tmp_path / "o.mp4", settings=SETTINGS, audio=True,
+            comparison=tmp_path / "cmp.mp4")
+        with av.open(str(res.comparison_path)) as container:
+            assert container.streams.audio
+
+    def test_pairs_backward_on_a_cadence_doubling_chain(self, clip, tmp_path):
+        # 25 -> 50 fps: each source frame yields two outputs, both pairing
+        # to the SAME retained source frame (harness fed one src_arr to
+        # every frame-rate-converted output). One comparison frame per
+        # output unit; the tee raises if pairing desyncs.
+        config = {
+            "pipeline": ["fps"],
+            "fps": {"processor": "videotoolbox", "profile": "normal",
+                    "target_fps": 50},
+        }
+        res = run_file(
+            config, video=clip, output=tmp_path / "o.mp4",
+            settings=SETTINGS, layout=Layout.CV_RGBA_HALF,
+            comparison=tmp_path / "cmp.mp4")
+        with av.open(str(res.comparison_path)) as container:
+            codec = container.streams.video[0].codec_context
+            assert (codec.width, codec.height) == (2 * W, H)
+            frames = sum(1 for _ in container.decode(video=0))
+        assert frames == res.frames_out
+        assert res.frames_out > N   # the cadence really doubled
+
+    def test_none_means_no_comparison(self, clip, tmp_path):
+        res = run_file({"pipeline": []}, video=clip,
+                       output=tmp_path / "o.mp4", settings=SETTINGS)
+        assert res.comparison_path is None
+
+
 def test_learned_chain_through_endpoints(clip, tmp_path):
     config = {
         "pipeline": ["up"],

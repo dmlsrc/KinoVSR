@@ -426,6 +426,119 @@ class FileRunResult:
     frames_out: int
     output_spec: StreamSpec
     elapsed_s: float
+    comparison_path: Path | None = None
+
+
+class _ComparisonTee:
+    """Side-by-side comparison output: NEAREST-upscaled source vs post.
+
+    The typed analog of the harness's comparison writer. ``run_file`` owns
+    both endpoints, so the tee retains decoded source frames (uint8 RGB,
+    bounded by chain latency), pairs each emitted output unit with the
+    latest source frame at-or-before its instant (interpolated outputs
+    repeat the source frame, exactly as the harness fed the same ``src_arr``
+    to every frame-rate-converted output), nearest-upscales the source half
+    to the output geometry, and appends the composite to a second FileSink
+    riding the same output timeline. The composite is built in pure MLX -
+    integer-gather nearest resample + concat - which for the harness's
+    integer-scale shapes is pixel-identical to its ``mx.repeat`` pre half.
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        output_spec: StreamSpec,
+        source: FileSource,
+        *,
+        quality: float,
+        audio_track: Any = None,
+        audio_codec: str = "alac",
+        encode_chroma: str = "auto",
+    ) -> None:
+        from collections import deque
+
+        from kinovsr.processors.specs import DType
+
+        out_geometry = output_spec.frame.geometry
+        comp_frame = dataclasses.replace(
+            output_spec.frame,
+            layout=Layout.MLX_RGB_HWC,
+            dtype=DType.FLOAT32,
+            geometry=Geometry(out_geometry.width * 2, out_geometry.height,
+                              out_geometry.pixel_aspect))
+        self.sink = FileSink(
+            path, dataclasses.replace(output_spec, frame=comp_frame),
+            source=source, quality=quality, label="comparison",
+            audio_track=audio_track, audio_codec=audio_codec,
+            encode_chroma=encode_chroma)
+        self._retained: Any = deque()   # (seconds, uint8 (H,W,3) mx.array)
+        self._src_time_base = float(source.spec.timeline.time_base)
+        self._out_time_base = float(output_spec.timeline.time_base)
+        self._src_layout = source.spec.frame.layout
+        self._out_layout = output_spec.frame.layout
+        self._out_w, self._out_h = out_geometry.width, out_geometry.height
+        src_geometry = source.spec.frame.geometry
+        # Nearest-neighbor gather maps, source -> output geometry. For an
+        # integer scale s this is j // s, identical to mx.repeat.
+        import mlx.core as mx
+
+        self._ix = mx.array(
+            [(x * src_geometry.width) // self._out_w
+             for x in range(self._out_w)], dtype=mx.int32)
+        self._iy = mx.array(
+            [(y * src_geometry.height) // self._out_h
+             for y in range(self._out_h)], dtype=mx.int32)
+
+    def _to_uint8_rgb(self, payload: Any, layout: Layout) -> Any:
+        import mlx.core as mx
+
+        from kinovsr.media import pixel_buffers as _pb
+
+        if layout is Layout.MLX_RGB_HWC:
+            rgb = (payload[..., :3] if payload.dtype == mx.uint8
+                   else mx.clip(payload[..., :3] * 255.0, 0,
+                                255).astype(mx.uint8))
+        else:
+            rgb = _pb.read_pixel_buffer_rgb(payload)
+        rgb = mx.contiguous(rgb)
+        mx.eval(rgb)   # materialize: free the decode graph, keep only uint8
+        return rgb
+
+    def tap(self, units: Any) -> Any:
+        """Wrap the source iterator, retaining each decoded frame."""
+        for unit in units:
+            self._retained.append(
+                (unit.pts * self._src_time_base,
+                 self._to_uint8_rgb(unit.payload, self._src_layout)))
+            yield unit
+
+    def emit(self, unit: FrameUnit) -> None:
+        """Composite ``unit`` against its paired source frame and append."""
+        import mlx.core as mx
+
+        out_seconds = unit.pts * self._out_time_base
+        # Advance to the LATEST retained source frame at-or-before this
+        # output instant; drop everything strictly earlier (paired frames
+        # can repeat for cadence-upsampled outputs, so keep the pair).
+        while (len(self._retained) >= 2
+               and self._retained[1][0] <= out_seconds + 1e-9):
+            self._retained.popleft()
+        if not self._retained:
+            raise PipelineError(
+                "comparison tee has no retained source frame to pair with "
+                "an emitted output unit; the chain emitted before consuming")
+        pre = self._retained[0][1]
+        pre_up = mx.take(mx.take(pre, self._iy, axis=0), self._ix, axis=1)
+        pre_f = pre_up.astype(mx.float32) / 255.0
+        if self._out_layout is Layout.MLX_RGB_HWC:
+            post_f = unit.payload[..., :3].astype(mx.float32)
+        else:
+            from kinovsr.media import pixel_buffers as _pb
+
+            post_f = _pb.read_pixel_buffer_rgb(
+                unit.payload).astype(mx.float32) / 255.0
+        self.sink.append(
+            unit.with_payload(mx.concatenate([pre_f, post_f], axis=1)))
 
 
 def _save_frame_png(payload: Any, layout: Layout, out_dir: Path,
@@ -471,6 +584,7 @@ def run_file(
     encode_chroma: str = "auto",
     save_pre_frames: Path | str | None = None,
     save_post_frames: Path | str | None = None,
+    comparison: Path | str | None = None,
     reader: Any = None,
 ) -> FileRunResult:
     """Run a composed pipeline config file-to-file through the endpoints.
@@ -547,6 +661,23 @@ def run_file(
     post_layout = session.output_spec.frame.layout
     post_index = 0
 
+    # The side-by-side comparison output (harness --comparison parity):
+    # retained source frames pair with emitted output units into a second
+    # sink at 2*out_w. auto chroma follows the POST output's own pick so
+    # both files carry the same profile, as the harness's shared `profile`
+    # variable did.
+    tee = None
+    if comparison is not None:
+        comp_chroma = encode_chroma
+        if (comp_chroma == "auto"
+                and session.output_spec.frame.layout is Layout.CV_NV12):
+            comp_chroma = "420"
+        tee = _ComparisonTee(
+            comparison, session.output_spec, source, quality=quality,
+            audio_track=track, audio_codec=audio_codec,
+            encode_chroma=comp_chroma)
+        source_units = tee.tap(source_units)
+
     # A duration-preserving chain must end exactly at the source-window
     # duration. Interpolation's regenerated grid can round the final unit's
     # end past that (its natural grid-interval duration overshoots the last
@@ -573,6 +704,8 @@ def run_file(
                     post_index += 1
                 if pending is not None:
                     sink.append(pending)
+                    if tee is not None:
+                        tee.emit(pending)
                     frames_out += 1
                 pending = unit
                 if (max_output_frames is not None
@@ -594,17 +727,23 @@ def run_file(
                     pending = pending.retimed(
                         pending.pts, max(1, clamped_end - pending.pts))
                 sink.append(pending)
+                if tee is not None:
+                    tee.emit(pending)
                 frames_out += 1
     except BaseException:
-        # The partial output is not a deliverable; drop the temp file and
-        # leave any pre-existing file at `output` untouched.
+        # The partial output is not a deliverable; drop the temp files and
+        # leave any pre-existing files untouched.
         sink.discard()
+        if tee is not None:
+            tee.sink.discard()
         raise
     path = sink.finish()
+    comparison_path = tee.sink.finish() if tee is not None else None
     return FileRunResult(
         path=path, frames_in=source.frame_count, frames_out=frames_out,
         output_spec=session.output_spec,
-        elapsed_s=time.perf_counter() - t0)
+        elapsed_s=time.perf_counter() - t0,
+        comparison_path=comparison_path)
 
 
 __all__ = ["FileRunResult", "FileSink", "FileSource", "run_file"]
