@@ -55,6 +55,38 @@ with session, session.process(my_units()) as run:
   `kinovsr.reporting.Reporter`; the CLI passes its Rich-backed one,
   a host can pass its own, tests use `RecordingReporter`.
 
+## Frame ownership and lifetime
+
+A `FrameUnit` payload is either an MLX array or a `CVPixelBuffer` - the
+input `StreamSpec`'s `Layout` says which - and the two carry different
+ownership rules. Zero-copy adds one more.
+
+- **MLX payloads are values.** A stage returns a new unit
+  (`with_payload`) instead of mutating; MLX arrays are functional. Keep
+  output frames as long as you like.
+- **Input CVPixelBuffers you pass to `process()` are borrowed, and a
+  stateful stage may hold one across pulls.** Temporal interpolation
+  keeps the previous source frame until the next one arrives, so a
+  buffer handed in on one pull can still be read on the next. Do not
+  mutate it, overwrite it, or return it to your own pool until the run
+  finishes or you close it; hand in a fresh or retained buffer per
+  unit.
+- **Output CVPixelBuffers are yours by default.** In the plain session
+  path KinoVSR allocates a fresh IOSurface-backed buffer per output
+  unit and yields the only reference; retain it freely.
+- **The zero-copy fast path recycles, so a yielded buffer is valid
+  only until the next pull.** When output buffers come from a
+  `CVPixelBufferPool` - how the file writer runs internally, and how a
+  host opts into zero-copy - the pool may hand the same IOSurface back
+  on the following unit. Copy it, or hand it off (retain it, enqueue it
+  to an encoder) before advancing the iterator. The file path is safe
+  because the writer consumes each buffer synchronously before the next
+  pull.
+- **Frame count is not preserved.** One unit in can yield zero, one, or
+  several out (interpolation), and a stateful stage can absorb several
+  before it emits. Do not assume a 1:1 mapping or a stable total; drive
+  off the units the iterator actually yields.
+
 ## File runs
 
 `process_video_file` is the same chain grounded by the file endpoints:
@@ -64,6 +96,26 @@ verifies the declared output timeline unit by unit while carrying
 audio only when duration was preserved (the synchronization-correct
 policy). The CLI's `[pipeline]`-config route calls exactly this
 function.
+
+## Audio
+
+The session is a **video** contract. A `FrameUnit` carries one video
+frame, no stage reads or writes audio, and `open_pipeline` /
+`PipelineSession` take no audio argument. This is deliberate: a video
+processor can rewrite frame timing (interpolation changes the cadence),
+and only a muxer that owns both tracks can keep audio aligned across
+that - so the honest stream promise is exact per-unit `pts` /
+`duration` on the validated output timeline, which the host uses to
+resynchronize its own audio.
+
+`process_video_file` is the supported way to get audio *out* of
+KinoVSR: it reads the source track, trims it to the input window and
+any output cap, and muxes it **only when the chain preserved clip
+duration** - a duration-rewriting chain drops the carry rather than
+shipping a track that drifts against the video. A public stream-side
+file sink that a host could feed with its own `AudioTrack` stays
+deferred until a real out-of-tree adapter proves its shape; today,
+encode-with-audio means `process_video_file`.
 
 ## Compatibility policy
 

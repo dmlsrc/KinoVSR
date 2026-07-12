@@ -63,6 +63,22 @@ def test_annotations_resolve_at_runtime():
         assert hints, func.__name__
 
 
+def test_session_surface_is_video_only():
+    """The M5 audio-surface review, pinned: the stream contract carries
+    no audio. ``open_pipeline`` takes no audio argument and ``FrameUnit``
+    has no audio field - audio is a file-endpoint concern handled by
+    ``process_video_file`` (docs/API.md, Audio)."""
+    import inspect
+
+    from kinovsr.api import open_pipeline
+    from kinovsr.processors import FrameUnit
+
+    params = inspect.signature(open_pipeline).parameters
+    assert not any("audio" in name.lower() for name in params), params
+    assert set(FrameUnit.__dataclass_fields__) == {
+        "payload", "pts", "duration", "boundaries"}
+
+
 def test_open_pipeline_is_the_session_constructor():
     from fractions import Fraction
 
