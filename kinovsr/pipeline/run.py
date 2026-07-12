@@ -661,6 +661,15 @@ def run_file(
         max_frames=max_frames, chunk_size=chunk_size,
         source_color=source_color, source_range=source_range,
         context_frames=context_frames, reader=reader)
+    # Probe-time auto geometry: rewrite bars="auto"/edges="auto" stage
+    # tables into detected literal counts before the chain resolves
+    # (sampling through the same reader the run decodes with).
+    from .auto_geometry import resolve_auto_geometry, wants_auto_geometry
+
+    if wants_auto_geometry(config):
+        config = resolve_auto_geometry(
+            config, video=video_path, vr=source._vr,
+            pixel_aspect=source.spec.frame.geometry.pixel_aspect)
     session = open_pipeline(
         config, source.spec, settings=settings, reporter=reporter,
         windowing=windowing)
