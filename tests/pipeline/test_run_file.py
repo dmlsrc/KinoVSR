@@ -434,3 +434,24 @@ def test_ntsc_cadence_writes_the_exact_rational_grid(tmp_path):
         # the sink writes round(i/cadence*24000)/24000; allow that
         # rounding but not the index-grid quantization drift
         assert abs(t - expected) <= half_tick, (i, float(t), float(expected))
+
+
+def test_odd_output_dimension_is_rejected(tmp_path):
+    from kinovsr.pipeline.run import FileSink
+    from kinovsr.processors import (
+        Geometry,
+        StreamSpec,
+        TimelineSpec,
+        frame_spec_for_matrix,
+    )
+
+    # 4:2:0 subsamples both axes, so an odd height (or width) has no even luma
+    # grid. The harness silently evened both dimensions; the sink now rejects
+    # loudly (parity bug C7 - the guard checked only width before).
+    odd = StreamSpec(
+        frame=frame_spec_for_matrix(
+            "bt709", full_range=False, geometry=Geometry(100, 99)),
+        timeline=TimelineSpec(
+            time_base=Fraction(1, 24000), cadence=Fraction(25)))
+    with pytest.raises(MediaError, match="odd dimension"):
+        FileSink(tmp_path / "out.mp4", odd)

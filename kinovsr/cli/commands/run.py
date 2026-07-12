@@ -77,6 +77,30 @@ _STAGE_SELECTORS = (
     ("cut_detect", "off"),
 )
 
+# Geometry/orchestration flags a [pipeline] config also owns (crop, anamorphic,
+# junk-edge sanitize, keyframe windowing). Silently ignoring them was a parity
+# trap; reject them loudly like the stage selectors. A flag is "set" when its
+# value is not one of these unset sentinels.
+_GEOMETRY_FLAGS = (
+    "crop_bars", "crop_aspect", "square_pixels", "sanitize_edges",
+    "snap_start", "gop_align",
+)
+_UNSET = (None, False, "off", "")
+
+
+def _pipeline_owned_flags(options) -> list[str]:
+    """Flag names a ``[pipeline]`` config owns and that are set on ``options``.
+
+    A ``[pipeline]`` config composes the whole chain, so any stage-selector or
+    geometry/orchestration flag alongside it is a config error, not silently
+    ignored.
+    """
+    owned = [name for name, default in _STAGE_SELECTORS
+             if getattr(options, name, default) != default]
+    owned += [name for name in _GEOMETRY_FLAGS
+              if getattr(options, name, None) not in _UNSET]
+    return owned
+
 
 def _source_layout(config):
     """The file-source layout the FIRST stage accepts (MLX preferred).
@@ -118,13 +142,12 @@ def _run_typed(invocation) -> int:
     from pathlib import Path
 
     options = invocation.options
-    selected = [name for name, default in _STAGE_SELECTORS
-                if getattr(options, name, default) != default]
+    selected = _pipeline_owned_flags(options)
     if selected:
         flags = ", ".join("--" + n.replace("_", "-") for n in selected)
         get_console().print(
-            f"config error: a [pipeline] config owns stage composition; "
-            f"drop the stage flags ({flags}) or the pipeline table",
+            f"config error: a [pipeline] config owns the full chain; "
+            f"drop the flags ({flags}) or the pipeline table",
             style="bold red", markup=False)
         return 2
     if not options.output_dir:

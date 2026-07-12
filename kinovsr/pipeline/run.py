@@ -223,11 +223,13 @@ class FileSink:
         if layout not in _DECODE_FORMATS:
             raise MediaError(
                 f"output endpoint cannot encode layout {layout.value!r}")
-        if output_spec.frame.geometry.width % 2:
+        geometry = output_spec.frame.geometry
+        if geometry.width % 2 or geometry.height % 2:
             raise MediaError(
-                f"output width {output_spec.frame.geometry.width} is odd; "
-                f"the 4:2:2/4:2:0 encoder paths need even luma widths - "
-                f"crop or pad the chain to an even geometry")
+                f"output geometry {geometry.width}x{geometry.height} has an "
+                f"odd dimension; the 4:2:2 and 4:2:0 encoder paths need even "
+                f"luma width AND height (4:2:0 subsamples both) - crop or pad "
+                f"the chain to an even geometry")
         timeline = output_spec.timeline
         if not isinstance(timeline.cadence, Fraction):
             raise MediaError("output endpoint requires a CFR cadence")
