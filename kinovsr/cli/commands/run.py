@@ -209,6 +209,10 @@ def _run_typed(invocation) -> int:
     out_root = Path(options.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
     output = out_root / f"{stem}_post.mp4"
+    # Per-frame PNG dumps land in sibling {stem}_pre / {stem}_post dirs,
+    # matching the harness naming (the _post dir sits beside _post.mp4).
+    save_pre = out_root / f"{stem}_pre" if options.save_pre_frames else None
+    save_post = out_root / f"{stem}_post" if options.save_post_frames else None
 
     limit = resolve_mlx_cache_limit_gb(invocation.settings)
     if limit > 0 and not invocation.settings.quiet:
@@ -232,6 +236,8 @@ def _run_typed(invocation) -> int:
             source_color=options.source_color,
             source_range=options.source_range,
             encode_chroma=options.encode_chroma,
+            save_pre_frames=save_pre,
+            save_post_frames=save_post,
             layout=_source_layout(invocation.config),
             reader=reader,
         )

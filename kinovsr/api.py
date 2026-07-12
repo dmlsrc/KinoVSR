@@ -126,6 +126,8 @@ def process_video_file(
     source_color: str = "auto",
     source_range: str = "auto",
     encode_chroma: str = "auto",
+    save_pre_frames: Path | str | None = None,
+    save_post_frames: Path | str | None = None,
     layout: Any = None,
     reader: Any = None,
 ) -> VideoProcessResult:
@@ -168,6 +170,8 @@ def process_video_file(
         source_color=source_color,
         source_range=source_range,
         encode_chroma=encode_chroma,
+        save_pre_frames=save_pre_frames,
+        save_post_frames=save_post_frames,
         reader=reader,
     )
     return VideoProcessResult(

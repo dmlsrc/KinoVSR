@@ -428,6 +428,26 @@ class FileRunResult:
     elapsed_s: float
 
 
+def _save_frame_png(payload: Any, layout: Layout, out_dir: Path,
+                    index: int, _pb: Any) -> None:
+    """Write one unit's RGB to ``out_dir/frame_NNNNN.png``.
+
+    An MLX unit carries a float32 [0,1] (H,W,3|4) array (uint8 already
+    display-ready); a native unit carries a CVPixelBuffer read straight to
+    uint8 RGB - the same two forms the harness dumped.
+    """
+    import mlx.core as mx
+
+    from kinovsr.media.images import save_image
+
+    if layout is Layout.MLX_RGB_HWC:
+        rgb = (payload[..., :3] if payload.dtype == mx.uint8
+               else mx.clip(payload[..., :3] * 255.0, 0, 255).astype(mx.uint8))
+    else:
+        rgb = _pb.read_pixel_buffer_rgb(payload)
+    save_image(rgb, out_dir / f"frame_{index:05d}.png")
+
+
 def run_file(
     config: dict,
     *,
@@ -449,6 +469,8 @@ def run_file(
     source_color: str = "auto",
     source_range: str = "auto",
     encode_chroma: str = "auto",
+    save_pre_frames: Path | str | None = None,
+    save_post_frames: Path | str | None = None,
     reader: Any = None,
 ) -> FileRunResult:
     """Run a composed pipeline config file-to-file through the endpoints.
@@ -502,6 +524,29 @@ def run_file(
         output, session.output_spec, source=source, quality=quality,
         audio_track=track, audio_codec=audio_codec,
         encode_chroma=encode_chroma)
+
+    # Optional per-frame PNG dumps: pre = the SOURCE frames (before the chain),
+    # post = the encoded output frames (after it). Debug taps, not chain
+    # stages - the PRE tap wraps the source iterator so it dumps exactly the
+    # frames the session pulls, and the POST tap dumps each emitted unit.
+    from kinovsr.media import pixel_buffers as _pbmod
+    pre_dir = Path(save_pre_frames) if save_pre_frames else None
+    post_dir = Path(save_post_frames) if save_post_frames else None
+    source_units = source.units()
+    if pre_dir is not None:
+        pre_dir.mkdir(parents=True, exist_ok=True)
+        src_layout = source.spec.frame.layout
+
+        def _pre_tapped(units: Any) -> Any:
+            for i, unit in enumerate(units):
+                _save_frame_png(unit.payload, src_layout, pre_dir, i, _pbmod)
+                yield unit
+        source_units = _pre_tapped(source_units)
+    if post_dir is not None:
+        post_dir.mkdir(parents=True, exist_ok=True)
+    post_layout = session.output_spec.frame.layout
+    post_index = 0
+
     # A duration-preserving chain must end exactly at the source-window
     # duration. Interpolation's regenerated grid can round the final unit's
     # end past that (its natural grid-interval duration overshoots the last
@@ -520,8 +565,12 @@ def run_file(
         # one-unit holdback lets the final frame be clamped before it is
         # written (the clamp needs to know it is the last).
         with session, session.process(
-                source.units(), retain_outputs=False) as run:
+                source_units, retain_outputs=False) as run:
             for unit in run:
+                if post_dir is not None:
+                    _save_frame_png(unit.payload, post_layout, post_dir,
+                                    post_index, _pbmod)
+                    post_index += 1
                 if pending is not None:
                     sink.append(pending)
                     frames_out += 1

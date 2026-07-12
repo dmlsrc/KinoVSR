@@ -211,6 +211,29 @@ class TestEncodeChroma:
             assert container.streams.video[0].codec_context.pix_fmt == pix_fmt
 
 
+class TestSaveFrames:
+    def test_pre_and_post_dumps(self, clip, tmp_path):
+        from kinovsr.media.images import load_image_rgb
+
+        pre, post = tmp_path / "pre", tmp_path / "post"
+        res = run_file(
+            {"pipeline": []}, video=clip, output=tmp_path / "o.mp4",
+            settings=SETTINGS, save_pre_frames=pre, save_post_frames=post)
+        pre_pngs = sorted(pre.glob("frame_*.png"))
+        post_pngs = sorted(post.glob("frame_*.png"))
+        # a 1:1 chain: one PNG per source frame in and per output frame out
+        assert len(pre_pngs) == res.frames_in == N
+        assert len(post_pngs) == res.frames_out == N
+        assert pre_pngs[0].name == "frame_00000.png"
+        img = load_image_rgb(str(post_pngs[0]))    # a real, loadable RGB image
+        assert img.shape == (H, W, 3)
+
+    def test_off_by_default(self, clip, tmp_path):
+        run_file({"pipeline": []}, video=clip, output=tmp_path / "o.mp4",
+                 settings=SETTINGS)
+        assert list(tmp_path.rglob("frame_*.png")) == []
+
+
 def test_learned_chain_through_endpoints(clip, tmp_path):
     config = {
         "pipeline": ["up"],
