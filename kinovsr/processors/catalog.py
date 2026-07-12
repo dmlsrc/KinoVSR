@@ -41,6 +41,7 @@ _FACTORY_TARGETS: dict[str, str] = {
     "safmn": "kinovsr.processors.safmn.factory:FACTORY",
     "sanitize_edges": "kinovsr.processors.sanitize_edges:FACTORY",
     "spatial": "kinovsr.processors.spatial:FACTORY",
+    "square_pixels": "kinovsr.processors.square_pixels:FACTORY",
     "stdf": "kinovsr.processors.stdf.factory:FACTORY",
     "toflow": "kinovsr.processors.toflow.factory:FACTORY",
     "videotoolbox": "kinovsr.processors.videotoolbox:FACTORY",
