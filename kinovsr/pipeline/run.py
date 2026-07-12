@@ -90,6 +90,8 @@ class FileSource:
         end: int | None = None,
         max_frames: int | None = None,
         chunk_size: int = 8,
+        source_color: str = "auto",
+        source_range: str = "auto",
         reader: Any = None,
     ) -> None:
         if layout not in _DECODE_FORMATS:
@@ -110,8 +112,23 @@ class FileSource:
             self._vr.probe_video(self.path))
         from kinovsr.media import color as _color
 
-        src_color = self._vr.probe_color(self.path)
-        self.resolved_color = _color.resolve(src_color, "auto", "auto")
+        self._src_color = self._vr.probe_color(self.path)
+        self.resolved_color = _color.resolve(
+            self._src_color, source_color, source_range)
+        # A forced matrix/range does not just re-tag the output: it re-reads
+        # the raw YUV with the chosen matrix (the fix for untagged SD clips VT
+        # mis-guesses). That native re-decode path is RGBAHalf-only.
+        self._force_read = source_color != "auto" or source_range != "auto"
+        if self._force_read:
+            if layout is not Layout.MLX_RGB_HWC:
+                raise MediaError(
+                    "forced --source-color/--source-range needs the MLX decode "
+                    "path (RGBAHalf); a native-CV chain cannot reinterpret the "
+                    "source's code values")
+            if not hasattr(self._vr, "iter_forced_color_chunks"):
+                raise MediaError(
+                    "forced --source-color/--source-range needs the native "
+                    "reader; the ffmpeg reader cannot re-decode raw YUV")
         self.transform = transform
         self.pixel_aspect = pixel_aspect
         self.source_fps = fps
@@ -162,10 +179,20 @@ class FileSource:
         """Decode the window and yield timestamped units, one per frame."""
         decode_format = getattr(self._pb, _DECODE_FORMATS[self.layout])
         to_mlx = self.layout is Layout.MLX_RGB_HWC
-        index = 0
-        for chunk in self._vr.iter_video_buffer_chunks(
+        if self._force_read:
+            # Re-decode raw YUV, force the resolved matrix, reinterpret the
+            # range: source's actual full_range in, resolved range out.
+            chunks = self._vr.iter_forced_color_chunks(
+                self.path, decode_format, self.resolved_color[2],
+                self._src_color["full_range"], chunk_size=self.chunk_size,
+                start_frame=self.start, end_frame=self.end,
+                reinterpret_full_range=self.resolved_color[3])
+        else:
+            chunks = self._vr.iter_video_buffer_chunks(
                 self.path, decode_format, chunk_size=self.chunk_size,
-                start_frame=self.start, end_frame=self.end):
+                start_frame=self.start, end_frame=self.end)
+        index = 0
+        for chunk in chunks:
             for buffer in chunk:
                 payload = (self._pb.read_buffer_rgb_f32(buffer)
                            if to_mlx else buffer)
@@ -409,6 +436,8 @@ def run_file(
     save_audio_sidecar: bool = False,
     quality: float = 0.65,
     chunk_size: int = 8,
+    source_color: str = "auto",
+    source_range: str = "auto",
     reader: Any = None,
 ) -> FileRunResult:
     """Run a composed pipeline config file-to-file through the endpoints.
@@ -433,7 +462,8 @@ def run_file(
             f"destroy the source")
     source = FileSource(
         video, layout=layout, start=start, end=end,
-        max_frames=max_frames, chunk_size=chunk_size, reader=reader)
+        max_frames=max_frames, chunk_size=chunk_size,
+        source_color=source_color, source_range=source_range, reader=reader)
     session = open_pipeline(
         config, source.spec, settings=settings, reporter=reporter)
     # The output cap resolves against the OUTPUT cadence (a time-form cap

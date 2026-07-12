@@ -123,6 +123,8 @@ def process_video_file(
     save_audio_sidecar: bool = False,
     quality: float = 0.65,
     chunk_size: int = 8,
+    source_color: str = "auto",
+    source_range: str = "auto",
     layout: Any = None,
     reader: Any = None,
 ) -> VideoProcessResult:
@@ -162,6 +164,8 @@ def process_video_file(
         save_audio_sidecar=save_audio_sidecar,
         quality=quality,
         chunk_size=chunk_size,
+        source_color=source_color,
+        source_range=source_range,
         reader=reader,
     )
     return VideoProcessResult(

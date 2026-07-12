@@ -229,6 +229,8 @@ def _run_typed(invocation) -> int:
             save_audio_sidecar=options.save_audio_sidecar,
             quality=options.encode_quality,
             chunk_size=options.video_chunk_size,
+            source_color=options.source_color,
+            source_range=options.source_range,
             layout=_source_layout(invocation.config),
             reader=reader,
         )

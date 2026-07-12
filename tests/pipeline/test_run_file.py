@@ -167,6 +167,34 @@ def test_audio_sidecar_written_beside_the_output(clip_with_audio, tmp_path):
     assert samples.shape[0] >= 1
 
 
+class TestForcedColor:
+    def test_forces_the_resolved_matrix_tag(self, clip):
+        from kinovsr.processors import ColorMatrix
+
+        auto = FileSource(clip).spec.frame.color_matrix
+        forced = FileSource(clip, source_color="bt2020")
+        # forcing overrides how the source is read (this untagged clip is
+        # auto-guessed as something other than 2020) and re-tags the spec.
+        assert forced.spec.frame.color_matrix is ColorMatrix.BT2020
+        assert forced.spec.frame.color_matrix is not auto
+        assert forced._force_read
+
+    def test_forced_run_re_decodes_and_re_tags_the_output(self, clip, tmp_path):
+        res = run_file(
+            {"pipeline": []}, video=clip, output=tmp_path / "o.mp4",
+            settings=SETTINGS, source_color="bt2020")
+        assert res.frames_out == N
+        with av.open(str(res.path)) as container:
+            # BT.2020 primaries (H.273 value 9): the forced decode + tag ran
+            assert container.streams.video[0].codec_context.color_primaries == 9
+
+    def test_forced_color_rejected_on_a_native_layout(self, clip):
+        # The re-decode is RGBAHalf-only; a native-CV source layout cannot
+        # reinterpret code values.
+        with pytest.raises(MediaError, match="MLX decode path"):
+            FileSource(clip, layout=Layout.CV_RGBA_HALF, source_color="bt2020")
+
+
 def test_learned_chain_through_endpoints(clip, tmp_path):
     config = {
         "pipeline": ["up"],
