@@ -378,3 +378,46 @@ class TestLumaChromaKeys:
                 factory.parse_config(
                     {"luma_strength": 0.5}, capability=capability,
                     profile=None, settings=SETTINGS)
+
+
+# Streaming map-capable denoise families take the full noise_map* surface;
+# pvdd is windowed and level-only, handled separately below.
+NOISE_MAP_FAMILIES = ("bsvd", "fastdvdnet", "mc")
+
+
+class TestNoiseMapKeys:
+    @pytest.mark.parametrize("family", NOISE_MAP_FAMILIES)
+    def test_families_accept_the_keys_and_default_off(self, family):
+        from kinovsr.processors.conditioning import NoiseMapConfig
+
+        factory = get_factory(family)
+        default = factory.parse_config(
+            {}, capability=Capability.DENOISE, profile=None, settings=SETTINGS)
+        assert default.noise_map == NoiseMapConfig()  # constant, no pulse
+        conditioned = factory.parse_config(
+            {"noise_map": "auto", "noise_map_gain": 1.2, "noise_map_pulse": True},
+            capability=Capability.DENOISE, profile=None, settings=SETTINGS)
+        assert conditioned.noise_map.mode == "auto"
+        assert conditioned.noise_map.gain == 1.2
+        assert conditioned.noise_map.pulse is True
+
+    def test_pvdd_conditioning_requires_a_level_variant(self):
+        factory = get_factory("pvdd")
+        with pytest.raises(ValueError, match="level PVDD variant"):
+            factory.parse_config(
+                {"noise_map": "auto"}, capability=Capability.DENOISE,
+                profile=None, settings=SETTINGS)
+        ok = factory.parse_config(
+            {"noise_map": "auto", "noise_map_gain": 1.2},
+            capability=Capability.DENOISE, profile="pvdd_level",
+            settings=SETTINGS)
+        assert ok.noise_map.mode == "auto"
+
+    def test_pvdd_rejects_the_streaming_only_keys(self):
+        # pvdd re-estimates per window; refresh/floor are frame-streaming only.
+        factory = get_factory("pvdd")
+        for key in ("noise_map_refresh", "noise_map_floor"):
+            with pytest.raises(ValueError, match="unknown"):
+                factory.parse_config(
+                    {key: 1}, capability=Capability.DENOISE,
+                    profile="pvdd_level", settings=SETTINGS)

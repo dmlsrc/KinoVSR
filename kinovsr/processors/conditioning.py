@@ -24,16 +24,25 @@ from kinovsr.config.helpers import typed_value
 # the flag CLI maps onto them directly. --noise-map-debug is intentionally
 # absent: it writes a post-run diagnostic PNG, an output concern rather than
 # conditioning config.
-NOISE_MAP_KEYS = (
+#
+# The tracker keys drive the sigma-map estimator and the pulse gain, and every
+# map-capable family takes them. The stream keys are engine-side streaming
+# controls (per-frame refresh cadence and the sigma floor) that only the
+# frame-streaming denoisers take; windowed pvdd re-estimates per window and
+# does not accept them.
+NOISE_MAP_TRACKER_KEYS = (
     "noise_map",
     "noise_map_gain",
-    "noise_map_refresh",
     "noise_map_masking",
     "noise_map_motion_cap",
     "noise_map_floor_mode",
-    "noise_map_floor",
     "noise_map_pulse",
 )
+NOISE_MAP_STREAM_KEYS = (
+    "noise_map_refresh",
+    "noise_map_floor",
+)
+NOISE_MAP_KEYS = (*NOISE_MAP_TRACKER_KEYS, *NOISE_MAP_STREAM_KEYS)
 
 _MODES = ("constant", "auto")
 _MOTION_CAPS = ("strict", "loose", "off")
@@ -112,6 +121,8 @@ def build_conditioning(config: NoiseMapConfig) -> tuple[Any | None, Any | None]:
 
 __all__ = [
     "NOISE_MAP_KEYS",
+    "NOISE_MAP_STREAM_KEYS",
+    "NOISE_MAP_TRACKER_KEYS",
     "NoiseMapConfig",
     "build_conditioning",
     "parse_noise_map",

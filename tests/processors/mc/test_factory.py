@@ -15,6 +15,7 @@ from kinovsr.processors import (
     frame_spec_for_matrix,
     get_factory,
 )
+from kinovsr.processors.conditioning import NoiseMapConfig
 from kinovsr.processors.mc import FACTORY, McStageConfig
 from kinovsr.settings import Settings
 
@@ -42,7 +43,7 @@ class TestParse:
         assert config == McStageConfig(
             strength=0.5, window=0, sigma=0.06, gate="smooth",
             clamp=False, occlusion=False, confidence=False,
-            flow="vt", flow_weights=None)
+            flow="vt", flow_weights=None, noise_map=NoiseMapConfig())
 
     def test_flow_vocabulary(self):
         assert parse({"flow": "spynet"}).flow == "spynet"

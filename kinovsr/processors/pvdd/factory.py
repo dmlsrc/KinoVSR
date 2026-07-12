@@ -20,6 +20,12 @@ from kinovsr.processors.capabilities import (
     CapabilitySpec,
     TemporalMode,
 )
+from kinovsr.processors.conditioning import (
+    NOISE_MAP_TRACKER_KEYS,
+    NoiseMapConfig,
+    build_conditioning,
+    parse_noise_map,
+)
 from kinovsr.processors.feed_driver import (
     LUMA_CHROMA_KEYS,
     FeedFlushProcessor,
@@ -50,6 +56,7 @@ class PvddStageConfig:
     trim: int
     noise_variance: float | None
     dtype: str
+    noise_map: NoiseMapConfig
     luma_strength: float
     chroma_strength: float
 
@@ -82,7 +89,8 @@ class PvddFactory:
     ) -> PvddStageConfig:
         reject_unknown_keys(
             raw, ("weights", "window", "trim", "noise_preset",
-                  "noise_variance", "dtype", *LUMA_CHROMA_KEYS))
+                  "noise_variance", "dtype", *LUMA_CHROMA_KEYS,
+                  *NOISE_MAP_TRACKER_KEYS))
         window = typed_value(raw, "window", int, 10)
         if window < 2:
             raise ValueError("window must be >= 2")
@@ -100,15 +108,26 @@ class PvddFactory:
             from . import LEVEL_PRESETS
 
             noise_variance = LEVEL_PRESETS[preset]
+        variant = profile or "pvdd"
+        noise_map = parse_noise_map(raw)
+        # Conditioning needs a level (non-blind) checkpoint; the blind
+        # variants take no map input. The engine reconfirms from the loaded
+        # checkpoint's is_level, but a known-blind profile is knowable now.
+        if (noise_map.mode == "auto" or noise_map.pulse) \
+                and "level" not in variant:
+            raise ValueError(
+                f"noise-map conditioning needs a level PVDD variant; "
+                f"{variant!r} is blind (use pvdd_level)")
         luma_strength, chroma_strength = parse_luma_chroma(raw)
         return PvddStageConfig(
             weights_path=typed_value(raw, "weights", str)
             or settings.pvdd_weights,
-            variant=profile or "pvdd",
+            variant=variant,
             window=window,
             trim=trim,
             noise_variance=noise_variance,
             dtype=dtype,
+            noise_map=noise_map,
             luma_strength=luma_strength,
             chroma_strength=chroma_strength,
         )
@@ -121,13 +140,15 @@ class PvddFactory:
             from .upscaler import PvddDenoiser
 
             dtype = mx.float16 if config.dtype == "float16" else mx.float32
+            tracker, pulse = build_conditioning(config.noise_map)
             return PvddDenoiser(
                 config.weights_path,
                 variant=config.variant,
                 window=config.window,
                 trim=config.trim,
                 noise_variance=config.noise_variance,
-                dtype=dtype)
+                dtype=dtype,
+                noise_map=tracker, pulse=pulse)
 
         return FeedFlushProcessor(
             make_driver,

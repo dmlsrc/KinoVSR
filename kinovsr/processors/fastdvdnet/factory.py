@@ -18,6 +18,12 @@ from kinovsr.processors.capabilities import (
     CapabilitySpec,
     TemporalMode,
 )
+from kinovsr.processors.conditioning import (
+    NOISE_MAP_KEYS,
+    NoiseMapConfig,
+    build_conditioning,
+    parse_noise_map,
+)
 from kinovsr.processors.feed_driver import (
     LUMA_CHROMA_KEYS,
     FeedFlushProcessor,
@@ -42,6 +48,7 @@ class FastDvdStageConfig:
     strength: float
     luma_strength: float
     chroma_strength: float
+    noise_map: NoiseMapConfig
 
 
 class FastDvdFactory:
@@ -70,7 +77,8 @@ class FastDvdFactory:
         profile: str | None,
         settings: Settings,
     ) -> FastDvdStageConfig:
-        reject_unknown_keys(raw, ("weights", "strength", *LUMA_CHROMA_KEYS))
+        reject_unknown_keys(
+            raw, ("weights", "strength", *LUMA_CHROMA_KEYS, *NOISE_MAP_KEYS))
         strength = typed_value(raw, "strength", float, 0.5)
         if not 0.0 <= strength <= 1.0:
             raise ValueError("strength must be in [0, 1]")
@@ -82,6 +90,7 @@ class FastDvdFactory:
             strength=strength,
             luma_strength=luma_strength,
             chroma_strength=chroma_strength,
+            noise_map=parse_noise_map(raw),
         )
 
     def build(self, config: FastDvdStageConfig, *,
@@ -89,10 +98,13 @@ class FastDvdFactory:
         def make_driver() -> Any:
             from . import FastDvdDenoiser
 
+            tracker, pulse = build_conditioning(config.noise_map)
             return FastDvdDenoiser(
                 config.weights_path,
                 variant=config.variant,
-                strength=config.strength)
+                strength=config.strength,
+                noise_map=tracker, map_refresh=config.noise_map.refresh,
+                pulse=pulse, map_floor=config.noise_map.floor)
 
         return FeedFlushProcessor(
             make_driver,
