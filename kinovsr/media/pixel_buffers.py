@@ -170,6 +170,60 @@ def flush_pool(pool: Any) -> None:
     Quartz.CVPixelBufferPoolFlush(pool, 1)
 
 
+def _copy_plane_bytes(src_base: Any, src_bpr: int,
+                      dst_base: Any, dst_bpr: int, height: int) -> None:
+    """Copy ``height`` rows between two locked planes. Copies min(bpr) bytes
+    per row so differing row-padding on the two buffers is safe - the valid
+    pixel bytes never exceed either stride, so they are always fully copied."""
+    src = src_base.as_buffer(height * src_bpr)
+    dst = dst_base.as_buffer(height * dst_bpr)
+    if src_bpr == dst_bpr:
+        dst[:height * src_bpr] = src[:height * src_bpr]
+        return
+    n = min(src_bpr, dst_bpr)
+    for r in range(height):
+        dst[r * dst_bpr:r * dst_bpr + n] = src[r * src_bpr:r * src_bpr + n]
+
+
+def copy_pixel_buffer(pb: Any) -> Any:
+    """Deep-copy a CVPixelBuffer into a fresh IOSurface-backed buffer.
+
+    Format-agnostic: copies every plane row by row, so it handles packed
+    formats (BGRA, RGBAHalf) and planar ones (NV12) alike. Used to hand a
+    session consumer an OWNED output that stays valid after the source buffer
+    is recycled or overwritten by the input owner.
+    """
+    require_pyobjc()
+    fmt = Quartz.CVPixelBufferGetPixelFormatType(pb)
+    w = Quartz.CVPixelBufferGetWidth(pb)
+    h = Quartz.CVPixelBufferGetHeight(pb)
+    dst = make_pixel_buffer_from_attrs(w, h, {
+        "PixelFormatType": fmt, "Width": w, "Height": h,
+        "IOSurfaceProperties": {}, "MetalCompatibility": True,
+    })
+    Quartz.CVPixelBufferLockBaseAddress(pb, 1)   # read-only source
+    Quartz.CVPixelBufferLockBaseAddress(dst, 0)  # writable destination
+    try:
+        if Quartz.CVPixelBufferIsPlanar(pb):
+            for i in range(Quartz.CVPixelBufferGetPlaneCount(pb)):
+                _copy_plane_bytes(
+                    Quartz.CVPixelBufferGetBaseAddressOfPlane(pb, i),
+                    Quartz.CVPixelBufferGetBytesPerRowOfPlane(pb, i),
+                    Quartz.CVPixelBufferGetBaseAddressOfPlane(dst, i),
+                    Quartz.CVPixelBufferGetBytesPerRowOfPlane(dst, i),
+                    Quartz.CVPixelBufferGetHeightOfPlane(pb, i))
+        else:
+            _copy_plane_bytes(
+                Quartz.CVPixelBufferGetBaseAddress(pb),
+                Quartz.CVPixelBufferGetBytesPerRow(pb),
+                Quartz.CVPixelBufferGetBaseAddress(dst),
+                Quartz.CVPixelBufferGetBytesPerRow(dst), h)
+    finally:
+        Quartz.CVPixelBufferUnlockBaseAddress(dst, 0)
+        Quartz.CVPixelBufferUnlockBaseAddress(pb, 1)
+    return dst
+
+
 def make_bgra_buffer(adaptor: Any, width: int, height: int) -> Any:
     """Get a BGRA CVPixelBuffer for the comparison composite output.
 

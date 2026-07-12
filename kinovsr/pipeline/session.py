@@ -19,11 +19,12 @@ sessions) - open another for the next stream.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 from kinovsr.processors import (
     FrameUnit,
+    Layout,
     PipelineContext,
     PipelineError,
     StreamSpec,
@@ -33,6 +34,39 @@ from kinovsr.settings import Settings
 
 from .builder import BuildPlan, build_processors, resolve_pipeline
 from .scheduler import ChainRun, run_chain
+
+# CV payload layouts whose buffers must be copied to give a retaining
+# consumer an owned output (MLX arrays are immutable values, never copied).
+_CV_LAYOUTS = frozenset({Layout.CV_NV12, Layout.CV_BGRA, Layout.CV_RGBA_HALF})
+
+
+class _OwnedCvOutputs:
+    """Wrap a :class:`ChainRun` so each yielded CVPixelBuffer output is a
+    fresh, host-owned deep copy - the retain-safe default for CV-layout
+    sessions. Iteration, cancellation, and context management delegate to the
+    underlying run; only the payload is replaced.
+    """
+
+    def __init__(self, run: ChainRun) -> None:
+        self._run = run
+        from kinovsr.media.pixel_buffers import copy_pixel_buffer
+        self._copy = copy_pixel_buffer
+
+    def __iter__(self) -> _OwnedCvOutputs:
+        return self
+
+    def __next__(self) -> FrameUnit:
+        unit = next(self._run)
+        return unit.with_payload(self._copy(unit.payload))
+
+    def close(self) -> None:
+        self._run.close()
+
+    def __enter__(self) -> _OwnedCvOutputs:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._run.__exit__(exc_type, exc, tb)
 
 
 class PipelineSession:
@@ -57,13 +91,26 @@ class PipelineSession:
         """The validated spec of the units :meth:`process` yields."""
         return self._plan.output_spec
 
-    def process(self, units: Iterable[FrameUnit]) -> ChainRun:
+    def process(self, units: Iterable[FrameUnit], *,
+                retain_outputs: bool = True) -> Iterator[FrameUnit]:
         """Pull ``units`` through the chain; yields output FrameUnits.
 
         Returns an owning iterator: close it (or this session) to cancel
         at any point, including before the first pull. Stage instances
         are built now; weights and native sessions materialize at the
         first pull (each stage's ``prepare``).
+
+        Output ownership (matters only for CVPixelBuffer layouts; MLX
+        payloads are immutable values either way):
+
+        - ``retain_outputs=True`` (default): each output CVPixelBuffer is a
+          fresh, host-owned deep copy - safe to keep indefinitely, even
+          after you feed or recycle the next input.
+        - ``retain_outputs=False``: outputs are yielded as produced, so a
+          payload may alias a borrowed input or a stage's reused buffer and
+          is valid only until the next pull. Copy or hand it off before
+          advancing. The file sink uses this (it consumes each unit into
+          the encoder synchronously, so there is nothing to retain).
         """
         if self._consumed:
             raise PipelineError(
@@ -71,8 +118,11 @@ class PipelineSession:
                 "for the next stream (stage state is never reused)")
         self._consumed = True
         built = build_processors(self._plan, self._context)
-        self._run = run_chain(built, units, self._context)
-        return self._run
+        run = run_chain(built, units, self._context)
+        self._run = run
+        if retain_outputs and self._plan.output_spec.frame.layout in _CV_LAYOUTS:
+            return _OwnedCvOutputs(run)
+        return run
 
     def close(self) -> None:
         """Cancel the active run (if any); safe to call repeatedly."""

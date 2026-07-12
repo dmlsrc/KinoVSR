@@ -133,6 +133,17 @@ def chain(*processors):
     return tuple((stage_for(p), p) for p in processors)
 
 
+def _context_chain(exc):
+    """Every exception reachable via __cause__/__context__ from exc (cycle
+    -safe), so a test can assert an outranked error was preserved."""
+    out, seen, node = [], set(), exc
+    while node is not None and id(node) not in seen:
+        out.append(node)
+        seen.add(id(node))
+        node = node.__cause__ or node.__context__
+    return out
+
+
 class TestLifecycle:
     def test_order_prepare_reset_process_flush_close(self):
         log = []
@@ -326,8 +337,29 @@ class TestCleanup:
                 raise RuntimeError("close failed too")
 
         boom = BadCloseBoom("boom", at_pts=0)
-        with pytest.raises(PipelineRuntimeError, match="kaboom"):
+        with pytest.raises(PipelineRuntimeError, match="kaboom") as exc:
             list(run_chain(chain(boom), units(1), CONTEXT))
+        # The active stage error wins, but the close failure is preserved on
+        # its context chain instead of being silently dropped (finding #7).
+        assert any("close failed too" in str(c)
+                   for c in _context_chain(exc.value))
+
+    def test_every_close_failure_is_preserved(self):
+        # Two stages both fail to close on the success path: the first wins,
+        # and the SECOND rides the context chain rather than vanishing.
+        class BadClose(Recorder):
+            def close(self, context):
+                super().close(context)
+                raise RuntimeError(f"{self.name}-close failed")
+
+        a, b = BadClose("a"), BadClose("b")
+        with pytest.raises(PipelineRuntimeError, match=r"\[a\].*close") as exc:
+            list(run_chain(chain(a, b), units(2), CONTEXT))
+        # both stages still closed, and both failures are reachable
+        assert [x for x in a.log if x[1] == "close"] == [("a", "close", "")]
+        assert [x for x in b.log if x[1] == "close"] == [("b", "close", "")]
+        assert any("b-close failed" in str(c)
+                   for c in _context_chain(exc.value))
 
 
 @pytest.mark.slow

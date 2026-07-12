@@ -99,6 +99,17 @@ class RealEsrganFactory:
                     "state scale when weights is an explicit path "
                     "(profiles declare it)")
             scale = scales[token or _DEFAULT_PROFILE]
+        else:
+            if scale <= 0:
+                raise ValueError("scale must be a positive integer")
+            # A profile (or a profile-named weight) fixes the scale via the
+            # manifest; reject a contradicting explicit scale at open rather
+            # than advertising it and failing when the checkpoint loads.
+            if token is not None and token in scales and scale != scales[token]:
+                raise ValueError(
+                    f"scale {scale} contradicts the {token!r} profile's fixed "
+                    f"{scales[token]}x; drop the scale override or select a "
+                    f"profile/checkpoint with that scale")
         return RealEsrganStageConfig(
             weights_spec=weights or profile or _DEFAULT_PROFILE,
             scale=scale, denoise_strength=denoise_strength)

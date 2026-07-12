@@ -272,3 +272,47 @@ class TestParseDetails:
         per_frame = get_factory("esc").capabilities[Capability.UPSCALE]
         assert per_frame.temporal_mode is TemporalMode.PER_FRAME
         assert not per_frame.stateful
+
+
+class TestOpenTimeValidation:
+    """Findings #4-#6: a constraint knowable at open must be rejected at
+    open, not deferred to build / prepare / the first frame."""
+
+    def test_basicvsrpp_rejects_window_at_or_below_twice_trim(self):
+        # The constructor would silently inflate window to 2*trim+1
+        # (millions of frames for trim=1000); reject it up front instead.
+        factory = get_factory("basicvsrpp")
+        with pytest.raises(ValueError, match=r"2\*trim"):
+            factory.parse_config(
+                {"window": 1, "trim": 1000}, capability=Capability.UPSCALE,
+                profile=None, settings=SETTINGS)
+
+    def test_realesrgan_rejects_scale_contradicting_the_profile(self):
+        factory = get_factory("realesrgan")
+        with pytest.raises(ValueError, match="contradicts"):
+            factory.parse_config(
+                {"scale": 2}, capability=Capability.UPSCALE,
+                profile="x4plus", settings=SETTINGS)
+
+    def test_realesrgan_rejects_nonpositive_scale(self):
+        factory = get_factory("realesrgan")
+        with pytest.raises(ValueError, match="positive"):
+            factory.parse_config(
+                {"scale": 0}, capability=Capability.UPSCALE,
+                profile=None, settings=SETTINGS)
+
+    def test_realviformer_rejects_too_small_geometry_at_open(self):
+        from kinovsr.pipeline import open_pipeline
+        from kinovsr.processors.errors import StreamEdgeError
+
+        tiny = StreamSpec(
+            frame=frame_spec_for_matrix(
+                "bt709", full_range=False, geometry=Geometry(2, 2)),
+            timeline=TimelineSpec(
+                time_base=Fraction(1, 24000), cadence=Fraction(25)))
+        with pytest.raises(StreamEdgeError):
+            open_pipeline(
+                {"pipeline": ["up"],
+                 "up": {"processor": "realviformer", "profile": "x4",
+                        "flow": "zero"}},
+                tiny, settings=SETTINGS)

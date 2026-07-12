@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import os
+import tempfile
 import time
 from collections.abc import Iterator
 from fractions import Fraction
@@ -255,10 +257,23 @@ class FileSink:
                     geometry.pixel_aspect.numerator,
                     geometry.pixel_aspect.denominator)
 
+        # Publish atomically: encode into a unique temp sibling and only
+        # rename it over the requested output when finish() succeeds. A
+        # failure mid-run (e.g. weights that fail to load at the first pull,
+        # after the writer already opened) then leaves any pre-existing
+        # output file untouched instead of destroying it.
+        self._final_path = Path(path)
+        self._final_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=self._final_path.parent,
+            prefix=f".{self._final_path.name}.", suffix=".partial")
+        os.close(fd)
+        self._temp_path = Path(tmp)
+
         profile = (HEVC_PROFILE_MAIN10 if layout is Layout.CV_NV12
                    else HEVC_PROFILE_MAIN422_10)
         self.writer = AVWriter(
-            Path(path),
+            self._temp_path,
             width=geometry.width, height=geometry.height,
             fps=float(timeline.cadence),
             source_pixel_format=getattr(_pb, _DECODE_FORMATS[layout]),
@@ -319,8 +334,20 @@ class FileSink:
                            duration_ticks=unit.duration or None)
 
     def finish(self) -> Path:
+        """Finalize the encode and publish it atomically to the requested
+        output path (Path.replace is atomic on the same filesystem)."""
         self.writer.finish()
-        return self.writer.path
+        self._temp_path.replace(self._final_path)
+        return self._final_path
+
+    def discard(self) -> None:
+        """Abandon the run: release the writer and delete the partial temp
+        file WITHOUT publishing, leaving any pre-existing output untouched.
+        Safe to call after a failure at any point."""
+        with contextlib.suppress(Exception):
+            self.writer.finish()
+        with contextlib.suppress(Exception):
+            self._temp_path.unlink()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -397,22 +424,47 @@ def run_file(
     sink = FileSink(
         output, session.output_spec, source=source, quality=quality,
         audio_track=track, audio_codec=audio_codec)
+    # A duration-preserving chain must end exactly at the source-window
+    # duration. Interpolation's regenerated grid can round the final unit's
+    # end past that (its natural grid-interval duration overshoots the last
+    # source frame), which would leave muxed audio drifting; clamp the last
+    # emitted unit's duration so total output duration matches the source.
+    preserve_duration = (session.output_spec.timeline.duration_policy
+                         is DurationPolicy.PRESERVED)
+    source_end_ticks = round(
+        source.frame_count / source.source_fps
+        / session.output_spec.timeline.time_base)
     frames_out = 0
+    pending: FrameUnit | None = None
+    hit_cap = False
     try:
-        with session, session.process(source.units()) as run:
+        # retain_outputs=False: the sink consumes each unit into the encoder
+        # synchronously, so outputs need not be copied for retention. A
+        # one-unit holdback lets the final frame be clamped before it is
+        # written (the clamp needs to know it is the last).
+        with session, session.process(
+                source.units(), retain_outputs=False) as run:
             for unit in run:
-                sink.append(unit)
-                frames_out += 1
-                if frames_out == max_output_frames:
-                    # Cancel the chain; cadence-changing stages mean the
-                    # output count is not the input count.
+                if pending is not None:
+                    sink.append(pending)
+                    frames_out += 1
+                pending = unit
+                if (max_output_frames is not None
+                        and frames_out + 1 == max_output_frames):
+                    # The staged unit is the capped final frame; stop pulling
+                    # (cadence-changing stages mean output count != input).
+                    hit_cap = True
                     break
+            if pending is not None:
+                if not hit_cap and preserve_duration:
+                    pending = pending.retimed(
+                        pending.pts, max(1, source_end_ticks - pending.pts))
+                sink.append(pending)
+                frames_out += 1
     except BaseException:
-        # Release writer resources without masking the chain's error; the
-        # partial output is not a deliverable, so a finalize failure here
-        # is noise.
-        with contextlib.suppress(Exception):
-            sink.finish()
+        # The partial output is not a deliverable; drop the temp file and
+        # leave any pre-existing file at `output` untouched.
+        sink.discard()
         raise
     path = sink.finish()
     return FileRunResult(

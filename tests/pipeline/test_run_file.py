@@ -199,6 +199,29 @@ def test_interpolation_preserves_duration_and_carries_audio(
     assert abs(audio_s - video_s) < 0.05
 
 
+def test_interpolation_noninteger_ratio_stays_in_sync(
+        clip_with_audio, tmp_path):
+    """A non-integer cadence rewrite (25 -> 40 fps) whose regenerated grid
+    overshoots the source window by ~15ms on the tail: the final unit is
+    clamped so the output duration equals the source and muxed audio stays
+    in sync (finding #2). The sibling 2x test cannot catch this - an exact
+    ratio never overshoots, so its output already lands on the boundary."""
+    config = {
+        "pipeline": ["fps"],
+        "fps": {"processor": "videotoolbox", "profile": "normal",
+                "target_fps": 40},
+    }
+    result = run_file(
+        config, video=clip_with_audio, output=tmp_path / "interp40.mp4",
+        settings=SETTINGS, layout=Layout.CV_RGBA_HALF, audio=True)
+    source_seconds = N / FPS   # 0.96s
+    video_s, audio_s, _, _ = _stream_seconds(result.path)
+    # Tight bound: without the clamp the tail rounds ~15ms past the source.
+    assert abs(video_s - source_seconds) < 0.008
+    assert audio_s is not None
+    assert abs(audio_s - video_s) < 0.03
+
+
 def test_max_output_frames_caps_the_interpolated_stream(clip, tmp_path):
     """--max-frames semantics: the cap counts OUTPUT frames, so a
     cadence-doubling chain stops at the cap instead of emitting
@@ -251,6 +274,28 @@ def test_zero_output_cap_is_rejected(clip, tmp_path):
                  output=tmp_path / "zero.mp4", settings=SETTINGS,
                  max_output_frames=0)
     assert not (tmp_path / "zero.mp4").exists()
+
+
+def test_failed_run_preserves_existing_output(clip, tmp_path):
+    """Finding #3 atomicity: a run that fails after the writer opened (the
+    weights load at the first pull, past open-time validation) must leave a
+    pre-existing output untouched and drop its partial temp file."""
+    out = tmp_path / "keep.mp4"
+    run_file({"pipeline": []}, video=clip, output=out, settings=SETTINGS)
+    original = out.read_bytes()
+    assert original
+
+    # realesrgan with a bogus explicit weights path passes open (explicit
+    # path + scale) but fails when the checkpoint loads at the first pull.
+    config = {"pipeline": ["up"],
+              "up": {"processor": "realesrgan",
+                     "weights": str(tmp_path / "nope.safetensors"),
+                     "scale": 4}}
+    with pytest.raises(Exception):  # noqa: B017 - loader error, wrapped
+        run_file(config, video=clip, output=out, settings=SETTINGS,
+                 max_frames=4)
+    assert out.read_bytes() == original            # original intact
+    assert not list(tmp_path.glob(".keep.mp4.*"))  # no partial temp left
 
 
 _FBCNN_WEIGHTS = Path(

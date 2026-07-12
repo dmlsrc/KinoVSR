@@ -15,7 +15,7 @@ Resolution is pure: it reads values and returns values (the effectful
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +27,8 @@ from kinovsr.processors import (
     CapabilitySpec,
     FieldViolation,
     PipelineContext,
+    PipelineError,
+    PipelineRuntimeError,
     Processor,
     ProcessorFactory,
     StageConfigError,
@@ -240,6 +242,40 @@ def _boundary_violation(kind: BoundaryKind) -> FieldViolation:
         "not provided by the input endpoint or any earlier stage")
 
 
+def _wrap_stage_error(stage: ResolvedStage, exc: Exception) -> Exception:
+    """Name the offending stage on a raw processor error, leaving an
+    already-typed PipelineError untouched."""
+    if isinstance(exc, PipelineError):
+        return exc
+    return PipelineRuntimeError(stage.name, f"{type(exc).__name__}: {exc}")
+
+
+def _append_context(winner: BaseException,
+                    losers: Iterable[BaseException | None]) -> None:
+    """Append each loser (and its own ``__context__`` chain) to the END of
+    the winner's chain, exactly once, preserving any existing cause/context
+    and never forming a cycle.
+
+    This lets a raised winner keep the documented precedence while still
+    carrying every outranked error - cleanup failures ride the chain, never
+    silently dropped.
+    """
+    seen: set[int] = {id(winner)}
+    tail = winner
+    while tail.__context__ is not None and id(tail.__context__) not in seen:
+        tail = tail.__context__
+        seen.add(id(tail))
+    for loser in losers:
+        if loser is None or id(loser) in seen:
+            continue
+        tail.__context__ = loser
+        tail = loser
+        seen.add(id(tail))
+        while tail.__context__ is not None and id(tail.__context__) not in seen:
+            tail = tail.__context__
+            seen.add(id(tail))
+
+
 def build_processors(
     plan: BuildPlan, context: PipelineContext,
 ) -> tuple[tuple[ResolvedStage, Processor], ...]:
@@ -262,11 +298,14 @@ def build_processors(
                  stage.factory.build(stage.config, context=stage_context)))
     except BaseException as build_error:
         interrupt: BaseException | None = None
+        close_errors: list[BaseException] = []
         for stage, processor in built:
             try:
                 processor.close(context.for_stage(stage.name))
-            except Exception:  # noqa: S110
-                pass           # ordinary close failures lose to the build error
+            except Exception as exc:  # noqa: BLE001 - collected, chained below
+                # Ordinary close failures lose to the build error but ride its
+                # context chain so a leaked-resource failure is still visible.
+                close_errors.append(_wrap_stage_error(stage, exc))
             except BaseException as exc:
                 # KeyboardInterrupt/SystemExit during cleanup: finish
                 # closing the remaining stages first, then deliver it
@@ -274,7 +313,9 @@ def build_processors(
                 if interrupt is None:
                     interrupt = exc
         if interrupt is not None:
+            _append_context(interrupt, close_errors)
             raise interrupt from build_error
+        _append_context(build_error, close_errors)
         raise
     return tuple(built)
 

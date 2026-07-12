@@ -68,6 +68,10 @@ class RealViformerFactory:
                 layouts=(Layout.MLX_RGB_HWC,),
                 dtypes=(DType.FLOAT32, DType.FLOAT16),
                 domains=(Domain.UNIT, Domain.UNIT_SANITIZED),
+                # _pad4 reflect-pads to a multiple of 4; reflect needs each
+                # side strictly greater than its pad (up to 3), so sides < 3
+                # crash on the first frame. Reject them at open instead.
+                min_side=3,
             ),
             produces=_produces,
             temporal_mode=TemporalMode.CAUSAL,

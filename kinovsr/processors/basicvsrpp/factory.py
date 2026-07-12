@@ -111,6 +111,14 @@ class BasicVsrppFactory:
         trim = typed_value(raw, "trim", int, 2)
         if trim < 0:
             raise ValueError("trim must be >= 0")
+        if trim and window <= 2 * trim:
+            # The runtime constructor inflates window to max(window, 2*trim+1);
+            # reject the contradiction at open instead of silently buffering a
+            # huge window mid-stream (matches realbasicvsr/pvdd).
+            raise ValueError(
+                "window must be greater than 2*trim so each window keeps a "
+                f"processed interior after trimming {trim} warm-up frames per "
+                f"edge; got window={window}, trim={trim}")
         flow = typed_value(raw, "flow", str, "spynet")
         if flow not in _FLOWS:
             raise ValueError(f"flow must be one of {_FLOWS}")

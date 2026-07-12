@@ -58,12 +58,10 @@ with session, session.process(my_units()) as run:
 ## Frame ownership and lifetime
 
 A `FrameUnit` payload is either an MLX array or a `CVPixelBuffer` - the
-input `StreamSpec`'s `Layout` says which - and the two carry different
-ownership rules. Zero-copy adds one more.
+input `StreamSpec`'s `Layout` says which. MLX arrays are immutable
+values, so they are never an ownership question. CVPixelBuffers are, and
+`process(units, *, retain_outputs=True)` is the switch.
 
-- **MLX payloads are values.** A stage returns a new unit
-  (`with_payload`) instead of mutating; MLX arrays are functional. Keep
-  output frames as long as you like.
 - **Input CVPixelBuffers you pass to `process()` are borrowed, and a
   stateful stage may hold one across pulls.** Temporal interpolation
   keeps the previous source frame until the next one arrives, so a
@@ -71,17 +69,18 @@ ownership rules. Zero-copy adds one more.
   mutate it, overwrite it, or return it to your own pool until the run
   finishes or you close it; hand in a fresh or retained buffer per
   unit.
-- **Output CVPixelBuffers are yours by default.** In the plain session
-  path KinoVSR allocates a fresh IOSurface-backed buffer per output
-  unit and yields the only reference; retain it freely.
-- **The zero-copy fast path recycles, so a yielded buffer is valid
-  only until the next pull.** When output buffers come from a
-  `CVPixelBufferPool` - how the file writer runs internally, and how a
-  host opts into zero-copy - the pool may hand the same IOSurface back
-  on the following unit. Copy it, or hand it off (retain it, enqueue it
-  to an encoder) before advancing the iterator. The file path is safe
-  because the writer consumes each buffer synchronously before the next
-  pull.
+- **Outputs are yours to keep by default (`retain_outputs=True`).** MLX
+  outputs pass through as the immutable values they are; for a
+  CVPixelBuffer layout, `process()` yields a fresh deep copy of each
+  output, so you can retain it indefinitely - even after you feed or
+  recycle the next input.
+- **`retain_outputs=False` is the zero-copy opt-out.** Then outputs are
+  yielded exactly as produced: a CV payload may alias a borrowed input
+  (a pass-through or identity stage yields the input buffer unchanged)
+  or a stage's reused buffer, so it is valid only until the next pull.
+  Copy it, or hand it off (retain it, enqueue it to an encoder) before
+  advancing the iterator. The file sink runs this way - it consumes each
+  unit into the encoder synchronously, so there is nothing to retain.
 - **Frame count is not preserved.** One unit in can yield zero, one, or
   several out (interpolation), and a stateful stage can absorb several
   before it emits. Do not assume a 1:1 mapping or a stable total; drive
@@ -112,7 +111,11 @@ resynchronize its own audio.
 KinoVSR: it reads the source track, trims it to the input window and
 any output cap, and muxes it **only when the chain preserved clip
 duration** - a duration-rewriting chain drops the carry rather than
-shipping a track that drifts against the video. A public stream-side
+shipping a track that drifts against the video. For a duration-
+preserving cadence change (interpolation), the final output frame is
+trimmed to end exactly at the source-window duration, so the muxed
+audio stays in sync instead of drifting by the target grid's tail
+rounding. A public stream-side
 file sink that a host could feed with its own `AudioTrack` stays
 deferred until a real out-of-tree adapter proves its shape; today,
 encode-with-audio means `process_video_file`.

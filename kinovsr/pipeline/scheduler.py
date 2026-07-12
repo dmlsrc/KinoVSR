@@ -37,19 +37,16 @@ from kinovsr.processors import (
     BoundaryKind,
     FrameUnit,
     PipelineContext,
-    PipelineError,
-    PipelineRuntimeError,
     Processor,
 )
 
-from .builder import BuildPlan, ResolvedStage, build_processors
-
-
-def _wrap_stage_error(stage: ResolvedStage, exc: Exception) -> Exception:
-    if isinstance(exc, PipelineError):
-        return exc
-    return PipelineRuntimeError(
-        stage.name, f"{type(exc).__name__}: {exc}")
+from .builder import (
+    BuildPlan,
+    ResolvedStage,
+    _append_context,
+    _wrap_stage_error,
+    build_processors,
+)
 
 
 def _stage_stream(
@@ -170,22 +167,49 @@ class ChainRun:
                     stage, processor, stream,
                     self._context.for_stage(stage.name))
             self._stream = stream
+        to_raise: BaseException | None
         try:
             return next(self._stream)
         except StopIteration:
-            close_error, interrupt = self._close_all()
-            failure = interrupt or close_error
-            if failure is not None:
-                # success path: cleanup failures surface
-                raise failure from None
-            raise
+            to_raise = self._deliver_cleanup(None)
+            if to_raise is None:
+                raise
         except BaseException as active:
-            _, interrupt = self._close_all()
-            if interrupt is not None:
-                # a cleanup interrupt outranks the stage error but keeps
-                # it on the chain
-                raise interrupt from active
-            raise   # the active error wins; an ordinary close error loses
+            to_raise = self._deliver_cleanup(active)
+        # Raise OUTSIDE the except block: raising a different exception while
+        # one is being handled makes Python overwrite the raised exception's
+        # __context__ with the handled one, which would clobber the cleanup
+        # chain built above. Out here nothing is being handled.
+        raise to_raise
+
+    def _deliver_cleanup(
+        self, active: BaseException | None,
+    ) -> BaseException | None:
+        """Close every stage and return the exception the caller should
+        raise (or None to let the current one propagate). Builds the full
+        precedence-correct context chain so no cleanup failure is dropped.
+
+        ``active`` is the stage/body error in flight, or None on the
+        stream-exhausted success path.
+        """
+        close_errors, interrupt = self._close_all()
+        if active is None:
+            ordered = [c for c in (*close_errors, interrupt) if c is not None]
+            if not ordered:
+                return None
+            winner = next((c for c in ordered if self._is_interrupt(c)),
+                          ordered[0])
+            _append_context(winner, [c for c in ordered if c is not winner])
+            return winner
+        if interrupt is not None:
+            # an interrupt outranks the active error, which (with any close
+            # failures) stays on the delivered chain
+            _append_context(interrupt, [active, *close_errors])
+            return interrupt
+        # the active error wins; ordinary close failures ride its context
+        # chain instead of being dropped
+        _append_context(active, close_errors)
+        return active
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -197,8 +221,8 @@ class ChainRun:
         """Close the stream, then every processor - unconditionally - and
         return the one cleanup failure to deliver (or None). Precedence:
         an interrupt beats ordinary failures; otherwise the FIRST failure
-        (stream close happens before processor close) wins, with the
-        loser chained onto the winner's context where possible."""
+        (stream close happens before processor close) wins, with every
+        other failure preserved on the winner's context chain."""
         stream, self._stream = self._stream, None
         stream_error: BaseException | None = None
         if stream is not None:
@@ -206,18 +230,17 @@ class ChainRun:
                 stream.close()
             except BaseException as exc:  # noqa: BLE001 - re-delivered below
                 stream_error = exc
-        close_error, interrupt = self._close_all()
+        close_errors, interrupt = self._close_all()
         # Chronological order: the stream closed before the processors.
         # The first interrupt wins; failing that, the first failure wins.
-        ordered = [c for c in (stream_error, close_error, interrupt)
+        # Every other error is preserved on the winner's context chain.
+        ordered = [c for c in (stream_error, *close_errors, interrupt)
                    if c is not None]
         if not ordered:
             return None
         winner = next((c for c in ordered if self._is_interrupt(c)),
                       ordered[0])
-        for loser in ordered:
-            if loser is not winner and winner.__context__ is None:
-                winner.__context__ = loser
+        _append_context(winner, [c for c in ordered if c is not winner])
         return winner
 
     def close(self) -> None:
@@ -235,10 +258,9 @@ class ChainRun:
         if failure is None:
             return
         if exc is not None and not self._is_interrupt(failure):
-            # The active body error outranks ordinary cleanup failures;
-            # keep the cleanup trace on its context chain when free.
-            if exc.__context__ is None:
-                exc.__context__ = failure
+            # The active body error outranks ordinary cleanup failures; keep
+            # the whole cleanup chain on its context (appended, not clobbered).
+            _append_context(exc, [failure])
             return
         raise failure
 
@@ -248,27 +270,27 @@ class ChainRun:
         with contextlib.suppress(BaseException):
             self.close()
 
-    def _close_all(self) -> tuple[Exception | None, BaseException | None]:
+    def _close_all(self) -> tuple[list[Exception], BaseException | None]:
         """Close every stage exactly once; report failures instead of
-        raising so callers own delivery precedence. Returns the first
-        ordinary close error (wrapped) and the first interrupt."""
+        raising so callers own delivery precedence. Returns EVERY ordinary
+        close error (wrapped, in chain order) and the first interrupt - no
+        stage's failure is dropped when a later stage also fails."""
         if self._closed:
-            return None, None
+            return [], None
         self._closed = True
-        first_close_error: Exception | None = None
+        close_errors: list[Exception] = []
         interrupt: BaseException | None = None
         for stage, processor in self._built:
             try:
                 processor.close(self._context.for_stage(stage.name))
             except Exception as exc:  # noqa: BLE001 - collected, not lost
-                if first_close_error is None:
-                    first_close_error = _wrap_stage_error(stage, exc)
+                close_errors.append(_wrap_stage_error(stage, exc))
             except BaseException as exc:
                 # KeyboardInterrupt/SystemExit mid-cleanup: keep closing
                 # the remaining stages, then deliver it.
                 if interrupt is None:
                     interrupt = exc
-        return first_close_error, interrupt
+        return close_errors, interrupt
 
 
 def run_chain(
