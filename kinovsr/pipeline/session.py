@@ -144,6 +144,7 @@ def open_pipeline(
     *,
     settings: Settings | None = None,
     reporter: Reporter | None = None,
+    windowing: Any = None,
 ) -> PipelineSession:
     """Resolve and validate ``config`` against ``input_spec``; return a
     session ready to process units.
@@ -152,14 +153,21 @@ def open_pipeline(
     stage-config problems, stream-contract violations), so a session
     that opens will not fail preflight mid-stream. ``settings`` defaults
     to the environment-resolved product settings; ``reporter`` receives
-    phase progress (default: none).
+    phase progress (default: none). ``windowing`` is an optional
+    GOP-aligned recurrent-window plan carried to every stage via
+    :class:`PipelineContext` (see its docstring for the contract).
     """
     if settings is None:
         settings = Settings.from_env()
     plan = resolve_pipeline(config, input_spec=input_spec, settings=settings)
-    context = (PipelineContext(settings=settings) if reporter is None
-               else PipelineContext(settings=settings, reporter=reporter))
-    return PipelineSession(plan, context)
+    kwargs: dict[str, Any] = {"settings": settings}
+    if reporter is not None:
+        kwargs["reporter"] = reporter
+    if windowing is not None:
+        kwargs["windowing"] = tuple(
+            (int(p0), int(p1), int(e0), int(e1))
+            for p0, p1, e0, e1 in windowing)
+    return PipelineSession(plan, PipelineContext(**kwargs))
 
 
 __all__ = ["PipelineSession", "open_pipeline"]

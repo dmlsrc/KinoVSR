@@ -185,3 +185,36 @@ class TestParseHelper:
     def test_values_pass_through_including_overdrive(self):
         assert parse_luma_chroma(
             {"luma_strength": 0.4, "chroma_strength": 1.5}) == (0.4, 1.5)
+
+
+class TestWindowing:
+    """PipelineContext.windowing drives schedule-capable drivers at prepare."""
+
+    class _SchedDriver(_HalveDelayDriver):
+        def __init__(self):
+            super().__init__(0)
+            self.schedule = None
+
+        def set_schedule(self, schedule):
+            self.schedule = schedule
+
+    def test_schedule_reaches_a_capable_driver(self):
+        driver = self._SchedDriver()
+        proc = FeedFlushProcessor(lambda: driver)
+        ctx = PipelineContext(
+            settings=SETTINGS, windowing=((0, 9, 0, 8), (8, 17, 8, 16)))
+        proc.prepare(stream(), ctx)
+        assert driver.schedule == [(0, 9, 0, 8), (8, 17, 8, 16)]
+
+    def test_per_frame_driver_is_skipped(self):
+        # No set_schedule on the driver: the plan is ignored, not an error.
+        proc = FeedFlushProcessor(lambda: _HalveDelayDriver(0))
+        ctx = PipelineContext(settings=SETTINGS, windowing=((0, 4, 0, 4),))
+        out = run(proc, stream(), [gray_unit(0.4, 0)])
+        del out
+        proc.prepare(stream(), ctx)   # idempotent, still no error
+
+    def test_no_windowing_leaves_continuous_mode(self):
+        driver = self._SchedDriver()
+        FeedFlushProcessor(lambda: driver).prepare(stream(), CTX)
+        assert driver.schedule is None

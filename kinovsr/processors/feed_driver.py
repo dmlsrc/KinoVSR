@@ -111,6 +111,13 @@ class FeedFlushProcessor:
                 context: PipelineContext) -> None:
         if self._driver is None:
             self._driver = self._make_driver()
+        # The run's GOP-aligned window plan drives every schedule-capable
+        # driver (the harness's one-schedule-drives-all contract); per-frame
+        # drivers lack the method and stay in continuous-stream mode.
+        if (context.windowing is not None
+                and hasattr(self._driver, "set_schedule")):
+            self._driver.set_schedule(
+                [tuple(window) for window in context.windowing])
         if self._blend is None and (self._luma_strength != 1.0
                                     or self._chroma_strength != 1.0):
             from kinovsr.media.yuv import luma_chroma_blend

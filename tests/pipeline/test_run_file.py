@@ -289,6 +289,81 @@ class TestComparison:
         assert res.comparison_path is None
 
 
+class TestGopAlign:
+    """--snap-start / --gop-align parity: keyframe windowing on the typed
+    endpoints. The clip fixture encodes g=8, so keyframes sit at 0, 8, 16."""
+
+    def test_context_frames_ride_negative_pts(self, clip):
+        src = FileSource(clip, start=12, end=20, context_frames=4)
+        units = list(src.units())
+        assert len(units) == 12                      # 4 context + 8 window
+        assert units[0].pts < 0
+        assert units[4].pts == 0                     # window start anchors 0
+        assert src.frame_count == 8                  # context is not output
+
+    def test_context_frames_must_fit_before_start(self, clip):
+        with pytest.raises(MediaError, match="context_frames"):
+            FileSource(clip, start=2, end=8, context_frames=4)
+
+    def test_gop_align_drops_context_outputs(self, clip, tmp_path):
+        # start mid-GOP: the enclosing keyframe (8) extends the read, the
+        # [8, 12) context is processed but never written.
+        res = run_file(
+            {"pipeline": []}, video=clip, output=tmp_path / "gop.mp4",
+            settings=SETTINGS, start=12, end=20, gop_align=True)
+        plain = run_file(
+            {"pipeline": []}, video=clip, output=tmp_path / "plain.mp4",
+            settings=SETTINGS, start=12, end=20)
+        assert res.frames_out == plain.frames_out == 8
+        # identical content: the context changed nothing on an empty chain
+        with av.open(str(res.path)) as a, av.open(str(plain.path)) as b:
+            first_gop = next(a.decode(video=0)).to_ndarray(format="rgb24")
+            first_plain = next(b.decode(video=0)).to_ndarray(format="rgb24")
+        diff = abs(first_gop.astype("f4") - first_plain.astype("f4")).mean()
+        assert diff < 2.0
+
+    def test_snap_start_moves_to_the_nearest_keyframe(self, clip, tmp_path):
+        # start=11 snaps to keyframe 8 -> the window becomes [8, 20).
+        res = run_file(
+            {"pipeline": []}, video=clip, output=tmp_path / "snap.mp4",
+            settings=SETTINGS, start=11, end=20, snap_start=True)
+        assert res.frames_out == 12
+
+    def test_schedule_windows_a_recurrent_stage(self, clip, tmp_path):
+        # The one-schedule-drives-all contract, end to end on real weights:
+        # gop-align resets the recurrent net per keyframe window, so its
+        # output DIFFERS from continuous-stream mode while the frame count
+        # and timeline stay identical. Runs through the public
+        # process_video_file (which caps + clears the MLX cache, keeping
+        # this net-loading test from starving later writer sessions in the
+        # same process) and so also covers the api-level gop threading.
+        from kinovsr.api import process_video_file
+        from kinovsr.processors.bsvd import default_weights_path
+
+        if not default_weights_path().exists():
+            pytest.skip("bsvd weights not available")
+        cfg = {"pipeline": ["dn"],
+               "dn": {"processor": "bsvd", "strength": 0.05}}
+        gop = process_video_file(
+            cfg, video=clip, output=tmp_path / "gop.mp4", settings=SETTINGS,
+            start=12, end=20, gop_align=True, gop_min_window=4,
+            gop_max_window=16)
+        cont = process_video_file(
+            cfg, video=clip, output=tmp_path / "cont.mp4", settings=SETTINGS,
+            start=12, end=20)
+        assert gop.frames_out == cont.frames_out == 8
+
+        def frames(path):
+            with av.open(str(path)) as container:
+                return [f.to_ndarray(format="rgb24")
+                        for f in container.decode(video=0)]
+        a, b = frames(gop.post_path), frames(cont.post_path)
+        total = sum(
+            abs(x.astype("f4") - y.astype("f4")).mean()
+            for x, y in zip(a, b, strict=True))
+        assert total > 0.5   # windowed state != continuous state
+
+
 def test_learned_chain_through_endpoints(clip, tmp_path):
     config = {
         "pipeline": ["up"],

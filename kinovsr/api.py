@@ -93,17 +93,21 @@ def open_pipeline(
     *,
     settings: Settings | None = None,
     reporter: Reporter | None = None,
+    windowing: Any = None,
 ) -> PipelineSession:
     """Resolve and preflight-validate ``config`` against ``input_spec``;
     return a session over the caller's own frame units.
 
     See :class:`kinovsr.pipeline.PipelineSession`: ``process(units)``
     yields output units with natural backpressure, weights load at the
-    first pull, and closing cancels deterministically.
+    first pull, and closing cancels deterministically. ``windowing``
+    optionally carries a GOP-aligned recurrent-window plan to every
+    schedule-capable stage (see ``PipelineContext.windowing``).
     """
     from kinovsr.pipeline import open_pipeline as _open
 
-    return _open(config, input_spec, settings=settings, reporter=reporter)
+    return _open(config, input_spec, settings=settings, reporter=reporter,
+                 windowing=windowing)
 
 
 def process_video_file(
@@ -129,6 +133,10 @@ def process_video_file(
     save_pre_frames: Path | str | None = None,
     save_post_frames: Path | str | None = None,
     comparison: Path | str | None = None,
+    snap_start: bool = False,
+    gop_align: bool = False,
+    gop_min_window: int = 16,
+    gop_max_window: int = 96,
     layout: Any = None,
     reader: Any = None,
 ) -> VideoProcessResult:
@@ -174,6 +182,10 @@ def process_video_file(
         save_pre_frames=save_pre_frames,
         save_post_frames=save_post_frames,
         comparison=comparison,
+        snap_start=snap_start,
+        gop_align=gop_align,
+        gop_min_window=gop_min_window,
+        gop_max_window=gop_max_window,
         reader=reader,
     )
     return VideoProcessResult(

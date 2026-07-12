@@ -249,11 +249,16 @@ class TestPipelineOwnedFlags:
         assert "denoise" in self._flags(denoise="mc,bsvd")
 
     def test_geometry_flags_are_flagged(self):
-        # C8: crop/anamorphic/sanitize/keyframe flags were silently ignored
-        # alongside a [pipeline] config before this.
+        # C8: crop/anamorphic/sanitize flags were silently ignored alongside
+        # a [pipeline] config before this.
         assert "crop_bars" in self._flags(crop_bars="auto")
         assert "crop_aspect" in self._flags(crop_aspect="16:9")
         assert "square_pixels" in self._flags(square_pixels=True)
         assert "sanitize_edges" in self._flags(sanitize_edges="2,0,0,0")
-        assert "gop_align" in self._flags(gop_align=True)
-        assert "snap_start" in self._flags(snap_start=True)
+
+    def test_keyframe_windowing_is_run_level_not_rejected(self):
+        # --snap-start / --gop-align are run-level orchestration (like
+        # --start): the typed route threads them, so they compose WITH a
+        # [pipeline] config instead of being rejected.
+        assert self._flags(gop_align=True) == []
+        assert self._flags(snap_start=True) == []

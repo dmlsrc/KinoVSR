@@ -77,13 +77,14 @@ _STAGE_SELECTORS = (
     ("cut_detect", "off"),
 )
 
-# Geometry/orchestration flags a [pipeline] config also owns (crop, anamorphic,
-# junk-edge sanitize, keyframe windowing). Silently ignoring them was a parity
-# trap; reject them loudly like the stage selectors. A flag is "set" when its
-# value is not one of these unset sentinels.
+# Geometry flags a [pipeline] config also owns (crop, anamorphic, junk-edge
+# sanitize compose as stages). Silently ignoring them was a parity trap;
+# reject them loudly like the stage selectors. A flag is "set" when its value
+# is not one of these unset sentinels. Keyframe windowing (--snap-start /
+# --gop-align) is NOT here: it is run-level orchestration like --start, now
+# threaded through the typed endpoints.
 _GEOMETRY_FLAGS = (
     "crop_bars", "crop_aspect", "square_pixels", "sanitize_edges",
-    "snap_start", "gop_align",
 )
 _UNSET = (None, False, "off", "")
 
@@ -241,6 +242,10 @@ def _run_typed(invocation) -> int:
             save_pre_frames=save_pre,
             save_post_frames=save_post,
             comparison=comparison,
+            snap_start=options.snap_start,
+            gop_align=options.gop_align,
+            gop_min_window=options.gop_min_window,
+            gop_max_window=options.gop_max_window,
             layout=_source_layout(invocation.config),
             reader=reader,
         )

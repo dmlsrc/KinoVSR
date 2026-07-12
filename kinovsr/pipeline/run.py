@@ -92,6 +92,7 @@ class FileSource:
         chunk_size: int = 8,
         source_color: str = "auto",
         source_range: str = "auto",
+        context_frames: int = 0,
         reader: Any = None,
     ) -> None:
         if layout not in _DECODE_FORMATS:
@@ -136,6 +137,15 @@ class FileSource:
         if start < 0:
             raise MediaError(f"start must be >= 0, got {start}")
         self.start = start
+        # gop-align context: frames BEFORE the window, decoded and fed as
+        # recurrence warmup with NEGATIVE pts. They are processed, never
+        # output - run_file drops non-positive-time outputs - so the output
+        # timeline stays anchored at `start` and frame_count is unchanged.
+        if context_frames < 0 or context_frames > start:
+            raise MediaError(
+                f"context_frames must be within [0, start={start}], got "
+                f"{context_frames}")
+        self.context_frames = int(context_frames)
         self._total = total
         stop = total if end is None else min(end, total)
         if max_frames is not None:
@@ -176,22 +186,27 @@ class FileSource:
         return round(index / timeline.cadence / timeline.time_base)
 
     def units(self) -> Iterator[FrameUnit]:
-        """Decode the window and yield timestamped units, one per frame."""
+        """Decode the window and yield timestamped units, one per frame.
+
+        Context frames (gop-align) extend the read BEFORE the window and
+        carry negative pts; the window's first frame stays at pts 0.
+        """
         decode_format = getattr(self._pb, _DECODE_FORMATS[self.layout])
         to_mlx = self.layout is Layout.MLX_RGB_HWC
+        read_start = self.start - self.context_frames
         if self._force_read:
             # Re-decode raw YUV, force the resolved matrix, reinterpret the
             # range: source's actual full_range in, resolved range out.
             chunks = self._vr.iter_forced_color_chunks(
                 self.path, decode_format, self.resolved_color[2],
                 self._src_color["full_range"], chunk_size=self.chunk_size,
-                start_frame=self.start, end_frame=self.end,
+                start_frame=read_start, end_frame=self.end,
                 reinterpret_full_range=self.resolved_color[3])
         else:
             chunks = self._vr.iter_video_buffer_chunks(
                 self.path, decode_format, chunk_size=self.chunk_size,
-                start_frame=self.start, end_frame=self.end)
-        index = 0
+                start_frame=read_start, end_frame=self.end)
+        index = -self.context_frames
         for chunk in chunks:
             for buffer in chunk:
                 payload = (self._pb.read_buffer_rgb_f32(buffer)
@@ -585,6 +600,10 @@ def run_file(
     save_pre_frames: Path | str | None = None,
     save_post_frames: Path | str | None = None,
     comparison: Path | str | None = None,
+    snap_start: bool = False,
+    gop_align: bool = False,
+    gop_min_window: int = 16,
+    gop_max_window: int = 96,
     reader: Any = None,
 ) -> FileRunResult:
     """Run a composed pipeline config file-to-file through the endpoints.
@@ -607,12 +626,41 @@ def run_file(
             f"output {output_path} is the input file; the writer truncates "
             f"its target before the first decoded frame, which would "
             f"destroy the source")
+    # Keyframe-driven windowing (the harness's --snap-start / --gop-align).
+    # snap-start MOVES the window start to the nearest keyframe; gop-align
+    # KEEPS it, reads back to the enclosing keyframe as recurrence context
+    # (processed, never output), and plans keyframe-anchored windows that
+    # drive every schedule-capable stage through PipelineContext.windowing.
+    windowing = None
+    context_frames = 0
+    if snap_start or gop_align:
+        from kinovsr.media import video_reader as _native_vr
+
+        vr = reader if reader is not None else _native_vr
+        keyframes = vr.keyframe_display_indices(video_path)
+        if snap_start and keyframes:
+            start = min(keyframes, key=lambda k: abs(k - start))
+        if gop_align:
+            from kinovsr.modeling.upscaler_base import plan_gop_windows
+
+            _, _, _, total, _, _ = vr.probe_video(video_path)
+            end_abs = total if end is None else min(end, total)
+            enclosing = [k for k in keyframes if k <= start]
+            read_start = max(enclosing) if enclosing else start
+            context_frames = start - read_start
+            kf_rel = sorted({k - read_start for k in keyframes
+                             if read_start <= k < end_abs})
+            windowing = plan_gop_windows(
+                kf_rel, end_abs - read_start, gop_min_window, gop_max_window)
+
     source = FileSource(
         video, layout=layout, start=start, end=end,
         max_frames=max_frames, chunk_size=chunk_size,
-        source_color=source_color, source_range=source_range, reader=reader)
+        source_color=source_color, source_range=source_range,
+        context_frames=context_frames, reader=reader)
     session = open_pipeline(
-        config, source.spec, settings=settings, reporter=reporter)
+        config, source.spec, settings=settings, reporter=reporter,
+        windowing=windowing)
     # The output cap resolves against the OUTPUT cadence (a time-form cap
     # on a cadence-changing chain means output duration, not input).
     out_cadence = session.output_spec.timeline.cadence
@@ -698,6 +746,11 @@ def run_file(
         with session, session.process(
                 source_units, retain_outputs=False) as run:
             for unit in run:
+                if unit.pts < 0:
+                    # gop-align context frames: fed to the stages as
+                    # recurrence warmup, dropped here after every stage
+                    # consumed them (the harness's _gop_head_skip).
+                    continue
                 if post_dir is not None:
                     _save_frame_png(unit.payload, post_layout, post_dir,
                                     post_index, _pbmod)

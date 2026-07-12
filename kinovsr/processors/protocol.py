@@ -48,11 +48,20 @@ class PipelineContext:
     :meth:`for_stage`. Carries no mutable services on purpose - progress
     goes through the reporter contract, and nothing here may force MLX
     evaluation.
+
+    ``windowing`` is the run's GOP-aligned recurrent-window plan, when one
+    was computed: (proc_start, proc_end, emit_start, emit_end) specs whose
+    frame indices are stream-relative (0 = the first unit this run feeds,
+    context frames included) and whose emit ranges tile the fed stream.
+    Stages whose driver speaks ``set_schedule`` apply it at prepare; every
+    other stage ignores it - the same one-schedule-drives-all contract the
+    inherited harness used.
     """
 
     settings: Settings
     reporter: Reporter = NullReporter()
     stage_id: str | None = None
+    windowing: tuple[tuple[int, int, int, int], ...] | None = None
 
     def for_stage(self, stage_id: str) -> PipelineContext:
         return replace(self, stage_id=stage_id)
