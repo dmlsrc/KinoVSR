@@ -116,3 +116,60 @@ class TestDeblockMap:
         # blockiness (not sigma).
         assert tracker.min_frames == 1
         assert tracker.estimator is estimate_blockiness_map
+
+
+class TestDiagnosticsHelpers:
+    """The shared end-of-run report helpers (harness line formats)."""
+
+    def _driver(self, **attrs):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(**attrs)
+
+    def test_noise_map_lines(self):
+        import mlx.core as mx
+
+        from kinovsr.processors.conditioning import noise_map_diagnostics
+
+        drv = self._driver(
+            last_noise_map=mx.full((4, 4, 1), 0.08, dtype=mx.float32),
+            SIGMA_MIN=5.0 / 255.0, SIGMA_MAX=55.0 / 255.0, _map_floor=0.0,
+            _pulse=object(), _pulse_log=[1.0, 1.1, 1.5])
+        lines = noise_map_diagnostics(drv)
+        assert lines[0].startswith("[noise-map] estimated sigma: min 0.0800")
+        assert "(floor 0.0196, ceil 0.2157)" in lines[1]
+        assert "pulse gain over 3 frames" in lines[2]
+        assert "(1 frames > 1.2)" in lines[2]
+
+    def test_no_conditioning_reports_nothing(self):
+        from kinovsr.processors.conditioning import noise_map_diagnostics
+
+        assert noise_map_diagnostics(self._driver(last_noise_map=None,
+                                                  _pulse=None)) == []
+
+    def test_blockiness_lines_and_image(self):
+        import mlx.core as mx
+
+        from kinovsr.processors.conditioning import (
+            blockiness_debug_image,
+            blockiness_diagnostics,
+        )
+
+        bm = mx.broadcast_to(
+            mx.array([0.2, 0.9])[:, None, None], (2, 4, 1)).astype(mx.float32)
+        drv = self._driver(last_blockiness_map=bm)
+        (line,) = blockiness_diagnostics(drv)
+        assert line.startswith("[deblock-map] blockiness mask: median")
+        assert "(50% of frame > 0.5)" in line
+        image = blockiness_debug_image(drv)["blockmap"]
+        assert image.shape == (2, 4)
+
+    def test_noise_map_image_normalizes_by_015(self):
+        import mlx.core as mx
+
+        from kinovsr.processors.conditioning import noise_map_debug_image
+
+        drv = self._driver(
+            last_noise_map=mx.full((2, 2, 1), 0.15, dtype=mx.float32))
+        image = noise_map_debug_image(drv)["noisemap"]
+        assert float(image.max()) == 1.0

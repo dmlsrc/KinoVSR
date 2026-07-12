@@ -154,6 +154,89 @@ def build_blockiness_tracker(config: DeblockMapConfig) -> Any | None:
                            estimator=estimate_blockiness_map)
 
 
+# ---- End-of-run diagnostics (shared by every map-conditioned family) -----
+#
+# Families expose run_diagnostics()/debug_images() by delegating here: the
+# attribute convention (last_noise_map, SIGMA_MIN/MAX, _map_floor, _pulse /
+# _pulse_log, last_blockiness_map) is this module's conditioning contract,
+# so the report logic lives next to it instead of as four copies. The line
+# formats are the inherited harness's, verbatim, for output parity.
+
+def noise_map_diagnostics(driver: Any) -> list[str]:
+    """The harness's ``[noise-map]`` end-of-run report from a driver's own
+    conditioning state; [] when no map conditioning ran."""
+    import mlx.core as mx
+
+    lines: list[str] = []
+    nm = getattr(driver, "last_noise_map", None)
+    if nm is not None:
+        s = mx.sort(nm.reshape(-1))
+        n = s.shape[0]
+        lines.append(
+            f"[noise-map] estimated sigma: min {float(s[0]):.4f}  "
+            f"median {float(s[n // 2]):.4f}  "
+            f"p95 {float(s[int(0.95 * (n - 1))]):.4f}  "
+            f"max {float(s[-1]):.4f}")
+        # what the net actually receives: the estimate clamped into the
+        # consumer's conditioning bounds (trained range and/or user floor)
+        lo = max(float(getattr(driver, "SIGMA_MIN", 0.0) or 0.0),
+                 float(getattr(driver, "_map_floor", 0.0) or 0.0))
+        hi = float(getattr(driver, "SIGMA_MAX", 0.0) or 0.0)
+        if lo > 0.0 or hi > 0.0:
+            e = mx.sort(mx.clip(nm, lo, hi if hi > 0 else 1.0).reshape(-1))
+            lines.append(
+                f"[noise-map] effective conditioning: min {float(e[0]):.4f}  "
+                f"median {float(e[n // 2]):.4f}  max {float(e[-1]):.4f}  "
+                f"(floor {lo:.4f}"
+                f"{f', ceil {hi:.4f}' if hi > 0 else ''})")
+    if getattr(driver, "_pulse", None) is not None:
+        log = list(getattr(driver, "_pulse_log", ()) or ())
+        if log:
+            ps = sorted(log)
+            lines.append(
+                f"[noise-map] pulse gain over {len(ps)} frames: "
+                f"min {ps[0]:.2f}  median {ps[len(ps) // 2]:.2f}  "
+                f"max {ps[-1]:.2f}  "
+                f"({sum(1 for g in ps if g > 1.2)} frames > 1.2)")
+    return lines
+
+
+def noise_map_debug_image(driver: Any) -> dict[str, Any]:
+    """The harness's ``_noisemap.png`` content: sigma / 0.15, in [0,1]."""
+    import mlx.core as mx
+
+    nm = getattr(driver, "last_noise_map", None)
+    if nm is None:
+        return {}
+    return {"noisemap": mx.clip(nm[:, :, 0] / 0.15, 0, 1)}
+
+
+def blockiness_diagnostics(driver: Any) -> list[str]:
+    """The harness's ``[deblock-map]`` mask stats; [] with no mask."""
+    import mlx.core as mx
+
+    bm = getattr(driver, "last_blockiness_map", None)
+    if bm is None:
+        return []
+    s = mx.sort(bm.reshape(-1))
+    n = s.shape[0]
+    share = float(mx.mean((bm > 0.5).astype(mx.float32))) * 100
+    return [
+        f"[deblock-map] blockiness mask: median {float(s[n // 2]):.3f}  "
+        f"p95 {float(s[int(0.95 * (n - 1))]):.3f}  max {float(s[-1]):.3f}  "
+        f"({share:.0f}% of frame > 0.5)"]
+
+
+def blockiness_debug_image(driver: Any) -> dict[str, Any]:
+    """The harness's ``_blockmap.png`` content: the mask, in [0,1]."""
+    import mlx.core as mx
+
+    bm = getattr(driver, "last_blockiness_map", None)
+    if bm is None:
+        return {}
+    return {"blockmap": mx.clip(bm[:, :, 0], 0, 1)}
+
+
 __all__ = [
     "DEBLOCK_MAP_KEYS",
     "NOISE_MAP_KEYS",
@@ -161,8 +244,12 @@ __all__ = [
     "NOISE_MAP_TRACKER_KEYS",
     "DeblockMapConfig",
     "NoiseMapConfig",
+    "blockiness_debug_image",
+    "blockiness_diagnostics",
     "build_blockiness_tracker",
     "build_conditioning",
+    "noise_map_debug_image",
+    "noise_map_diagnostics",
     "parse_deblock_map",
     "parse_noise_map",
 ]

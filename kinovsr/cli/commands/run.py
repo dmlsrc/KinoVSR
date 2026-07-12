@@ -257,6 +257,7 @@ def _run_typed(invocation) -> int:
             gop_max_window=options.gop_max_window,
             cut_log=options.cut_log,
             skip_post_mp4=options.skip_post_mp4,
+            noise_map_debug=options.noise_map_debug,
             layout=_source_layout(invocation.config),
             reader=reader,
         )

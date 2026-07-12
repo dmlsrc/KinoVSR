@@ -610,6 +610,7 @@ def run_file(
     gop_max_window: int = 96,
     cut_log: Path | str | None = None,
     skip_post_mp4: bool = False,
+    noise_map_debug: bool = False,
     reader: Any = None,
 ) -> FileRunResult:
     """Run a composed pipeline config file-to-file through the endpoints.
@@ -820,6 +821,11 @@ def run_file(
             # collect the families' end-of-run reports - the harness's
             # inline diagnostics, family-owned on the typed path.
             diagnostics = session.stage_diagnostics()
+            # --noise-map-debug parity: dump the conditioning maps beside
+            # the post output ({stem}_noisemap.png / {stem}_blockmap.png);
+            # like the harness, only when a post file is being written.
+            debug_images = (session.stage_debug_images()
+                            if noise_map_debug and sink is not None else {})
     except BaseException:
         # The partial output is not a deliverable; drop the temp files and
         # leave any pre-existing files untouched.
@@ -830,6 +836,15 @@ def run_file(
         raise
     for line in diagnostics:
         _log.info("%s", line)
+    for suffix, image in debug_images.items():
+        import mlx.core as mx
+
+        from kinovsr.media.images import save_image
+
+        png = output_path.with_name(f"{output_path.stem}_{suffix}.png")
+        u8 = (mx.clip(image, 0, 1) * 255).astype(mx.uint8)
+        save_image(mx.stack([u8, u8, u8], axis=-1), png)
+        _log.info("[noise-map-debug] %s written: %s", suffix, png)
     path = sink.finish() if sink is not None else None
     comparison_path = tee.sink.finish() if tee is not None else None
     return FileRunResult(

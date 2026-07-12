@@ -91,5 +91,15 @@ class PvddDenoiser(WindowedUpscaler):
         return self.net.denoise_clip(frames, noise_variance=self._nv,
                                      frame_gains=gains)
 
+    def run_diagnostics(self) -> list:
+        from kinovsr.processors.conditioning import noise_map_diagnostics
+
+        return noise_map_diagnostics(self)
+
+    def debug_images(self) -> dict:
+        from kinovsr.processors.conditioning import noise_map_debug_image
+
+        return noise_map_debug_image(self)
+
     def close(self) -> None:
         """Denoiser-protocol no-op (the harness calls close() on denoise stages)."""

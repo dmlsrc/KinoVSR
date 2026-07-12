@@ -169,6 +169,19 @@ class StaticStateDeflicker:
                 "jitter_px": (self._stat_jit_px / self._stat_jit_pairs
                               if self._stat_jit_pairs else 0.0)}
 
+    def run_diagnostics(self) -> list:
+        st = self.stats()
+        jit = (f", compensated jitter avg {st['jitter_px']:.2f}px"
+               if st["jitter_px"] else "")
+        return [
+            f"[deflicker] run avg: static-verified "
+            f"{st['verified'] * 100:.1f}% of pixels, oscillatory "
+            f"{st['oscillatory'] * 100:.1f}%, fired "
+            f"{st['fired'] * 100:.1f}%, applied "
+            f"{st['applied'] * 1000:.2f}e-3 luma{jit} "
+            f"(verification is the scope gate: bounded by "
+            f"camera/subject motion, not band/window)"]
+
     def close(self) -> None:
         pass
 

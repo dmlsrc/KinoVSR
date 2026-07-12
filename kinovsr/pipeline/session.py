@@ -133,8 +133,9 @@ class PipelineSession:
         family owns its own reporting - noise-map stats, gate openness,
         auto-QF reports - exactly the lines the inherited harness printed
         at end of run); stages without the hook contribute nothing. Call
-        AFTER draining :meth:`process` and BEFORE the session closes -
-        a closed stage has released the state the report reads.
+        after draining :meth:`process`: the run's iterator closes stages
+        on exhaustion, so hook-bearing stages stash their final report at
+        close and keep answering afterward.
         """
         lines: list[str] = []
         for _stage, processor in self._built:
@@ -142,6 +143,18 @@ class PipelineSession:
             if callable(hook):
                 lines.extend(hook())
         return lines
+
+    def stage_debug_images(self) -> dict[str, Any]:
+        """End-of-run debug maps (suffix -> [0,1] (H,W) array) from stages
+        exposing ``debug_images()``; same lifecycle window as
+        :meth:`stage_diagnostics`. Later stages win a suffix collision
+        (one map of each kind per run, like the harness's single dump)."""
+        images: dict[str, Any] = {}
+        for _stage, processor in self._built:
+            hook = getattr(processor, "debug_images", None)
+            if callable(hook):
+                images.update(hook())
+        return images
 
     def close(self) -> None:
         """Cancel the active run (if any); safe to call repeatedly."""

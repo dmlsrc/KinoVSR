@@ -83,6 +83,16 @@ class StdfDeblocker:
         self._reset()
         self._reset_conditioning(clear_debug=True)
 
+    def run_diagnostics(self) -> list:
+        from kinovsr.processors.conditioning import blockiness_diagnostics
+
+        return blockiness_diagnostics(self)
+
+    def debug_images(self) -> dict:
+        from kinovsr.processors.conditioning import blockiness_debug_image
+
+        return blockiness_debug_image(self)
+
     def close(self) -> None:
         pass
 

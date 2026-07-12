@@ -467,6 +467,16 @@ class BsvdDenoiser:
         self._schedule = list(schedule) if schedule else None
         self._sched_i = 0
 
+    def run_diagnostics(self) -> list:
+        from kinovsr.processors.conditioning import noise_map_diagnostics
+
+        return noise_map_diagnostics(self)
+
+    def debug_images(self) -> dict:
+        from kinovsr.processors.conditioning import noise_map_debug_image
+
+        return noise_map_debug_image(self)
+
     def close(self) -> None:
         pass
 

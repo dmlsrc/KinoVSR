@@ -116,6 +116,36 @@ class FbcnnDeblocker:
     def reset(self) -> None:
         self._reset_conditioning(clear_debug=True)
 
+    def run_diagnostics(self) -> list:
+        import mlx.core as mx
+
+        from kinovsr.processors.conditioning import blockiness_diagnostics
+
+        lines = []
+        qi = self.last_qf_info
+        if qi is not None:
+            qmed = ""
+            qg = getattr(self, "_qf_grid", None)
+            if qg is not None:
+                qs = mx.sort(qg.reshape(-1))
+                qmed = (f"  tile QF median "
+                        f"{float(qs[int(qs.shape[0]) // 2]):.0f}")
+            mode = qi.get("mode", "measured")
+            note = {"measured": "per-tile measured",
+                    "gentle": "sparse combs -> mostly gentle",
+                    "fallback": "no JPEG evidence -> fallback QF"}[mode]
+            lines.append(
+                f"[deblock] fbcnn auto QF: global {qi['global']['qf']} "
+                f"(conf {qi['global']['confidence']:g})  "
+                f"comb coverage {qi['coverage'] * 100:.0f}%{qmed}  [{note}]")
+        lines += blockiness_diagnostics(self)
+        return lines
+
+    def debug_images(self) -> dict:
+        from kinovsr.processors.conditioning import blockiness_debug_image
+
+        return blockiness_debug_image(self)
+
     def close(self) -> None:
         pass
 

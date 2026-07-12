@@ -331,6 +331,41 @@ class TestCutLogAndSkipPost:
         assert len(list(post.glob("frame_*.png"))) == 16
 
 
+class TestRunDiagnostics:
+    def test_noise_map_report_and_debug_png(self, clip, tmp_path, caplog):
+        # A map-conditioned denoiser reports its estimated sigma at end of
+        # run (the harness's [noise-map] block, family-owned), and
+        # noise_map_debug dumps the map beside the post output.
+        import logging
+
+        from kinovsr.processors.bsvd import default_weights_path
+
+        if not default_weights_path().exists():
+            pytest.skip("bsvd weights not available")
+        cfg = {"pipeline": ["dn"],
+               "dn": {"processor": "bsvd", "strength": 0.05,
+                      "noise_map": "auto"}}
+        with caplog.at_level(logging.INFO, logger="kinovsr.pipeline.run"):
+            run_file(cfg, video=clip, output=tmp_path / "o.mp4",
+                     settings=SETTINGS, end=10, noise_map_debug=True)
+        text = caplog.text
+        assert "[noise-map] estimated sigma:" in text
+        assert "[noise-map] effective conditioning:" in text
+        assert (tmp_path / "o_noisemap.png").stat().st_size > 0
+
+    def test_no_debug_flag_writes_no_png(self, clip, tmp_path):
+        from kinovsr.processors.bsvd import default_weights_path
+
+        if not default_weights_path().exists():
+            pytest.skip("bsvd weights not available")
+        cfg = {"pipeline": ["dn"],
+               "dn": {"processor": "bsvd", "strength": 0.05,
+                      "noise_map": "auto"}}
+        run_file(cfg, video=clip, output=tmp_path / "o.mp4",
+                 settings=SETTINGS, end=10)
+        assert not (tmp_path / "o_noisemap.png").exists()
+
+
 class TestGopAlign:
     """--snap-start / --gop-align parity: keyframe windowing on the typed
     endpoints. The clip fixture encodes g=8, so keyframes sit at 0, 8, 16."""

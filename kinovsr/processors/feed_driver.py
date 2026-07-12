@@ -106,6 +106,9 @@ class FeedFlushProcessor:
         self._chroma_strength = float(chroma_strength)
         # A blend closure bound at prepare when the split is active, else None.
         self._blend: Any = None
+        # The family's final report, stashed at close (see run_diagnostics).
+        self._final_diagnostics: list[str] = []
+        self._final_debug_images: dict[str, Any] = {}
 
     def prepare(self, input_spec: StreamSpec,
                 context: PipelineContext) -> None:
@@ -153,14 +156,34 @@ class FeedFlushProcessor:
 
     def run_diagnostics(self) -> list[str]:
         """End-of-run diagnostic lines from the wrapped driver, when the
-        family implements ``run_diagnostics()`` (the session collects
-        these after the stream drains)."""
+        family implements ``run_diagnostics()``. The run's iterator closes
+        its stages on exhaustion, so ``close`` stashes the final report and
+        this keeps answering after the driver is released."""
+        if self._driver is None:
+            return list(self._final_diagnostics)
         hook = getattr(self._driver, "run_diagnostics", None)
         return list(hook()) if callable(hook) else []
+
+    def debug_images(self) -> Mapping[str, Any]:
+        """End-of-run debug maps (suffix -> [0,1] (H,W) array) from the
+        wrapped driver, for the run-level ``noise_map_debug`` PNG dump;
+        stashed at close like :meth:`run_diagnostics`."""
+        if self._driver is None:
+            return dict(self._final_debug_images)
+        hook = getattr(self._driver, "debug_images", None)
+        return dict(hook()) if callable(hook) else {}
 
     def close(self, context: PipelineContext) -> None:
         driver, self._driver = self._driver, None
         if driver is not None:
+            # Capture the family's final report before releasing it: the
+            # session's diagnostics collection runs after the chain closed.
+            hook = getattr(driver, "run_diagnostics", None)
+            if callable(hook):
+                self._final_diagnostics = list(hook())
+            hook = getattr(driver, "debug_images", None)
+            if callable(hook):
+                self._final_debug_images = dict(hook())
             close = getattr(driver, "close", None)
             if callable(close):
                 close()

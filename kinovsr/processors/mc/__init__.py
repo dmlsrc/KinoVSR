@@ -616,6 +616,26 @@ class _McDriver:
         if self._engine is not None:
             self._engine.reset()
 
+    def run_diagnostics(self) -> list:
+        from kinovsr.processors.conditioning import noise_map_diagnostics
+
+        engine = self._engine
+        if engine is None:
+            return []
+        lines = noise_map_diagnostics(engine)
+        if engine.gate_openness > 0:
+            lines.append(
+                f"[denoise] mc gate openness: "
+                f"{engine.gate_openness * 100:.1f}% of the strength ceiling "
+                f"realized (flow={engine.flow_source}; low = flow-limited, "
+                f"the lever is a better flow, not more strength)")
+        return lines
+
+    def debug_images(self) -> dict:
+        from kinovsr.processors.conditioning import noise_map_debug_image
+
+        return noise_map_debug_image(self._engine) if self._engine else {}
+
     def close(self) -> None:
         engine, self._engine = self._engine, None
         if engine is not None:

@@ -306,6 +306,16 @@ class FastDvdDenoiser:
         self._reset_state()
         self._reset_conditioning(clear_debug=True)
 
+    def run_diagnostics(self) -> list:
+        from kinovsr.processors.conditioning import noise_map_diagnostics
+
+        return noise_map_diagnostics(self)
+
+    def debug_images(self) -> dict:
+        from kinovsr.processors.conditioning import noise_map_debug_image
+
+        return noise_map_debug_image(self)
+
     def close(self) -> None:
         pass
 

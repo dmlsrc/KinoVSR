@@ -139,6 +139,7 @@ def process_video_file(
     gop_max_window: int = 96,
     cut_log: Path | str | None = None,
     skip_post_mp4: bool = False,
+    noise_map_debug: bool = False,
     layout: Any = None,
     reader: Any = None,
 ) -> VideoProcessResult:
@@ -190,6 +191,7 @@ def process_video_file(
         gop_max_window=gop_max_window,
         cut_log=cut_log,
         skip_post_mp4=skip_post_mp4,
+        noise_map_debug=noise_map_debug,
         reader=reader,
     )
     return VideoProcessResult(
