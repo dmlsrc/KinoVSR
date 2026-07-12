@@ -106,6 +106,23 @@ class TestParseAndSpec:
         assert plan.stages[0].output_spec.frame.layout is Layout.MLX_RGB_HWC
         assert plan.output_spec.frame.layout is Layout.CV_RGBA_HALF
 
+    def test_crop_composes_before_the_native_upscale(self):
+        # Parity gap C3: crop is MLX-only; now that the upscale accepts MLX,
+        # a crop (MLX->MLX) threads its geometry through into the native scale.
+        from kinovsr.pipeline import resolve_pipeline
+
+        plan = resolve_pipeline(
+            {"pipeline": ["crop", "up"],
+             "crop": {"processor": "crop", "bars": "4,4,0,0"},
+             "up": {"processor": "videotoolbox", "capability": "upscale",
+                    "profile": "balanced"}},
+            input_spec=mlx_stream(100, 100), settings=SETTINGS)
+        assert [s.name for s in plan.stages] == ["crop", "up"]
+        assert plan.output_spec.frame.layout is Layout.CV_RGBA_HALF
+        # cropped 100x92, then 4x
+        assert plan.output_spec.frame.geometry.width == 400
+        assert plan.output_spec.frame.geometry.height == 368
+
 
 def mlx_units(n, w=W, h=H):
     import mlx.core as mx
