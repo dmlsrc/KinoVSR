@@ -125,6 +125,7 @@ def process_video_file(
     chunk_size: int = 8,
     source_color: str = "auto",
     source_range: str = "auto",
+    encode_chroma: str = "auto",
     layout: Any = None,
     reader: Any = None,
 ) -> VideoProcessResult:
@@ -166,6 +167,7 @@ def process_video_file(
         chunk_size=chunk_size,
         source_color=source_color,
         source_range=source_range,
+        encode_chroma=encode_chroma,
         reader=reader,
     )
     return VideoProcessResult(

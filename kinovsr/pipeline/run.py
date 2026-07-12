@@ -238,6 +238,7 @@ class FileSink:
         label: str = "pipeline",
         audio_track: Any = None,
         audio_codec: str = "alac",
+        encode_chroma: str = "auto",
     ) -> None:
         from kinovsr.media import pixel_buffers as _pb
         from kinovsr.native.writer import (
@@ -304,8 +305,17 @@ class FileSink:
         # drop the just-created temp so a failed construction leaves nothing
         # behind (and never touches the requested output).
         try:
-            profile = (HEVC_PROFILE_MAIN10 if layout is Layout.CV_NV12
-                       else HEVC_PROFILE_MAIN422_10)
+            # auto picks by output layout (NV12/fast is inherently 4:2:0, the
+            # RGBAHalf/learned path preserves chroma -> 4:2:2); an explicit
+            # 420/422 forces the profile, mirroring the harness's
+            # _pick_hevc_profile.
+            if encode_chroma == "420":
+                profile = HEVC_PROFILE_MAIN10
+            elif encode_chroma == "422":
+                profile = HEVC_PROFILE_MAIN422_10
+            else:
+                profile = (HEVC_PROFILE_MAIN10 if layout is Layout.CV_NV12
+                           else HEVC_PROFILE_MAIN422_10)
             self.writer = AVWriter(
                 self._temp_path,
                 width=geometry.width, height=geometry.height,
@@ -438,6 +448,7 @@ def run_file(
     chunk_size: int = 8,
     source_color: str = "auto",
     source_range: str = "auto",
+    encode_chroma: str = "auto",
     reader: Any = None,
 ) -> FileRunResult:
     """Run a composed pipeline config file-to-file through the endpoints.
@@ -489,7 +500,8 @@ def run_file(
         track.save_wav(output_path.with_name(f"{output_path.stem}_audio.wav"))
     sink = FileSink(
         output, session.output_spec, source=source, quality=quality,
-        audio_track=track, audio_codec=audio_codec)
+        audio_track=track, audio_codec=audio_codec,
+        encode_chroma=encode_chroma)
     # A duration-preserving chain must end exactly at the source-window
     # duration. Interpolation's regenerated grid can round the final unit's
     # end past that (its natural grid-interval duration overshoots the last

@@ -195,6 +195,22 @@ class TestForcedColor:
             FileSource(clip, layout=Layout.CV_RGBA_HALF, source_color="bt2020")
 
 
+class TestEncodeChroma:
+    # An RGB/MLX chain (no upscale) reaches the encoder as RGBAHalf, so auto
+    # is 4:2:2; forcing 420 must reach 4:2:0 even here (the harness parity gap).
+    @pytest.mark.parametrize(("chroma", "pix_fmt"), [
+        ("auto", "yuv422p10le"),
+        ("420", "yuv420p10le"),
+        ("422", "yuv422p10le"),
+    ])
+    def test_forces_the_hevc_chroma_profile(self, clip, tmp_path, chroma, pix_fmt):
+        res = run_file(
+            {"pipeline": []}, video=clip, output=tmp_path / f"o_{chroma}.mp4",
+            settings=SETTINGS, encode_chroma=chroma)
+        with av.open(str(res.path)) as container:
+            assert container.streams.video[0].codec_context.pix_fmt == pix_fmt
+
+
 def test_learned_chain_through_endpoints(clip, tmp_path):
     config = {
         "pipeline": ["up"],

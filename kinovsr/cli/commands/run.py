@@ -231,6 +231,7 @@ def _run_typed(invocation) -> int:
             chunk_size=options.video_chunk_size,
             source_color=options.source_color,
             source_range=options.source_range,
+            encode_chroma=options.encode_chroma,
             layout=_source_layout(invocation.config),
             reader=reader,
         )
