@@ -1,13 +1,10 @@
 """A geometry-cropping preprocess family (bars and aspect windows).
 
-Thin factory over the shared edge_sanitize implementation. The crop is
-declared, not detected: explicit bar counts and/or an aspect window are
-pure functions of the input geometry, so ``produces`` computes the
-output spec at resolve time and the builder validates the whole chain
-against it. Auto bar DETECTION is a probe-time concern - whoever
-assembles the config (the CLI's probe pass) detects on sample frames
-and writes the resolved counts here, the same division the flat CLI
-uses today.
+The crop is declared, not detected: explicit bar counts and/or an aspect
+window are pure functions of the input geometry, so ``produces`` computes the
+output spec at resolve time and the builder validates the whole chain against
+it. Auto bar detection is a probe-time analysis concern; the resolved counts
+are written into this family's config before preflight.
 """
 
 from __future__ import annotations
@@ -16,9 +13,9 @@ import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
-from kinovsr.config.helpers import reject_unknown_keys, typed_value
-from kinovsr.edge_sanitize import compute_aspect_crop, crop_rgb, parse_edges_spec
+from kinovsr.config.helpers import parse_edge_counts, reject_unknown_keys, typed_value
 from kinovsr.processors.capabilities import Capability, CapabilitySpec
+from kinovsr.processors.crop.geometry import compute_aspect_crop, crop_rgb
 from kinovsr.processors.feed_driver import FeedFlushProcessor
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
@@ -129,9 +126,9 @@ class CropFactory:
         reject_unknown_keys(raw, ("bars", "trim", "aspect", "anchor",
                                   "offset"))
         bars_spec = typed_value(raw, "bars", str)
-        bars = parse_edges_spec(bars_spec) if bars_spec else (0, 0, 0, 0)
+        bars = parse_edge_counts(bars_spec) if bars_spec else (0, 0, 0, 0)
         trim_spec = typed_value(raw, "trim", str)
-        trim = parse_edges_spec(trim_spec) if trim_spec else (0, 0, 0, 0)
+        trim = parse_edge_counts(trim_spec) if trim_spec else (0, 0, 0, 0)
         aspect_spec = typed_value(raw, "aspect", str)
         aspect: tuple[int, int] | None = None
         if aspect_spec:

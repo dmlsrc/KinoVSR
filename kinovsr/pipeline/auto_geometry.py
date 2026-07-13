@@ -68,7 +68,7 @@ def _gather_samples(video: Path, vr: Any, pb: Any) -> list:
 
 
 def _crop_samples(samples: list, crop: tuple[int, int, int, int]) -> list:
-    from kinovsr.edge_sanitize import crop_rgb
+    from kinovsr.processors.crop.geometry import crop_rgb
 
     if not any(crop):
         return samples
@@ -104,7 +104,7 @@ def resolve_auto_geometry(
     so the probe samples through the same decoder. ``pixel_aspect`` is
     the source PAR (aspect windows on anamorphic sources fold it in).
     """
-    from kinovsr.edge_sanitize import detect_bars, detect_junk_edges
+    from kinovsr.analysis.edges import detect_bars, detect_junk_edges
     from kinovsr.media import pixel_buffers as pb
 
     samples = _gather_samples(Path(video), vr, pb)
@@ -145,9 +145,9 @@ def resolve_auto_geometry(
                 # detect on the post-bars picture, keep the active area
                 # even (the harness's +1px bump into the content), fold
                 # into bars.
-                from kinovsr.edge_sanitize import parse_edges_spec
+                from kinovsr.config.helpers import parse_edge_counts
 
-                bars_now = (parse_edges_spec(table["bars"])
+                bars_now = (parse_edge_counts(table["bars"])
                             if table.get("bars") else (0, 0, 0, 0))
                 sub = _crop_samples(samples, bars_now)
                 edges, notices = detect_junk_edges(sub)

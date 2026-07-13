@@ -14,10 +14,9 @@ frame, and a companion post-pass restores it (planning 05's companion
 mechanism). Because the composite runs in MLX, the builder places the
 companion at the last MLX point - after the learned/native-MLX upscalers
 but before any native-CV stage, or the chain end when every stage stays
-MLX - which is exactly where the inherited harness restores. The two halves
-share a PTS-keyed buffer, so a windowed stage's delay does not desynchronize
-them; ``restore_borders`` nearest-upscales the captured band to whatever
-geometry the chain produced up to that point.
+MLX. The two halves share a PTS-keyed buffer, so a windowed stage's delay does
+not desynchronize them; ``restore_borders`` nearest-upscales the captured band
+to whatever geometry the chain produced up to that point.
 
 The bands are declared, not detected - junk DETECTION is probe-time, like
 crop's bar detection. ``trim`` (crop the junk off) is the crop family's
@@ -30,12 +29,7 @@ import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
-from kinovsr.config.helpers import reject_unknown_keys, typed_value
-from kinovsr.edge_sanitize import (
-    parse_edges_spec,
-    restore_borders,
-    sanitize_rgb,
-)
+from kinovsr.config.helpers import parse_edge_counts, reject_unknown_keys, typed_value
 from kinovsr.processors.capabilities import (
     Capability,
     CapabilitySpec,
@@ -44,6 +38,7 @@ from kinovsr.processors.capabilities import (
 )
 from kinovsr.processors.feed_driver import FeedFlushProcessor
 from kinovsr.processors.protocol import PipelineContext, Processor
+from kinovsr.processors.sanitize_edges.ops import restore_borders, sanitize_rgb
 from kinovsr.processors.specs import (
     Domain,
     DType,
@@ -181,7 +176,7 @@ class SanitizeEdgesFactory:
             raise ValueError(
                 "state edges as T,B,L,R (junk detection is probe-time; "
                 "a sanitize stage with no bands is config noise)")
-        edges = parse_edges_spec(edges_spec)
+        edges = parse_edge_counts(edges_spec)
         if edges == (0, 0, 0, 0):
             raise ValueError("edges declare no bands")
         fill = typed_value(raw, "fill", str, "extend")

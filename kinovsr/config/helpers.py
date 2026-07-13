@@ -39,3 +39,15 @@ def typed_value(raw: Mapping[str, Any], key: str, kind: type,
     if not isinstance(value, kind) or isinstance(value, bool) and kind is not bool:
         raise ValueError(f"{key} must be a {kind.__name__}, got {value!r}")
     return value
+
+
+def parse_edge_counts(spec: str) -> tuple[int, int, int, int]:
+    """Parse a nonnegative ``T,B,L,R`` pixel-count value."""
+    parts = [part.strip() for part in spec.split(",")]
+    if len(parts) != 4:
+        raise ValueError(
+            f"edge spec must be T,B,L,R (four integers), got {spec!r}")
+    values = [int(part) for part in parts]
+    if any(value < 0 for value in values):
+        raise ValueError(f"edge counts must be >= 0, got {spec!r}")
+    return values[0], values[1], values[2], values[3]

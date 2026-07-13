@@ -795,15 +795,15 @@ def test_safmn_pool_clamp_touches_only_interior_outliers():
     assert float(mx.max(mx.abs(_pool_clamp(tiny, 4.0) - tiny))) == 0.0
 
 
-def test_edge_sanitize_parse_spec():
-    from kinovsr.edge_sanitize import parse_edges_spec
+def test_parse_edge_counts():
+    from kinovsr.config.helpers import parse_edge_counts
 
-    assert parse_edges_spec("0,1,0,0") == (0, 1, 0, 0)
-    assert parse_edges_spec(" 2, 3 ,4,5 ") == (2, 3, 4, 5)
+    assert parse_edge_counts("0,1,0,0") == (0, 1, 0, 0)
+    assert parse_edge_counts(" 2, 3 ,4,5 ") == (2, 3, 4, 5)
     with pytest.raises(ValueError, match="four integers"):
-        parse_edges_spec("1,2,3")
+        parse_edge_counts("1,2,3")
     with pytest.raises(ValueError, match=">= 0"):
-        parse_edges_spec("1,-2,3,4")
+        parse_edge_counts("1,-2,3,4")
 
 
 def _sanitize_samples(junk_bottom=False, bar_rows=0):
@@ -820,31 +820,31 @@ def _sanitize_samples(junk_bottom=False, bar_rows=0):
     return out
 
 
-def test_edge_sanitize_detects_dark_junk_row():
-    from kinovsr.edge_sanitize import detect_junk_edges
+def test_detect_junk_edges_finds_dark_row():
+    from kinovsr.analysis.edges import detect_junk_edges
 
     edges, notices = detect_junk_edges(_sanitize_samples(junk_bottom=True))
     assert edges == (0, 1, 0, 0)
     assert notices == []
 
 
-def test_edge_sanitize_clean_content_untouched():
-    from kinovsr.edge_sanitize import detect_junk_edges
+def test_detect_junk_edges_leaves_clean_content_untouched():
+    from kinovsr.analysis.edges import detect_junk_edges
 
     edges, notices = detect_junk_edges(_sanitize_samples())
     assert edges == (0, 0, 0, 0)
 
 
-def test_edge_sanitize_letterbox_reported_not_filled():
-    from kinovsr.edge_sanitize import detect_junk_edges
+def test_detect_junk_edges_reports_letterbox_without_filling():
+    from kinovsr.analysis.edges import detect_junk_edges
 
     edges, notices = detect_junk_edges(_sanitize_samples(bar_rows=12))
     assert edges == (0, 0, 0, 0)
     assert any("letterbox-class" in n for n in notices)
 
 
-def test_edge_sanitize_blank_samples_yield_no_detection():
-    from kinovsr.edge_sanitize import detect_junk_edges
+def test_detect_junk_edges_ignores_blank_samples():
+    from kinovsr.analysis.edges import detect_junk_edges
 
     blanks = [mx.full((32, 32, 3), 0.02) for _ in range(5)]
     edges, notices = detect_junk_edges(blanks)
@@ -852,8 +852,8 @@ def test_edge_sanitize_blank_samples_yield_no_detection():
     assert any("too few" in n for n in notices)
 
 
-def test_edge_sanitize_rgb_replaces_bands_and_keeps_dims():
-    from kinovsr.edge_sanitize import sanitize_rgb
+def test_sanitize_rgb_replaces_bands_and_keeps_dims():
+    from kinovsr.processors.sanitize_edges.ops import sanitize_rgb
 
     fr = mx.broadcast_to(mx.arange(10, dtype=mx.float32)[:, None, None], (10, 8, 3))
     out = sanitize_rgb(fr, (2, 1, 0, 0))
@@ -868,8 +868,8 @@ def test_edge_sanitize_rgb_replaces_bands_and_keeps_dims():
         sanitize_rgb(fr, (5, 5, 0, 0))
 
 
-def test_edge_sanitize_restore_borders_composites_original():
-    from kinovsr.edge_sanitize import restore_borders
+def test_restore_borders_composites_original():
+    from kinovsr.processors.sanitize_edges.ops import restore_borders
 
     mx.random.seed(9)
     src = mx.random.uniform(shape=(8, 10, 3))
@@ -896,8 +896,8 @@ def test_edge_sanitize_restore_borders_composites_original():
         restore_borders(mx.zeros((15, 20, 3)), src, (1, 0, 0, 0), feather=0)
 
 
-def test_edge_sanitize_restore_feather_ramps_into_content():
-    from kinovsr.edge_sanitize import restore_borders
+def test_restore_borders_feather_ramps_into_content():
+    from kinovsr.processors.sanitize_edges.ops import restore_borders
 
     src = mx.zeros((8, 6, 3), dtype=mx.float32)
     out = mx.ones((16, 12, 3), dtype=mx.float32)   # processed at 2x
@@ -914,8 +914,8 @@ def test_edge_sanitize_restore_feather_ramps_into_content():
     assert col[6] == 1.0 and col[7] == 1.0
 
 
-def test_edge_sanitize_detect_bars_letterbox_and_pillarbox():
-    from kinovsr.edge_sanitize import detect_bars
+def test_detect_bars_finds_letterbox_and_pillarbox():
+    from kinovsr.analysis.edges import detect_bars
 
     mx.random.seed(11)
     letter, pillar = [], []
@@ -946,8 +946,8 @@ def test_edge_sanitize_detect_bars_letterbox_and_pillarbox():
     assert detect_bars(clean) == (0, 0, 0, 0)
 
 
-def test_edge_sanitize_crop_rgb():
-    from kinovsr.edge_sanitize import crop_rgb
+def test_crop_rgb():
+    from kinovsr.processors.crop.geometry import crop_rgb
 
     fr = mx.arange(6 * 8 * 3, dtype=mx.float32).reshape(6, 8, 3)
     out = crop_rgb(fr, (1, 2, 3, 0))
@@ -957,8 +957,8 @@ def test_edge_sanitize_crop_rgb():
     assert batched.shape == (1, 3, 5, 3)
 
 
-def test_edge_sanitize_compute_aspect_crop():
-    from kinovsr.edge_sanitize import compute_aspect_crop
+def test_compute_aspect_crop():
+    from kinovsr.processors.crop.geometry import compute_aspect_crop
 
     # 16:9 window on a 4:3 frame: full width, centered vertically.
     assert compute_aspect_crop(640, 480, 16, 9) == (60, 60, 0, 0)
@@ -979,8 +979,8 @@ def test_edge_sanitize_compute_aspect_crop():
         compute_aspect_crop(640, 480, 0, 9)
 
 
-def test_edge_sanitize_aspect_crop_anchors():
-    from kinovsr.edge_sanitize import compute_aspect_crop
+def test_compute_aspect_crop_anchors():
+    from kinovsr.processors.crop.geometry import compute_aspect_crop
 
     # 16:9 on 4:3 (640x480 -> 640x360): the vertical slack is 120.
     assert compute_aspect_crop(640, 480, 16, 9, anchor="top") == (0, 120, 0, 0)
@@ -997,8 +997,8 @@ def test_edge_sanitize_aspect_crop_anchors():
         compute_aspect_crop(640, 480, 16, 9, anchor="middle-ish")
 
 
-def test_edge_sanitize_aspect_crop_picks_closest_even_fit():
-    from kinovsr.edge_sanitize import compute_aspect_crop
+def test_compute_aspect_crop_picks_closest_even_fit():
+    from kinovsr.processors.crop.geometry import compute_aspect_crop
 
     # 16:9 in storage px on 348x288: even boxes can only approximate;
     # 344x194 (-0.26%) beats 346x194 (+0.32%) and 348x194 (+0.90%).

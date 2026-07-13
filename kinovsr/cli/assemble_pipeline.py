@@ -102,7 +102,7 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
     bump for explicit crop counts needs them, exactly as the harness
     bumped against the probed size).
     """
-    from kinovsr.edge_sanitize import parse_edges_spec
+    from kinovsr.config.helpers import parse_edge_counts
 
     config: dict[str, Any] = {}
     pipeline: list[str] = []
@@ -123,17 +123,17 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
     if bars_spec and bars_spec != "auto" and trim_spec and trim_spec != "auto":
         # Both explicit: fold with the harness's two-step bump (bars are
         # bumped against the source, trim against the post-bars area).
-        bars = _bump_even(list(parse_edges_spec(bars_spec)), width, height)
+        bars = _bump_even(list(parse_edge_counts(bars_spec)), width, height)
         inner_w = width - bars[2] - bars[3]
         inner_h = height - bars[0] - bars[1]
-        trim = _bump_even(list(parse_edges_spec(trim_spec)), inner_w, inner_h)
+        trim = _bump_even(list(parse_edge_counts(trim_spec)), inner_w, inner_h)
         crop_table["bars"] = ",".join(
             str(b + t) for b, t in zip(bars, trim, strict=True))
     else:
         if bars_spec:
             crop_table["bars"] = (
                 bars_spec if bars_spec == "auto" else ",".join(map(str,
-                    _bump_even(list(parse_edges_spec(bars_spec)),
+                    _bump_even(list(parse_edge_counts(bars_spec)),
                                width, height))))
         if trim_spec:
             # With auto bars ahead of an explicit trim the post-bars area
@@ -141,7 +141,7 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
             # detected values itself).
             crop_table["trim"] = (
                 trim_spec if trim_spec == "auto" else ",".join(map(str,
-                    _bump_even(list(parse_edges_spec(trim_spec)),
+                    _bump_even(list(parse_edge_counts(trim_spec)),
                                width, height))))
     if options.crop_aspect:
         crop_table["aspect"] = options.crop_aspect
