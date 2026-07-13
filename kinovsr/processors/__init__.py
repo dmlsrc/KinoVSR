@@ -17,7 +17,15 @@ from .capabilities import (
     TemporalMode,
     preserve_stream,
 )
-from .catalog import UnknownFamilyError, available_families, get_factory, register
+from .catalog import (
+    CatalogEntry,
+    CliOptionContribution,
+    UnknownFamilyError,
+    available_families,
+    catalog_entries,
+    get_factory,
+    register,
+)
 from .errors import (
     MediaError,
     PipelineCancelled,
@@ -64,11 +72,13 @@ __all__ = [
     "BracketFactory",
     "Capability",
     "CapabilitySpec",
+    "CatalogEntry",
     "Cardinality",
     "CompanionSpec",
     "ColorMatrix",
     "ColorPrimaries",
     "ColorRange",
+    "CliOptionContribution",
     "DType",
     "Domain",
     "DurationPolicy",
@@ -97,6 +107,7 @@ __all__ = [
     "VariableCadence",
     "WeightsError",
     "available_families",
+    "catalog_entries",
     "coherence_violations",
     "describe_spec",
     "frame_spec_for_matrix",

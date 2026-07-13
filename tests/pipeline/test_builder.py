@@ -114,7 +114,7 @@ def cap(capability, *, accepts=MLX_CONSTRAINT, produces=None, profiles=(),
 @pytest.fixture
 def families(monkeypatch):
     """A tiny universe of fake families registered in a clean catalog."""
-    monkeypatch.setattr(catalog, "_FACTORY_TARGETS", {})
+    monkeypatch.setattr(catalog, "_CATALOG", {})
     monkeypatch.setattr(catalog, "_loaded", {})
 
     denoise = FakeFamily("fakedenoise", {

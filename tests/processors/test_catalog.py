@@ -2,6 +2,7 @@
 
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -38,7 +39,7 @@ class FakeFactory:
 
 @pytest.fixture
 def clean_catalog(monkeypatch):
-    monkeypatch.setattr(catalog, "_FACTORY_TARGETS", {})
+    monkeypatch.setattr(catalog, "_CATALOG", {})
     monkeypatch.setattr(catalog, "_loaded", {})
     return catalog
 
@@ -115,6 +116,24 @@ def test_empty_capabilities_rejected(clean_catalog, monkeypatch):
 
 
 def test_real_catalog_targets_stay_inside_kinovsr():
-    for name, target in catalog._FACTORY_TARGETS.items():
-        module_name = target.partition(":")[0]
-        assert module_name.startswith("kinovsr."), (name, target)
+    for entry in catalog.catalog_entries():
+        module_name = entry.factory_target.partition(":")[0]
+        assert module_name.startswith("kinovsr."), (
+            entry.name, entry.factory_target)
+
+
+def test_cli_contributions_are_unique_and_family_local():
+    processors_dir = Path(catalog.__file__).parent
+    claimed_orders: dict[int, str] = {}
+    for entry in catalog.catalog_entries():
+        if not entry.cli_options:
+            assert entry.cli_options_path is None
+            continue
+        path = entry.cli_options_path
+        assert path is not None
+        assert (processors_dir / path).is_file(), (entry.name, path)
+        for contribution in entry.cli_options:
+            assert contribution.order not in claimed_orders, (
+                contribution.order, entry.name,
+                claimed_orders.get(contribution.order))
+            claimed_orders[contribution.order] = entry.name

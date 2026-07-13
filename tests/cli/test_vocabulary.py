@@ -27,13 +27,9 @@ def test_registry_loading_keeps_family_implementations_lazy():
     code = """
 import sys
 import kinovsr.cli._registry
+from kinovsr.processors.catalog import catalog_entries
 
-families = {
-    "basicvsrpp", "bsvd", "crop", "cut_detect", "deflicker", "esc",
-    "fastdvdnet", "fbcnn", "mc", "metalfx", "nafnet", "pvdd",
-    "realbasicvsr", "realesrgan", "realplksr", "realviformer", "safmn",
-    "sanitize_edges", "spatial", "square_pixels", "stdf", "toflow",
-}
+families = {entry.name for entry in catalog_entries()}
 loaded = sorted(
     name for name in sys.modules
     if name.startswith("kinovsr.processors.")

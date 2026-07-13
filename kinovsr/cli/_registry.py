@@ -8,6 +8,8 @@ vocabulary conformance tests.
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
+from kinovsr.processors.catalog import catalog_entries
+
 from .foundation_options import (
     DEBLOCK_SLOT_OPTIONS,
     DEBLOCK_STRENGTH_OPTIONS,
@@ -39,103 +41,45 @@ def _load_contribution(path: str, *names: str) -> tuple[list[Opt], ...]:
     return tuple(getattr(module, name) for name in names)
 
 
-(
-    BASICVSRPP_RESTORE_OPTIONS,
-    BASICVSRPP_UPSCALE_OPTIONS,
-) = _load_contribution(
-    "basicvsrpp/cli_options.py",
-    "BASICVSRPP_RESTORE_OPTIONS",
-    "BASICVSRPP_UPSCALE_OPTIONS",
-)
-BSVD_OPTIONS, BSVD_STRENGTH_OPTIONS = _load_contribution(
-    "bsvd/cli_options.py", "BSVD_OPTIONS", "BSVD_STRENGTH_OPTIONS")
 (DEBLOCK_MAP_OPTIONS, NOISE_MAP_OPTIONS) = _load_contribution(
     "conditioning_cli_options.py", "DEBLOCK_MAP_OPTIONS", "NOISE_MAP_OPTIONS")
-(CROP_OPTIONS,) = _load_contribution("crop/cli_options.py", "CROP_OPTIONS")
-(CUT_OPTIONS,) = _load_contribution("cut_detect/cli_options.py", "CUT_OPTIONS")
-(DEFLICKER_OPTIONS,) = _load_contribution(
-    "deflicker/cli_options.py", "DEFLICKER_OPTIONS")
-(ESC_OPTIONS,) = _load_contribution("esc/cli_options.py", "ESC_OPTIONS")
-(
-    FASTDVDNET_OPTIONS,
-    FASTDVDNET_STRENGTH_OPTIONS,
-) = _load_contribution(
-    "fastdvdnet/cli_options.py",
-    "FASTDVDNET_OPTIONS",
-    "FASTDVDNET_STRENGTH_OPTIONS",
-)
-FBCNN_OPTIONS, FBCNN_WEIGHT_OPTIONS = _load_contribution(
-    "fbcnn/cli_options.py", "FBCNN_OPTIONS", "FBCNN_WEIGHT_OPTIONS")
-MC_OPTIONS, MC_STRENGTH_OPTIONS = _load_contribution(
-    "mc/cli_options.py", "MC_OPTIONS", "MC_STRENGTH_OPTIONS")
-(METALFX_OPTIONS,) = _load_contribution("metalfx/cli_options.py", "METALFX_OPTIONS")
-(NAFNET_OPTIONS,) = _load_contribution("nafnet/cli_options.py", "NAFNET_OPTIONS")
-PVDD_OPTIONS, PVDD_STRENGTH_OPTIONS = _load_contribution(
-    "pvdd/cli_options.py", "PVDD_OPTIONS", "PVDD_STRENGTH_OPTIONS")
-(REALBASICVSR_OPTIONS,) = _load_contribution(
-    "realbasicvsr/cli_options.py", "REALBASICVSR_OPTIONS")
-(REALESRGAN_OPTIONS,) = _load_contribution(
-    "realesrgan/cli_options.py", "REALESRGAN_OPTIONS")
-(REALPLKSR_OPTIONS,) = _load_contribution(
-    "realplksr/cli_options.py", "REALPLKSR_OPTIONS")
-(REALVIFORMER_OPTIONS,) = _load_contribution(
-    "realviformer/cli_options.py", "REALVIFORMER_OPTIONS")
-(SAFMN_OPTIONS,) = _load_contribution("safmn/cli_options.py", "SAFMN_OPTIONS")
-(SANITIZE_EDGE_OPTIONS,) = _load_contribution(
-    "sanitize_edges/cli_options.py", "SANITIZE_EDGE_OPTIONS")
-(SPATIAL_OPTIONS,) = _load_contribution("spatial/cli_options.py", "SPATIAL_OPTIONS")
-(SQUARE_PIXELS_OPTIONS,) = _load_contribution(
-    "square_pixels/cli_options.py", "SQUARE_PIXELS_OPTIONS")
-(STDF_OPTIONS,) = _load_contribution("stdf/cli_options.py", "STDF_OPTIONS")
-(
-    TOFLOW_OPTIONS,
-    TOFLOW_STRENGTH_OPTIONS,
-    TOFLOW_UPSCALE_OPTIONS,
-) = _load_contribution(
-    "toflow/cli_options.py",
-    "TOFLOW_OPTIONS",
-    "TOFLOW_STRENGTH_OPTIONS",
-    "TOFLOW_UPSCALE_OPTIONS",
-)
+
+
+def _family_fragments() -> list[tuple[int, list[Opt]]]:
+    fragments = []
+    for entry in catalog_entries():
+        if not entry.cli_options:
+            continue
+        path = entry.cli_options_path
+        assert path is not None
+        exports = tuple(item.export for item in entry.cli_options)
+        option_lists = _load_contribution(path, *exports)
+        fragments.extend(
+            (item.order, options)
+            for item, options in zip(
+                entry.cli_options, option_lists, strict=True)
+        )
+    return fragments
+
+
+_FRAGMENTS = [
+    (10, SOURCE_AND_OUTPUT_OPTIONS),
+    (60, PREPROCESS_SLOT_OPTIONS),
+    (90, DEBLOCK_SLOT_OPTIONS),
+    (120, DEBLOCK_STRENGTH_OPTIONS),
+    (130, DEBLOCK_MAP_OPTIONS),
+    (150, DENOISE_SLOT_OPTIONS),
+    (260, NOISE_MAP_OPTIONS),
+    (300, UPSCALE_SLOT_OPTIONS),
+    (390, RUNTIME_OPTIONS),
+    *_family_fragments(),
+]
+_orders = [order for order, _options in _FRAGMENTS]
+if len(_orders) != len(set(_orders)):
+    raise RuntimeError("duplicate CLI option fragment order in processor catalog")
 
 REGISTRY = [
-    *SOURCE_AND_OUTPUT_OPTIONS,
-    *SANITIZE_EDGE_OPTIONS,
-    *CROP_OPTIONS,
-    *SQUARE_PIXELS_OPTIONS,
-    *CUT_OPTIONS,
-    *PREPROCESS_SLOT_OPTIONS,
-    *BASICVSRPP_RESTORE_OPTIONS,
-    *DEFLICKER_OPTIONS,
-    *DEBLOCK_SLOT_OPTIONS,
-    *STDF_OPTIONS,
-    *FBCNN_WEIGHT_OPTIONS,
-    *DEBLOCK_STRENGTH_OPTIONS,
-    *DEBLOCK_MAP_OPTIONS,
-    *FBCNN_OPTIONS,
-    *DENOISE_SLOT_OPTIONS,
-    *SPATIAL_OPTIONS,
-    *MC_STRENGTH_OPTIONS,
-    *FASTDVDNET_STRENGTH_OPTIONS,
-    *BSVD_STRENGTH_OPTIONS,
-    *TOFLOW_STRENGTH_OPTIONS,
-    *PVDD_STRENGTH_OPTIONS,
-    *FASTDVDNET_OPTIONS,
-    *BSVD_OPTIONS,
-    *TOFLOW_OPTIONS,
-    *PVDD_OPTIONS,
-    *NOISE_MAP_OPTIONS,
-    *MC_OPTIONS,
-    *TOFLOW_UPSCALE_OPTIONS,
-    *NAFNET_OPTIONS,
-    *UPSCALE_SLOT_OPTIONS,
-    *METALFX_OPTIONS,
-    *BASICVSRPP_UPSCALE_OPTIONS,
-    *REALBASICVSR_OPTIONS,
-    *REALESRGAN_OPTIONS,
-    *REALVIFORMER_OPTIONS,
-    *ESC_OPTIONS,
-    *REALPLKSR_OPTIONS,
-    *SAFMN_OPTIONS,
-    *RUNTIME_OPTIONS,
+    option
+    for _order, options in sorted(_FRAGMENTS, key=lambda fragment: fragment[0])
+    for option in options
 ]

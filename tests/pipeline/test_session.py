@@ -99,7 +99,11 @@ def tracker(monkeypatch) -> Tracker:
     """Register a close-tracking fake family for the test's duration."""
     log = Tracker()
     factory = _FakeFactory("fakestage", log)
-    monkeypatch.setitem(catalog_module._FACTORY_TARGETS, "fakestage", "<test>")
+    monkeypatch.setitem(
+        catalog_module._CATALOG,
+        "fakestage",
+        catalog_module.CatalogEntry("fakestage", "<test>"),
+    )
     monkeypatch.setitem(catalog_module._loaded, "fakestage", factory)
     return log
 
