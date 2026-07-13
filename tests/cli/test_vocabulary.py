@@ -6,6 +6,8 @@ spellings are hidden aliases, and settings-backed flags stay None-default so
 the env/TOML trifecta layers show through.
 """
 
+import subprocess
+import sys
 from dataclasses import fields
 
 import pytest
@@ -19,6 +21,31 @@ pytestmark = pytest.mark.unit
 
 def test_registry_has_no_vocabulary_violations():
     assert vocabulary_violations(REGISTRY) == []
+
+
+def test_registry_loading_keeps_family_implementations_lazy():
+    code = """
+import sys
+import kinovsr.cli._registry
+
+families = {
+    "basicvsrpp", "bsvd", "crop", "cut_detect", "deflicker", "esc",
+    "fastdvdnet", "fbcnn", "mc", "metalfx", "nafnet", "pvdd",
+    "realbasicvsr", "realesrgan", "realplksr", "realviformer", "safmn",
+    "sanitize_edges", "spatial", "square_pixels", "stdf", "toflow",
+}
+loaded = sorted(
+    name for name in sys.modules
+    if name.startswith("kinovsr.processors.")
+    and name.split(".", 3)[2] in families
+)
+if loaded:
+    raise SystemExit("family implementations loaded by CLI registry: " + repr(loaded))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        check=False)
+    assert result.returncode == 0, result.stderr
 
 
 def test_family_flags_compose_family_and_key():

@@ -2,8 +2,8 @@
 
 The deformable fusion runs on Y only; the RGB<->Y split needs the
 stream's luma coefficients, so the build binds (Kr, Kb) from the input
-StreamSpec's color matrix at prepare time. Blockiness-map conditioning
-stays harness-wired until conditioning becomes stage config.
+StreamSpec's color matrix at prepare time. Blockiness-map conditioning is
+typed stage config.
 """
 
 from __future__ import annotations

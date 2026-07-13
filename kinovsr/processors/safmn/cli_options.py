@@ -1,0 +1,37 @@
+"""CLI option rows owned by the SAFMN family."""
+
+from kinovsr.cli.options import Opt
+
+SAFMN_OPTIONS = [
+    Opt(flag='--safmn-weights',
+        group='Spatial Upscalers',
+        metavar='PATH',
+        family='safmn',
+        key='weights',
+        settings_backed=True,
+        help='SAFMN weights path (.safetensors) for --upscale safmn (or $SAFMN_WEIGHTS). Prefer --safmn-profile for the named checkpoints.'),
+    Opt(flag='--safmn-profile',
+        group='Spatial Upscalers',
+        choices=('light', 'real', 'real2x', 'purescale', 'purescale2x',
+                 'purescale2x-sharp'),
+        family='safmn',
+        key='profile',
+        help='Which SAFMN model for --upscale safmn. light (default; light_SAFMN++, tiny fidelity 4x trained on compressed content), real (SAFMN_L_Real_LSDIR, real-world perceptual 4x trained with the Real-ESRGAN degradation -- video-appropriate, ~3x faster than the RRDBNet class), real2x (same family, 2x output); purescale / purescale2x / purescale2x-sharp (PureScale 2.0, SAFMN-L retrained with a fixed SAFM branch that eliminates the known transient block-lattice artifact of the stock models; sharp adds deblur. For DECENT-quality sources: it has no denoising prior, so noisy or compressed video gets its noise rendered as etched, flickering texture -- use real with --safmn-pool-clamp there. CAUTION: PureScale weights are CC BY-NC-SA 4.0 -- NON-COMMERCIAL use only). None are bundled; see kinovsr/processors/safmn/weights/README.md. Ignored when --safmn-weights is given.'),
+    Opt(flag='--safmn-safm-up',
+        group='Spatial Upscalers',
+        default='auto',
+        choices=('auto', 'nearest', 'bicubic'),
+        family='safmn',
+        key='safm_up',
+        help="SAFM upsampler inside the SAFMN blocks. auto (default) = the mode each checkpoint was trained with (nearest for the stock models, bicubic for the purescale retrains, verified against the reference). Forcing the other mode is a safe shape-only override. On the stock real models, bicubic is a CREATIVE dial: the trained nearest-up gate is blocky and flattens micro-texture within its blocks, and a smooth gate frees the GAN's texture synthesis -- measured ~30 percent more output high-frequency energy, visibly grainier/sharper surfaces (judge on video: hallucinated micro-texture can shimmer temporally). It also rounds lattice blocks into soft blobs without fixing the underlying hot-pixel winner. The POOLING statistic is trained in and always follows the checkpoint -- swapping it corrupts the output."),
+    Opt(flag='--safmn-pool-clamp',
+        group='Spatial Upscalers',
+        type=float,
+        default=0.0,
+        metavar='K',
+        family='safmn',
+        key='pool_clamp',
+        help='Winsorize SAFM pooled features to mean +/- K sigma per channel; a stock-weights (real/real2x) mitigation for the transient block-lattice artifact (default 0 = off). DIRECTION: K is the allowed width in sigmas, so LOWER K = STRONGER suppression -- raising K weakens it. Calibrated levels: 4 = visually free on normal content, lattice greatly reduced but findable frame by frame; 3 = lattice imperceptible, cost still negligible (the recommended setting); 2.5 = boundary, specular-rich content starts dulling; 2 = visibly muted highlights and flattened texture sparkle. Failure is graceful at any K (it can only under-modulate, never corrupt). Frame-boundary pooled cells are exempt (one cell = 2/4/8 px per level): synthetic border rows/bars saturate the features into a quiet self-limiting response, and clamping them re-engages texture hallucination and makes borders bloom. The purescale variants fix the artifact at the root and do not need this.'),
+]
+
+__all__ = ["SAFMN_OPTIONS"]

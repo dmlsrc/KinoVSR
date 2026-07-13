@@ -2,8 +2,7 @@
 
 The net consumes two future neighbors per output frame, paid as output
 delay through its own buffer (CENTERED, radius 2). ``strength`` maps
-onto the trained sigma range. Noise-map conditioning stays
-harness-wired until conditioning becomes stage config.
+onto the trained sigma range. Noise-map conditioning is typed stage config.
 """
 
 from __future__ import annotations

@@ -4,8 +4,7 @@ Runs in sliding windows (default 10) whose future half is self-buffered
 and paid as output delay (CENTERED). The level variants take a noise
 dial: ``noise_preset`` S/M/L maps to the reference variance levels, and
 ``noise_variance`` overrides it exactly (sigma^2, not sigma); blind
-variants ignore both. Noise-map conditioning stays harness-wired until
-conditioning becomes stage config.
+variants ignore both. Noise-map conditioning is typed stage config.
 """
 
 from __future__ import annotations

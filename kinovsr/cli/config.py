@@ -42,10 +42,10 @@ _DEBLOCK_WEIGHT_FAMILIES = ("stdf", "fbcnn", "toflow")
 class Invocation:
     """A fully resolved CLI invocation: settings, stage options, config.
 
-    ``options`` is the transitional flat namespace of canonical option
-    destinations consumed by the inherited orchestration. ``config`` is
-    the composed TOML document; when it declares a ``pipeline`` list the
-    run routes through the typed pipeline instead.
+    ``options`` is the flat namespace of canonical option destinations consumed
+    by the flag-to-pipeline assembler. ``config`` is the composed TOML document;
+    an explicit ``pipeline`` list bypasses flag assembly and supplies the typed
+    pipeline directly.
     """
 
     settings: Settings
