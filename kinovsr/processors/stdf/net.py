@@ -13,6 +13,7 @@ Layout: MLX-native NHWC. Conv weights -> (O,kH,kW,I) at load; ConvTranspose weig
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -207,14 +208,18 @@ def make_forward(p: dict, strength: float = 1.0, cfg: tuple | None = None, compi
     return _cached(_COMPILE_CACHE, (id(p), float(strength), cfg), lambda: mx.compile(run))
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     p = load_params()
     in_nc, input_len, nb = _config(p)
-    print(f"loaded STDF: in_nc={in_nc}, frames={input_len} (radius {input_len // 2}), nb={nb}")
+    _log.info(f"loaded STDF: in_nc={in_nc}, frames={input_len} (radius {input_len // 2}), nb={nb}")
     mx.random.seed(0)
     frames = [mx.clip(mx.random.uniform(shape=(1, 64, 96, in_nc)), 0, 1) for _ in range(input_len)]
     mx.eval(*frames)
     out = deblock(frames, p)
     mx.eval(out)
-    print(f"deblock: {input_len}x{tuple(frames[0].shape)} -> {tuple(out.shape)}, "
+    _log.info(f"deblock: {input_len}x{tuple(frames[0].shape)} -> {tuple(out.shape)}, "
           f"residual mean={float(mx.mean(mx.abs(out - frames[input_len // 2]))):.4f}")

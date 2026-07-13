@@ -7,6 +7,8 @@ Validated against a pure-MLX gather reference below.
 """
 from __future__ import annotations
 
+import logging
+
 import mlx.core as mx
 
 # bilinear_interpolate + the im2col body, lifted from mps-deform-conv's
@@ -165,7 +167,11 @@ def ref_deform_conv2d(inp, offset, weight, bias=None, mask=None,
     return out
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     mx.random.seed(0)
     # BasicVSR++-shaped-ish small case: deform_groups, mask, 3x3 pad1
     N, Cin, Cout, H, W, K, dg = 1, 8, 6, 12, 14, 3, 2
@@ -177,9 +183,9 @@ if __name__ == "__main__":
     a = deform_conv2d(inp, offset, weight, bias, mask, deform_groups=dg)
     b = ref_deform_conv2d(inp, offset, weight, bias, mask, deform_groups=dg)
     mx.eval(a, b)
-    print(f"kernel vs pure-MLX ref: max|diff|={float(mx.max(mx.abs(a - b))):.2e}  shapes {a.shape}")
+    _log.info(f"kernel vs pure-MLX ref: max|diff|={float(mx.max(mx.abs(a - b))):.2e}  shapes {a.shape}")
     # also without mask (plain deformable conv, DCNv1)
     a2 = deform_conv2d(inp, offset, weight, None, None, deform_groups=dg)
     b2 = ref_deform_conv2d(inp, offset, weight, None, None, deform_groups=dg)
     mx.eval(a2, b2)
-    print(f"no-mask (DCNv1):        max|diff|={float(mx.max(mx.abs(a2 - b2))):.2e}")
+    _log.info(f"no-mask (DCNv1):        max|diff|={float(mx.max(mx.abs(a2 - b2))):.2e}")

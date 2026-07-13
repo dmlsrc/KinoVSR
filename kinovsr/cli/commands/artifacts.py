@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -28,11 +29,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from kinovsr.ui.console import get_console
-
-
-def _print(*parts: object) -> None:
-    get_console().print(*parts, markup=False, highlight=False)
+_log = logging.getLogger(__name__)
 
 
 def _percentile(values: mx.array, q: float) -> float:
@@ -474,7 +471,7 @@ def compare(args: argparse.Namespace) -> dict:
                 overlay_writer.write(risk_overlay(cand_u8, map_risk, args.threshold))
 
             if args.progress and len(rows) % args.progress == 0:
-                _print(
+                _log.info(
                     f"[{len(rows):5d}] frame={ref_idx:6d} "
                     f"raw_mean={row.raw_mean:.5f} raw_area={row.raw_area:.5f} "
                     f"weighted_area={row.weighted_area:.5f}",
@@ -493,30 +490,28 @@ def compare(args: argparse.Namespace) -> dict:
     return summary
 
 
-def print_summary(summary: dict) -> None:
-    _print("=== VSR Artifact Risk ===")
-    _print(f"reference: {summary['reference']}")
-    _print(f"candidate: {summary['candidate']}")
-    _print(
+def log_summary(summary: dict) -> None:
+    _log.info("=== VSR Artifact Risk ===")
+    _log.info(f"reference: {summary['reference']}")
+    _log.info(f"candidate: {summary['candidate']}")
+    _log.info(
         f"frames:    {summary['frames_compared']} at "
         f"{summary['resolution']['width']}x{summary['resolution']['height']}"
     )
-    _print(f"threshold: {summary['threshold']:.3f}")
-    _print()
+    _log.info(f"threshold: {summary['threshold']:.3f}")
     risk = summary["risk"]
-    _print("metric                 mean       p95")
-    _print(f"raw frame risk     {risk['raw_mean']:.6f}  {risk['raw_p95_frame_mean']:.6f}")
-    _print(f"raw area fraction  {risk['raw_area_mean']:.6f}  {risk['raw_area_p95']:.6f}")
-    _print(f"flat-weighted risk {risk['weighted_mean']:.6f}  {risk['weighted_p95_frame_mean']:.6f}")
-    _print(f"weighted area      {risk['weighted_area_mean']:.6f}  {risk['weighted_area_p95']:.6f}")
-    _print()
+    _log.info("metric                 mean       p95")
+    _log.info(f"raw frame risk     {risk['raw_mean']:.6f}  {risk['raw_p95_frame_mean']:.6f}")
+    _log.info(f"raw area fraction  {risk['raw_area_mean']:.6f}  {risk['raw_area_p95']:.6f}")
+    _log.info(f"flat-weighted risk {risk['weighted_mean']:.6f}  {risk['weighted_p95_frame_mean']:.6f}")
+    _log.info(f"weighted area      {risk['weighted_area_mean']:.6f}  {risk['weighted_area_p95']:.6f}")
     worst = summary["worst_frames"]
-    _print(
+    _log.info(
         "worst raw-area frame:      "
         f"{worst['raw_area']['index']} area={worst['raw_area']['raw_area']:.6f} "
         f"p99={worst['raw_area']['raw_p99']:.6f}"
     )
-    _print(
+    _log.info(
         "worst weighted-area frame: "
         f"{worst['weighted_area']['index']} area={worst['weighted_area']['weighted_area']:.6f} "
         f"p99={worst['weighted_area']['weighted_p99']:.6f}"
@@ -577,7 +572,7 @@ def run_compare(argv: list[str] | None = None) -> int:
         parser.error("--heatmap-video/--overlay-video require --output-dir")
 
     summary = compare(args)
-    print_summary(summary)
+    log_summary(summary)
 
 
 _SUBCOMMANDS = ("compare",)
@@ -585,11 +580,15 @@ _SUBCOMMANDS = ("compare",)
 
 def run_artifacts_command(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
-        _print(f"usage: kinovsr artifacts {{{'|'.join(_SUBCOMMANDS)}}} ...")
+        log = _log.info if argv else _log.error
+        log("usage: kinovsr artifacts {%s} ...", "|".join(_SUBCOMMANDS))
         return 0 if argv else 2
     name, rest = argv[0], argv[1:]
     if name == "compare":
         return run_compare(rest) or 0
-    _print(f"unknown artifacts subcommand {name!r} "
-           f"(available: {', '.join(_SUBCOMMANDS)})")
+    _log.error(
+        "unknown artifacts subcommand %r (available: %s)",
+        name,
+        ", ".join(_SUBCOMMANDS),
+    )
     return 2

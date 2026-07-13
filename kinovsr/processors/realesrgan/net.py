@@ -15,6 +15,7 @@ than RRDBNet) are also supported and auto-detected by the absence of conv_first.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -309,10 +310,14 @@ def upscale(frames: list, p: dict) -> list:
     return out
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     params = load_params()
-    print(f"loaded RRDBNet: scale={scale_of(params)}x, blocks={_num_blocks(params)}")
+    _log.info(f"loaded RRDBNet: scale={scale_of(params)}x, blocks={_num_blocks(params)}")
     clip = [mx.random.uniform(shape=(1, 48, 64, 3))]
     mx.eval(*clip)
     sr = upscale(clip, params)
-    print(f"upscale: {tuple(clip[0].shape)} -> {tuple(sr[0].shape)}")
+    _log.info(f"upscale: {tuple(clip[0].shape)} -> {tuple(sr[0].shape)}")

@@ -16,16 +16,18 @@ Call :func:`configure_logging` once at CLI startup (typically via
 silent at INFO, as library logging convention expects; warnings and errors
 still reach stderr via logging's last-resort handler.
 
-Bare ``print`` is forbidden in new runtime modules - it clobbers live
-progress bars and bypasses the level and theme toggles. (The inherited
-harness and converter scripts keep their prints until they migrate.)
+Direct terminal writes are forbidden in package modules and developer tools:
+they clobber live progress bars and bypass severity, verbosity, file logging,
+and per-module filtering. Machine-readable subprocess protocols use dedicated
+logging handlers when stdout is part of the transport contract.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TextIO
 
 from rich.logging import RichHandler
 
@@ -37,6 +39,28 @@ if TYPE_CHECKING:
 # Parent logger for the whole package; every ``kinovsr.*`` logger propagates
 # up to it, so one handler here renders all subsystems.
 _ROOT_LOGGER = "kinovsr"
+
+
+def configure_machine_output(
+    logger_name: str,
+    *,
+    stream: TextIO | None = None,
+) -> logging.Logger:
+    """Configure one isolated logger for a machine-readable stdout protocol.
+
+    Human-facing logs remain on the shared Rich stderr console. This logger
+    deliberately emits only ``record.message`` so a parent process can parse
+    each line without timestamps, level labels, or duplicate propagation.
+    """
+    handler = logging.StreamHandler(stream or sys.stdout)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger(logger_name)
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
 
 
 def _level_for(verbosity: int, quiet: bool) -> int:

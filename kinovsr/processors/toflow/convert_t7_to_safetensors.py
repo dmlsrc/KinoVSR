@@ -19,12 +19,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import re
 import struct
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 _PARAMS_BY_TYPE = {
     "nn.Mul": ("weight",),
@@ -465,7 +468,7 @@ def main() -> int:
 
     data = src.read_bytes()
     sha = hashlib.sha256(data).hexdigest()
-    print(f"[load] {src.name}: {len(data):,} bytes sha256={sha}")
+    _log.info(f"[load] {src.name}: {len(data):,} bytes sha256={sha}")
     root = _load_t7(src, long_size=args.long_size)
     if _typename(root) != "nn.Sequential":
         raise SystemExit(f"error: expected nn.Sequential root, got {_typename(root)}")
@@ -501,19 +504,20 @@ def main() -> int:
     graph_out.write_text(json.dumps(graph, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     n_params = sum(int(np.prod(t.shape)) for t in tensors.values())
-    print(f"[convert] modules={sum(counts.values())} tensors={len(tensors)} "
+    _log.info(f"[convert] modules={sum(counts.values())} tensors={len(tensors)} "
           f"params={n_params/1e6:.3f}M unique")
-    print(f"[write] weights: {out}")
-    print(f"[write] graph:   {graph_out}")
+    _log.info(f"[write] weights: {out}")
+    _log.info(f"[write] graph:   {graph_out}")
     if not args.no_verify:
         w = mx.load(str(out))
         ok = len(w) == len(tensors)
         sample_key = next(iter(w))
-        print(f"[verify] mlx.core.load OK: {len(w)} arrays "
+        _log.info(f"[verify] mlx.core.load OK: {len(w)} arrays "
               f"(e.g. {sample_key} {tuple(w[sample_key].shape)} {w[sample_key].dtype}); "
               f"match={ok}")
     return 0
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     raise SystemExit(main())

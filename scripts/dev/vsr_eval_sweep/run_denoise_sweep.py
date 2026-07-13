@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import os
 import re
 import subprocess
@@ -27,6 +28,8 @@ from kinovsr.eval.config import (
     load_config,
     resolve_path,
 )
+
+_log = logging.getLogger("kinovsr.dev.vsr_eval_sweep.run_denoise_sweep")
 
 # scripts/dev/vsr_eval_sweep/ -> repo root is three levels up.
 REPO = Path(__file__).resolve().parents[3]
@@ -220,9 +223,9 @@ def run_variant(args: argparse.Namespace, clip: dict[str, Any], variant: dict[st
         "cmd": cmd,
         "log": str(log_path),
     }
-    print(f"[run] {label}:{name}", flush=True)
+    _log.info("running %s:%s", label, name)
     if args.dry_run:
-        print(" ".join(cmd), flush=True)
+        _log.info("command: %s", " ".join(cmd))
         row.update({"returncode": 0, "seconds": 0.0, "dry_run": True})
         return row
 
@@ -242,7 +245,14 @@ def run_variant(args: argparse.Namespace, clip: dict[str, Any], variant: dict[st
     row.update(parse_run_log(proc.stdout))
     if proc.returncode != 0:
         row["error"] = f"kinovsr returned {proc.returncode}"
-    print(f"[done] {label}:{name} rc={proc.returncode} {row['seconds']:.1f}s", flush=True)
+    log = _log.info if proc.returncode == 0 else _log.error
+    log(
+        "completed %s:%s rc=%s in %.1fs",
+        label,
+        name,
+        proc.returncode,
+        row["seconds"],
+    )
     return row
 
 
@@ -261,7 +271,7 @@ def evaluate_clip_faces(args: argparse.Namespace, clip: dict[str, Any], manifest
     ]
     if args.face_model is not None:
         cmd.extend(["--model", str(args.face_model)])
-    print(f"[face-eval] {clip['label']}", flush=True)
+    _log.info("face evaluation: %s", clip["label"])
     subprocess.run(cmd, cwd=REPO, check=True)
     rows = json.loads((out_dir / "face_yunet_metrics.json").read_text(encoding="utf-8"))
     for row in rows:
@@ -281,10 +291,14 @@ def evaluate_clip_perceptual(args: argparse.Namespace, clip: dict[str, Any], man
         "--musiq-every", str(args.perceptual_musiq_every),
         "--metrics", args.perceptual_metrics,
     ]
-    print(f"[perceptual] {clip['label']}", flush=True)
+    _log.info("perceptual evaluation: %s", clip["label"])
     proc = subprocess.run(cmd, cwd=REPO, check=False)
     if proc.returncode != 0:
-        print(f"[perceptual] {clip['label']} failed rc={proc.returncode}; continuing", flush=True)
+        _log.warning(
+            "perceptual evaluation %s failed rc=%s; continuing",
+            clip["label"],
+            proc.returncode,
+        )
         return []
     rows = json.loads((out_dir / "perceptual_metrics.json").read_text(encoding="utf-8"))
     for row in rows:
@@ -354,12 +368,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    from kinovsr.ui.logging import configure_logging
+
+    configure_logging()
     summary = run_sweep(_normalise_config(parse_args()))
-    print(f"[done] {Path(summary['output_root']) / 'run_summary.json'}", flush=True)
+    _log.info("wrote %s", Path(summary["output_root"]) / "run_summary.json")
     if summary.get("face_metrics"):
-        print(f"[done] {Path(summary['output_root']) / 'face_metrics.csv'}", flush=True)
+        _log.info("wrote %s", Path(summary["output_root"]) / "face_metrics.csv")
     if summary.get("perceptual_metrics"):
-        print(f"[done] {Path(summary['output_root']) / 'perceptual_metrics.csv'}", flush=True)
+        _log.info(
+            "wrote %s",
+            Path(summary["output_root"]) / "perceptual_metrics.csv",
+        )
     return 0
 
 

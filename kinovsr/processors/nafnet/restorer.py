@@ -17,6 +17,7 @@ claim about the task.
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,8 @@ from kinovsr.modeling.compile_cache import cached as _cached
 from kinovsr.modeling.vsr_blocks import box3
 
 from . import net
+
+_log = logging.getLogger(__name__)
 
 _LOCAL_POOL_VARIANTS = {"gopro", "gopro32", "reds"}
 _GLOBAL_POOL_VARIANTS = {"sidd", "sidd32"}
@@ -520,7 +523,7 @@ class NafnetRestorer:
         if self._progress_message is not None:
             self._progress_message(message)
         else:
-            print(message)
+            _log.warning(message)
 
     def _notice_once(self, mode: str, peak: float, frac: float) -> None:
         self._guarded_frames += 1
@@ -541,4 +544,4 @@ class NafnetRestorer:
         if self._progress_message is not None:
             self._progress_message(message)
         else:
-            print(message)
+            _log.warning(message)

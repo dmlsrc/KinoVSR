@@ -22,6 +22,7 @@ default), matching the reference.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -332,13 +333,17 @@ def make_forward(
     )
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     p = load_params(dtype=mx.float32)
     cfg = _config(p)
-    print(f"loaded NAFNet: width={cfg[0]} enc={cfg[1]} middle={cfg[2]} dec={cfg[3]}")
+    _log.info(f"loaded NAFNet: width={cfg[0]} enc={cfg[1]} middle={cfg[2]} dec={cfg[3]}")
     mx.random.seed(0)
     x = mx.clip(mx.random.uniform(shape=(1, 64, 96, 3)), 0, 1)
     mx.eval(x)
     out = nafnet(x, p, cfg)
     mx.eval(out)
-    print(f"{tuple(x.shape)} -> {tuple(out.shape)}, residual mean {float(mx.mean(mx.abs(out - x))):.4f}")
+    _log.info(f"{tuple(x.shape)} -> {tuple(out.shape)}, residual mean {float(mx.mean(mx.abs(out - x))):.4f}")

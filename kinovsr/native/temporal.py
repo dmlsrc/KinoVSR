@@ -20,12 +20,15 @@ Cleanly handles arbitrary float fps both sides:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from typing import Any
 
 from kinovsr.media import pixel_buffers as _pb
 
 from .frameworks import vt
+
+_log = logging.getLogger(__name__)
 
 
 class VtfrcSession:
@@ -97,11 +100,16 @@ class VtfrcSession:
 
         self.src_attrs = dict(self.config.sourcePixelBufferAttributes() or {})
         self.dst_attrs = dict(self.config.destinationPixelBufferAttributes() or {})
-        print(
-            f"Temporal session ready ({source_fps:.3f}fps -> {target_fps:.3f}fps "
-            f"@ {in_w}x{in_h}, mode={mode}, "
-            f"src fmt {_pb.resolve_pixel_format(self.src_attrs):#x}, "
-            f"dst fmt {_pb.resolve_pixel_format(self.dst_attrs):#x})"
+        _log.info(
+            "Temporal session ready (%.3ffps -> %.3ffps @ %sx%s, mode=%s, "
+            "src fmt %#x, dst fmt %#x)",
+            source_fps,
+            target_fps,
+            in_w,
+            in_h,
+            mode,
+            _pb.resolve_pixel_format(self.src_attrs),
+            _pb.resolve_pixel_format(self.dst_attrs),
         )
 
         self._dst_pool: Any = None

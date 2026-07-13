@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import platform
 import statistics
@@ -27,6 +28,9 @@ from fractions import Fraction
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+_log = logging.getLogger("kinovsr.dev.bench_scheduler")
+_result_log = logging.getLogger("kinovsr.dev.bench_scheduler.result")
 
 WARMUP = 30
 FRAMES = 120
@@ -123,8 +127,15 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.single is not None:
-        print(json.dumps(run_single(args.single)))
+        from kinovsr.ui.logging import configure_machine_output
+
+        configure_machine_output(_result_log.name)
+        _result_log.info("%s", json.dumps(run_single(args.single)))
         return 0
+
+    from kinovsr.ui.logging import configure_logging
+
+    configure_logging()
 
     report = {
         "machine": platform.machine(),
@@ -154,9 +165,17 @@ def main() -> int:
             "p95_ms_per_stage_frame": p95,
             "pass": passed,
         }
-        print(f"stages={n_stages}: median {median:.4f} ms/stage/frame, "
-              f"p95 {p95:.4f} (gate {MEDIAN_GATE_MS}/{P95_GATE_MS}) "
-              f"{'PASS' if passed else 'FAIL'}")
+        log = _log.info if passed else _log.error
+        log(
+            "stages=%s: median %.4f ms/stage/frame, p95 %.4f "
+            "(gate %s/%s) %s",
+            n_stages,
+            median,
+            p95,
+            MEDIAN_GATE_MS,
+            P95_GATE_MS,
+            "PASS" if passed else "FAIL",
+        )
 
     base = os.environ.get("SHARED_TEMP_DIR") or os.environ.get("TMPDIR") or "/tmp"
     out_dir = Path(base) / "trace_analysis"
@@ -164,8 +183,11 @@ def main() -> int:
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out_path = out_dir / f"kinovsr_scheduler_bench_{stamp}.json"
     out_path.write_text(json.dumps(report, indent=1))
-    print(f"report: {out_path}")
-    print("GATE:", "PASS" if ok else "FAIL")
+    _log.info("report: %s", out_path)
+    if ok:
+        _log.info("GATE: PASS")
+    else:
+        _log.error("GATE: FAIL")
     return 0 if ok else 1
 
 

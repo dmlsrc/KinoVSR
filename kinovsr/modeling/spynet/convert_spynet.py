@@ -14,8 +14,11 @@ loads through the restricted unpickler in
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 
 def _state_dict(node):
@@ -37,8 +40,9 @@ def _state_dict(node):
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("usage: convert_spynet.py <spynet .pth> [output.safetensors]",
-              file=sys.stderr)
+        _log.error(
+            "usage: convert_spynet.py <spynet .pth> [output.safetensors]"
+        )
         return 2
     src = Path(sys.argv[1])
     dst = Path(sys.argv[2]) if len(sys.argv) > 2 else (
@@ -54,7 +58,7 @@ def main() -> int:
         tree, _demoted = tree
     state = _state_dict(tree)
     if state is None:
-        print("error: no state dict found in the checkpoint", file=sys.stderr)
+        _log.error("no state dict found in the checkpoint")
         return 2
 
     out: dict = {}
@@ -72,9 +76,10 @@ def main() -> int:
     dst.parent.mkdir(parents=True, exist_ok=True)
     mx.save_safetensors(str(dst), out)
     check = mx.load(str(dst))
-    print(f"wrote {dst} ({len(check)} tensors)")
+    _log.info(f"wrote {dst} ({len(check)} tensors)")
     return 0
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     raise SystemExit(main())

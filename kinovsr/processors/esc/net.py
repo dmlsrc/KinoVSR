@@ -32,6 +32,7 @@ Layout: MLX-native NHWC; conv weights -> (O,kH,kW,I) at load.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -296,14 +297,18 @@ def make_forward(p: dict, cfg: tuple | None = None, compile: bool = True):
     return _cached(_COMPILE_CACHE, (id(p), cfg), lambda: mx.compile(run))
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     p = load_params()
     cfg = _config(p)
-    print(f"loaded ESC-Real: dim={cfg[0]} blocks={cfg[1]}x{cfg[2]} heads={cfg[3]} "
+    _log.info(f"loaded ESC-Real: dim={cfg[0]} blocks={cfg[1]}x{cfg[2]} heads={cfg[3]} "
           f"window={cfg[4]} pdim={cfg[5]} scale={cfg[6]}x")
     mx.random.seed(0)
     x = mx.clip(mx.random.uniform(shape=(1, 64, 96, 3)), 0, 1)
     mx.eval(x)
     out = esc(x, p, cfg)
     mx.eval(out)
-    print(f"{tuple(x.shape)} -> {tuple(out.shape)}, finite={bool(mx.all(mx.isfinite(out)))}")
+    _log.info(f"{tuple(x.shape)} -> {tuple(out.shape)}, finite={bool(mx.all(mx.isfinite(out)))}")

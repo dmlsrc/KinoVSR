@@ -28,17 +28,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import subprocess
-import sys
 from pathlib import Path
 
 import mlx.core as mx
 
-from kinovsr.ui.console import get_console
-
-
-def _print(*parts: object) -> None:
-    get_console().print(*parts, markup=False, highlight=False)
+_log = logging.getLogger(__name__)
 
 
 def _percentile(values: mx.array, q: float) -> float:
@@ -127,7 +123,7 @@ def stream_tsd(path: str, w: int, h: int, grid: int) -> tuple[mx.array, mx.array
     finally:
         proc.wait()
         if proc.returncode not in (0, None):
-            sys.stderr.write(f"ffmpeg exited with {proc.returncode} on {path}\n")
+            _log.error("ffmpeg exited with %s on %s", proc.returncode, path)
 
     tsd_per_patch = tsd_per_patch / max(n_pairs, 1)
     return mx.array(tsd_per_frame), tsd_per_patch
@@ -188,79 +184,74 @@ def run_shimmer(argv: list[str] | None = None) -> int:
     fps = fps_a  # for per-second bucketing
     w, h = wa, ha
 
-    _print(f"Resolution:  {w}x{h}")
-    _print(f"Grid:        {args.grid}x{args.grid}  ({h // args.grid}x{w // args.grid} pixels per patch)")
-    _print(f"FPS:         {fps:.3f}")
-    _print()
+    _log.info(f"Resolution:  {w}x{h}")
+    _log.info(f"Grid:        {args.grid}x{args.grid}  ({h // args.grid}x{w // args.grid} pixels per patch)")
+    _log.info(f"FPS:         {fps:.3f}")
 
-    _print(f"Streaming {label_a}: {args.video_a}")
+    _log.info(f"Streaming {label_a}: {args.video_a}")
     tsd_a, patches_a = stream_tsd(args.video_a, w, h, args.grid)
-    _print(f"  {len(tsd_a)} TSD samples")
+    _log.info(f"  {len(tsd_a)} TSD samples")
 
-    _print(f"Streaming {label_b}: {args.video_b}")
+    _log.info(f"Streaming {label_b}: {args.video_b}")
     tsd_b, patches_b = stream_tsd(args.video_b, w, h, args.grid)
-    _print(f"  {len(tsd_b)} TSD samples")
+    _log.info(f"  {len(tsd_b)} TSD samples")
 
     n = min(len(tsd_a), len(tsd_b))
     if n < len(tsd_a) or n < len(tsd_b):
-        _print(f"  (truncating both series to {n} frame pairs for comparison)")
+        _log.warning(
+            "truncating both series to %s frame pairs for comparison", n
+        )
     tsd_a = tsd_a[:n]
     tsd_b = tsd_b[:n]
     diff = tsd_a - tsd_b
-
-    _print()
-    _print("=== Temporal second-difference (TSD) per frame ===")
-    _print(f"{'video':<20s}{'mean':>10s}{'median':>10s}{'std':>10s}{'p95':>10s}{'max':>10s}")
+    _log.info("=== Temporal second-difference (TSD) per frame ===")
+    _log.info(f"{'video':<20s}{'mean':>10s}{'median':>10s}{'std':>10s}{'p95':>10s}{'max':>10s}")
     for label, series in ((label_a, tsd_a), (label_b, tsd_b)):
-        _print(
+        _log.info(
             f"{label:<20s}"
             f"{float(series.mean()):>10.4f}{_percentile(series, 50):>10.4f}"
             f"{float(mx.std(series)):>10.4f}"
             f"{_percentile(series, 95):>10.4f}{float(series.max()):>10.4f}"
         )
-
-    _print()
-    _print(f"=== Shimmer signal: TSD({label_a}) - TSD({label_b}) ===")
-    _print(f"  mean:    {float(diff.mean()):+.4f}")
-    _print(f"  median:  {_percentile(diff, 50):+.4f}")
-    _print(f"  p5:      {_percentile(diff, 5):+.4f}")
-    _print(f"  p95:     {_percentile(diff, 95):+.4f}")
-    _print(f"  max:     {float(diff.max()):+.4f}  (frame pair {int(mx.argmax(diff)) + 1})")
-    _print(f"  min:     {float(diff.min()):+.4f}  (frame pair {int(mx.argmin(diff)) + 1})")
+    _log.info(f"=== Shimmer signal: TSD({label_a}) - TSD({label_b}) ===")
+    _log.info(f"  mean:    {float(diff.mean()):+.4f}")
+    _log.info(f"  median:  {_percentile(diff, 50):+.4f}")
+    _log.info(f"  p5:      {_percentile(diff, 5):+.4f}")
+    _log.info(f"  p95:     {_percentile(diff, 95):+.4f}")
+    _log.info(f"  max:     {float(diff.max()):+.4f}  (frame pair {int(mx.argmax(diff)) + 1})")
+    _log.info(f"  min:     {float(diff.min()):+.4f}  (frame pair {int(mx.argmin(diff)) + 1})")
     a_higher = float(mx.mean(diff > 0)) * 100
-    _print(f"  fraction of frame pairs where {label_a} > {label_b}: {a_higher:.1f}%")
+    _log.info(f"  fraction of frame pairs where {label_a} > {label_b}: {a_higher:.1f}%")
 
     if args.per_second:
-        _print()
-        _print("=== Per-second mean TSD ===")
+        _log.info("=== Per-second mean TSD ===")
         step = max(1, int(round(fps)))
-        _print(f"  {'sec':>4s}  {label_a:>16s}  {label_b:>16s}  {'diff':>8s}")
+        _log.info(f"  {'sec':>4s}  {label_a:>16s}  {label_b:>16s}  {'diff':>8s}")
         for s in range((n + step - 1) // step):
             seg_a = tsd_a[s * step:(s + 1) * step]
             seg_b = tsd_b[s * step:(s + 1) * step]
             if seg_a.size == 0:
                 continue
             sa, sb = float(seg_a.mean()), float(seg_b.mean())
-            _print(f"  {s:>4d}  {sa:>16.4f}  {sb:>16.4f}  {sa - sb:>+8.4f}")
+            _log.info(f"  {s:>4d}  {sa:>16.4f}  {sb:>16.4f}  {sa - sb:>+8.4f}")
 
     diff_patches = patches_a - patches_b
-    _print()
-    _print(f"=== Per-patch shimmer ({label_a} - {label_b}, {args.grid}x{args.grid} grid) ===")
-    _print("  (rows top->bottom, cols left->right)")
+    _log.info(f"=== Per-patch shimmer ({label_a} - {label_b}, {args.grid}x{args.grid} grid) ===")
+    _log.info("  (rows top->bottom, cols left->right)")
     for r in range(args.grid):
         row = "  "
         for c in range(args.grid):
             row += _patch_glyph(float(diff_patches[r, c])) + " "
-        _print(row)
-    _print(
+        _log.info(row)
+    _log.info(
         "  legend: ##>=0.10  ++>=0.05  + >=0.02  . ~0  "
         "- <=-0.02  --<=-0.05  @@<=-0.10"
     )
     flat_max = int(mx.argmax(diff_patches))
     flat_min = int(mx.argmin(diff_patches))
     grid_w = diff_patches.shape[1]
-    _print(f"  max:  {float(diff_patches.max()):+.4f} at row {flat_max // grid_w}, col {flat_max % grid_w}")
-    _print(f"  min:  {float(diff_patches.min()):+.4f} at row {flat_min // grid_w}, col {flat_min % grid_w}")
+    _log.info(f"  max:  {float(diff_patches.max()):+.4f} at row {flat_max // grid_w}, col {flat_max % grid_w}")
+    _log.info(f"  min:  {float(diff_patches.min()):+.4f} at row {flat_min // grid_w}, col {flat_min % grid_w}")
 
 
 _SUBCOMMANDS = ("shimmer", "perceptual", "niqe", "faces", "dover", "musiq")
@@ -268,7 +259,8 @@ _SUBCOMMANDS = ("shimmer", "perceptual", "niqe", "faces", "dover", "musiq")
 
 def run_metrics_command(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
-        _print(f"usage: kinovsr metrics {{{'|'.join(_SUBCOMMANDS)}}} ...")
+        log = _log.info if argv else _log.error
+        log("usage: kinovsr metrics {%s} ...", "|".join(_SUBCOMMANDS))
         return 0 if argv else 2
     name, rest = argv[0], argv[1:]
     if name == "shimmer":
@@ -293,6 +285,9 @@ def run_metrics_command(argv: list[str]) -> int:
         from kinovsr.eval.musiq_score import run_musiq
 
         return run_musiq(rest) or 0
-    _print(f"unknown metrics subcommand {name!r} "
-           f"(available: {', '.join(_SUBCOMMANDS)})")
+    _log.error(
+        "unknown metrics subcommand %r (available: %s)",
+        name,
+        ", ".join(_SUBCOMMANDS),
+    )
     return 2

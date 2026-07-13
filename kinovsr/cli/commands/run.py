@@ -10,11 +10,14 @@ into the same typed config a ``[pipeline]`` TOML expresses (M6).
 
 from __future__ import annotations
 
+import logging
+
 from kinovsr.config import ConfigError
-from kinovsr.ui.console import get_console
 
 from ..args import build_parser, validate_args
 from ..config import assemble
+
+_log = logging.getLogger(__name__)
 
 
 def run_video_command(argv: list[str]) -> int:
@@ -25,8 +28,7 @@ def run_video_command(argv: list[str]) -> int:
     try:
         invocation = assemble(args)
     except ConfigError as exc:
-        get_console().print(f"config error: {exc}", style="bold red",
-                            markup=False)
+        _log.error("config error: %s", exc)
         return 2
 
     settings = invocation.settings
@@ -150,14 +152,14 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
     selected = () if assemble_flags else _pipeline_owned_flags(options)
     if selected:
         flags = ", ".join("--" + n.replace("_", "-") for n in selected)
-        get_console().print(
-            f"config error: a [pipeline] config owns the full chain; "
-            f"drop the flags ({flags}) or the pipeline table",
-            style="bold red", markup=False)
+        _log.error(
+            "config error: a [pipeline] config owns the full chain; "
+            "drop the flags (%s) or the pipeline table",
+            flags,
+        )
         return 2
     if not options.output_dir:
-        get_console().print("config error: --output-dir is required",
-                            style="bold red", markup=False)
+        _log.error("config error: --output-dir is required")
         return 2
 
     from kinovsr.api import process_video_file, resolve_mlx_cache_limit_gb
@@ -180,8 +182,7 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
         _w, _h, fps, total, _tf, _par = (reader or _vr).probe_video(video)
     except Exception as exc:
         if options.reader != "auto":
-            get_console().print(f"error: cannot open {video}: {exc}",
-                                style="bold red", markup=False)
+            _log.error("cannot open %s: %s", video, exc)
             return 2
         from kinovsr.media import ffmpeg_reader
 
@@ -189,9 +190,7 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
         try:
             _w, _h, fps, total, _tf, _par = reader.probe_video(video)
         except Exception as fallback_exc:
-            get_console().print(
-                f"error: cannot open {video}: {fallback_exc}",
-                style="bold red", markup=False)
+            _log.error("cannot open %s: %s", video, fallback_exc)
             return 2
     start, end = resolve_trim(options.start, options.end, fps, total)
     # --max-frames caps OUTPUT frames; a time spec is OUTPUT duration,
@@ -205,8 +204,7 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
             max_output_frames, max_output_seconds = parse_frames_or_seconds(
                 options.max_frames)
         except ValueError as exc:
-            get_console().print(f"error: bad --max-frames value: {exc}",
-                                style="bold red", markup=False)
+            _log.error("bad --max-frames value: %s", exc)
             return 2
 
     stem = (f"{sanitize_output_prefix(options.output_prefix)}_"
@@ -222,8 +220,8 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
                   if options.comparison else None)
 
     limit = resolve_mlx_cache_limit_gb(invocation.settings)
-    if limit > 0 and not invocation.settings.quiet:
-        get_console().print(f"MLX cache limit: {limit:g} GB")
+    if limit > 0:
+        _log.info("MLX cache limit: %g GB", limit)
 
     # The flag surface assembles into the same typed config a hand-written
     # [pipeline] TOML expresses (the probed dims feed the evenness bump).
@@ -265,14 +263,16 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
             reader=reader,
         )
     except (ConfigError, MediaError, PipelineError) as exc:
-        get_console().print(f"error: {exc}", style="bold red", markup=False)
+        _log.error("processing failed: %s", exc)
         return 2
-    get_console().print(
-        f"{result.frames_in} frames in -> {result.frames_out} out "
-        f"in {result.elapsed_s:.2f}s", markup=False)
+    _log.info(
+        "%s frames in -> %s out in %.2fs",
+        result.frames_in,
+        result.frames_out,
+        result.elapsed_s,
+    )
     if result.post_path is not None:
-        get_console().print(f"Post: {result.post_path}", markup=False)
+        _log.info("Post: %s", result.post_path)
     if result.comparison_path is not None:
-        get_console().print(f"Comparison: {result.comparison_path}",
-                            markup=False)
+        _log.info("Comparison: %s", result.comparison_path)
     return 0

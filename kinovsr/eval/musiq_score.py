@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -19,11 +20,8 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from kinovsr.eval.models.musiq import Musiq  # noqa: E402
-from kinovsr.ui.console import get_console
 
-
-def _print(*parts: object) -> None:
-    get_console().print(*parts, markup=False, highlight=False)
+_log = logging.getLogger(__name__)
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -62,7 +60,6 @@ def run_musiq(argv: list[str] | None = None) -> int:
             frames = _read_video_frames(p, args.every)
         scores = m.score_frames(frames)
         rows[inp] = sum(scores) / len(scores)
-        _print(f"{rows[inp]:7.2f}  {inp}")
-    _print(json.dumps(rows))
+        _log.info(f"{rows[inp]:7.2f}  {inp}")
+    _log.info(json.dumps(rows))
     return 0
-

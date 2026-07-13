@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import shutil
 import subprocess
@@ -19,11 +20,9 @@ from pathlib import Path
 import mlx.core as mx
 
 from kinovsr.media.images import draw_labels, load_image_rgb, resize_lanczos, save_image
-from kinovsr.ui.console import get_console
 
+_log = logging.getLogger(__name__)
 
-def _print(*parts: object) -> None:
-    get_console().print(*parts, markup=False, highlight=False)
 
 def run_command(cmd: list[str]) -> str:
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -296,7 +295,7 @@ def run_probe_edges(argv: list[str] | None = None) -> int:
         metrics_lines.append("")
 
     (output_dir / "metrics.txt").write_text("\n".join(metrics_lines), encoding="utf-8")
-    _print(f"Wrote edge analysis to {output_dir}")
+    _log.info("Wrote edge analysis to %s", output_dir)
 
     if not args.keep_extracted:
         shutil.rmtree(extracted_dir, ignore_errors=True)

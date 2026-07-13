@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 import re
@@ -35,6 +36,8 @@ from config import (
     load_config,
     resolve_path,
 )
+
+_log = logging.getLogger("kinovsr.dev.vsr_artifacts.run_fixture_tests")
 
 # scripts/dev/vsr_artifacts/ -> repo root is three levels up.
 REPO = Path(__file__).resolve().parents[3]
@@ -175,7 +178,7 @@ def summarize_probe(text: str) -> dict[str, Any]:
 
 
 def run(name: str, cmd: list[str], log_path: Path, python: Path) -> dict[str, Any]:
-    print(f"[run] {name}", flush=True)
+    _log.info("running %s", name)
     t0 = time.time()
     proc = subprocess.run(
         [str(python), *cmd],
@@ -422,8 +425,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    from kinovsr.ui.logging import configure_logging
+
+    configure_logging()
     summary = run_cases(_normalise_config(parse_args()))
-    print(f"[done] {Path(summary['out_root']) / 'summary.json'}", flush=True)
+    _log.info("wrote %s", Path(summary["out_root"]) / "summary.json")
     return 0
 
 

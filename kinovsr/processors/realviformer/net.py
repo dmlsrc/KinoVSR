@@ -30,6 +30,7 @@ Layout: MLX-native NHWC; conv weights -> (O,kH,kW,I) at load.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -372,10 +373,14 @@ def make_steps(p: dict, cfg: tuple | None = None, compile: bool = True) -> tuple
     return f, n
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     p = load_params()
     cfg = _config(p)
-    print(f"loaded RealViformer: nf={cfg[0]} blocks={cfg[1]}")
+    _log.info(f"loaded RealViformer: nf={cfg[0]} blocks={cfg[1]}")
     mx.random.seed(0)
     a = mx.clip(mx.random.uniform(shape=(1, 64, 96, 3)), 0, 1)
     b = mx.clip(mx.random.uniform(shape=(1, 64, 96, 3)), 0, 1)
@@ -383,4 +388,4 @@ if __name__ == "__main__":
     s0, fp = step_first(a, p, cfg)
     s1, fp = step_next(b, a, fp, p, cfg)
     mx.eval(s0, s1)
-    print(f"{tuple(a.shape)} -> {tuple(s1.shape)}, finite={bool(mx.all(mx.isfinite(s1)))}")
+    _log.info(f"{tuple(a.shape)} -> {tuple(s1.shape)}, finite={bool(mx.all(mx.isfinite(s1)))}")

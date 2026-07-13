@@ -11,6 +11,7 @@ deform_conv2d. Flow is (N,H,W,2) = (x-offset, y-offset), matching flow_warp.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -428,12 +429,16 @@ def upscale_ensemble(frames: list, p: dict, flow_mode: str = "spynet",
         history_gate=history_gate))
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     p = load_params()
     mx.random.seed(0)
     frames = [mx.clip(mx.random.uniform(shape=(1, 48, 64, 3)), 0, 1) for _ in range(5)]
     mx.eval(*frames)
     outs = upscale(frames, p)
     mx.eval(*outs)
-    print(f"upscale: {len(outs)} frames, 48x64 -> {outs[0].shape[1]}x{outs[0].shape[2]}, "
+    _log.info(f"upscale: {len(outs)} frames, 48x64 -> {outs[0].shape[1]}x{outs[0].shape[2]}, "
           f"center range [{float(mx.min(outs[2])):.3f}, {float(mx.max(outs[2])):.3f}]")

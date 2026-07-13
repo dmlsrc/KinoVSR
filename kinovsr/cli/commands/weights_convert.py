@@ -26,30 +26,14 @@ with mlx.core.load().
 from __future__ import annotations
 
 import argparse
+import logging
 import pickle
 import pickletools
-import sys
 import zipfile
 from pathlib import Path
 from typing import Any
 
-_STDERR_CONSOLE = None
-
-
-def _print(*parts: object, file: object = None) -> None:
-    """Shared-console output; error lines keep their stderr routing."""
-    global _STDERR_CONSOLE
-    if file is sys.stderr:
-        if _STDERR_CONSOLE is None:
-            from rich.console import Console
-
-            _STDERR_CONSOLE = Console(stderr=True)
-        console = _STDERR_CONSOLE
-    else:
-        from kinovsr.ui.console import get_console
-
-        console = get_console()
-    console.print(*parts, markup=False, highlight=False)
+_log = logging.getLogger(__name__)
 
 
 # Pickle opcodes that push the module/name strings a STACK_GLOBAL then consumes.
@@ -345,12 +329,14 @@ def _resolve_source(spec: str) -> Path | None:
     root = Path("weights-src")
     direct = root / spec
     if direct.is_file():
-        _print(f"[src] resolved from the source collection: {direct}")
+        _log.info("source resolved from the source collection: %s", direct)
         return direct
     if root.is_dir() and "/" not in spec:
         matches = sorted(p for p in root.rglob(spec) if p.is_file())
         if len(matches) == 1:
-            _print(f"[src] resolved from the source collection: {matches[0]}")
+            _log.info(
+                "source resolved from the source collection: %s", matches[0]
+            )
             return matches[0]
         if matches:
             raise SystemExit(
@@ -393,35 +379,39 @@ def run_convert(argv: list[str] | None = None) -> int:
         ap.error(
             f"no such file: {args.input} (also looked under weights-src/)")
     if args.keep_fp64:
-        _print("error: --keep-fp64 cannot be honored - MLX has no float64 dtype, "
-               "and the output exists to be MLX-loadable. float64 demotes to "
-               "float32.", file=sys.stderr)
+        _log.error(
+            "--keep-fp64 cannot be honored: MLX has no float64 dtype and the "
+            "output exists to be MLX-loadable; float64 demotes to float32"
+        )
         return 2
     if args.output:
         out = Path(args.output)
     elif src.parts[:1] == ("weights-src",):
-        _print("error: state -o when converting from weights-src/ - the "
-               "default output would land inside the source collection.",
-               file=sys.stderr)
+        _log.error(
+            "state -o when converting from weights-src/: the default output "
+            "would land inside the source collection"
+        )
         return 2
     else:
         out = src.with_suffix(".safetensors")
 
     # ---- 1. static safety scan (no execution) ------------------------------
     refs = _pickle_globals(src.read_bytes())
-    _print(f"[scan] pickle references {len(refs)} global(s):")
+    _log.info("pickle scan found %s global reference(s)", len(refs))
     for r in sorted(refs):
-        _print(f"        {r}")
+        _log.debug("pickle global: %s", r)
     bad = _suspicious(refs)
     if bad:
-        _print(f"[scan] SUSPICIOUS (outside tensor-rebuild allowlist): {bad}", file=sys.stderr)
+        _log.warning("pickle globals outside tensor-rebuild allowlist: %s", bad)
         if not args.force:
-            _print("[scan] refusing to load. Re-run with --force only if you trust this file "
-                  "(the restricted unpickler still hard-rejects non-allowlisted globals).",
-                  file=sys.stderr)
+            _log.error(
+                "refusing to load; rerun with --force only if you trust this "
+                "file (the restricted unpickler still rejects non-allowlisted "
+                "globals)"
+            )
             return 2
     else:
-        _print("[scan] clean - only tensor-rebuild / container globals.")
+        _log.info("pickle scan clean: only tensor-rebuild/container globals")
 
     # ---- 2. safe load (restricted unpickler, torch-free) -------------------
     import mlx.core as mx
@@ -430,13 +420,15 @@ def run_convert(argv: list[str] | None = None) -> int:
         obj, demoted = _load_pth_tree(src)
     except (_CheckpointFormatError, pickle.UnpicklingError, KeyError,
             zipfile.BadZipFile) as e:
-        _print(f"error: restricted checkpoint load refused/failed: {e}", file=sys.stderr)
-        _print("       The checkpoint carries constructs outside plain tensor "
-              "state dicts (optimizer state, custom classes, legacy format). "
-              "Extract just the weights first.", file=sys.stderr)
+        _log.error(
+            "restricted checkpoint load refused: %s; the checkpoint carries "
+            "constructs outside plain tensor state dicts (optimizer state, "
+            "custom classes, or legacy format); extract just the weights first",
+            e,
+        )
         return 1
     if demoted:
-        _print("[load] float64 storage demoted to float32 (MLX has no float64)")
+        _log.warning("float64 storage demoted to float32 (MLX has no float64)")
 
     # ---- 3. find the state_dict (handle common nesting) --------------------
     sd = obj
@@ -444,11 +436,12 @@ def run_convert(argv: list[str] | None = None) -> int:
         if not (isinstance(obj, dict) and args.param_key in obj
                 and hasattr(obj[args.param_key], "items")):
             have = list(obj.keys()) if isinstance(obj, dict) else type(obj).__name__
-            _print(f"error: --param-key '{args.param_key}' not in checkpoint (has: {have})",
-                  file=sys.stderr)
+            _log.error(
+                "--param-key %r not in checkpoint (has: %s)", args.param_key, have
+            )
             return 1
         sd = obj[args.param_key]
-        _print(f"[load] using nested checkpoint key '{args.param_key}' (explicit)")
+        _log.info("using explicit nested checkpoint key %r", args.param_key)
     elif not (hasattr(sd, "items") and any(_is_tensor(v) for v in sd.values())):
         if (
             isinstance(obj, dict)
@@ -457,17 +450,16 @@ def run_convert(argv: list[str] | None = None) -> int:
             and hasattr(obj["params"], "items")
             and hasattr(obj["params_ema"], "items")
         ):
-            _print(
-                "error: checkpoint carries BOTH 'params' and 'params_ema'; pass "
+            _log.error(
+                "checkpoint carries BOTH 'params' and 'params_ema'; pass "
                 "--param-key params or --param-key params_ema to match the "
-                "model's reference inference.",
-                file=sys.stderr,
+                "model's reference inference"
             )
             return 1
         for key in ("state_dict", "model", "net", "weights", "params", "params_ema"):
             if isinstance(obj, dict) and key in obj and hasattr(obj[key], "items"):
                 sd = obj[key]
-                _print(f"[load] using nested checkpoint key '{key}'")
+                _log.info("using nested checkpoint key %r", key)
                 break
 
     # ---- 4. make MLX-friendly: strip prefix, drop non-tensors --------------
@@ -485,20 +477,30 @@ def run_convert(argv: list[str] | None = None) -> int:
         stripped += (nk != k)
         tensors[nk] = mx.contiguous(v)
     if not tensors:
-        _print("error: no tensors found in the checkpoint.", file=sys.stderr)
+        _log.error("no tensors found in the checkpoint")
         return 1
     mx.eval(list(tensors.values()))
     n_params = sum(t.size for t in tensors.values())
     dtype_names = sorted({str(t.dtype).split(".")[-1] for t in tensors.values()})
-    _print(f"[convert] {len(tensors)} tensors, {n_params/1e6:.3f}M params, "
-          f"dtypes={dtype_names}")
+    _log.info(
+        "converted %s tensors, %.3fM params, dtypes=%s",
+        len(tensors),
+        n_params / 1e6,
+        dtype_names,
+    )
     if stripped:
-        _print(f"[convert] stripped '{prefix}' from {stripped} keys")
+        _log.info("stripped prefix %r from %s keys", prefix, stripped)
     if filtered:
-        _print(f"[convert] filtered out {filtered} tensor keys outside '{only_prefix}'")
+        _log.info(
+            "filtered out %s tensor keys outside %r", filtered, only_prefix
+        )
     if dropped:
-        _print(f"[convert] dropped {len(dropped)} non-tensor entries: {dropped[:6]}"
-              f"{'...' if len(dropped) > 6 else ''}")
+        _log.warning(
+            "dropped %s non-tensor entries: %s%s",
+            len(dropped),
+            dropped[:6],
+            "..." if len(dropped) > 6 else "",
+        )
 
     # ---- 5. save + verify it loads back ------------------------------------
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -506,7 +508,13 @@ def run_convert(argv: list[str] | None = None) -> int:
     loaded = mx.load(str(out))
     ok = len(loaded) == len(tensors)
     sample = next(iter(loaded.items()))
-    _print(f"[verify] mlx.core.load OK: {len(loaded)} arrays "
-          f"(e.g. {sample[0]} {tuple(sample[1].shape)} {sample[1].dtype}); match={ok}")
-    _print(f"[done] {out}")
+    _log.info(
+        "mlx.core.load verified %s arrays (for example %s %s %s); match=%s",
+        len(loaded),
+        sample[0],
+        tuple(sample[1].shape),
+        sample[1].dtype,
+        ok,
+    )
+    _log.info("wrote %s", out)
     return 0

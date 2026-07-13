@@ -11,6 +11,7 @@ shared Rich console; exit codes make ``verify`` scriptable:
 from __future__ import annotations
 
 import argparse
+import logging
 
 from kinovsr.modeling.weights import (
     ManifestError,
@@ -18,7 +19,8 @@ from kinovsr.modeling.weights import (
     registered_owners,
     verify_manifest,
 )
-from kinovsr.ui.console import get_console
+
+_log = logging.getLogger(__name__)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -49,28 +51,32 @@ def _select_owners(requested: list[str]) -> tuple[str, ...]:
 
 
 def _list(owners: tuple[str, ...]) -> int:
-    console = get_console()
     for owner in owners:
         manifest = load_registered(owner)
-        console.print(f"[bold]{manifest.name}[/bold] ({manifest.kind})")
+        _log.info("%s (%s)", manifest.name, manifest.kind)
         for profile in manifest.profiles.values():
             capabilities = "/".join(profile.capabilities) or "-"
-            console.print(
-                f"  profile {profile.name}: {capabilities}; "
-                f"weights {', '.join(profile.weights)}"
-                + (f"; defaults {profile.defaults}" if profile.defaults
-                   else ""))
+            _log.info(
+                "profile %s: %s; weights %s%s",
+                profile.name,
+                capabilities,
+                ", ".join(profile.weights),
+                f"; defaults {profile.defaults}" if profile.defaults else "",
+            )
         for asset in manifest.weights.values():
             status = "present" if asset.path.is_file() else "missing"
-            console.print(
-                f"  weights {asset.asset_id}: {asset.distribution}, "
-                f"{status}, license {asset.license or 'unrecorded'} "
-                f"({asset.path.name})")
+            _log.info(
+                "weights %s: %s, %s, license %s (%s)",
+                asset.asset_id,
+                asset.distribution,
+                status,
+                asset.license or "unrecorded",
+                asset.path.name,
+            )
     return 0
 
 
 def _verify(owners: tuple[str, ...]) -> int:
-    console = get_console()
     failures = 0
     for owner in owners:
         manifest = load_registered(owner)
@@ -79,15 +85,19 @@ def _verify(owners: tuple[str, ...]) -> int:
                        and not report.present)
                       or report.hash_ok is False)
             failures += broken
-            style = "bold red" if broken else None
-            console.print(
-                f"{report.owner}/{report.asset_id}: "
-                f"{report.distribution}, "
-                f"{'present' if report.present else 'missing'}; "
-                f"{report.note}",
-                style=style)
-    console.print("verify: FAIL" if failures else "verify: ok",
-                  style="bold red" if failures else "bold green")
+            log = _log.error if broken else _log.info
+            log(
+                "%s/%s: %s, %s; %s",
+                report.owner,
+                report.asset_id,
+                report.distribution,
+                "present" if report.present else "missing",
+                report.note,
+            )
+    if failures:
+        _log.error("verify: FAIL")
+    else:
+        _log.info("verify: ok")
     return 1 if failures else 0
 
 
@@ -106,5 +116,5 @@ def run_weights_command(argv: list[str]) -> int:
             return _list(owners)
         return _verify(owners)
     except ManifestError as exc:
-        get_console().print(f"weights error: {exc}", style="bold red")
+        _log.error("weights error: %s", exc)
         return 2

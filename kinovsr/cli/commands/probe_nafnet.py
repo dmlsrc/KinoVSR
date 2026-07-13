@@ -2,13 +2,14 @@
 
 This is intentionally a one-frame diagnostic, not a production filter. It decodes a
 video frame, applies small controlled perturbations, runs the local MLX NAFNet port,
-and prints raw residual plus deep SCA amplification stats. A perturbation that makes
+and logs raw residual plus deep SCA amplification stats. A perturbation that makes
 the residual collapse is a strong clue about the trigger in that frame.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -18,11 +19,9 @@ import mlx.core as mx  # noqa: E402
 
 from kinovsr.processors.nafnet import net  # noqa: E402
 from kinovsr.processors.nafnet.restorer import model_rgb, resolve_pool_mode  # noqa: E402
-from kinovsr.ui.console import get_console
 
+_log = logging.getLogger(__name__)
 
-def _print(*parts: object) -> None:
-    get_console().print(*parts, markup=False, highlight=False)
 
 Transform = tuple[str, "Callable[[mx.array], mx.array]"]
 
@@ -301,23 +300,28 @@ def _probe_frame(
     return results
 
 
-def _print_table(frame_no: int, shape: tuple[int, int, int], rows: list[dict[str, Any]], sort: str) -> None:
+def _log_table(
+    frame_no: int,
+    shape: tuple[int, int, int],
+    rows: list[dict[str, Any]],
+    sort: str,
+) -> None:
     if sort == "p99":
         rows = sorted(rows, key=lambda r: r["residual"]["p99"])
     ident = next(r for r in rows if r["transform"] == "identity")
     base_p99 = max(ident["residual"]["p99"], 1e-12)
-    _print(f"\nframe {frame_no}  {shape[1]}x{shape[0]}")
-    _print(
+    _log.info(f"\nframe {frame_no}  {shape[1]}x{shape[0]}")
+    _log.info(
         "transform            "
         "res_mean  res_p99  res_max  ratio  "
         "sg1_p99  sca_p99  scamul_p99  conv3_p99  block_p99"
     )
-    _print("-" * 105)
+    _log.info("-" * 105)
     for row in rows:
         res = row["residual"]
         tr = row["trace"]
         ratio = res["p99"] / base_p99
-        _print(
+        _log.info(
             f"{row['transform']:<20} "
             f"{res['mean']:8.4f} {res['p99']:8.4f} {res['max']:8.4f} {ratio:6.2f} "
             f"{tr['sg1']['p99']:8.2f} {tr['sca_conv']['p99']:8.2f} "
@@ -349,13 +353,13 @@ def run_probe_nafnet(argv: list[str] | None = None) -> int:
     weights = args.nafnet_weights if args.nafnet_weights is not None else args.nafnet
     args.pool_mode = resolve_pool_mode(weights, args.pool, variant=args.nafnet)
 
-    _print(
+    _log.info(
         f"loading NAFNet weights={weights} dtype={args.dtype} "
         f"pool={args.pool_mode} strength={args.strength}"
     )
     p = net.load_params(weights, dtype=_dtype(args.dtype))
     cfg = net._config(p)
-    _print(f"config width={cfg[0]} enc={cfg[1]} middle={cfg[2]} dec={cfg[3]} trace={args.trace_block}")
+    _log.info(f"config width={cfg[0]} enc={cfg[1]} middle={cfg[2]} dec={cfg[3]} trace={args.trace_block}")
 
     decoded = _read_frames(args.video, frames)
     report: dict[str, Any] = {
@@ -370,10 +374,10 @@ def run_probe_nafnet(argv: list[str] | None = None) -> int:
     }
     for frame_no in frames:
         rows = _probe_frame(decoded[frame_no], p, cfg, args)
-        _print_table(frame_no, decoded[frame_no].shape, rows, args.sort)
+        _log_table(frame_no, decoded[frame_no].shape, rows, args.sort)
         report["frames"][str(frame_no)] = rows
 
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        _print(f"\nwrote {args.json}")
+        _log.info(f"\nwrote {args.json}")

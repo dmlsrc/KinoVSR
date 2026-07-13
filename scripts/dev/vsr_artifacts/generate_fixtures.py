@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 import zlib
 from contextlib import suppress
 from fractions import Fraction
@@ -29,6 +30,8 @@ import av
 import cv2
 import numpy as np
 from config import config_get, config_section, listify, load_config, resolve_path
+
+_log = logging.getLogger("kinovsr.dev.vsr_artifacts.generate_fixtures")
 
 MODE_ORDER = [
     "reencode_only",
@@ -718,7 +721,7 @@ def _resolve_sources(sources: list[str | Path], base_dir: Path | None = None) ->
     existing = [p for p in selected if p.exists()]
     missing = [p for p in selected if not p.exists()]
     for path in missing:
-        print(f"[fixtures] missing source, skipped: {path}", flush=True)
+        _log.warning("missing source; skipped: %s", path)
     if not existing:
         raise SystemExit("no input sources found")
     return existing
@@ -829,9 +832,9 @@ def build_fixtures(args: argparse.Namespace) -> dict:
             out_name = f"{source.stem}__{mode}__s{args.seed}_crf{crf}.mp4"
             out_path = output_dir / out_name
             if out_path.exists() and not args.overwrite:
-                print(f"[fixtures] exists, skipped: {out_path}", flush=True)
+                _log.info("fixture exists; skipped: %s", out_path)
                 continue
-            print(f"[fixtures] {source.name} -> {out_path.name}", flush=True)
+            _log.info("fixture %s -> %s", source.name, out_path.name)
             manifest["outputs"].append(
                 {
                     "source": str(source),
@@ -877,8 +880,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    from kinovsr.ui.logging import configure_logging
+
+    configure_logging()
     manifest = build_fixtures(_normalise_config(parse_args()))
-    print(f"[fixtures] wrote {len(manifest['outputs'])} clips", flush=True)
+    _log.info("wrote %s fixture clips", len(manifest["outputs"]))
     return 0
 
 

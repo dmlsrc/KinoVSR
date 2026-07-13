@@ -10,6 +10,7 @@ doesn't stall the video append loop.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -27,6 +28,8 @@ from .frameworks import (
     av,
     libdispatch,
 )
+
+_log = logging.getLogger(__name__)
 
 # HEVC profile identifiers (Apple-stable strings; not exposed as PyObjC consts)
 HEVC_PROFILE_MAIN10 = "HEVC_Main10_AutoLevel"          # 4:2:0 10-bit
@@ -252,9 +255,14 @@ class AVWriter:
         self.audio_track = audio_track
 
         audio_desc = f", audio={audio_codec}" if audio_input is not None else ""
-        print(
-            f"[{label}] AVAssetWriter -> {output_path} "
-            f"(HEVC {profile} {_color_label(color_props)} q={quality}{audio_desc})"
+        _log.info(
+            "[%s] AVAssetWriter -> %s (HEVC %s %s q=%s%s)",
+            label,
+            output_path,
+            profile,
+            _color_label(color_props),
+            quality,
+            audio_desc,
         )
 
         # Audio pump (GCD pull pattern) --------------------------------------

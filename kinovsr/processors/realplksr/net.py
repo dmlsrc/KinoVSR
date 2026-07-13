@@ -35,6 +35,7 @@ run their reductions in fp32.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -255,14 +256,18 @@ def make_forward(p: dict, cfg: tuple | None = None, compile: bool = True):
     return _cached(_COMPILE_CACHE, (id(p), cfg), lambda: mx.compile(run))
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     p = load_params()
     cfg = _config(p)
-    print(f"loaded RealPLKSR: dim={cfg[0]} blocks={cfg[1]} ks={cfg[2]} pdim={cfg[3]} "
+    _log.info(f"loaded RealPLKSR: dim={cfg[0]} blocks={cfg[1]} ks={cfg[2]} pdim={cfg[3]} "
           f"scale={cfg[4]}x layer_norm={cfg[5]} dysample={cfg[6]} groups={cfg[7]}")
     mx.random.seed(0)
     x = mx.clip(mx.random.uniform(shape=(1, 48, 64, 3)), 0, 1)
     mx.eval(x)
     out = realplksr(x, p, cfg)
     mx.eval(out)
-    print(f"{tuple(x.shape)} -> {tuple(out.shape)}, finite={bool(mx.all(mx.isfinite(out)))}")
+    _log.info(f"{tuple(x.shape)} -> {tuple(out.shape)}, finite={bool(mx.all(mx.isfinite(out)))}")

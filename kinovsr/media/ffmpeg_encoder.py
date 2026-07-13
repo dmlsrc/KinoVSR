@@ -51,6 +51,7 @@ Encoder-choice details that aren't obvious from the flags alone:
 from __future__ import annotations
 
 import itertools
+import logging
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -58,6 +59,8 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+
+_log = logging.getLogger(__name__)
 
 
 def _human_size(n: float) -> str:
@@ -315,8 +318,8 @@ def encode_video_ffmpeg(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if verbose:
-        print(f"  encode tier: {tier} - {preset.notes}")
-        print(f"  -> {output_path}")
+        _log.info("encode tier: %s - %s", tier, preset.notes)
+        _log.info("output: %s", output_path)
 
     audio_path: Path | None = None
     sidecar_kept = False
@@ -339,7 +342,7 @@ def encode_video_ffmpeg(
         )
         audio_waveform = onset_result.samples
         if verbose and onset_result.applied:
-            print(f"  audio onset: {onset_result.detail}")
+            _log.info("audio onset: %s", onset_result.detail)
         if save_audio_sidecar:
             # Public sidecar: lives next to the output, survives encode.
             audio_path = output_path.with_suffix(".wav")
@@ -353,7 +356,12 @@ def encode_video_ffmpeg(
         else:
             write_wav_int16(audio_waveform, audio_path, audio_sample_rate)
         if verbose and sidecar_kept:
-            print(f"  audio sidecar: {audio_path}  ({audio_bit_depth}, {audio_sample_rate} Hz)")
+            _log.info(
+                "audio sidecar: %s (%s, %s Hz)",
+                audio_path,
+                audio_bit_depth,
+                audio_sample_rate,
+            )
 
     raw_pix_fmt = "rgb48le" if preset.frame_bit_depth == 16 else "rgb24"
     cmd = build_ffmpeg_cmd(
@@ -383,6 +391,6 @@ def encode_video_ffmpeg(
     if verbose:
         elapsed = time.perf_counter() - started
         size = output_path.stat().st_size
-        print(f"  done: {_human_size(size)} in {elapsed:.1f}s")
+        _log.info("encode complete: %s in %.1fs", _human_size(size), elapsed)
 
     return output_path

@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import shutil
 import subprocess
 import sys
@@ -56,29 +57,10 @@ import mlx.core as mx
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from kinovsr.eval.models.dover import DoverMobile  # noqa: E402
 from kinovsr.eval.models.musiq import Musiq  # noqa: E402
-from kinovsr.ui.console import get_console
 
 from .niqe import _luma_of, score_lumas  # noqa: E402
 
-_STDERR_CONSOLE = None
-
-
-def _print(*parts: object, file: object = None, flush: bool = False) -> None:
-    """Shared-console output; error lines keep their stderr routing and
-    the console flushes on every print, so ``flush`` is accepted and
-    ignored."""
-    global _STDERR_CONSOLE
-    import sys as _sys
-
-    if file is _sys.stderr:
-        if _STDERR_CONSOLE is None:
-            from rich.console import Console
-
-            _STDERR_CONSOLE = Console(stderr=True)
-        console = _STDERR_CONSOLE
-    else:
-        console = get_console()
-    console.print(*parts, markup=False, highlight=False)
+_log = logging.getLogger(__name__)
 
 ALL_METRICS = ("musiq", "dover", "niqe", "flicker", "vmaf")
 STATIC_THRESHOLD = 0.01          # source luma |diff| below this = static
@@ -87,7 +69,7 @@ EDGE_SKIP = (3, 2)               # frames dropped at clip head/tail
 
 
 def _note(msg: str) -> None:
-    _print(f"[perceptual] {msg}", file=sys.stderr, flush=True)
+    _log.warning("%s", msg)
 
 
 def read_frames(path: Path, max_frames: int) -> mx.array:
@@ -251,7 +233,7 @@ def run_perceptual(argv: list[str] | None = None) -> int:
             row["vmaf_src"] = (100.0 if name == "source" else vmaf_src(
                 vp, args.source, args.out_dir / f"vmaf_{name}.json"))
         rows.append(row)
-        _print(json.dumps(row), flush=True)
+        _log.info("%s", json.dumps(row))
 
     (args.out_dir / "perceptual_metrics.json").write_text(
         json.dumps(rows, indent=2) + "\n", encoding="utf-8")
@@ -272,17 +254,21 @@ def run_perceptual(argv: list[str] | None = None) -> int:
     present = [(k, fmt, max(12, len(k) + 2))
                for k, fmt in cols if any(k in r for r in rows)]
     name_w = max(20, max(len(str(r["variant"])) for r in rows) + 2)
-    _print(f"\n{'variant':{name_w}s}"
-          + "".join(f"{k:>{w}s}" for k, _, w in present))
+    _log.info(
+        "%s",
+        f"{'variant':{name_w}s}"
+        + "".join(f"{k:>{w}s}" for k, _, w in present),
+    )
     for r in sorted(rows, key=sort_key):
         line = f"{r['variant']:{name_w}s}"
         for k, fmt, w in present:
             v = r.get(k)
             cell = fmt.format(v) if isinstance(v, (int, float)) else "-"
             line += cell.rjust(w)
-        _print(line)
-    _print("\nhigher better: musiq, dover_fused; lower better: niqe "
-          "(tripwire only), flicker_e3, moving_dev_e3 (content-erasure "
-          "guard); vmaf_src = fidelity anchor")
+        _log.info("%s", line)
+    _log.info(
+        "higher better: musiq, dover_fused; lower better: niqe "
+        "(tripwire only), flicker_e3, moving_dev_e3 (content-erasure "
+        "guard); vmaf_src = fidelity anchor"
+    )
     return 0
-

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import platform
 import statistics
 import subprocess
@@ -35,6 +36,9 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+_log = logging.getLogger("kinovsr.dev.bench_endpoint_gates")
+_result_log = logging.getLogger("kinovsr.dev.bench_endpoint_gates.result")
 
 GATES = {
     "pass": ("file passthrough", 2.0, 0.10),
@@ -74,7 +78,14 @@ def _worker(args: argparse.Namespace) -> None:
         result = process_video_file(VideoFileConfig(
             settings=invocation.settings, options=invocation.options))
         elapsed = time.perf_counter() - t0
-        print(f"RESULT {json.dumps({'elapsed': elapsed, 'frames': result.frames_out, 'path': str(result.post_path)})}")
+        _result_log.info(
+            "RESULT %s",
+            json.dumps({
+                "elapsed": elapsed,
+                "frames": result.frames_out,
+                "path": str(result.post_path),
+            }),
+        )
         return
 
     import mlx.core as mx
@@ -100,7 +111,14 @@ def _worker(args: argparse.Namespace) -> None:
         config, video=args.clip, output=out_dir / "new.mp4",
         settings=Settings(), layout=layout, max_frames=args.frames)
     elapsed = time.perf_counter() - t0
-    print(f"RESULT {json.dumps({'elapsed': elapsed, 'frames': result.frames_out, 'path': str(result.path)})}")
+    _result_log.info(
+        "RESULT %s",
+        json.dumps({
+            "elapsed": elapsed,
+            "frames": result.frames_out,
+            "path": str(result.path),
+        }),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +138,14 @@ def _run_once(clip: str, path: str, chain: str, frames: int,
         for line in proc.stdout.splitlines():
             if line.startswith("RESULT "):
                 result = json.loads(line[len("RESULT "):])
-                print(f"  {chain}/{path} frames={frames}: "
-                      f"{result['elapsed']:.1f}s "
-                      f"(wall {time.perf_counter() - t0:.1f}s)",
-                      file=sys.stderr, flush=True)
+                _log.info(
+                    "%s/%s frames=%s: %.1fs (wall %.1fs)",
+                    chain,
+                    path,
+                    frames,
+                    result["elapsed"],
+                    time.perf_counter() - t0,
+                )
                 return result
         raise RuntimeError(
             f"worker {path}/{chain}/{frames} produced no result:\n"
@@ -198,11 +220,18 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.worker_path:
+        from kinovsr.ui.logging import configure_machine_output
+
+        configure_machine_output(_result_log.name)
         ns = argparse.Namespace(
             path=args.worker_path, chain=args.worker_chain,
             clip=args.clip, frames=args.frames, out=args.out)
         _worker(ns)
         return 0
+
+    from kinovsr.ui.logging import configure_logging
+
+    configure_logging()
 
     import mlx.core as mx
 
@@ -249,17 +278,25 @@ def main() -> int:
         status = "PASS" if ok and behavior["geometry_match"] else "FAIL"
         if status == "FAIL":
             failures.append(chain)
-        print(f"[{status}] {label}: control {control_ms:.2f} ms/frame, "
-              f"new {new_ms:.2f} ms/frame, delta {delta:+.2f} "
-              f"(margin {margin:.2f}); "
-              f"psnr-between {behavior['psnr_between_outputs_db']} dB")
+        log = _log.info if status == "PASS" else _log.error
+        log(
+            "[%s] %s: control %.2f ms/frame, new %.2f ms/frame, "
+            "delta %+.2f (margin %.2f); psnr-between %s dB",
+            status,
+            label,
+            control_ms,
+            new_ms,
+            delta,
+            margin,
+            behavior["psnr_between_outputs_db"],
+        )
 
     if args.report:
         out = Path(args.report)
         out.mkdir(parents=True, exist_ok=True)
         path = out / "endpoint_gates_report.json"
         path.write_text(json.dumps(report, indent=2))
-        print(f"report: {path}")
+        _log.info("report: %s", path)
     return 1 if failures else 0
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -18,12 +19,8 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from kinovsr.eval.models.dover import DoverMobile  # noqa: E402
-from kinovsr.ui.console import get_console
 
-
-def _print(*parts: object) -> None:
-    get_console().print(*parts, markup=False, highlight=False)
-
+_log = logging.getLogger(__name__)
 
 def _read_video(path: Path, max_frames: int) -> mx.array:
     import av
@@ -57,9 +54,11 @@ def run_dover(argv: list[str] | None = None) -> int:
         s = model.score(_read_video(vp, args.max_frames))
         results[str(vp)] = s
         if not args.json:
-            _print(f"tech {s['tech']:8.4f}  aes {s['aes']:8.4f}  "
+            _log.info(f"tech {s['tech']:8.4f}  aes {s['aes']:8.4f}  "
                   f"fused {s['fused']:6.4f}  {vp}")
     if args.json:
-        _print(json.dumps(results, indent=2))
-    return 0
+        from kinovsr.ui.logging import configure_machine_output
 
+        output = configure_machine_output("kinovsr.eval.dover_score.result")
+        output.info("%s", json.dumps(results, indent=2))
+    return 0

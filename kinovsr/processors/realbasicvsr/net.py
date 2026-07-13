@@ -7,6 +7,7 @@ loaded in NHWC layout, but follows the OpenMMLab key names after stripping
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -318,11 +319,15 @@ def upscale(
                      history_strength, history_gate)
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     params = load_params()
     mx.random.seed(0)
     clip = [mx.random.uniform(shape=(1, 64, 64, 3)) for _ in range(2)]
     mx.eval(*clip)
     sr = upscale(clip, params, clean_iters=1)
     mx.eval(*sr)
-    print(f"upscale: {len(sr)} frames, 64x64 -> {sr[0].shape[1]}x{sr[0].shape[2]}")
+    _log.info(f"upscale: {len(sr)} frames, 64x64 -> {sr[0].shape[1]}x{sr[0].shape[2]}")

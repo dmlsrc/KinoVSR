@@ -6,16 +6,16 @@ script before the M4 command split.
 
 from __future__ import annotations
 
+import logging
+
 _SUBCOMMANDS = ("edges", "nafnet", "noise")
+_log = logging.getLogger(__name__)
 
 
 def run_probe_command(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
-        from kinovsr.ui.console import get_console
-
-        get_console().print(
-            f"usage: kinovsr probe {{{'|'.join(_SUBCOMMANDS)}}} ...",
-            markup=False)
+        log = _log.info if argv else _log.error
+        log("usage: kinovsr probe {%s} ...", "|".join(_SUBCOMMANDS))
         return 0 if argv else 2
     name, rest = argv[0], argv[1:]
     if name == "edges":
@@ -30,9 +30,9 @@ def run_probe_command(argv: list[str]) -> int:
         from .probe_noise import run_probe_noise
 
         return run_probe_noise(rest) or 0
-    from kinovsr.ui.console import get_console
-
-    get_console().print(
-        f"unknown probe subcommand {name!r} "
-        f"(available: {', '.join(_SUBCOMMANDS)})", markup=False)
+    _log.error(
+        "unknown probe subcommand %r (available: %s)",
+        name,
+        ", ".join(_SUBCOMMANDS),
+    )
     return 2

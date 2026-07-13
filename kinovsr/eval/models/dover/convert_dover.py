@@ -22,11 +22,14 @@ Usage: convert_dover.py <DOVER-Mobile.pth> [out.safetensors]
 """
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
 import mlx.core as mx
 import torch
+
+_log = logging.getLogger(__name__)
 
 
 def main() -> int:
@@ -56,9 +59,10 @@ def main() -> int:
         out[k] = mx.array(t.contiguous().numpy())
     dst.parent.mkdir(parents=True, exist_ok=True)
     mx.save_safetensors(str(dst), out)
-    print(f"wrote {dst} ({len(out)} tensors; skipped {skipped})")
+    _log.info(f"wrote {dst} ({len(out)} tensors; skipped {skipped})")
     return 0
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     sys.exit(main())

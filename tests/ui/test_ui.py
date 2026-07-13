@@ -15,6 +15,7 @@ from kinovsr.ui import (
     WallClockPaceColumn,
     configure_logging,
     configure_logging_from_settings,
+    configure_machine_output,
     get_console,
     make_progress,
     track_phase,
@@ -100,6 +101,15 @@ def test_configure_logging_from_settings_maps_fields():
     assert logger.handlers[0].level == logging.DEBUG
     logger = configure_logging_from_settings(Settings(verbose=True, quiet=True))
     assert logger.handlers[0].level == logging.WARNING  # quiet wins
+
+
+def test_machine_output_is_plain_and_does_not_propagate():
+    stream = io.StringIO()
+    logger = configure_machine_output("kinovsr.test_ui.machine", stream=stream)
+    logger.info('{"ok": true}')
+    assert stream.getvalue() == '{"ok": true}\n'
+    assert logger.propagate is False
+    logger.handlers.clear()
 
 
 def test_get_console_is_a_singleton_on_stderr():

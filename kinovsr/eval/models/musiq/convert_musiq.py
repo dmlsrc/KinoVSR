@@ -17,11 +17,14 @@ Usage: convert_musiq.py <musiq_koniq_ckpt.pth> [out.safetensors]
 """
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
 import mlx.core as mx
 import torch
+
+_log = logging.getLogger(__name__)
 
 CONV_KEYS = {
     "conv_root.weight",
@@ -47,9 +50,10 @@ def main() -> int:
         out[k] = mx.array(t.numpy())
     dst.parent.mkdir(parents=True, exist_ok=True)
     mx.save_safetensors(str(dst), out)
-    print(f"{len(out)} tensors -> {dst}")
+    _log.info(f"{len(out)} tensors -> {dst}")
     return 0
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     sys.exit(main())

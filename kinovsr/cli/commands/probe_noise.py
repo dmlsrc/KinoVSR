@@ -6,27 +6,25 @@ proxy, per-channel split, the per-frame flash trace with keyframe
 distances, and tool guidance naming the cleanup stage the measurements
 support. Three sample windows across the trim range; prints and exits.
 
-Extracted verbatim from the inherited harness's --probe-noise block; the
-flat run flag delegates here.
+Extracted from the inherited harness's --probe-noise block; the flat run flag
+delegates here. Results are emitted through this module's logger.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 from typing import Any
 
 from kinovsr.media.timespec import resolve_trim
-from kinovsr.ui.console import get_console
 
-
-def _say(message: str = "") -> None:
-    get_console().print(message, markup=False, highlight=False)
+_log = logging.getLogger(__name__)
 
 
 def probe_noise(video: Path, *, start_spec: str | None = None,
                 end_spec: str | None = None, reader: str = "auto") -> int:
-    """Run the noise probe over `video`, printing the analysis report."""
+    """Run the noise probe over `video`, logging the analysis report."""
     import mlx.core as mx
 
     from kinovsr.analysis.noise import (
@@ -43,14 +41,14 @@ def probe_noise(video: Path, *, start_spec: str | None = None,
     if reader == "ffmpeg":
         from kinovsr.media import ffmpeg_reader
         vr = ffmpeg_reader
-        _say("[reader] ffmpeg compatibility reader (forced)")
+        _log.info("[reader] ffmpeg compatibility reader (forced)")
     elif reader == "auto":
         try:
             vr.probe_video(video)
         except Exception as e:
             from kinovsr.media import ffmpeg_reader
             vr = ffmpeg_reader
-            _say(f"[reader] native reader cannot open this file "
+            _log.info(f"[reader] native reader cannot open this file "
                  f"({type(e).__name__}); using the ffmpeg compatibility reader")
 
     in_w, in_h, source_fps, total_frames, _transform, _par = vr.probe_video(video)
@@ -59,7 +57,7 @@ def probe_noise(video: Path, *, start_spec: str | None = None,
     _pw_end = win_end if win_end is not None else total_frames
     _span = max(1, _pw_end - win_start)
     _starts = sorted({win_start + int(f * max(0, _span - 12)) for f in (0.1, 0.5, 0.9)})
-    _say(f"[probe] noise analysis: {len(_starts)} windows of 12 frames in "
+    _log.info(f"[probe] noise analysis: {len(_starts)} windows of 12 frames in "
          f"[{win_start}, {_pw_end})")
     try:
         _kfl = vr.keyframe_display_indices(video) or [0]
@@ -89,51 +87,51 @@ def probe_noise(video: Path, *, start_spec: str | None = None,
         def _kfd(i, _ws=ws):
             pri = [k for k in _kfl if k <= _ws + i + 1]
             return _ws + i + 1 - (max(pri) if pri else 0)
-        _say(f"[probe] window @ frame {ws}:")
-        _say("  sigma (med/p90 per block): " + "  ".join(
+        _log.info(f"[probe] window @ frame {ws}:")
+        _log.info("  sigma (med/p90 per block): " + "  ".join(
             f"{k} {r[k][0]:.4f}/{r[k][1]:.4f}"
             for k in ("q50", "q75", "q90", "q95", "rms", "tail5", "tail1", "max")))
-        _say(f"  flicker: density {r['flicker_density'][0]:.3f}/{r['flicker_density'][1]:.3f}"
+        _log.info(f"  flicker: density {r['flicker_density'][0]:.3f}/{r['flicker_density'][1]:.3f}"
              f"   amplitude {r['flicker_amplitude'][0]:.4f}/{r['flicker_amplitude'][1]:.4f}"
              f"   (fraction of pixels moving; how hard those move)")
-        _say(f"  structure: lag2/lag1 {r.get('lag2_over_lag1', 0):.2f}   "
+        _log.info(f"  structure: lag2/lag1 {r.get('lag2_over_lag1', 0):.2f}   "
              f"edge/flat {r['edge_over_flat']:.2f}   luma-corr {r['luma_corr']:+.2f}   "
              f"static-frac {r['static_fraction']:.2f}   "
              f"static-spatial-hf {r['static_spatial_hf']:.4f}   "
              f"row-period {r.get('row_periodicity', 0.0):.2f}@"
              f"{r.get('row_period_px', 0.0):.0f}px")
-        _say(f"  noise floor: mc sigma {r.get('mc_sigma', 0.0):.4f} "
+        _log.info(f"  noise floor: mc sigma {r.get('mc_sigma', 0.0):.4f} "
              f"lag {r.get('mc_lag21', 1.0):.2f}   |   "
              f"flat sigma {r.get('flat_sigma', 0.0):.4f} "
              f"lag {r.get('flat_lag21', 1.0):.2f} "
              f"diff-corr {r.get('flat_diff_corr', 0.0):.2f}   "
              f"(mc = the map's default floor: aligned-residual noise on "
              f"all pixels; lag ~1 + sigma >= 0.03 = dense real noise)")
-        _say(f"  spatial floor: sigma {r.get('spatial_sigma', 0.0):.4f}   "
+        _log.info(f"  spatial floor: sigma {r.get('spatial_sigma', 0.0):.4f}   "
              f"static grain ~{r.get('static_grain_sigma', 0.0):.4f}   "
              f"static-banding {r.get('static_row_periodicity', 0.0):.2f}@"
              f"{r.get('static_row_period_px', 0.0):.0f}px   "
              f"interlace {r.get('row_interlace', 0.0):.1f}x")
-        _say(f"  channels: R {r['sigma_R']:.4f}  G {r['sigma_G']:.4f}  B {r['sigma_B']:.4f}")
-        _say(f"  verdict: {', '.join(diag['labels'])}  risk={diag['risk']}")
+        _log.info(f"  channels: R {r['sigma_R']:.4f}  G {r['sigma_G']:.4f}  B {r['sigma_B']:.4f}")
+        _log.info(f"  verdict: {', '.join(diag['labels'])}  risk={diag['risk']}")
         for _msg in diag["warnings"][:2]:
-            _say(f"    warning: {_msg}")
+            _log.warning("%s", _msg)
         for _msg in diag["suggestions"][:2]:
-            _say(f"    try: {_msg}")
+            _log.info(f"    try: {_msg}")
         _pk = sorted(range(len(tr)), key=lambda i: -tr[i])[:3]
-        _say(f"  frame trace: med {sorted(tr)[len(tr) // 2]:.4f}  max {max(tr):.4f}"
+        _log.info(f"  frame trace: med {sorted(tr)[len(tr) // 2]:.4f}  max {max(tr):.4f}"
              "   top flashes: " + ", ".join(
                  f"diff{i + 1} {tr[i]:.4f} (kf+{_kfd(i)})" for i in _pk))
     # ---- tool guidance: name the tool the measurements support --------
-    _say("[probe] tool guidance:")
+    _log.info("[probe] tool guidance:")
     _comb = (estimate_qf(_all_frames) if _all_frames
              else {"qf": None, "confidence": 0.0})
     if _comb["qf"] is not None:
-        _say(f"  JPEG ancestry: QF ~{_comb['qf']} "
+        _log.info(f"  JPEG ancestry: QF ~{_comb['qf']} "
              f"(confidence {_comb['confidence']:g}) -> --deblock fbcnn "
              f"(auto QF tracks it per tile)")
     else:
-        _say("  no JPEG-family comb (native H.264/HEVC, or combs killed "
+        _log.info("  no JPEG-family comb (native H.264/HEVC, or combs killed "
              "by a later re-encode)")
     _bp95 = None
     if _mid_frames:
@@ -142,7 +140,7 @@ def probe_noise(video: Path, *, start_spec: str | None = None,
                   if r is not None and abs(r[0] - 8.0) > 0.3]
         if _pnon8:
             _pm = sum(_pnon8) / len(_pnon8)
-            _say(f"  grid period ~{_pm:.1f} px (~{_pm / 8.0:.2f}x resize of "
+            _log.info(f"  grid period ~{_pm:.1f} px (~{_pm / 8.0:.2f}x resize of "
                  f"an 8-grid): footage was compressed then RESIZED; the "
                  f"blockiness map tracks it (period=auto)")
         _blk = estimate_blockiness_map(_mid_frames)
@@ -161,25 +159,25 @@ def probe_noise(video: Path, *, start_spec: str | None = None,
             else:
                 _bmsg = ("little grid evidence (clean-encode baseline): "
                          "nothing grid-locked to deblock")
-            _say(f"  blockiness p95 {_bp95:.2f}: {_bmsg}")
+            _log.info(f"  blockiness p95 {_bp95:.2f}: {_bmsg}")
     _mc_med = sorted(_mc_sigs)[len(_mc_sigs) // 2] if _mc_sigs else 0.0
     if "dense sensor noise" in _all_labels:
-        _say(f"  dense noise (mc floor ~{_mc_med:.3f}) -> --denoise bsvd "
+        _log.info(f"  dense noise (mc floor ~{_mc_med:.3f}) -> --denoise bsvd "
              f"--noise-map auto")
     elif "sparse edge flicker" in _all_labels:
-        _say("  sparse edge flicker -> compression cleanup first "
+        _log.info("  sparse edge flicker -> compression cleanup first "
              "(deblock / fbcnn); plain denoise adds little")
     elif "dense motion, low noise floor" in _all_labels:
-        _say(f"  clean motion (mc floor ~{_mc_med:.3f}) -> skip or keep "
+        _log.info(f"  clean motion (mc floor ~{_mc_med:.3f}) -> skip or keep "
              f"denoise minimal; heavy denoise eats texture")
     elif "static/structured grain" in _all_labels:
-        _say("  static grain: temporal denoisers cannot remove it -> "
+        _log.info("  static grain: temporal denoisers cannot remove it -> "
              "spatial cleanup or a small --noise-map-floor")
     if "interlace/field residue" in _all_labels:
-        _say("  interlace residue -> deinterlace upstream before any "
+        _log.info("  interlace residue -> deinterlace upstream before any "
              "denoise/deblock (temporal nets smear combing)")
     if "static row banding" in _all_labels:
-        _say("  static row banding -> spatial-only artifact; temporal "
+        _log.info("  static row banding -> spatial-only artifact; temporal "
              "tools will not touch it")
     _bpp = None
     try:
@@ -192,15 +190,15 @@ def probe_noise(video: Path, *, start_spec: str | None = None,
             _bpp = 8.0 * (sum(_seg) / len(_seg)) / float(in_w * in_h)
             _bnote = ("starved encode, damage certain" if _bpp < 0.08
                       else "lean encode" if _bpp < 0.2 else "generous encode")
-            _say(f"  bpp {_bpp:.3f} over the probed range: {_bnote} "
+            _log.info(f"  bpp {_bpp:.3f} over the probed range: {_bnote} "
                  f"(last generation ONLY: high bpp proves nothing after "
                  f"a re-encode)")
     if (_comb["qf"] is None and _bp95 is not None and _bp95 < 0.4
             and _bpp is not None and _bpp < 0.12):
-        _say("  low bpp with no measurable grid or comb (mush): auto "
+        _log.info("  low bpp with no measurable grid or comb (mush): auto "
              "dials have no anchor here -> manual call (bsvd for "
              "shimmer, nafnet for structure)")
-    _say("[probe] done -- no processing performed")
+    _log.info("[probe] done -- no processing performed")
     return 0
 
 

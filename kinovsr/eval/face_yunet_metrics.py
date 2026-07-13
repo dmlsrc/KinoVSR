@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import math
 import time
 from dataclasses import dataclass
@@ -26,8 +27,6 @@ from typing import Any
 import cv2 as cv
 import numpy as np
 
-from kinovsr.ui.console import get_console
-
 from .config import (
     config_get,
     config_section,
@@ -36,9 +35,7 @@ from .config import (
     resolve_path,
 )
 
-
-def _print(*parts: object) -> None:
-    get_console().print(*parts, markup=False, highlight=False)
+_log = logging.getLogger(__name__)
 
 TOOL_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = TOOL_DIR / "weights" / "face_detection_yunet_2023mar.onnx"
@@ -504,13 +501,13 @@ def run_eval(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.contact_sheet:
         make_contact_sheet(args.out_dir / "face_yunet_contact_sheet.png", frames_by_variant, observations, list(variants))
 
-    _print(f"tracks={len(tracks)} samples={len(observations)}")
+    _log.info(f"tracks={len(tracks)} samples={len(observations)}")
     for row in sorted(
         [r for r in rows if r["variant"] != args.baseline],
         key=lambda r: r["face_score"],
         reverse=True,
     ):
-        _print(
+        _log.info(
             f"{row['variant']:28s} score={row['face_score']:7.2f} "
             f"ssim={row['ssim_luma']:.4f} gradR={row['grad_ratio']:.3f} "
             f"gradC={row['grad_corr']:.3f} hfR={row['hf_luma_ratio']:.3f} "
@@ -518,7 +515,7 @@ def run_eval(args: argparse.Namespace) -> list[dict[str, Any]]:
             f"tempR={row['temporal_hf_diff_ratio']:.3f} "
             f"mae={row['mae_luma']:.4f} cdrift={row['chroma_drift']:.4f}"
         )
-    _print(args.out_dir)
+    _log.info(args.out_dir)
     return rows
 
 

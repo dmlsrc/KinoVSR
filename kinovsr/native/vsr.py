@@ -9,6 +9,7 @@ ready to feed straight into AVAssetWriter.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
@@ -19,6 +20,8 @@ from kinovsr.media import pixel_buffers as _pb
 from kinovsr.settings import default_settings
 
 from .frameworks import Quartz, vt
+
+_log = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -130,7 +133,7 @@ def _wait_for_model_download(config: Any) -> None:
     status = config.configurationModelStatus()
     if status == vt.VTSuperResolutionScalerConfigurationModelStatusReady:
         return
-    print(f"VSR model not ready (status={status}); requesting download...")
+    _log.info("VSR model not ready (status=%s); requesting download", status)
     done = threading.Event()
     err_box: list[Any] = [None]
 
@@ -143,12 +146,12 @@ def _wait_for_model_download(config: Any) -> None:
     while not done.is_set():
         pct = int(config.configurationModelPercentageAvailable() * 100)
         if pct // 5 != last_reported // 5:
-            print(f"  model download: {pct}%")
+            _log.info("VSR model download: %s%%", pct)
             last_reported = pct
         done.wait(timeout=0.5)
     if err_box[0] is not None:
         raise RuntimeError(f"VSR model download failed: {err_box[0]}")
-    print("  model download: done")
+    _log.info("VSR model download complete")
 
 
 class VsrSession:
@@ -221,10 +224,16 @@ class VsrSession:
 
         self.src_attrs = dict(self.config.sourcePixelBufferAttributes() or {})
         self.dst_attrs = dict(self.config.destinationPixelBufferAttributes() or {})
-        print(
-            f"VSR session ready (mode={mode}, {in_w}x{in_h} -> {self.out_w}x{self.out_h}, "
-            f"src fmt {_pb.resolve_pixel_format(self.src_attrs):#x}, "
-            f"dst fmt {_pb.resolve_pixel_format(self.dst_attrs):#x})"
+        _log.info(
+            "VSR session ready (mode=%s, %sx%s -> %sx%s, src fmt %#x, "
+            "dst fmt %#x)",
+            mode,
+            in_w,
+            in_h,
+            self.out_w,
+            self.out_h,
+            _pb.resolve_pixel_format(self.src_attrs),
+            _pb.resolve_pixel_format(self.dst_attrs),
         )
 
         self._prev_src_frame: Any = None
@@ -233,7 +242,9 @@ class VsrSession:
         # Src pool: two buffers in flight at any time (current + prev_src).
         self._src_pool = _pb.make_pool_from_attrs(self.src_attrs)
         if self._src_pool is None:
-            print("  warning: src pool creation failed; falling back to per-frame allocation")
+            _log.warning(
+                "source pool creation failed; falling back to per-frame allocation"
+            )
         # Dst pool: typically set by the caller to the AVAssetWriter adaptor's
         # pool for zero-copy from VSR output to encoder.
         self._dst_pool: Any = None

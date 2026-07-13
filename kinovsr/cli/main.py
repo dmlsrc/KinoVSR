@@ -9,6 +9,9 @@ from __future__ import annotations
 
 
 def main(argv: list[str] | None = None) -> int:
+    from kinovsr.ui.logging import configure_logging
+
+    configure_logging()
     if argv is None:
         import sys
 

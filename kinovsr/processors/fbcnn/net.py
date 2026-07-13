@@ -20,6 +20,7 @@ from torch (out,in) so forward is x @ W + b.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -250,14 +251,18 @@ def make_forward(p: dict, qf_input: Any = None, strength: float = 1.0,
     return _cached(_COMPILE_CACHE, key, lambda: mx.compile(run))
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     p = load_params(dtype=mx.float32)
     in_nc, nb = _config(p)
-    print(f"loaded FBCNN: in_nc={in_nc}, nb={nb}")
+    _log.info(f"loaded FBCNN: in_nc={in_nc}, nb={nb}")
     mx.random.seed(0)
     x = mx.clip(mx.random.uniform(shape=(1, 64, 96, in_nc)), 0, 1)
     mx.eval(x)
     out, qf = fbcnn(x, p)
     mx.eval(out, qf)
-    print(f"blind: {tuple(x.shape)} -> {tuple(out.shape)}, predicted JPEG QF "
+    _log.info(f"blind: {tuple(x.shape)} -> {tuple(out.shape)}, predicted JPEG QF "
           f"{float((1 - qf[0, 0]) * 100):.1f}, residual mean {float(mx.mean(mx.abs(out - x))):.4f}")

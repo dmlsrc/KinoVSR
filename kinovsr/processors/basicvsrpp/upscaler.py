@@ -13,6 +13,7 @@ wrapper only loads the BasicVSR++ weights and upscales each window.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import mlx.core as mx
@@ -58,7 +59,11 @@ class BasicVsrUpscaler(WindowedUpscaler):
                   history_gate=self._history_gate)
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     import math
 
     def psnr(a, b):
@@ -78,7 +83,7 @@ if __name__ == "__main__":
         emitted.extend(up.feed(f[0], token=i))
     emitted.extend(up.flush())
     toks = [t for _, t in emitted]
-    print(f"emitted {len(emitted)}/{N} frames, order ok: {toks == list(range(N))}")
+    _log.info(f"emitted {len(emitted)}/{N} frames, order ok: {toks == list(range(N))}")
     for idx in (3, N // 2, N - 4):
-        print(f"  interior frame {idx}: windowed-vs-fullclip PSNR = "
+        _log.info(f"  interior frame {idx}: windowed-vs-fullclip PSNR = "
               f"{psnr(emitted[idx][0], full[idx][0]):.1f} dB")

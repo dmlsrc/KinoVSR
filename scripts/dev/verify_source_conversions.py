@@ -16,6 +16,7 @@ from weights-src/ or have no shipped artifact are reported as SKIP.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import subprocess
 import sys
@@ -23,6 +24,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
+
+_log = logging.getLogger("kinovsr.dev.verify_source_conversions")
 
 SRC = REPO / "weights-src"
 OUT = Path(os.environ.get("SHARED_TEMP_DIR")
@@ -136,7 +139,9 @@ def compare_safetensors(a: Path, b: Path) -> tuple[bool, str]:
 
 def main() -> int:
     from kinovsr.modeling.weights import load_registered
+    from kinovsr.ui.logging import configure_logging
 
+    configure_logging()
     OUT.mkdir(parents=True, exist_ok=True)
     results: list[tuple[str, str, str]] = []   # (verdict, name, detail)
 
@@ -207,9 +212,20 @@ def main() -> int:
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
     for verdict, name, detail in results:
         counts[verdict] += 1
-        print(f"{verdict:4}  {name:{width}}  {detail}")
-    print(f"\n{counts['PASS']} pass, {counts['FAIL']} fail, "
-          f"{counts['SKIP']} skip of {len(results)}")
+        log = {
+            "PASS": _log.info,
+            "SKIP": _log.warning,
+            "FAIL": _log.error,
+        }[verdict]
+        log("%4s  %-*s  %s", verdict, width, name, detail)
+    summary_log = _log.error if counts["FAIL"] else _log.info
+    summary_log(
+        "%s pass, %s fail, %s skip of %s",
+        counts["PASS"],
+        counts["FAIL"],
+        counts["SKIP"],
+        len(results),
+    )
     return 1 if counts["FAIL"] else 0
 
 

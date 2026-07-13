@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import statistics
 import sys
 import time
@@ -36,6 +37,8 @@ from config import (
     load_config,
     resolve_path,
 )
+
+_log = logging.getLogger("kinovsr.dev.vsr_artifacts.analyze_maps")
 
 # scripts/dev/vsr_artifacts/ -> repo root is three levels up.
 REPO = Path(__file__).resolve().parents[3]
@@ -472,7 +475,7 @@ def run_analysis(args: argparse.Namespace) -> dict[str, Any]:
         "clips": rows,
     }
     for idx, path in enumerate(args.videos, 1):
-        print(f"[analysis] {idx:02d}/{len(args.videos):02d} {path.name}", flush=True)
+        _log.info("analysis %02d/%02d %s", idx, len(args.videos), path.name)
         rows.append(_summarize_clip(path, args))
         (args.output_root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     _apply_reencode_baselines(rows)
@@ -505,8 +508,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    from kinovsr.ui.logging import configure_logging
+
+    configure_logging()
     summary = run_analysis(_normalise_config(parse_args()))
-    print(f"[done] {Path(summary['output_root']) / 'summary.json'}", flush=True)
+    _log.info("wrote %s", Path(summary["output_root"]) / "summary.json")
     return 0
 
 

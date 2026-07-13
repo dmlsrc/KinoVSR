@@ -9,6 +9,7 @@ the GOP period the way a single-frame restorer does on inter-coded video.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import mlx.core as mx
@@ -61,7 +62,11 @@ class BasicVsrRestorer(WindowedUpscaler):
         return out
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     r = BasicVsrRestorer("decompress_track1", window=10, trim=2)
     mx.random.seed(0)
     emitted: list = []
@@ -69,5 +74,5 @@ if __name__ == "__main__":
         emitted.extend(r.feed(mx.random.uniform(shape=(60, 80, 3)), token=i))
     emitted.extend(r.flush())
     toks = [t for _, t in emitted]
-    print(f"restore: emitted {len(emitted)}/14, order ok: {toks == list(range(14))}, "
+    _log.info(f"restore: emitted {len(emitted)}/14, order ok: {toks == list(range(14))}, "
           f"frame shape {tuple(emitted[0][0].shape)}")

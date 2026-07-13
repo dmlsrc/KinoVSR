@@ -38,6 +38,7 @@ multiple of 8 (the deepest pooling level) and the output cropped back.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -338,13 +339,17 @@ def make_forward(p: dict, cfg: tuple | None = None, compile: bool = True):
     return _cached(_COMPILE_CACHE, (id(p), cfg), lambda: mx.compile(run))
 
 
+_log = logging.getLogger(__name__)
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     p = load_params()
     cfg = _config(p)
-    print(f"loaded SAFMN: variant={cfg[0]} dim={cfg[1]} blocks={cfg[2]} scale={cfg[3]}x")
+    _log.info(f"loaded SAFMN: variant={cfg[0]} dim={cfg[1]} blocks={cfg[2]} scale={cfg[3]}x")
     mx.random.seed(0)
     x = mx.clip(mx.random.uniform(shape=(1, 64, 96, 3)), 0, 1)
     mx.eval(x)
     out = safmn(x, p, cfg)
     mx.eval(out)
-    print(f"{tuple(x.shape)} -> {tuple(out.shape)}, finite={bool(mx.all(mx.isfinite(out)))}")
+    _log.info(f"{tuple(x.shape)} -> {tuple(out.shape)}, finite={bool(mx.all(mx.isfinite(out)))}")

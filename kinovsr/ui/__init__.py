@@ -9,7 +9,11 @@ wire the terminal implementations up.
 """
 
 from .console import get_console
-from .logging import configure_logging, configure_logging_from_settings
+from .logging import (
+    configure_logging,
+    configure_logging_from_settings,
+    configure_machine_output,
+)
 from .progress import (
     RichReporter,
     WallClockPaceColumn,
@@ -23,6 +27,7 @@ __all__ = [
     "WallClockPaceColumn",
     "configure_logging",
     "configure_logging_from_settings",
+    "configure_machine_output",
     "get_console",
     "log_phase_summary",
     "make_progress",

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import sys
 from pathlib import Path
@@ -41,11 +42,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.ui.console import get_console
+_log = logging.getLogger(__name__)
 
-
-def _print(*parts: object) -> None:
-    get_console().print(*parts, markup=False, highlight=False)
 
 MODEL_PATH = Path(__file__).resolve().parent / "weights" / "niqe_pristine_reds.safetensors"
 PATCH = 96
@@ -203,7 +201,7 @@ def fit_model(folder: Path, out: Path, max_images: int = 200,
         "cov": cov.astype(mx.float32),
         "n": mx.array([int(allf.shape[0])], dtype=mx.int32),
     })
-    _print(f"pristine model: {int(allf.shape[0])} patches from {len(paths)} images -> {out}")
+    _log.info(f"pristine model: {int(allf.shape[0])} patches from {len(paths)} images -> {out}")
 
 
 def _read_video_lumas(path: Path, every: int = 1) -> list[Any]:
@@ -255,7 +253,6 @@ def run_niqe(argv: list[str] | None = None) -> int:
     for inp in args.inputs:
         lumas = _read_video_lumas(Path(inp), every=args.every)
         rows[inp] = score_lumas(lumas, Path(args.model))
-        _print(f"{rows[inp]:7.3f}  {inp}")
-    _print(json.dumps(rows))
+        _log.info(f"{rows[inp]:7.3f}  {inp}")
+    _log.info(json.dumps(rows))
     return 0
-
