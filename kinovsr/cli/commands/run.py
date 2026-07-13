@@ -46,23 +46,11 @@ def run_video_command(argv: list[str]) -> int:
                            end_spec=options.end, reader=options.reader)
 
     # A config that declares a pipeline list runs through the typed
-    # pipeline; the flag-driven stage surface stays on the inherited
-    # orchestration until it reaches feature parity.
+    # pipeline as written; a flag-driven invocation assembles into the
+    # same typed config (M6 step 3: one engine, two authoring surfaces).
     if invocation.config.get("pipeline") is not None:
         return _run_typed(invocation)
-    from kinovsr.api import (
-        VideoFileConfig,
-        process_video_options,
-        resolve_mlx_cache_limit_gb,
-    )
-
-    limit = resolve_mlx_cache_limit_gb(settings)
-    if limit > 0 and not settings.quiet:
-        get_console().print(f"MLX cache limit: {limit:g} GB")
-
-    process_video_options(
-        VideoFileConfig(settings=settings, options=invocation.options))
-    return 0
+    return _run_typed(invocation, assemble_flags=True)
 
 
 # Flags that select stages on the flag-driven surface; a [pipeline]
@@ -146,13 +134,20 @@ def _source_layout(config):
     return Layout.MLX_RGB_HWC
 
 
-def _run_typed(invocation) -> int:
-    """Run a [pipeline] config file-to-file through the typed pipeline."""
+def _run_typed(invocation, assemble_flags: bool = False) -> int:
+    """Run file-to-file through the typed pipeline.
+
+    ``assemble_flags=False``: the invocation carries a hand-written
+    ``[pipeline]`` config; stage/geometry flags alongside it are a config
+    error (C8). ``assemble_flags=True``: the flag surface IS the config
+    source - the stage selectors and geometry flags assemble into the
+    same typed config after the source is probed.
+    """
     from datetime import datetime
     from pathlib import Path
 
     options = invocation.options
-    selected = _pipeline_owned_flags(options)
+    selected = () if assemble_flags else _pipeline_owned_flags(options)
     if selected:
         flags = ", ".join("--" + n.replace("_", "-") for n in selected)
         get_console().print(
@@ -230,9 +225,17 @@ def _run_typed(invocation) -> int:
     if limit > 0 and not invocation.settings.quiet:
         get_console().print(f"MLX cache limit: {limit:g} GB")
 
+    # The flag surface assembles into the same typed config a hand-written
+    # [pipeline] TOML expresses (the probed dims feed the evenness bump).
+    config = invocation.config
+    if assemble_flags:
+        from ..assemble_pipeline import assemble_pipeline
+
+        config = assemble_pipeline(options, width=_w, height=_h)
+
     try:
         result = process_video_file(
-            invocation.config,
+            config,
             video=video,
             output=output,
             settings=invocation.settings,
@@ -258,7 +261,7 @@ def _run_typed(invocation) -> int:
             cut_log=options.cut_log,
             skip_post_mp4=options.skip_post_mp4,
             noise_map_debug=options.noise_map_debug,
-            layout=_source_layout(invocation.config),
+            layout=_source_layout(config),
             reader=reader,
         )
     except (ConfigError, MediaError, PipelineError) as exc:
