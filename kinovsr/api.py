@@ -23,10 +23,6 @@ Compatibility: this module is the supported import surface
 freely; breaking changes to these names are called out in commit
 history and the planning record. Underscore-prefixed names and every
 other module are internal.
-
-The transitional flat-options entry (:func:`process_video_options`)
-runs the inherited orchestration for the flag-driven CLI surface until
-it reaches typed-pipeline parity; hosts should not target it.
 """
 
 from __future__ import annotations
@@ -40,18 +36,6 @@ from kinovsr.pipeline import PipelineSession
 from kinovsr.processors import StreamSpec
 from kinovsr.reporting import Reporter
 from kinovsr.settings import Settings
-
-
-@dataclass(frozen=True)
-class VideoFileConfig:
-    """A resolved flat-options run: global settings plus stage options.
-
-    The transitional shape consumed by :func:`process_video_options`;
-    ``options`` is the flat namespace of canonical CLI destinations.
-    """
-
-    settings: Settings
-    options: Any
 
 
 @dataclass(frozen=True)
@@ -203,26 +187,10 @@ def process_video_file(
     )
 
 
-def process_video_options(config: VideoFileConfig) -> VideoProcessResult:
-    """Process one video file per a resolved flat-options invocation.
-
-    The transitional entry for the flag-driven CLI surface; it wraps the
-    inherited harness orchestration and retires when that surface
-    reaches typed-pipeline parity.
-    """
-    _runtime_setup(config.settings)
-
-    from kinovsr import _harness  # heavy import (MLX, native session setup)
-
-    return _harness.run(config.options, settings=config.settings)
-
-
 __all__ = [
     "PipelineSession",
-    "VideoFileConfig",
     "VideoProcessResult",
     "open_pipeline",
     "process_video_file",
-    "process_video_options",
     "resolve_mlx_cache_limit_gb",
 ]

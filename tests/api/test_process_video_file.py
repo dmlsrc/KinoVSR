@@ -1,9 +1,9 @@
-"""M2 acceptance fixture: synthetic file-to-file through the new entry.
+"""M2 acceptance fixture: synthetic file-to-file through the flag CLI.
 
 Proves source probing (trim math over a probed window), audio carry,
 output creation, and representative legacy CLI options (including a
-hidden-alias spelling) through ``kinovsr.cli.main`` and the internal
-``process_video_options`` facade.
+hidden-alias spelling) through ``kinovsr.cli.main`` - since M6 the flag
+surface assembles into the typed pipeline.
 
 The fixture clip is muxed by PyAV (no binary fixtures): mpeg4 video plus
 an AAC sine tone. The run itself uses the product's native path (reader
@@ -16,11 +16,7 @@ import pytest
 
 av = pytest.importorskip("av")
 
-from kinovsr.api import VideoFileConfig, process_video_options  # noqa: E402
-from kinovsr.cli.args import build_parser, validate_args  # noqa: E402
-from kinovsr.cli.config import assemble  # noqa: E402
 from kinovsr.cli.main import main  # noqa: E402
-from kinovsr.settings import Settings  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
@@ -78,9 +74,8 @@ def _output_streams(path):
         return frames, len(video), len(sound)
 
 
-def test_facade_probes_trims_and_carries_audio(clip_with_audio, tmp_path):
-    parser = build_parser()
-    args = parser.parse_args([
+def test_flag_cli_probes_trims_and_carries_audio(clip_with_audio, tmp_path):
+    rc = main([
         "--video", str(clip_with_audio),
         "--output-dir", str(tmp_path),
         "--upscale", "none",
@@ -88,15 +83,10 @@ def test_facade_probes_trims_and_carries_audio(clip_with_audio, tmp_path):
         "--audio",
         "--mlx-cache-limit-gb", "0.25",
     ])
-    validate_args(parser, args)
-    invocation = assemble(args, base=Settings())
-    result = process_video_options(VideoFileConfig(
-        settings=invocation.settings, options=invocation.options))
-
-    assert result.post_path is not None and result.post_path.exists()
-    assert result.frames_out == 8
-    assert result.elapsed_s > 0
-    frames, n_video, n_audio = _output_streams(result.post_path)
+    assert rc == 0
+    outputs = list(tmp_path.glob("*_post.mp4"))
+    assert len(outputs) == 1
+    frames, n_video, n_audio = _output_streams(outputs[0])
     assert frames == 8
     assert n_video == 1
     assert n_audio == 1, "muxed audio track missing from the output"
@@ -124,8 +114,4 @@ def test_main_runs_legacy_spellings_end_to_end(clip_with_audio, tmp_path):
     assert frames == 6
     assert n_audio == 0  # no --audio: silent output
 
-    # Reader choice is per-run: a forced-ffmpeg run must not rebind the
-    # module-level reader that later runs (facade calls) start from.
-    import kinovsr._harness as harness
-    import kinovsr.media.video_reader as native_reader
-    assert harness._native_vr is native_reader
+

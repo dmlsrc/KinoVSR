@@ -4,8 +4,8 @@ This is the flat invocation (``kinovsr --video ...``), also reachable as
 an explicit subcommand (``kinovsr run --video ...``). It owns the
 terminal wiring for a processing run - logging configuration and the
 MLX cache-limit echo - and hands the resolved invocation to the
-:func:`kinovsr.api.process_video_options` facade (flag surface) or
-the public :func:`kinovsr.api.process_video_file` (pipeline configs).
+:func:`kinovsr.api.process_video_file` - flag invocations assemble
+into the same typed config a ``[pipeline]`` TOML expresses (M6).
 """
 
 from __future__ import annotations

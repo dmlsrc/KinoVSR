@@ -12,7 +12,6 @@ is internal and may change without notice.
 | `open_pipeline(config, input_spec, *, settings=None, reporter=None)` | Validate the same config against a host stream's `StreamSpec`; returns `PipelineSession`. |
 | `PipelineSession` | One validated chain, run at most once; `process(units)` yields output `FrameUnit`s. |
 | `VideoProcessResult` | What a file run produced (paths, frame counts, wall time). |
-| `VideoFileConfig`, `process_video_options` | Transitional flat-options entry for the flag CLI; retires at parity. Hosts should not target it. |
 | `resolve_mlx_cache_limit_gb` | The effective MLX cache cap for a `Settings`. |
 
 The stream vocabulary (`StreamSpec`, `FrameUnit`, `Layout`, typed

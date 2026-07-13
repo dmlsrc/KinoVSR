@@ -178,12 +178,10 @@ def test_end_to_end_upscale_through_the_chain(mx):
 
 
 @pytest.mark.integration
-def test_harness_end_to_end(tmp_path):
+def test_flag_cli_end_to_end(tmp_path):
     av = pytest.importorskip("av")
 
-    from kinovsr.api import VideoFileConfig, process_video_options
-    from kinovsr.cli.args import build_parser, validate_args
-    from kinovsr.cli.config import assemble
+    from kinovsr.cli.main import main
 
     w, h, n, fps = 160, 128, 6, 25
     clip = tmp_path / "clip.mp4"
@@ -203,24 +201,19 @@ def test_harness_end_to_end(tmp_path):
         out.mux(pkt)
     out.close()
 
-    parser = build_parser()
-    args = parser.parse_args([
-        "--video", str(clip),
-        "--output-dir", str(tmp_path),
-        "--upscale", "metalfx", "--metalfx-scale", "2",
-        "--mlx-cache-limit-gb", "0.25",
-    ])
-    validate_args(parser, args)
-    invocation = assemble(args, base=Settings())
     try:
-        result = process_video_options(VideoFileConfig(
-            settings=invocation.settings, options=invocation.options))
+        rc = main([
+            "--video", str(clip),
+            "--output-dir", str(tmp_path),
+            "--upscale", "metalfx", "--metalfx-scale", "2",
+            "--mlx-cache-limit-gb", "0.25",
+        ])
     except MediaError as exc:
         skip_if_unsupported(exc)
-
-    assert result.post_path is not None and result.post_path.exists()
-    assert result.frames_out == n
-    with av.open(str(result.post_path)) as container:
+    assert rc == 0
+    outputs = list(tmp_path.glob("*_post.mp4"))
+    assert len(outputs) == 1
+    with av.open(str(outputs[0])) as container:
         stream_info = container.streams.video[0]
         assert (stream_info.width, stream_info.height) == (w * 2, h * 2)
         assert sum(1 for _ in container.decode(video=0)) == n

@@ -14,11 +14,9 @@ pytestmark = pytest.mark.unit
 
 EXPECTED = {
     "PipelineSession",
-    "VideoFileConfig",
     "VideoProcessResult",
     "open_pipeline",
     "process_video_file",
-    "process_video_options",
     "resolve_mlx_cache_limit_gb",
 }
 
@@ -57,8 +55,7 @@ def test_annotations_resolve_at_runtime():
 
     import kinovsr.api as api
 
-    for func in (api.open_pipeline, api.process_video_file,
-                 api.process_video_options):
+    for func in (api.open_pipeline, api.process_video_file):
         hints = typing.get_type_hints(func)
         assert hints, func.__name__
 

@@ -6,9 +6,9 @@ Conversion (`VtfrcSession`), and AVAssetWriter (`AVWriter`). These require the
 PyObjC frameworks listed in the project dependencies; constructing them on a
 base install raises a SystemExit with the install hint.
 
-Learned restoration and upscaler families (denoise, deblock, toflow, nafnet,
+Learned restoration and upscaler families (deblock, toflow, nafnet,
 basicvsrpp, realesrgan, ...) live in their own submodules and are imported
-directly, for example `from kinovsr.denoise import ...`.
+directly, for example `from kinovsr.processors.bsvd import ...`.
 
 Public surface:
 
