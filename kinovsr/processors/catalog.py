@@ -181,7 +181,8 @@ _CATALOG: dict[str, CatalogEntry] = {
         ),
         _entry(
             "videotoolbox",
-            "kinovsr.processors.videotoolbox:FACTORY"
+            "kinovsr.processors.videotoolbox:FACTORY",
+            (15, "VIDEOTOOLBOX_OPTIONS"),
         ),
     )
 }

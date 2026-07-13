@@ -1,9 +1,9 @@
 """M2 acceptance fixture: synthetic file-to-file through the flag CLI.
 
 Proves source probing (trim math over a probed window), audio carry,
-output creation, and representative legacy CLI options (including a
-hidden-alias spelling) through ``kinovsr.cli.main`` - since M6 the flag
-surface assembles into the typed pipeline.
+output creation, and representative canonical CLI options through
+``kinovsr.cli.main`` - since M6 the flag surface assembles into the typed
+pipeline.
 
 The fixture clip is muxed by PyAV (no binary fixtures): mpeg4 video plus
 an AAC sine tone. The run itself uses the product's native path (reader

@@ -126,9 +126,7 @@ def test_cli_contributions_are_unique_and_family_local():
     processors_dir = Path(catalog.__file__).parent
     claimed_orders: dict[int, str] = {}
     for entry in catalog.catalog_entries():
-        if not entry.cli_options:
-            assert entry.cli_options_path is None
-            continue
+        assert entry.cli_options, f"{entry.name} has no family-local CLI contribution"
         path = entry.cli_options_path
         assert path is not None
         assert (processors_dir / path).is_file(), (entry.name, path)

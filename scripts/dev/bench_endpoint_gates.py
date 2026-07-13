@@ -1,32 +1,40 @@
-"""M3 performance gates: file passthrough and a representative learned chain.
+"""Post-M6 performance gates for the public file-processing endpoint.
 
-Compares the typed pipeline's file endpoints (kinovsr.pipeline.run_file)
-against the harness control (kinovsr.api.process_video_file) on a real
-clip, per planning 06-perf-baseline.md:
+M3 originally compared the typed file endpoints with the inherited harness.
+M6 deleted that second orchestration path, so a same-checkout A/B comparison is
+no longer possible or useful. This gate now measures the one public typed path
+against a machine- and clip-specific baseline recorded by this script:
 
-- passthrough:   new path slower by at most max(2 ms/frame, 10% of control)
-- learned chain: new path slower by at most max(5 ms/frame, 3% of control)
+- passthrough: current path slower by at most max(2 ms/frame, 10% of baseline)
+- learned chain: current path slower by at most max(5 ms/frame, 3% of baseline)
   (bsvd temporal denoise + realplksr 2x spatial SR, the M3 provers)
 
-Method: fresh process per run; steady-state ms/frame is the slope between
-a short and a long run of the same clip so startup, probe, and compile
-cost cancel in the intercept. Behavior must match too: frame count,
-geometry, container duration, and a PSNR-between-outputs probe computed
-from the final slope run's kept outputs (no extra runs).
+The source hash, source probe, output probe, chip, run count, and measured frame
+count must match the baseline before timings are compared. Raw baselines and
+reports belong under $SHARED_TEMP_DIR rather than in the repository.
 
-Usage:
-    python scripts/dev/bench_endpoint_gates.py --clip PATH [--runs 2]
-        [--short 12] [--long 36] [--report DIR]
+Record the baseline once after an intentional path change:
 
-The clip should be a CFR H.264/HEVC file of at least --long frames. The
-gate margins carry absolute floors (2 / 5 ms per frame), so a small
-geometry keeps the protocol fast without changing which code paths run;
-record the clip geometry with the result.
+    python scripts/dev/bench_endpoint_gates.py --clip PATH --record-baseline
+
+Run the gate afterward:
+
+    python scripts/dev/bench_endpoint_gates.py --clip PATH
+
+Use --baseline PATH to override the default baseline at
+$SHARED_TEMP_DIR/trace_analysis/kinovsr_endpoint_baseline.json.
+
+Method: fresh process per run; each sample is end-to-end elapsed time divided by
+the written frame count. This intentionally includes setup, probe, compile,
+decode, processing, and encode because it gates the public endpoint as a whole.
+The final output is retained only long enough to verify its frame count,
+geometry, and cadence against the recorded baseline.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import platform
@@ -40,6 +48,8 @@ from pathlib import Path
 _log = logging.getLogger("kinovsr.dev.bench_endpoint_gates")
 _result_log = logging.getLogger("kinovsr.dev.bench_endpoint_gates.result")
 
+BASELINE_SCHEMA = 2
+BASELINE_FILENAME = "kinovsr_endpoint_baseline.json"
 GATES = {
     "pass": ("file passthrough", 2.0, 0.10),
     "learned": ("bsvd + realplksr 2x", 5.0, 0.03),
@@ -51,73 +61,46 @@ GATES = {
 # ---------------------------------------------------------------------------
 
 def _worker(args: argparse.Namespace) -> None:
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if args.path == "control":
-        from kinovsr.api import VideoFileConfig, process_video_file
-        from kinovsr.cli.args import build_parser, validate_args
-        from kinovsr.cli.config import assemble
-        from kinovsr.settings import Settings
-
-        argv = [
-            "--video", args.clip, "--output-dir", str(out_dir),
-            "--max-frames", str(args.frames),
-            "--mlx-cache-limit-gb", "1",
-            "--output-prefix", "control",
-        ]
-        if args.chain == "pass":
-            argv += ["--upscale", "none"]
-        else:
-            argv += ["--upscale", "realplksr", "--denoise", "bsvd",
-                     "--bsvd-strength", "0.5"]
-        parser = build_parser()
-        parsed = parser.parse_args(argv)
-        validate_args(parser, parsed)
-        invocation = assemble(parsed, base=Settings())
-        t0 = time.perf_counter()
-        result = process_video_file(VideoFileConfig(
-            settings=invocation.settings, options=invocation.options))
-        elapsed = time.perf_counter() - t0
-        _result_log.info(
-            "RESULT %s",
-            json.dumps({
-                "elapsed": elapsed,
-                "frames": result.frames_out,
-                "path": str(result.post_path),
-            }),
-        )
-        return
-
-    import mlx.core as mx
-
-    from kinovsr.pipeline import run_file
+    from kinovsr.api import process_video_file
     from kinovsr.processors.specs import Layout
     from kinovsr.settings import Settings
 
-    mx.set_cache_limit(10 ** 9)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
     if args.chain == "pass":
         config: dict = {"pipeline": []}
         layout = Layout.CV_RGBA_HALF
     else:
         config = {
             "pipeline": ["den", "up"],
-            "den": {"processor": "bsvd", "profile": "c64",
-                    "strength": 0.5},
+            "den": {
+                "processor": "bsvd",
+                "profile": "c64",
+                "strength": 0.5,
+            },
             "up": {"processor": "realplksr", "profile": "public2x"},
         }
         layout = Layout.MLX_RGB_HWC
+
     t0 = time.perf_counter()
-    result = run_file(
-        config, video=args.clip, output=out_dir / "new.mp4",
-        settings=Settings(), layout=layout, max_frames=args.frames)
+    result = process_video_file(
+        config,
+        video=args.clip,
+        output=out_dir / "current.mp4",
+        settings=Settings(),
+        layout=layout,
+        max_frames=args.frames,
+    )
     elapsed = time.perf_counter() - t0
     _result_log.info(
         "RESULT %s",
-        json.dumps({
-            "elapsed": elapsed,
-            "frames": result.frames_out,
-            "path": str(result.path),
-        }),
+        json.dumps(
+            {
+                "elapsed": elapsed,
+                "frames": result.frames_out,
+                "path": str(result.post_path),
+            }
+        ),
     )
 
 
@@ -125,109 +108,228 @@ def _worker(args: argparse.Namespace) -> None:
 # Parent mode: orchestrate fresh-process runs and evaluate the gates
 # ---------------------------------------------------------------------------
 
-def _run_once(clip: str, path: str, chain: str, frames: int,
-              keep_dir: Path | None = None) -> dict:
+def _run_once(
+    clip: str,
+    chain: str,
+    frames: int,
+    keep_dir: Path | None = None,
+) -> dict:
     t0 = time.perf_counter()
     with tempfile.TemporaryDirectory() as scratch:
         out = keep_dir if keep_dir is not None else Path(scratch)
         proc = subprocess.run(
-            [sys.executable, __file__, "--worker-path", path,
-             "--worker-chain", chain, "--clip", clip,
-             "--frames", str(frames), "--out", str(out)],
-            capture_output=True, text=True, timeout=1800, check=False)
+            [
+                sys.executable,
+                __file__,
+                "--worker-chain",
+                chain,
+                "--clip",
+                clip,
+                "--frames",
+                str(frames),
+                "--out",
+                str(out),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+            check=False,
+        )
         for line in proc.stdout.splitlines():
             if line.startswith("RESULT "):
-                result = json.loads(line[len("RESULT "):])
+                result = json.loads(line.removeprefix("RESULT "))
                 _log.info(
-                    "%s/%s frames=%s: %.1fs (wall %.1fs)",
+                    "%s frames=%s: %.1fs (wall %.1fs)",
                     chain,
-                    path,
                     frames,
                     result["elapsed"],
                     time.perf_counter() - t0,
                 )
                 return result
         raise RuntimeError(
-            f"worker {path}/{chain}/{frames} produced no result:\n"
-            f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}")
+            f"worker {chain}/{frames} produced no result:\n"
+            f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+        )
 
 
-def _steady_ms(clip: str, path: str, chain: str, short: int, long: int,
-               runs: int, keep_dir: Path) -> tuple[float, list[float], Path]:
-    """Median slope over `runs`; the final long run keeps its output for
-    the behavior comparison, so no extra measurement runs are needed."""
-    slopes = []
+def _measure_ms(
+    clip: str,
+    chain: str,
+    frames: int,
+    runs: int,
+    keep_dir: Path,
+) -> tuple[float, list[float], Path]:
+    """Return median end-to-end cost and retain the final output for probing."""
+    samples = []
     kept: Path | None = None
-    for i in range(runs):
-        last = i == runs - 1
-        t_short = _run_once(clip, path, chain, short)["elapsed"]
-        long_result = _run_once(clip, path, chain, long,
-                                keep_dir=keep_dir if last else None)
-        slopes.append((long_result["elapsed"] - t_short) * 1000.0
-                      / (long - short))
+    for index in range(runs):
+        last = index == runs - 1
+        result = _run_once(
+            clip,
+            chain,
+            frames,
+            keep_dir=keep_dir if last else None,
+        )
+        samples.append(result["elapsed"] * 1000.0 / result["frames"])
         if last:
-            kept = Path(long_result["path"])
-    return statistics.median(slopes), slopes, kept
+            kept = Path(result["path"])
+    assert kept is not None
+    return statistics.median(samples), samples, kept
 
 
-def _compare_outputs(control_mp4: Path, new_mp4: Path) -> dict:
-    """Frame count, geometry, duration, and PSNR between the two outputs."""
-    import mlx.core as mx
+def _probe(path: Path | str) -> list[int | float]:
+    from kinovsr.media.video_reader import probe_video
 
-    from kinovsr.media import pixel_buffers as _pb
-    from kinovsr.media import video_reader as vr
+    width, height, fps, frames, _, _ = probe_video(path)
+    return [width, height, round(fps, 3), frames]
 
-    info = {}
-    probes = {}
-    for name, path in (("control", control_mp4), ("new", new_mp4)):
-        w, h, fps, n, _, _ = vr.probe_video(path)
-        probes[name] = (w, h, round(fps, 3), n)
-    info["geometry_match"] = probes["control"] == probes["new"]
-    info["control_probe"] = probes["control"]
-    info["new_probe"] = probes["new"]
 
-    total, count = 0.0, 0
-    readers = [
-        iter(f for chunk in vr.iter_video_buffer_chunks(
-            p, _pb.PIX_RGBAHALF, chunk_size=4) for f in chunk)
-        for p in (control_mp4, new_mp4)]
-    for a, b in zip(*readers, strict=True):
-        fa = mx.clip(_pb.read_buffer_rgb_f32(a), 0, 1)
-        fb = mx.clip(_pb.read_buffer_rgb_f32(b), 0, 1)
-        diff = fa - fb
-        mse = float(mx.mean(diff * diff))
-        total += 10.0 * (0.0 - float(mx.log10(mx.array(max(mse, 1e-12)))))
-        count += 1
-    info["psnr_between_outputs_db"] = round(total / max(count, 1), 2)
-    info["frames_compared"] = count
-    return info
+def _sha256(path: Path | str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _chip_name() -> str:
+    result = subprocess.run(
+        ["sysctl", "-n", "machdep.cpu.brand_string"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() or platform.machine()
+
+
+def _default_baseline_path() -> Path:
+    from kinovsr.settings import Settings
+
+    return Settings.from_env().shared_temp_dir / "trace_analysis" / BASELINE_FILENAME
+
+
+def _validate_baseline(
+    baseline: dict,
+    *,
+    chip: str,
+    clip_sha256: str,
+    clip_probe: list[int | float],
+    runs: int,
+    frames: int,
+    selected: set[str],
+) -> None:
+    if baseline.get("schema") != BASELINE_SCHEMA:
+        raise ValueError(
+            f"baseline schema must be {BASELINE_SCHEMA}, got {baseline.get('schema')!r}"
+        )
+    expected = {
+        "chip": chip,
+        "clip_sha256": clip_sha256,
+        "clip_probe": clip_probe,
+        "runs": runs,
+        "frames": frames,
+    }
+    mismatches = [
+        f"{key}: baseline={baseline.get(key)!r}, current={value!r}"
+        for key, value in expected.items()
+        if baseline.get(key) != value
+    ]
+    missing = sorted(selected - set(baseline.get("gates", {})))
+    if missing:
+        mismatches.append(f"missing gates: {missing}")
+    if mismatches:
+        raise ValueError("baseline does not match this run: " + "; ".join(mismatches))
+
+
+def _evaluate_gate(
+    measured_ms: float,
+    samples: list[float],
+    output_probe: list[int | float],
+    baseline: dict,
+    *,
+    floor_ms: float,
+    fraction: float,
+) -> dict:
+    baseline_ms = float(baseline["baseline_ms_per_frame"])
+    margin = max(floor_ms, fraction * baseline_ms)
+    delta = measured_ms - baseline_ms
+    timing_pass = delta <= margin
+    behavior_pass = output_probe == baseline["output_probe"]
+    return {
+        "baseline_ms_per_frame": round(baseline_ms, 3),
+        "current_ms_per_frame": round(measured_ms, 3),
+        "delta_ms": round(delta, 3),
+        "delta_pct": round(100.0 * delta / baseline_ms, 2) if baseline_ms else None,
+        "allowed_margin_ms": round(margin, 3),
+        "current_runs": [round(value, 3) for value in samples],
+        "timing_pass": timing_pass,
+        "baseline_output_probe": baseline["output_probe"],
+        "current_output_probe": output_probe,
+        "behavior_pass": behavior_pass,
+        "pass": timing_pass and behavior_pass,
+    }
+
+
+def _write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2) + "\n")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--clip", required=True)
-    parser.add_argument("--runs", type=int, default=2)
-    parser.add_argument("--short", type=int, default=12)
-    parser.add_argument("--long", type=int, default=36)
-    parser.add_argument("--report", default=None,
-                        help="directory for the JSON report")
-    parser.add_argument("--gates", default="pass,learned",
-                        help="comma list of gates to run")
-    parser.add_argument("--worker-path", choices=("control", "new"))
-    parser.add_argument("--worker-chain", choices=("pass", "learned"))
-    parser.add_argument("--frames", type=int)
+    parser.add_argument("--runs", type=int, default=4)
+    parser.add_argument("--frames", type=int, default=36)
+    parser.add_argument(
+        "--baseline",
+        help=(
+            "baseline JSON path; defaults to "
+            "$SHARED_TEMP_DIR/trace_analysis/kinovsr_endpoint_baseline.json"
+        ),
+    )
+    parser.add_argument(
+        "--record-baseline",
+        action="store_true",
+        help="record the selected machine/clip as the new baseline instead of gating",
+    )
+    parser.add_argument(
+        "--report",
+        help="directory for the current-run endpoint_gates_report.json",
+    )
+    parser.add_argument(
+        "--gates",
+        default="pass,learned",
+        help="comma list of gates to run",
+    )
+    parser.add_argument("--worker-chain", choices=tuple(GATES))
     parser.add_argument("--out")
     args = parser.parse_args()
 
-    if args.worker_path:
+    if args.worker_chain:
         from kinovsr.ui.logging import configure_machine_output
 
         configure_machine_output(_result_log.name)
-        ns = argparse.Namespace(
-            path=args.worker_path, chain=args.worker_chain,
-            clip=args.clip, frames=args.frames, out=args.out)
-        _worker(ns)
+        _worker(
+            argparse.Namespace(
+                chain=args.worker_chain,
+                clip=args.clip,
+                frames=args.frames,
+                out=args.out,
+            )
+        )
         return 0
+
+    if args.runs < 1 or args.frames < 1:
+        parser.error("require runs >= 1 and frames >= 1")
+
+    selected = {value.strip() for value in args.gates.split(",") if value.strip()}
+    unknown = sorted(selected - set(GATES))
+    if unknown:
+        parser.error(f"unknown gates: {unknown}")
+    if not selected:
+        parser.error("select at least one gate")
+    if args.record_baseline and selected != set(GATES):
+        parser.error("recording a baseline requires both pass and learned gates")
 
     from kinovsr.ui.logging import configure_logging
 
@@ -235,68 +337,122 @@ def main() -> int:
 
     import mlx.core as mx
 
+    baseline_path = Path(args.baseline) if args.baseline else _default_baseline_path()
+    chip = _chip_name()
+    clip_sha256 = _sha256(args.clip)
+    clip_probe = _probe(args.clip)
+    baseline: dict | None = None
+    if not args.record_baseline:
+        try:
+            baseline = json.loads(baseline_path.read_text())
+            _validate_baseline(
+                baseline,
+                chip=chip,
+                clip_sha256=clip_sha256,
+                clip_probe=clip_probe,
+                runs=args.runs,
+                frames=args.frames,
+                selected=selected,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            _log.error(
+                "cannot use endpoint baseline %s: %s; record it with --record-baseline",
+                baseline_path,
+                exc,
+            )
+            return 2
+
     report: dict = {
+        "schema": BASELINE_SCHEMA,
+        "mode": "record" if args.record_baseline else "gate",
         "machine": platform.platform(),
+        "chip": chip,
         "python": sys.version.split()[0],
         "mlx": mx.__version__,
         "clip": args.clip,
-        "short_frames": args.short, "long_frames": args.long,
+        "clip_sha256": clip_sha256,
+        "clip_probe": clip_probe,
         "runs": args.runs,
+        "frames": args.frames,
+        "baseline": str(baseline_path),
+        "gates": {},
+    }
+    recorded: dict = {
+        "schema": BASELINE_SCHEMA,
+        "chip": chip,
+        "python": sys.version.split()[0],
+        "mlx": mx.__version__,
+        "clip_sha256": clip_sha256,
+        "clip_probe": clip_probe,
+        "runs": args.runs,
+        "frames": args.frames,
         "gates": {},
     }
     failures = []
-    selected = {g.strip() for g in args.gates.split(",") if g.strip()}
     for chain, (label, floor_ms, fraction) in GATES.items():
         if chain not in selected:
             continue
-        keep = Path(tempfile.mkdtemp(prefix=f"gate_{chain}_"))
-        control_ms, control_raw, control_out = _steady_ms(
-            args.clip, "control", chain, args.short, args.long, args.runs,
-            keep_dir=keep)
-        new_ms, new_raw, new_out = _steady_ms(
-            args.clip, "new", chain, args.short, args.long, args.runs,
-            keep_dir=keep)
-        margin = max(floor_ms, fraction * control_ms)
-        delta = new_ms - control_ms
-        ok = delta <= margin
-        behavior = _compare_outputs(control_out, new_out)
+        with tempfile.TemporaryDirectory(prefix=f"gate_{chain}_") as keep_raw:
+            measured_ms, samples, output = _measure_ms(
+                args.clip,
+                chain,
+                args.frames,
+                args.runs,
+                keep_dir=Path(keep_raw),
+            )
+            output_probe = _probe(output)
 
-        entry = {
-            "label": label,
-            "control_ms_per_frame": round(control_ms, 3),
-            "new_ms_per_frame": round(new_ms, 3),
-            "delta_ms": round(delta, 3),
-            "delta_pct": round(100.0 * delta / control_ms, 2)
-            if control_ms else None,
-            "allowed_margin_ms": round(margin, 3),
-            "control_slopes": [round(s, 3) for s in control_raw],
-            "new_slopes": [round(s, 3) for s in new_raw],
-            "timing_pass": ok,
-            "behavior": behavior,
-        }
+        if args.record_baseline:
+            entry = {
+                "label": label,
+                "baseline_ms_per_frame": round(measured_ms, 3),
+                "runs": [round(value, 3) for value in samples],
+                "output_probe": output_probe,
+            }
+            recorded["gates"][chain] = entry
+            report["gates"][chain] = entry
+            _log.info(
+                "[RECORDED] %s: %.2f ms/frame; output=%s",
+                label,
+                measured_ms,
+                output_probe,
+            )
+            continue
+
+        assert baseline is not None
+        entry = _evaluate_gate(
+            measured_ms,
+            samples,
+            output_probe,
+            baseline["gates"][chain],
+            floor_ms=floor_ms,
+            fraction=fraction,
+        )
+        entry["label"] = label
         report["gates"][chain] = entry
-        status = "PASS" if ok and behavior["geometry_match"] else "FAIL"
-        if status == "FAIL":
+        status = "PASS" if entry["pass"] else "FAIL"
+        if not entry["pass"]:
             failures.append(chain)
-        log = _log.info if status == "PASS" else _log.error
+        log = _log.info if entry["pass"] else _log.error
         log(
-            "[%s] %s: control %.2f ms/frame, new %.2f ms/frame, "
-            "delta %+.2f (margin %.2f); psnr-between %s dB",
+            "[%s] %s: baseline %.2f ms/frame, current %.2f, "
+            "delta %+.2f (margin %.2f); output=%s",
             status,
             label,
-            control_ms,
-            new_ms,
-            delta,
-            margin,
-            behavior["psnr_between_outputs_db"],
+            entry["baseline_ms_per_frame"],
+            entry["current_ms_per_frame"],
+            entry["delta_ms"],
+            entry["allowed_margin_ms"],
+            "MATCH" if entry["behavior_pass"] else "MISMATCH",
         )
 
+    if args.record_baseline:
+        _write_json(baseline_path, recorded)
+        _log.info("baseline: %s", baseline_path)
     if args.report:
-        out = Path(args.report)
-        out.mkdir(parents=True, exist_ok=True)
-        path = out / "endpoint_gates_report.json"
-        path.write_text(json.dumps(report, indent=2))
-        _log.info("report: %s", path)
+        report_path = Path(args.report) / "endpoint_gates_report.json"
+        _write_json(report_path, report)
+        _log.info("report: %s", report_path)
     return 1 if failures else 0
 
 

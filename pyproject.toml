@@ -115,30 +115,5 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-# Scripts are CLI/diagnostic entry points; print() is legitimate user output
-# there.
-"scripts/**" = ["T20"]
-# Inherited family implementations and standalone conversion/demo paths still
-# emit bare print output. New orchestration modules (cli, ui, config, api,
-# settings, reporting) use logging or the reporter and stay out of this list.
-"kinovsr/processors/basicvsrpp/**" = ["T20"]
-"kinovsr/modeling/deform_conv.py" = ["T20"]
-"kinovsr/modeling/spynet/convert_spynet.py" = ["T20"]
-"kinovsr/eval/models/dover/**" = ["T20"]
-"kinovsr/processors/esc/**" = ["T20"]
-"kinovsr/processors/fbcnn/**" = ["T20"]
-"kinovsr/media/ffmpeg_encoder.py" = ["T20"]
-"kinovsr/eval/models/musiq/**" = ["T20"]
-"kinovsr/processors/nafnet/**" = ["T20"]
-"kinovsr/processors/realbasicvsr/**" = ["T20"]
-"kinovsr/processors/realesrgan/**" = ["T20"]
-"kinovsr/processors/realplksr/**" = ["T20"]
-"kinovsr/processors/realviformer/**" = ["T20"]
-"kinovsr/processors/safmn/**" = ["T20"]
-"kinovsr/processors/stdf/**" = ["T20"]
-"kinovsr/native/temporal.py" = ["T20"]
-"kinovsr/processors/toflow/**" = ["T20"]
-"kinovsr/native/vsr.py" = ["T20"]
-"kinovsr/native/writer.py" = ["T20"]
 # Transitional: legacy tests predate KinoMLX's stricter pytest style.
 "tests/**" = ["PT006", "PT011", "PT018"]
