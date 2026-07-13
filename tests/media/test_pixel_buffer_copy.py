@@ -16,7 +16,7 @@ pytestmark = pytest.mark.integration
 _H = _W = 8
 
 def _make(fmt_name: str):
-    from kinovsr.native.compat import Quartz
+    from kinovsr.native.frameworks import Quartz
     attrs = {
         Quartz.kCVPixelBufferPixelFormatTypeKey: getattr(pb, fmt_name),
         Quartz.kCVPixelBufferWidthKey: _W,

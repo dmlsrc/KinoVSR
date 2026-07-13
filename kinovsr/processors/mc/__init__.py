@@ -19,7 +19,7 @@ import mlx.core as mx
 from kinovsr.config.helpers import reject_unknown_keys, typed_value
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.modeling.vsr_blocks import compiled_spynet_flow
-from kinovsr.native.compat import Foundation, Quartz, autorelease_pool, vt
+from kinovsr.native.frameworks import Foundation, Quartz, autorelease_pool, vt
 from kinovsr.native.vsr import _suppress_native_stderr
 from kinovsr.processors.capabilities import (
     Capability,

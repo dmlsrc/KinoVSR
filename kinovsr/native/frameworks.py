@@ -1,4 +1,4 @@
-"""Shared PyObjC framework imports for the native KinoVSR modules."""
+"""Shared PyObjC framework bindings for KinoVSR's native modules."""
 
 from __future__ import annotations
 

@@ -30,7 +30,7 @@ def _np_frame(kind: str) -> np.ndarray:
 
 
 def _make_buffer(fmt: int):
-    from kinovsr.native.compat import Quartz
+    from kinovsr.native.frameworks import Quartz
     attrs = {
         Quartz.kCVPixelBufferPixelFormatTypeKey: fmt,
         Quartz.kCVPixelBufferWidthKey: _W,
@@ -71,7 +71,7 @@ def test_retype_range_copy_reinterprets_not_rescales():
     under the video-range identity, exactly black under full-range.
     """
     from kinovsr.media import video_reader as vr
-    from kinovsr.native.compat import Quartz, vt
+    from kinovsr.native.frameworks import Quartz, vt
 
     src = _make_buffer(vr._YUV10_VIDEO)
     # Y plane: code 0. Chroma plane: neutral (10-bit 512, left-justified in

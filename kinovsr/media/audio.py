@@ -8,7 +8,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.native.compat import CoreAudio, CoreMedia
+from kinovsr.native.frameworks import CoreAudio, CoreMedia
 
 # CoreAudio FormatID constants (avoid importing the whole module just for these)
 AUDIO_FORMAT_LPCM = 1819304813     # 'lpcm' kAudioFormatLinearPCM
@@ -134,7 +134,7 @@ def read_wav(path: Any) -> tuple[int, mx.array]:
     scipy / soundfile. Samples come straight from the AVAudioPCMBuffer's
     deinterleaved float channels via the buffer protocol.
     """
-    from kinovsr.native.compat import Foundation, av
+    from kinovsr.native.frameworks import Foundation, av
 
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     audio_file, err = av.AVAudioFile.alloc().initForReading_error_(url, None)
@@ -197,7 +197,7 @@ def _write_wav(samples: Any, path: Any, sample_rate: int, *, float32: bool) -> N
     written into a float32 AVAudioPCMBuffer and AVAudioFile converts to the file
     format and writes the container/header.
     """
-    from kinovsr.native.compat import Foundation, av
+    from kinovsr.native.frameworks import Foundation, av
 
     w = mx.array(samples, dtype=mx.float32)
     if w.ndim == 3:
@@ -244,7 +244,7 @@ def write_wav_float32(audio_waveform: Any, path: Any, sample_rate: int) -> None:
 
 def audio_writer_settings(codec: str, sample_rate: int, channels: int) -> dict:
     """AVAssetWriterInput output settings for the configured audio codec."""
-    from kinovsr.native.compat import av  # late import so the module loads without pyobjc
+    from kinovsr.native.frameworks import av
 
     if codec == "alac":
         return {

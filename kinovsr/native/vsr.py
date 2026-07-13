@@ -18,7 +18,7 @@ from typing import Any
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.settings import default_settings
 
-from .compat import Quartz, vt
+from .frameworks import Quartz, vt
 
 
 @contextmanager

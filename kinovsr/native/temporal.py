@@ -25,7 +25,7 @@ from typing import Any
 
 from kinovsr.media import pixel_buffers as _pb
 
-from .compat import vt
+from .frameworks import vt
 
 
 class VtfrcSession:

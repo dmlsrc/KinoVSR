@@ -25,7 +25,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.native.compat import Foundation, Quartz, autorelease_pool
+from kinovsr.native.frameworks import Foundation, Quartz, autorelease_pool
 
 from .pixel_buffers import ci_context, srgb_colorspace
 

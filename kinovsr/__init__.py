@@ -33,8 +33,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .media.audio import AudioTrack
-    from .native.compat import autorelease_pool
     from .native.encode import encode_video_videotoolbox
+    from .native.frameworks import autorelease_pool
     from .native.temporal import VtfrcSession
     from .native.vsr import VsrSession
     from .native.writer import AVWriter
@@ -50,7 +50,7 @@ _EXPORTS = {
     "CutDetector": ("kinovsr.processors.cut_detect", "CutDetector"),
     "VsrSession": ("kinovsr.native.vsr", "VsrSession"),
     "VtfrcSession": ("kinovsr.native.temporal", "VtfrcSession"),
-    "autorelease_pool": ("kinovsr.native.compat", "autorelease_pool"),
+    "autorelease_pool": ("kinovsr.native.frameworks", "autorelease_pool"),
     "encode_video_videotoolbox": ("kinovsr.native.encode",
                                   "encode_video_videotoolbox"),
 }

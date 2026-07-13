@@ -13,7 +13,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.native.compat import CoreMedia, Foundation, Quartz
+from kinovsr.native.frameworks import CoreMedia, Foundation, Quartz
 
 # FourCC pixel-format constants ----------------------------------------------
 #

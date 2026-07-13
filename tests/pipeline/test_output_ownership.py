@@ -34,7 +34,7 @@ def _cv_spec() -> StreamSpec:
 
 def _cv_unit():
     from kinovsr.media import pixel_buffers as pb
-    from kinovsr.native.compat import Quartz
+    from kinovsr.native.frameworks import Quartz
     attrs = {
         Quartz.kCVPixelBufferPixelFormatTypeKey: pb.PIX_RGBAHALF,
         Quartz.kCVPixelBufferWidthKey: 8,

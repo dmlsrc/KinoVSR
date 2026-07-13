@@ -19,7 +19,7 @@ from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media import yuv as _yuv
 from kinovsr.media.audio import AudioTrack, audio_writer_settings
 
-from .compat import (
+from .frameworks import (
     CoreMedia,
     Foundation,
     Quartz,

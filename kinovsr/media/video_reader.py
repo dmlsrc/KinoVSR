@@ -27,7 +27,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from kinovsr.native.compat import CoreMedia, Foundation, Quartz, av, vt
+from kinovsr.native.frameworks import CoreMedia, Foundation, Quartz, av, vt
 
 from . import pixel_buffers as _pb
 
