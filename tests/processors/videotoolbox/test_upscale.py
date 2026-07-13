@@ -118,8 +118,11 @@ class TestParseAndSpec:
         assert FACTORY.preferred_source_layout(
             capability=Capability.UPSCALE,
             profile="balanced") is Layout.CV_RGBA_HALF
+        # A head interpolate decodes straight into the FRC's CV currency
+        # (MLX stays accepted mid-chain via the upload bridge).
         assert FACTORY.preferred_source_layout(
-            capability=Capability.INTERPOLATE, profile="normal") is None
+            capability=Capability.INTERPOLATE,
+            profile="normal") is Layout.CV_RGBA_HALF
 
     @pytest.mark.parametrize("mode,max_w,max_h", [
         ("fast", 960, 960), ("balanced", 1920, 1080), ("image", 1920, 1080),

@@ -40,7 +40,8 @@ def wants_auto_geometry(config: dict) -> bool:
     for name in config.get("pipeline") or []:
         table = config.get(name) or {}
         family = table.get("processor")
-        if family == "crop" and table.get("bars") == "auto":
+        if family == "crop" and ("auto" in (table.get("bars"),
+                                          table.get("trim"))):
             return True
         if family == "sanitize_edges" and table.get("edges") == "auto":
             return True
@@ -113,7 +114,8 @@ def resolve_auto_geometry(
     for name in config.get("pipeline") or []:
         table = dict(config.get(name) or {})
         family = table.get("processor")
-        is_auto = ((family == "crop" and table.get("bars") == "auto")
+        is_auto = ((family == "crop"
+                    and "auto" in (table.get("bars"), table.get("trim")))
                    or (family == "sanitize_edges"
                        and table.get("edges") == "auto"))
         if family not in _GEOMETRY_FAMILIES:
@@ -127,17 +129,49 @@ def resolve_auto_geometry(
                 f"cannot follow stage '{scaled_past}', which changes what "
                 f"this stage would see - state literal counts or move the "
                 f"stage before it")
-        if family == "crop" and table.get("bars") == "auto":
-            bars = detect_bars(samples)
-            if any(bars):
-                table["bars"] = ",".join(str(b) for b in bars)
-                _log.info("[crop] auto: bars top=%d bottom=%d left=%d "
-                          "right=%d px", *bars)
-            elif table.get("aspect"):
-                del table["bars"]   # aspect-only crop remains meaningful
-                _log.info("[crop] auto: no bars detected; aspect window kept")
-            else:
-                _log.info("[crop] auto: no bars detected; stage %r removed",
+        if family == "crop" and (table.get("bars") == "auto"
+                                 or table.get("trim") == "auto"):
+            if table.get("bars") == "auto":
+                bars = detect_bars(samples)
+                if any(bars):
+                    table["bars"] = ",".join(str(b) for b in bars)
+                    _log.info("[crop] auto: bars top=%d bottom=%d left=%d "
+                              "right=%d px", *bars)
+                else:
+                    del table["bars"]
+                    _log.info("[crop] auto: no bars detected")
+            if table.get("trim") == "auto":
+                # Junk-edge TRIM (the harness's sanitize fill="trim"):
+                # detect on the post-bars picture, keep the active area
+                # even (the harness's +1px bump into the content), fold
+                # into bars.
+                from kinovsr.edge_sanitize import parse_edges_spec
+
+                bars_now = (parse_edges_spec(table["bars"])
+                            if table.get("bars") else (0, 0, 0, 0))
+                sub = _crop_samples(samples, bars_now)
+                edges, notices = detect_junk_edges(sub)
+                for note in notices:
+                    _log.info("[sanitize] %s", note)
+                if any(edges) and sub:
+                    te = list(edges)
+                    h = int(sub[0].shape[0])
+                    w = int(sub[0].shape[1])
+                    if (h - te[0] - te[1]) % 2:
+                        te[1] += 1
+                    if (w - te[2] - te[3]) % 2:
+                        te[3] += 1
+                    folded = tuple(b + t for b, t
+                                   in zip(bars_now, te, strict=True))
+                    table["bars"] = ",".join(str(b) for b in folded)
+                    _log.info("[sanitize] trim: top=%d bottom=%d left=%d "
+                              "right=%d px cropped off", *te)
+                else:
+                    _log.info("[sanitize] trim: no junk edges detected")
+                del table["trim"]
+            if not (table.get("bars") or table.get("trim")
+                    or table.get("aspect")):
+                _log.info("[crop] auto: nothing detected; stage %r removed",
                           name)
                 resolved.pop(name, None)
                 continue

@@ -40,6 +40,7 @@ _ANCHOR_TOKENS = (
 @dataclasses.dataclass(frozen=True, slots=True)
 class CropStageConfig:
     bars: tuple[int, int, int, int]     # (top, bottom, left, right)
+    trim: tuple[int, int, int, int]     # junk-edge trim, folded after bars
     aspect: tuple[int, int] | None      # display aspect of the window
     anchor: str
     offset: tuple[int, int]             # (dx, dy), right/down positive
@@ -49,13 +50,17 @@ def _combined_crop(width: int, height: int, pixel_aspect,
                    config: CropStageConfig) -> tuple[int, int, int, int]:
     """Total (top, bottom, left, right) crop for a frame of WxH.
 
-    ``aspect`` is a DISPLAY aspect; on anamorphic sources the pixel
-    aspect folds into the storage-domain target (display = storage *
-    PAR), so 16:9 means 16:9 on screen regardless of storage shape.
+    ``trim`` (junk-edge bands cropped off rather than filled) folds
+    additively with ``bars`` before the aspect window - the harness's
+    bars -> trim -> aspect order. ``aspect`` is a DISPLAY aspect; on
+    anamorphic sources the pixel aspect folds into the storage-domain
+    target (display = storage * PAR), so 16:9 means 16:9 on screen
+    regardless of storage shape.
     """
     from fractions import Fraction as _F
 
-    t, b, left, r = config.bars
+    t, b, left, r = (bar + trim for bar, trim
+                     in zip(config.bars, config.trim, strict=True))
     inner_w, inner_h = width - left - r, height - t - b
     if inner_w < 2 or inner_h < 2:
         raise ValueError(
@@ -121,9 +126,12 @@ class CropFactory:
         profile: str | None,
         settings: Settings,
     ) -> CropStageConfig:
-        reject_unknown_keys(raw, ("bars", "aspect", "anchor", "offset"))
+        reject_unknown_keys(raw, ("bars", "trim", "aspect", "anchor",
+                                  "offset"))
         bars_spec = typed_value(raw, "bars", str)
         bars = parse_edges_spec(bars_spec) if bars_spec else (0, 0, 0, 0)
+        trim_spec = typed_value(raw, "trim", str)
+        trim = parse_edges_spec(trim_spec) if trim_spec else (0, 0, 0, 0)
         aspect_spec = typed_value(raw, "aspect", str)
         aspect: tuple[int, int] | None = None
         if aspect_spec:
@@ -134,9 +142,9 @@ class CropFactory:
             aspect = (int(parts[0]), int(parts[1]))
             if aspect[0] <= 0 or aspect[1] <= 0:
                 raise ValueError("aspect must be positive")
-        if bars == (0, 0, 0, 0) and aspect is None:
+        if bars == trim == (0, 0, 0, 0) and aspect is None:
             raise ValueError(
-                "state bars and/or aspect; a crop stage that crops "
+                "state bars, trim, and/or aspect; a crop stage that crops "
                 "nothing is config noise")
         anchor = typed_value(raw, "anchor", str, "center")
         if anchor not in _ANCHOR_TOKENS:
@@ -146,7 +154,7 @@ class CropFactory:
         if len(parts) != 2:
             raise ValueError(f"offset must be DX,DY, got {offset_spec!r}")
         return CropStageConfig(
-            bars=bars, aspect=aspect, anchor=anchor,
+            bars=bars, trim=trim, aspect=aspect, anchor=anchor,
             offset=(int(parts[0]), int(parts[1])))
 
     def build(self, config: CropStageConfig, *,

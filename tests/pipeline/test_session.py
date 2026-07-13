@@ -196,10 +196,13 @@ class TestLayoutParity:
             session = open_pipeline(config, spec(layout=layout),
                                     settings=SETTINGS)
             assert session.output_spec.timeline.cadence == Fraction(50)
-        mlx_spec = spec()   # MLX layout refused by the CV-only family...
-        with pytest.raises(StreamEdgeError):
-            open_pipeline(config, mlx_spec, settings=SETTINGS)
-        # ...and accepted by an MLX family, through the same validator.
+        # An MLX input uploads into the FRC session (the learned-upscale ->
+        # --target-fps shape), so the SAME chain validates and produces the
+        # session's CV currency.
+        mlx_spec = spec()
+        session = open_pipeline(config, mlx_spec, settings=SETTINGS)
+        assert session.output_spec.frame.layout is Layout.CV_RGBA_HALF
+        # An MLX family accepts MLX through the same validator.
         mlx_config = {"pipeline": ["up"],
                       "up": {"processor": "metalfx", "scale": 2}}
         session = open_pipeline(mlx_config, mlx_spec, settings=SETTINGS)

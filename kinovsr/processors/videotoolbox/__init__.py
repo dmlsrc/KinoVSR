@@ -93,7 +93,15 @@ def _produces(spec: StreamSpec, config: object) -> StreamSpec:
                      if config.target_fps > spec.timeline.cadence
                      else Cardinality.MANY_TO_ONE),
     )
-    return dataclasses.replace(spec, timeline=timeline)
+    frame = spec.frame
+    if frame.layout is Layout.MLX_RGB_HWC:
+        # MLX frames upload into RGBAHalf buffers for the FRC session (a
+        # learned upscale followed by --target-fps, the harness shape
+        # where FRC ran on the writer-bound buffers); the output is the
+        # session's native CV currency.
+        frame = dataclasses.replace(
+            frame, layout=Layout.CV_RGBA_HALF, dtype=DType.FLOAT16)
+    return dataclasses.replace(spec, timeline=timeline, frame=frame)
 
 
 class VtInterpolateProcessor:
@@ -143,6 +151,20 @@ class VtInterpolateProcessor:
         cadence = input_spec.timeline.cadence
         geometry = input_spec.frame.geometry
         self._time_base = input_spec.timeline.time_base
+        # An MLX input uploads each frame into an IOSurface-backed
+        # RGBAHalf buffer for the session (the learned-upscale ->
+        # --target-fps shape); CV inputs feed straight through.
+        self._upload_pool = None
+        if input_spec.frame.layout is Layout.MLX_RGB_HWC:
+            from kinovsr.media import pixel_buffers as _pb
+
+            self._pb = _pb
+            self._upload_pool = _pb.make_pool_from_attrs({
+                "PixelFormatType": _pb.PIX_RGBAHALF,
+                "Width": geometry.width, "Height": geometry.height,
+                "IOSurfaceProperties": {},
+                "MetalCompatibility": True,
+            })
         try:
             self._session = VtfrcSession(
                 geometry.width, geometry.height,
@@ -159,8 +181,19 @@ class VtInterpolateProcessor:
             self._origin = unit.pts
         index = self._source_index
         self._source_index += 1
-        for payload in self._session.feed(unit.payload, index):
-            yield self._emit(payload)
+        payload = unit.payload
+        if self._upload_pool is not None:
+            import mlx.core as mx
+
+            rgb = payload
+            rgba = mx.concatenate(
+                [rgb[..., :3].astype(mx.float16),
+                 mx.ones((*rgb.shape[:2], 1), mx.float16)], axis=-1)
+            buffer = self._pb.pool_create_buffer(self._upload_pool)
+            self._pb.upload_frame_to_buffer(rgba, buffer)
+            payload = buffer
+        for produced in self._session.feed(payload, index):
+            yield self._emit(produced)
 
     def reset(self, boundary: Boundary,
               context: PipelineContext) -> None:
@@ -291,7 +324,7 @@ class VideoToolboxFactory:
             profiles=_PROFILES,
             accepts=StreamConstraint(
                 layouts=(Layout.CV_BGRA, Layout.CV_RGBA_HALF,
-                         Layout.CV_NV12),
+                         Layout.CV_NV12, Layout.MLX_RGB_HWC),
                 cadences=(Fraction,),      # CFR sources only
             ),
             produces=_produces,
@@ -358,6 +391,11 @@ class VideoToolboxFactory:
         preference."""
         if capability is Capability.UPSCALE:
             return _UPSCALE_NATIVE_SRC[profile or "balanced"]
+        if capability is Capability.INTERPOLATE:
+            # The FRC session's currency; MLX is accepted mid-chain (a
+            # learned upscale feeding --target-fps) but a HEAD interpolate
+            # should decode straight into buffers, not upload per frame.
+            return Layout.CV_RGBA_HALF
         return None
 
 
