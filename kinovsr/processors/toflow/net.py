@@ -158,7 +158,7 @@ def _fold_convs(graph: dict, params: dict) -> dict:
             if len(kids) != 3:
                 raise ValueError("TOFlow direct: unexpected level arity")
             ct_down, ct_warp, refine = kids
-            sel1, sel2, coarser = E.kids(E.typed(ct_down, "nn.ConcatTable"), 3)
+            _, _, coarser = E.kids(E.typed(ct_down, "nn.ConcatTable"), 3)
             inner = E.kids(E.typed(coarser, "nn.Sequential"))
             # [ParallelTable(pool,pool,Identity), REC, Upsample, MulConstant]
             if len(inner) != 4:

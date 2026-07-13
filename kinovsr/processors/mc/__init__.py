@@ -222,7 +222,6 @@ class McTemporalDenoiser:
             self._hist = []
             self._pool = None
             self._workers = []
-            self._idx = 0
             return
         cls = vt.VTOpticalFlowConfiguration
         if not cls.isSupported():
@@ -246,7 +245,6 @@ class McTemporalDenoiser:
         )
         self._prev: Any = None       # previous OUTPUT frame (recursive mode)
         self._hist: list[Any] = []   # last N INPUT frames, oldest first (FIR mode)
-        self._idx = 0
         if self_test:
             try:
                 self._self_test_flow()
@@ -546,7 +544,6 @@ class McTemporalDenoiser:
             self._hist.append(curr)                     # FIR: keep input frames
             if len(self._hist) > self.window:
                 self._hist.pop(0)
-        self._idx += 1
 
 
 

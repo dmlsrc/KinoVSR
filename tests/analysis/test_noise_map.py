@@ -712,7 +712,7 @@ def test_row_spectrum_detects_jumping_scanlines():
     base = _content()
     clip = []
     for t in range(T):
-        phase = int(mx.random.randint(0, 11).item()) if False else (t * 5) % 11
+        phase = (t * 5) % 11
         rows = ((mx.arange(H) + phase) % 11 < 1).astype(mx.float32)
         keep = (mx.random.uniform(shape=(H,)) >= 0.3).astype(mx.float32)
         lines = (rows * keep).reshape(H, 1, 1)

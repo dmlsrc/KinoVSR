@@ -19,10 +19,10 @@ Then it makes the weights MLX-friendly: strips DataParallel 'module.' prefixes,
 demotes float64 -> float32, drops non-tensor entries, and verifies the output
 loads with mlx.core.load().
 
-    scripts/pth_to_safetensors.py model.pth                  # -> model.safetensors
-    scripts/pth_to_safetensors.py model.pth -o weights.safetensors
-    scripts/pth_to_safetensors.py ckpt.pth --strip-prefix "" --keep-fp64
-    scripts/pth_to_safetensors.py ckpt.pth --only-prefix generator_ema. --strip-prefix generator_ema.
+    scripts/dev/pth_to_safetensors.py model.pth                  # -> model.safetensors
+    scripts/dev/pth_to_safetensors.py model.pth -o weights.safetensors
+    scripts/dev/pth_to_safetensors.py ckpt.pth --strip-prefix "" --keep-fp64
+    scripts/dev/pth_to_safetensors.py ckpt.pth --only-prefix generator_ema. --strip-prefix generator_ema.
 """
 
 from __future__ import annotations

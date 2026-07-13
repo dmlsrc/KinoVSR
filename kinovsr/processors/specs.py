@@ -313,7 +313,7 @@ def frame_spec_for_matrix(
 
     ``matrix_token`` accepts the resolve()-style tokens (``bt709``/``709``,
     ...); primaries and transfer follow the matrix family, matching how
-    ``kinovsr.color`` pairs them.
+    ``kinovsr.media.color`` pairs them.
     """
     matrix = _MATRIX_TOKENS.get(str(matrix_token).lower())
     if matrix is None:

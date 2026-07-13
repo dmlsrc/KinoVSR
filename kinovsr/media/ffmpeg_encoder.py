@@ -1,7 +1,7 @@
 """ffmpeg (software-codec) encode backend for KinoVSR outputs.
 
 This is one of two encode backends. The other is the VideoToolbox /
-AVAssetWriter backend in `kinovsr.encode`
+AVAssetWriter backend in `kinovsr.native.encode`
 (`encode_video_videotoolbox`), which hardware-encodes the `default` tier.
 The `default` tier auto-routes to VideoToolbox; this ffmpeg backend handles
 the tiers VideoToolbox does not: `web` (libx264 - software x264 produces
@@ -79,18 +79,6 @@ COLOR_TAGS_BT709 = [
     "-colorspace", "bt709",
     "-color_range", "tv",
 ]
-
-# For RGB-domain streams (gbrp10le etc.), set matrix_coefficients=0 (identity)
-# so the decoder doesn't apply a YUV->RGB conversion. Required when encoding
-# RGB-direct (e.g. libx265 lossless gbrp10le). Currently used only by the
-# harness's benchmark presets; documented here for future HDR / extended tiers.
-COLOR_TAGS_RGB = [
-    "-color_primaries", "bt709",
-    "-color_trc", "bt709",
-    "-colorspace", "gbr",
-    "-color_range", "pc",
-]
-
 
 def scale_filter(pix_fmt: str) -> list[str]:
     """RGB->{YUV or RGB} color conversion filter chain.
@@ -293,7 +281,7 @@ def encode_video_ffmpeg(
     temp path and deleted once ffmpeg consumes it.
 
     `audio_onset_trim_mode` / `audio_onset_trim_ms` route through to
-    `kinovsr.audio.mitigate_onset()` before WAV writing.  Default
+    `kinovsr.media.audio.mitigate_onset()` before WAV writing.  Default
     is "auto" (detect-then-zero-fill); pass "off" to disable.  The trim
     is applied to BOTH the ffmpeg input and (if kept) the sidecar so the
     on-disk artifact and the muxed track agree.
@@ -339,7 +327,7 @@ def encode_video_ffmpeg(
             )
         # Sequence-start onset mitigation, applied once here so both the
         # ffmpeg input WAV and the optional sidecar carry the cleaned
-        # waveform.  See kinovsr.audio for the detector spec.
+        # waveform.  See kinovsr.media.audio for the detector spec.
         from .audio import DEFAULT_TRIM_MS, mitigate_onset
 
         onset_trim_ms = (

@@ -1,7 +1,7 @@
 """High-level VideoToolbox encode helper for KinoVSR pipelines.
 
 `encode_video_videotoolbox()` is the AVAssetWriter-backed sister of
-`kinovsr.ffmpeg_encoder.encode_video_ffmpeg()`.  It accepts the same frame
+`kinovsr.media.ffmpeg_encoder.encode_video_ffmpeg()`. It accepts the same frame
 list / audio waveform shape used by MLX video pipelines and emits an
 HEVC mp4 - no ffmpeg, no on-disk WAV unless `save_audio_sidecar=True`.
 

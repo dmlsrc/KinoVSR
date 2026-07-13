@@ -62,8 +62,8 @@ _CASES = [
 
 @pytest.mark.skipif(not _have_pyobjc(), reason="pyobjc / VideoToolbox unavailable")
 @pytest.mark.parametrize("container", ["numpy", "mlx"])
-@pytest.mark.parametrize("case_id,kind,fmt_name,golden", _CASES, ids=[c[0] for c in _CASES])
-def test_upload_chroma_roundtrip(container, case_id, kind, fmt_name, golden):
+@pytest.mark.parametrize("_case_id,kind,fmt_name,golden", _CASES, ids=[c[0] for c in _CASES])
+def test_upload_chroma_roundtrip(container, _case_id, kind, fmt_name, golden):
     frame = _np_frame(kind)
     if container == "mlx":
         frame = mx.array(frame)

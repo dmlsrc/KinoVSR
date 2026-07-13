@@ -187,7 +187,7 @@ def _latest_post(out_dir: Path) -> Path | None:
     return posts[-1] if posts else None
 
 
-def run_harness(args: argparse.Namespace, clip: dict[str, Any], variant: dict[str, Any]) -> dict[str, Any]:
+def run_variant(args: argparse.Namespace, clip: dict[str, Any], variant: dict[str, Any]) -> dict[str, Any]:
     label = str(clip["label"])
     name = str(variant["name"])
     out_dir = args.output_root / label / name
@@ -317,7 +317,7 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
         clip_dir.mkdir(parents=True, exist_ok=True)
         manifest: dict[str, str] = {}
         for variant in args.variants:
-            run = run_harness(args, clip, variant)
+            run = run_variant(args, clip, variant)
             summary["runs"].append(run)
             if post := run.get("post"):
                 manifest[str(variant["name"])] = str(post)

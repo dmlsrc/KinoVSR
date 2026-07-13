@@ -160,7 +160,7 @@ class RichReporter:
         self._progress.start()
         return self
 
-    def __exit__(self, *exc_info: object) -> None:
+    def __exit__(self, *_exc_info: object) -> None:
         self._progress.stop()
 
     # -- Reporter protocol -------------------------------------------------

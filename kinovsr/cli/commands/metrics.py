@@ -21,9 +21,9 @@ keeps a 3-frame ring buffer in memory, computes per-frame TSD plus an
 of luma at any time regardless of video resolution.
 
 Usage:
-    scripts/compare_video_shimmer.py <video-a> <video-b>
-    scripts/compare_video_shimmer.py a.mp4 b.mp4 --label-a image --label-b balanced
-    scripts/compare_video_shimmer.py a.mp4 b.mp4 --grid 16  # finer spatial grid
+    kinovsr metrics shimmer <video-a> <video-b>
+    kinovsr metrics shimmer a.mp4 b.mp4 --label-a image --label-b balanced
+    kinovsr metrics shimmer a.mp4 b.mp4 --grid 16  # finer spatial grid
 """
 from __future__ import annotations
 
@@ -179,6 +179,12 @@ def run_shimmer(argv: list[str] | None = None) -> int:
             f"video dimensions differ: {args.video_a} is {wa}x{ha}, "
             f"{args.video_b} is {wb}x{hb}. TSD comparison requires matched resolutions."
         )
+    if abs(fps_a - fps_b) > 1e-3:
+        p.error(
+            f"video frame rates differ: {args.video_a} is {fps_a:.6g} fps, "
+            f"{args.video_b} is {fps_b:.6g} fps. TSD comparison requires "
+            "matched frame rates."
+        )
     fps = fps_a  # for per-second bucketing
     w, h = wa, ha
 
@@ -290,4 +296,3 @@ def run_metrics_command(argv: list[str]) -> int:
     _print(f"unknown metrics subcommand {name!r} "
            f"(available: {', '.join(_SUBCOMMANDS)})")
     return 2
-

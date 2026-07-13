@@ -88,16 +88,6 @@ def frame_pts(frame_index: int, fps: float) -> Any:
     return CoreMedia.CMTimeMake(frame_index * frame_duration, VIDEO_TIME_SCALE)
 
 
-# ---------------------------------------------------------------------------
-# Pixel format inspection
-# ---------------------------------------------------------------------------
-
-def buffer_dims(pb: Any) -> tuple[int, int]:
-    """(width, height) of a CVPixelBuffer, in pixels."""
-    require_pyobjc()
-    return int(Quartz.CVPixelBufferGetWidth(pb)), int(Quartz.CVPixelBufferGetHeight(pb))
-
-
 def resolve_pixel_format(attrs: dict) -> int:
     """Extract the PixelFormatType from a VT config's attributes dict.
 
@@ -222,30 +212,6 @@ def copy_pixel_buffer(pb: Any) -> Any:
         Quartz.CVPixelBufferUnlockBaseAddress(dst, 0)
         Quartz.CVPixelBufferUnlockBaseAddress(pb, 1)
     return dst
-
-
-def make_bgra_buffer(adaptor: Any, width: int, height: int) -> Any:
-    """Get a BGRA CVPixelBuffer for the comparison composite output.
-
-    Prefers the AVAssetWriter adaptor's own pool (zero-copy into the encoder);
-    falls back to fresh allocation if the pool isn't ready yet.
-    """
-    require_pyobjc()
-    pool = adaptor.pixelBufferPool() if adaptor is not None else None
-    if pool is not None:
-        pb = pool_create_buffer(pool)
-        if pb is not None:
-            return pb
-    attrs = {
-        Quartz.kCVPixelBufferPixelFormatTypeKey: PIX_BGRA,
-        Quartz.kCVPixelBufferWidthKey: width,
-        Quartz.kCVPixelBufferHeightKey: height,
-        Quartz.kCVPixelBufferIOSurfacePropertiesKey: {},
-    }
-    err, pb = Quartz.CVPixelBufferCreate(None, width, height, PIX_BGRA, attrs, None)
-    if err != 0:
-        raise RuntimeError(f"CVPixelBufferCreate({width}x{height}, BGRA) failed: {err}")
-    return pb
 
 
 # ---------------------------------------------------------------------------

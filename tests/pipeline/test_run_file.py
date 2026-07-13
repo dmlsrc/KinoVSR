@@ -7,6 +7,7 @@ against a real container with a real audio track and the output file's
 video and audio timelines must agree.
 """
 
+import logging
 import math
 from pathlib import Path
 
@@ -95,6 +96,13 @@ def _stream_seconds(path):
 
 
 class TestFileSource:
+    def test_probe_reports_resolved_source_color(self, clip, caplog):
+        with caplog.at_level(logging.INFO, logger="kinovsr.pipeline.run"):
+            FileSource(clip)
+        assert any(
+            message.startswith("Source color:")
+            for message in caplog.messages)
+
     def test_probe_produces_concrete_spec(self, clip):
         source = FileSource(clip)
         frame = source.spec.frame

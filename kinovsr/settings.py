@@ -115,11 +115,10 @@ class Settings:
     # ---- UX ---------------------------------------------------------------
 
     # Keep native VideoToolbox/AVFoundation logs on stderr (historically any
-    # non-empty KINOVSR_VERBOSE enabled this; see kinovsr/vsr.py).
+    # non-empty KINOVSR_VERBOSE enabled this; see kinovsr/native/vsr.py).
     verbose: bool = field(default=False, metadata={"env": "{{KINOVSR_VERBOSE}}"})
 
     quiet: bool = field(default=False, metadata={"env": "{{KINOVSR_QUIET}}"})
-    json_output: bool = field(default=False, metadata={"env": "{{KINOVSR_JSON}}"})
 
     # ---- Scratch / performance ---------------------------------------------
 

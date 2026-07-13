@@ -74,23 +74,6 @@ HQ_MAX_INPUT_W = 1920
 HQ_MAX_INPUT_H = 1080
 
 
-def source_format_for_mode(mode: str) -> int:
-    """The CVPixelBuffer format VSR consumes as its source for this mode.
-
-    fast (LowLatency) takes NV12 ('420v'); balanced/image (HighQuality) take
-    RGBAHalf ('RGhA'). Exposed so an external decoder can produce frames
-    already in VSR's source format - avoiding an intermediate RGB array and
-    its re-quantization - and feed them via `upscale_buffer_to_buffer`.
-    """
-    if mode == "fast":
-        return _pb.PIX_NV12
-    if mode in ("balanced", "image", "basicvsrpp", "realbasicvsr", "realesrgan", "safmn", "esc", "realviformer", "realplksr", "toflow", "metalfx"):
-        # Learned MLX upscalers do not use VideoToolbox, but they also want RGB
-        # in fp16-preserving RGBAHalf on the native decoder path.
-        return _pb.PIX_RGBAHALF
-    raise ValueError(f"unknown VSR spatial-mode: {mode!r}")
-
-
 def _validate_combination(width: int, height: int, scale: int, mode: str) -> None:
     """Check the (input size, scale, mode) combo is something VT supports.
 
@@ -329,7 +312,7 @@ class VsrSession:
 
     def upscale_buffer_to_buffer(self, src_pb: Any, frame_index: int) -> Any:
         """Upscale one frame whose source CVPixelBuffer comes from an external
-        decoder (already in VSR's source format; see `source_format_for_mode`).
+        decoder already configured for the session's source format.
 
         The buffer is normalized into a clean VSR pool buffer via
         VTPixelTransferSession before processing, rather than fed raw. A raw

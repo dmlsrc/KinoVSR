@@ -352,9 +352,6 @@ class NafnetRestorer:
             self._p, self._cfg, self._strength, self._pool_mode, self._guard, compile,
         )
 
-    def set_progress_message(self, progress_message: Callable[[str], None] | None) -> None:
-        self._progress_message = progress_message
-
     def reset(self) -> None:
         self._control_source_locked = False
         self._reject_locked = False
@@ -400,19 +397,6 @@ class NafnetRestorer:
         out = mx.clip(out, 0.0, 1.0)
         mx.eval(out)
         return out[0]
-
-    def _apply_residual_guard(self, inp: Any, out: Any) -> Any:
-        residual = out - inp
-        local_peak = float(mx.max(_local_mag(residual)))
-        if local_peak <= self._guard:
-            return out
-        knee = residual_guard_map(residual, self._guard)
-        self._notice_once(
-            "residual",
-            local_peak,
-            float(mx.mean((knee < 0.999).astype(mx.float32))),
-        )
-        return inp + residual * knee.astype(residual.dtype)
 
     def _reject_gain_up(self) -> None:
         if self._guard_ramp_frames > 0:

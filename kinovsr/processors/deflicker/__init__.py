@@ -123,7 +123,6 @@ class StaticStateDeflicker:
         # light dynamics (e.g. archival scans) where every oscillation is
         # junk.
         self._illum_veto = bool(illum_veto)
-        self.last_fix_fraction = 0.0     # fraction of pixels touched (debug)
         # gate attribution (run averages); lives OUTSIDE _reset_state so it
         # survives flush() and cut-boundary resets -- it describes the run,
         # not the buffer
@@ -303,7 +302,6 @@ class StaticStateDeflicker:
         idx = list(range(lo, hi + 1))
         if len(idx) < 2:
             self._emitted += 1
-            self.last_fix_fraction = 0.0
             return cur, tok
         Ss, SLs, Vs = [], [], []
         for j in idx:
@@ -427,7 +425,6 @@ class StaticStateDeflicker:
                          mx.mean((verified & oscillatory).astype(mx.float32)),
                          mx.mean(mx.abs(_to_luma_2d(out) - cur_l))])
         mx.eval(out, stat)
-        self.last_fix_fraction = float(stat[0])
         self._stat_frames += 1
         self._stat_fired += float(stat[0])
         self._stat_verified += float(stat[1])

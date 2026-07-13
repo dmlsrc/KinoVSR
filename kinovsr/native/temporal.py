@@ -115,7 +115,6 @@ class VtfrcSession:
         # target frame M is at time M / target_fps.
         # M / target_fps in [N/source_fps, (N+1)/source_fps) means
         #   M in [N * (target/source), (N+1) * (target/source))
-        self._ratio = target_fps / source_fps
         self._prev_src_pb: Any = None
         self._prev_src_index: int = -1   # source frame index of buffered prev
         self._next_target_index: int = 0  # next target frame index to emit

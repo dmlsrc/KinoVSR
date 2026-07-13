@@ -7,13 +7,11 @@ Two capabilities, both wrapping native VTFrameProcessor sessions:
   regenerated timestamps, and preserved clip duration - which is what
   keeps copied audio synchronized.
 - UPSCALE (VTSuperResolutionScaler / VTLowLatencySuperResolutionScaler):
-  the harness's `--upscale fast|balanced|image` spatial modes. This is
+  the `--upscale fast|balanced|image` spatial modes. This is
   also the pipeline's MLX->CV bridge: it accepts an MLX RGB frame (the
   output of any MLX preprocessing chain) and produces a native CV buffer,
-  which is exactly the harness's "MLX denoise -> native upscale" shape.
-  The zero-copy CV->CV path (decoding the source straight into the VSR
-  source format, no MLX round-trip) is a perf follow-up; today the family
-  bridges from MLX, so a pure-upscale chain round-trips through MLX once.
+  while a head-stage upscale decodes directly into the session's native
+  source format for a zero-copy CV->CV path.
 """
 
 from __future__ import annotations
@@ -58,9 +56,9 @@ _UPSCALE_MODE = {
     "image":    (4, Layout.CV_RGBA_HALF, DType.FLOAT16,  Domain.UNIT,   1920, 1080),
 }
 
-# The CVPixelBuffer layout each mode's VSR session consumes as its SOURCE
-# (source_format_for_mode). A source already decoded in this layout feeds
-# upscale_buffer_to_buffer zero-copy, the harness's mainstream path.
+# The CVPixelBuffer layout each mode's VSR session consumes as its source.
+# A source already decoded in this layout feeds upscale_buffer_to_buffer
+# zero-copy.
 _UPSCALE_NATIVE_SRC = {
     "fast": Layout.CV_NV12,
     "balanced": Layout.CV_RGBA_HALF,

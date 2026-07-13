@@ -116,14 +116,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 # Scripts are CLI/diagnostic entry points; print() is legitimate user output
-# there. The inherited harness also has source-checkout import setup before
-# package imports.
+# there.
 "scripts/**" = ["T20"]
-# Transitional: inherited runtime modules still emit CLI/progress/demo
-# output with bare print. New package modules (cli, ui, config, api,
-# settings, reporting) use logging or the reporter instead - keep them
-# OUT of this list. Entries disappear as M4 migrates each family.
-"kinovsr/_harness.py" = ["T20"]
+# Inherited family implementations and standalone conversion/demo paths still
+# emit bare print output. New orchestration modules (cli, ui, config, api,
+# settings, reporting) use logging or the reporter and stay out of this list.
 "kinovsr/processors/basicvsrpp/**" = ["T20"]
 "kinovsr/modeling/deform_conv.py" = ["T20"]
 "kinovsr/modeling/spynet/convert_spynet.py" = ["T20"]

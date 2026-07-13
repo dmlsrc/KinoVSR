@@ -253,7 +253,6 @@ class AVWriter:
         self.frame_count = 0
         self._explicit_end_ticks: int | None = None
         self.audio_track = audio_track
-        self._audio_codec = audio_codec
 
         audio_desc = f", audio={audio_codec}" if audio_input is not None else ""
         print(

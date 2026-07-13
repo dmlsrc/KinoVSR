@@ -10,6 +10,7 @@ stage is CAUSAL stateful even though the net itself is per-frame.
 from __future__ import annotations
 
 import dataclasses
+import logging
 from collections.abc import Mapping
 from typing import Any
 
@@ -28,6 +29,8 @@ from kinovsr.processors.specs import (
     StreamConstraint,
 )
 from kinovsr.settings import Settings
+
+_log = logging.getLogger(__name__)
 
 _POOLS = ("auto", "local", "global")
 _GUARDS = ("auto", "off", "residual", "control", "control-source", "fast",
@@ -143,7 +146,8 @@ class NafnetFactory:
                 guard_fast_fraction=config.guard_fast_fraction,
                 guard_lockout_frames=config.guard_lockout,
                 guard_ramp_frames=config.guard_ramp,
-                guard_fall_frames=config.guard_fall))
+                guard_fall_frames=config.guard_fall,
+                progress_message=_log.warning))
 
         return FeedFlushProcessor(make_driver)
 

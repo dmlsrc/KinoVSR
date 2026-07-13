@@ -2,7 +2,7 @@
 
 The intended use is recurrent VSR debugging:
 
-    scripts/compare_vsr_artifacts.py --reference window1.mp4 --candidate recurrent.mp4 \
+    kinovsr artifacts compare --reference window1.mp4 --candidate recurrent.mp4 \
         --output-dir /tmp/vsr_artifacts --heatmap-video --overlay-video
 
 `reference` should be the safer render, for example window=1/history-free.
@@ -593,4 +593,3 @@ def run_artifacts_command(argv: list[str]) -> int:
     _print(f"unknown artifacts subcommand {name!r} "
            f"(available: {', '.join(_SUBCOMMANDS)})")
     return 2
-

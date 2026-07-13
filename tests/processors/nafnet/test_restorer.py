@@ -55,6 +55,39 @@ def test_nafnet_guard_auto_protects_gopro_variants_only():
         resolve_guard_mode("gopro32", guard_mode="bogus")
 
 
+def test_nafnet_factory_routes_guard_notices_to_logging(
+        monkeypatch, caplog):
+    import kinovsr.processors.nafnet as nafnet_package
+    from kinovsr.processors.nafnet.factory import FACTORY, NafnetStageConfig
+
+    captured: dict = {}
+
+    class StubRestorer:
+        def __init__(self, *_args, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(nafnet_package, "NafnetRestorer", StubRestorer)
+    config = NafnetStageConfig(
+        weights_spec="unused.safetensors",
+        variant="gopro",
+        strength=1.0,
+        pool="auto",
+        guard="reject",
+        guard_threshold=0.12,
+        guard_fast_fraction=0.85,
+        guard_lockout=48,
+        guard_ramp=12,
+        guard_fall=None,
+    )
+    processor = FACTORY.build(config, context=None)
+    processor._make_driver()
+
+    with caplog.at_level(
+            "WARNING", logger="kinovsr.processors.nafnet.factory"):
+        captured["progress_message"]("[nafnet] guard notice")
+    assert "[nafnet] guard notice" in caplog.messages
+
+
 def test_nafnet_residual_guard_map_quadratic_knee():
     from kinovsr.processors.nafnet.restorer import residual_guard_map
 

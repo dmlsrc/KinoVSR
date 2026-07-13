@@ -281,9 +281,9 @@ def classify_noise_analysis(stats: dict) -> dict:
     by --probe-noise.
     """
     dens_med, dens_p90 = stats.get("flicker_density", (0.0, 0.0))
-    amp_med, amp_p90 = stats.get("flicker_amplitude", (0.0, 0.0))
+    _, amp_p90 = stats.get("flicker_amplitude", (0.0, 0.0))
     tail5_med, tail5_p90 = stats.get("tail5", (0.0, 0.0))
-    rms_med, rms_p90 = stats.get("rms", (0.0, 0.0))
+    _, rms_p90 = stats.get("rms", (0.0, 0.0))
     lag = float(stats.get("lag2_over_lag1", 0.0))
     edge = float(stats.get("edge_over_flat", 1.0))
     static = float(stats.get("static_fraction", 0.0))

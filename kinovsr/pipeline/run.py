@@ -120,6 +120,12 @@ class FileSource:
         self._src_color = self._vr.probe_color(self.path)
         self.resolved_color = _color.resolve(
             self._src_color, source_color, source_range)
+        origin = ("tagged" if self._src_color["tagged"]
+                  else "untagged, reader guessed"
+                  if self._src_color.get("guessed") else "untagged")
+        _log.info(
+            "Source color: %s -> output %s",
+            origin, _color.describe(self.resolved_color))
         # A forced matrix/range does not just re-tag the output: it re-reads
         # the raw YUV with the chosen matrix (the fix for untagged SD clips VT
         # mis-guesses). That native re-decode path is RGBAHalf-only.
