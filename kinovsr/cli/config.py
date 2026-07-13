@@ -11,10 +11,8 @@ stage tables are composed and structurally validated by
 :mod:`kinovsr.config`, but executing them requires the M3 builder, so
 their presence is an explicit error rather than a silent no-op.
 
-Assembly also owns the compatibility normalizations that keep legacy
-spellings working (planning 07-cli-vocabulary.md): family-name aliases in
-chain values (``fastdvd`` -> ``fastdvdnet``) and the deprecated
-``--deblock-weights`` fill-in for chained deblockers.
+Assembly normalizes whitespace in comma-separated processor chains before
+the flag surface is converted to typed pipeline configuration.
 """
 
 from __future__ import annotations
@@ -26,16 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from kinovsr.config import ConfigError, compose_config, validate_config
+from kinovsr.processors.catalog import available_families
 from kinovsr.settings import Settings, settings_from_args
-
-# Chain-token aliases: accepted spelling -> canonical family name.
-FAMILY_ALIASES = {
-    "fastdvd": "fastdvdnet",
-}
-
-# Families a legacy --deblock-weights value may fill (when the family-level
-# weights value is unset).
-_DEBLOCK_WEIGHT_FAMILIES = ("stdf", "fbcnn", "toflow")
 
 
 @dataclass(frozen=True)
@@ -54,11 +44,38 @@ class Invocation:
 
 
 def normalize_chain(value: str) -> str:
-    """Canonicalize family names in a comma-chain value ('off' passes)."""
+    """Normalize and validate a comma-chain value (``off`` passes)."""
     if not value or value == "off":
         return value
     names = [n.strip() for n in value.split(",")]
-    return ",".join(FAMILY_ALIASES.get(n, n) for n in names if n)
+    available = set(available_families())
+    unknown = [name for name in names if name and name not in available]
+    if unknown:
+        raise ConfigError(
+            f"unknown processor family in chain: {', '.join(unknown)}")
+    return ",".join(n for n in names if n)
+
+
+def _reject_profile_tokens_in_weight_flags(args: argparse.Namespace) -> None:
+    """Keep CLI weight overrides path-only; named checkpoints use profiles."""
+    from ._registry import REGISTRY
+
+    selectors = {}
+    for opt in REGISTRY:
+        tokens = (opt.choices if opt.key == "profile"
+                  else opt.profile_tokens)
+        if opt.family is not None and tokens:
+            selectors[opt.family] = (opt.flag, frozenset(tokens))
+    for opt in REGISTRY:
+        if opt.family is None or opt.key != "weights":
+            continue
+        value = getattr(args, opt.resolved_dest, None)
+        selector = selectors.get(opt.family)
+        if value is None or selector is None or value not in selector[1]:
+            continue
+        raise ConfigError(
+            f"{opt.flag} expects a checkpoint path; use "
+            f"{selector[0]} {value} to select that profile")
 
 
 def _settings_from_table(base: Settings, table: dict[str, Any]) -> Settings:
@@ -105,18 +122,10 @@ def assemble(args: argparse.Namespace,
     config = compose_config(args.base_config, args.config)
     validate_config(config)
 
-    # Chain-token family aliases.
+    # Normalize comma-chain whitespace before flag-to-pipeline assembly.
     args.denoise = normalize_chain(args.denoise)
     args.deblock = normalize_chain(args.deblock)
-
-    # Deprecated --deblock-weights fills chained deblockers that got no
-    # family-level value (never overrides one).
-    if getattr(args, "deblock_weights", None):
-        chain = [] if args.deblock == "off" else args.deblock.split(",")
-        for family in _DEBLOCK_WEIGHT_FAMILIES:
-            dest = f"{family}_weights"
-            if family in chain and getattr(args, dest, None) is None:
-                setattr(args, dest, args.deblock_weights)
+    _reject_profile_tokens_in_weight_flags(args)
 
     settings = base if base is not None else Settings.from_env()
     settings = _settings_from_table(settings, config.get("settings", {}))

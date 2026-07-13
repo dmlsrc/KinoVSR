@@ -10,7 +10,7 @@
 
 base_flags = [
   "--reader", "ffmpeg",
-  "--spatial-mode", "none",
+  "--upscale", "none",
   "--start", "0",
   "--end", "5s",
 ]
@@ -61,7 +61,7 @@ flags = [
 [[sweep.variants]]
 name = "fastdvd_f05_l45"
 flags = [
-  "--denoise", "fastdvd",
+  "--denoise", "fastdvdnet",
   "--noise-map", "auto",
   "--noise-map-gain", "1.5",
   "--noise-map-motion-cap", "loose",

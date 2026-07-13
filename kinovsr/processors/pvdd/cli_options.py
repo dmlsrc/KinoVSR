@@ -14,7 +14,6 @@ PVDD_STRENGTH_OPTIONS = [
 
 PVDD_OPTIONS = [
     Opt(flag='--pvdd-profile',
-        aliases=('--pvdd-variant',),
         group='Denoise And Noise Maps',
         default='pvdd',
         choices=('pvdd', 'crvd', 'davis', 'pvdd_level', 'pvdd_raw', 'pvdd_raw_level'),

@@ -43,7 +43,7 @@ class BasicVsrRestorer(WindowedUpscaler):
         if net.is_low_res_input(self._p):
             raise ValueError(
                 "this checkpoint is a 4x-SR BasicVSR++ model, not a 1x-restoration one; "
-                "use --spatial-mode basicvsrpp for SR. Restoration tokens: "
+                "use --upscale basicvsrpp for SR. Restoration tokens: "
                 f"{list(net._RESTORE_VARIANTS)}")
         self._flow_mode = flow_mode
         self._strength = float(strength)

@@ -14,7 +14,6 @@ FASTDVDNET_STRENGTH_OPTIONS = [
 
 FASTDVDNET_OPTIONS = [
     Opt(flag='--fastdvdnet-weights',
-        aliases=('--fastdvd-weights',),
         group='Denoise And Noise Maps',
         metavar='PATH',
         family='fastdvdnet',
@@ -22,7 +21,6 @@ FASTDVDNET_OPTIONS = [
         settings_backed=True,
         help='Override FastDVDnet weights (.safetensors) for --denoise fastdvdnet. Optional - defaults to the bundled --fastdvdnet-profile weights (or $FASTDVD_WEIGHTS). Convert a .pth with kinovsr weights convert.'),
     Opt(flag='--fastdvdnet-profile',
-        aliases=('--fastdvd-variant',),
         group='Denoise And Noise Maps',
         default='clipped',
         choices=('clipped', 'standard'),

@@ -6,8 +6,8 @@ family means adding one catalog entry and its tests. Importing this module
 imports no family code; a runtime module loads only when selected, and CLI
 assembly reads contribution data without executing family package initializers.
 
-Names are canonical (planning 07): chain-token aliases like ``fastdvd``
-are normalized in CLI assembly before they reach the catalog.
+Names are canonical (planning 07); retired family spellings are rejected
+before lookup.
 """
 
 from __future__ import annotations

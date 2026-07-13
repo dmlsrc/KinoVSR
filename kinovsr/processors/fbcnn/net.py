@@ -63,7 +63,7 @@ def resolve_weights(spec: Any = None) -> Path:
             f"  curl -L -o fbcnn_color.pth {_DOWNLOAD_URL}\n"
             f"  kinovsr weights convert fbcnn_color.pth -o "
             f"{_WEIGHTS_DIR / _VARIANTS['color']} --strip-prefix ''\n"
-            f"or point $FBCNN_WEIGHTS / --deblock-weights at an existing .safetensors."
+            f"or point $FBCNN_WEIGHTS / --fbcnn-weights at an existing .safetensors."
         ) from None
 
 

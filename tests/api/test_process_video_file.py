@@ -97,21 +97,19 @@ def test_flag_cli_probes_trims_and_carries_audio(clip_with_audio, tmp_path):
     assert previous == int(0.25 * (1000 ** 3))
 
 
-def test_main_runs_legacy_spellings_end_to_end(clip_with_audio, tmp_path):
+def test_main_runs_canonical_spellings_end_to_end(clip_with_audio, tmp_path):
     rc = main([
         "--video", str(clip_with_audio),
         "--output-dir", str(tmp_path),
-        "--spatial-mode", "none",        # hidden legacy alias for --upscale
+        "--upscale", "none",
         "--reader", "ffmpeg",            # force the compatibility reader
         "--max-frames", "6",
-        "--output-prefix", "legacy",
+        "--output-prefix", "canonical",
         "--mlx-cache-limit-gb", "0.25",
     ])
     assert rc == 0
-    outputs = list(tmp_path.glob("legacy*_post.mp4"))
+    outputs = list(tmp_path.glob("canonical*_post.mp4"))
     assert len(outputs) == 1
     frames, _, n_audio = _output_streams(outputs[0])
     assert frames == 6
     assert n_audio == 0  # no --audio: silent output
-
-

@@ -1,7 +1,7 @@
 # FastDVDnet weights
 
 `model.safetensors` and `model_clipped_noise.safetensors` (~9.5MB each) ARE bundled
-(`--denoise fastdvd --fastdvd-variant model|clipped`). Provenance / re-download -- direct
+(`--denoise fastdvdnet --fastdvdnet-profile standard|clipped`). Provenance / re-download -- direct
 download and the sha256 of the source `.pth`:
 
 | variant | download | sha256 |

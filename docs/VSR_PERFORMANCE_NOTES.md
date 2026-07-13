@@ -160,7 +160,7 @@ All measured, all worth not re-litigating:
   determine dispatch-boundedness; frame size does.
 - **Cross-stage fusion** (compiling consecutive stateless stages as one graph):
   1.01-1.04x when stages are balanced; 0.98x for the realistic
-  fbcnn+fastdvd+nafnet chain (a temporal stage isolates the stateless ones, and
+  fbcnn+fastdvdnet+nafnet chain (a temporal stage isolates the stateless ones, and
   the fusable pair was dominated by one net). Barrier removal is noise next to
   conv compute.
 - **SPyNet pair batching** (all flow pairs on the batch axis): 1.12x at 256x448
@@ -321,7 +321,7 @@ predicts a whole-frame residual from a luma-control input, and `fast` applies
 compiled single-pass residual attenuation. Use `--nafnet-guard off` for raw
 model A/Bs.
 
-| ms/frame | --spatial-mode / weights | character |
+| ms/frame | --upscale / weights | character |
 | --- | --- | --- |
 | 19 | safmn light | fidelity, trained on compressed content; the fast default |
 | 148 | realesrgan general (SRVGG) | light perceptual |
@@ -356,9 +356,9 @@ overshoot from in-range input at hard edges. WHERE it enters: only the
 fp16-preserving decode path (`read_rgbahalf_rgb`, used by balanced/image/none
 and all learned-upscaler modes) -- the NV12/fast path reads 8-bit (clipped by
 construction). GUARDS, both boundaries: every learned-net ENTRY clips (preprocessors:
-nafnet/fbcnn/stdf/spatial/mc/fastdvd; upscalers via `to_rgb_batch`;
+nafnet/fbcnn/stdf/spatial/mc/fastdvdnet; upscalers via `to_rgb_batch`;
 realviformer also locally), and every stage OUTPUT clips (audited: safmn,
-realesrgan, esc, realviformer, basicvsrpp, realbasicvsr, stdf, fastdvd,
+realesrgan, esc, realviformer, basicvsrpp, realbasicvsr, stdf, fastdvdnet,
 fbcnn, luma_chroma_blend; the one gap was the nafnet reject-guard's
 raw/blended emissions, now clipped once in denoise()). So between-stage
 overshoot is doubly impossible: outputs are in-range and entries clip anyway.
@@ -528,7 +528,7 @@ positions), applied after the bar crop; `--crop-offset
 DX,DY` shifts the window from center, clamped inside the frame. Even
 dimensions matter beyond cropping: 4:2:0 stores one chroma sample per 2x2
 luma block, so odd-dimension video misaligns or fails on the NV12 input path
-(--spatial-mode fast) and 4:2:0 encodes; the harness now warns at setup when
+(--upscale fast) and 4:2:0 encodes; the harness now warns at setup when
 the source itself has odd dimensions.
 
 ### Case study: the "river" artifact was a merge-normalization port bug
@@ -631,8 +631,8 @@ footage hides under motion blur.
   resampling low-passes the state, the restoration body re-sharpens it, and
   sub-pixel/content-shaped flow or over-admitted history turns locked edges
   into ridges. RealBasicVSR's black-line ghosting belongs to the same class.
-  `--basicvsrpp-flow-mode zero`, `--realbasicvsr-flow-mode zero`, and
-  `--realviformer-flow-mode zero` are diagnostic controls for separating
+  `--basicvsrpp-flow zero`, `--realbasicvsr-flow zero`, and
+  `--realviformer-flow zero` are diagnostic controls for separating
   recurrence-only state from motion-compensated recurrence; they are not
   quality presets.
 
@@ -674,7 +674,7 @@ footage hides under motion blur.
   quantization, standing out against the cleaner background. Judge texture
   artifacts on the encoded deliverable, not only on raw net output.
 
-Peak MLX memory, one pass at 854x480 (1 GB cache cap): stdf 0.8 GB, fastdvd
+Peak MLX memory, one pass at 854x480 (1 GB cache cap): stdf 0.8 GB, fastdvdnet
 1.0, general 1.2, fbcnn 1.9, nafnet-fp32 2.3, bsrgan 4.0, realbasicvsr-5-window
 6.4, basicvsrpp-5-window 7.2 GB. Scales roughly linearly with window length and
 pixel count; 1080p BasicVSR++ projects to ~25-30 GB.

@@ -8,7 +8,7 @@ sha256 is of the source `.pth`:
 | token | download | sha256 |
 | --- | --- | --- |
 | general (bundled) | https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth | `8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292` |
-| general-wdn (bundled; the --realesrgan-denoise companion) | https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth | `1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca` |
+| general-wdn (bundled; the --realesrgan-denoise-strength companion) | https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth | `1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca` |
 | x4plus | https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth | `4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1` |
 | realesrnet | https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.1/RealESRNet_x4plus.pth | `a820b9bde89a874d7599d545567308ce6c128fc8754a53208eda016d40aa81df` |
 | bsrgan | https://github.com/cszn/KAIR/releases/download/v1.0/BSRGAN.pth | `5d505a0766160921e0388d76e1ddf08cb114303990f9080432bf2b1c988b1c54` |

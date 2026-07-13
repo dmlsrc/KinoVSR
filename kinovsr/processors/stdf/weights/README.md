@@ -1,7 +1,7 @@
 # STDF weights
 
 `stdf_mfqev2_r3.safetensors` and `stdf_vimeo90k_r3.safetensors` (~1.4MB each) ARE bundled
-(`--deblock stdf --deblock-weights mfqev2|vimeo90k`). Both are `.pt` checkpoints inside one
+(`--deblock stdf --stdf-profile mfqev2|vimeo90k`). Both are `.pt` checkpoints inside one
 release archive:
 
 https://github.com/ryanxingql/stdf-pytorch/releases/download/v1.0.0/exp.zip

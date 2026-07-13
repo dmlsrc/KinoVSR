@@ -144,13 +144,6 @@ DEBLOCK_SLOT_OPTIONS = [
         metavar='NAME[,NAME...]',
         family='deblock',
         help="Pre-upscale compression-artifact deblock, applied before denoise + VSR (deblock before SR amplifies the blocking). Comma-chain to run several in order (e.g. toflow,stdf: TOFlow's gentle flow-fused pass then STDF's deformable fusion; stages run left to right). off (default); stdf = STDF deformable spatio-temporal fusion (HEVC-trained, luma-only 7-frame window, weights bundled); toflow = the TOFlow deblock checkpoint (task-oriented-flow seven-frame window, weights bundled; heavy -- see --denoise toflow notes; --deblock-strength is its dry/wet blend, --deblock-map does not apply); fbcnn = FBCNN flexible blind JPEG-artifact removal (single-image RGB, ~72M params, weights downloaded not bundled -- see kinovsr/processors/fbcnn/weights/README.md). Routes frames through the MLX path."),
-    Opt(flag='--deblock-weights',
-        group='Deblock',
-        metavar='VARIANT|PATH',
-        family='deblock',
-        key='weights',
-        hidden=True,
-        help='Deprecated: use the family flags --stdf-weights / --fbcnn-weights / --toflow-weights. Fills the weights of any chained deblocker that has no family-level value.'),
 ]
 
 DEBLOCK_STRENGTH_OPTIONS = [
@@ -197,7 +190,6 @@ DENOISE_SLOT_OPTIONS = [
 
 UPSCALE_SLOT_OPTIONS = [
     Opt(flag='--upscale',
-        aliases=('--spatial-mode',),
         group='Spatial Upscalers',
         default='balanced',
         choices=('fast', 'balanced', 'image', 'none', 'basicvsrpp', 'realbasicvsr', 'realesrgan', 'safmn', 'esc', 'realviformer', 'realplksr', 'toflow', 'metalfx'),

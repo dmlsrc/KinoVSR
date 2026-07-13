@@ -8,8 +8,9 @@ a conformance test rejects rows that invent a new name for a shared
 concept. Stage tables and ``--set`` (M3) reuse the same key names in
 snake_case.
 
-Legacy spellings are carried as ``aliases``: they parse onto the canonical
-destination but are hidden from ``--help``.
+Only canonical spellings are accepted.  The compatibility aliases retained
+during the harness migration were retired once all in-repository callers used
+the shared vocabulary.
 """
 
 from __future__ import annotations
@@ -93,17 +94,19 @@ FAMILY_KEYS: dict[str, frozenset[str]] = {
 
 @dataclass(frozen=True)
 class Opt:
-    """One CLI option: canonical flag, hidden aliases, and parse shape."""
+    """One canonical CLI option and its parse shape."""
 
     flag: str
     group: str
     help: str
-    aliases: tuple[str, ...] = ()
     dest: str | None = None
     kind: str = "store"                     # "store" | "flag" (store_true)
     type: Callable | None = None            # None = str
     default: object = None
     choices: tuple | None = None
+    # Named checkpoint tokens owned by a slot selector whose key is not
+    # literally ``profile`` (for example --restore and --nafnet).
+    profile_tokens: tuple[str, ...] = ()
     metavar: str | None = None
     required: bool = False
     family: str | None = None               # prefix for conformance checks
@@ -112,8 +115,6 @@ class Opt:
     # trifecta (default < env < TOML < CLI), so its argparse default must
     # stay None for the env/TOML layers to show through.
     settings_backed: bool = False
-    # Deprecated spelling kept parseable but absent from --help.
-    hidden: bool = False
 
     @property
     def resolved_dest(self) -> str:
@@ -126,17 +127,16 @@ def vocabulary_violations(registry: list[Opt]) -> list[str]:
     - a family option's key must be a shared key or registered for that
       family (slot/selector rows carry ``key=None`` and are exempt);
     - a settings-backed row must not declare a non-None argparse default;
-    - aliases must differ from the canonical flag and stay unique.
+    - canonical flags must stay unique.
     """
     problems: list[str] = []
     seen_flags: dict[str, str] = {}
     for opt in registry:
-        for spelling in (opt.flag, *opt.aliases):
-            if spelling in seen_flags:
-                problems.append(
-                    f"{spelling} defined by both {seen_flags[spelling]} "
-                    f"and {opt.flag}")
-            seen_flags[spelling] = opt.flag
+        if opt.flag in seen_flags:
+            problems.append(
+                f"{opt.flag} defined by both {seen_flags[opt.flag]} "
+                f"and {opt.flag}")
+        seen_flags[opt.flag] = opt.flag
         if opt.family is not None and opt.key is not None:
             allowed = SHARED_KEYS | FAMILY_KEYS.get(opt.family, frozenset())
             if opt.key not in allowed:

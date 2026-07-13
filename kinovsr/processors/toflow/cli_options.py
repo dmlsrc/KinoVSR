@@ -14,7 +14,6 @@ TOFLOW_STRENGTH_OPTIONS = [
 
 TOFLOW_OPTIONS = [
     Opt(flag='--toflow-profile',
-        aliases=('--toflow-variant',),
         group='Denoise And Noise Maps',
         default='denoise',
         choices=('denoise', 'deblock'),
@@ -23,7 +22,7 @@ TOFLOW_OPTIONS = [
         help='Which converted TOFlow model for --denoise toflow. denoise (default) is the seven-frame video denoiser; deblock uses the released TOFlow deblocking checkpoint in the same seven-frame runtime shape. Ignored when --toflow-weights points at a specific converted checkpoint.'),
     Opt(flag='--toflow-weights',
         group='Denoise And Noise Maps',
-        metavar='VARIANT|PATH',
+        metavar='PATH',
         family='toflow',
         key='weights',
         settings_backed=True,

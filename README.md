@@ -14,5 +14,5 @@ options follow one shared vocabulary: `--<family>-<key>` where the same key
 means the same concept in every processor family. Chain-level dials such as
 `--denoise-strength` distribute positionally over a comma-chain
 (`--denoise mc,bsvd`); a family-level flag such as `--bsvd-strength`
-overrides the chain value for that family. Legacy flag spellings from the
-original harness keep parsing as hidden aliases.
+overrides the chain value for that family. The CLI accepts canonical
+vocabulary spellings only.

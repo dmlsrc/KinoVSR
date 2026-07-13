@@ -33,7 +33,7 @@ REPO = Path(__file__).resolve().parents[3]
 
 DEFAULT_BASE_FLAGS = [
     "--reader", "ffmpeg",
-    "--spatial-mode", "none",
+    "--upscale", "none",
     "--start", "0",
     "--end", "5s",
 ]
@@ -71,7 +71,7 @@ DEFAULT_VARIANTS = [
     {
         "name": "fastdvd_f05_l45",
         "flags": [
-            "--denoise", "fastdvd",
+            "--denoise", "fastdvdnet",
             "--noise-map", "auto",
             "--noise-map-gain", "1.5",
             "--noise-map-motion-cap", "loose",

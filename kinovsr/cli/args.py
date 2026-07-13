@@ -2,10 +2,9 @@
 
 The parser is generated, not hand-written: every option is an
 :class:`~kinovsr.cli.options.Opt` row in :mod:`kinovsr.cli._registry`.
-Canonical flags show in ``--help``; legacy aliases parse onto the same
-destination but are suppressed from help. Settings-backed rows double as
-the CLI layer of the settings trifecta, so the settings group only adds
-flags for fields the registry does not already own.
+Canonical flags show in ``--help`` and are the only accepted spellings.
+Settings-backed rows double as the CLI layer of the settings trifecta, so the
+settings group only adds flags for fields the registry does not already own.
 """
 
 from __future__ import annotations
@@ -70,16 +69,9 @@ def _add_option(group: argparse._ArgumentGroup, opt: Opt) -> None:
             common["choices"] = opt.choices
         if opt.metavar is not None:
             common["metavar"] = opt.metavar
-    help_text = argparse.SUPPRESS if opt.hidden else opt.help
     group.add_argument(
         opt.flag, default=opt.default, required=opt.required,
-        help=help_text, **common)
-    for alias in opt.aliases:
-        # The alias never carries the default: when absent it must not
-        # touch the destination, so the canonical default stands.
-        group.add_argument(
-            alias, default=argparse.SUPPRESS, help=argparse.SUPPRESS,
-            **common)
+        help=opt.help, **common)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="kinovsr",
         description=_DESCRIPTION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
     groups: dict[str, argparse._ArgumentGroup] = {}
     for opt in REGISTRY:

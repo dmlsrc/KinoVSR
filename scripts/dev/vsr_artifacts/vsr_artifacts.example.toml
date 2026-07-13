@@ -115,7 +115,7 @@ overwrite = false
 # output_root = "../../path/to/test-output"
 
 base_flags = [
-  "--spatial-mode", "none",
+  "--upscale", "none",
   "--gop-align",
   "--snap-start",
   "--start", "0",

@@ -108,12 +108,12 @@ def _validate_combination(width: int, height: int, scale: int, mode: str) -> Non
             mn = cls.minimumDimensions()
             mx = cls.maximumDimensions()
             raise SystemExit(
-                f"--spatial-mode fast does not support {width}x{height} input. "
+                f"--upscale fast does not support {width}x{height} input. "
                 f"Allowed: {mn.width}x{mn.height} to {mx.width}x{mx.height}."
             )
         if float(scale) not in [float(s) for s in ok]:
             raise SystemExit(
-                f"--spatial-mode fast at {width}x{height} supports scale={ok}, "
+                f"--upscale fast at {width}x{height} supports scale={ok}, "
                 f"requested scale={scale}."
             )
     else:
@@ -123,8 +123,8 @@ def _validate_combination(width: int, height: int, scale: int, mode: str) -> Non
         ok = [int(s) for s in cls.supportedScaleFactors()]
         if scale not in ok:
             raise SystemExit(
-                f"--spatial-mode {mode} supports scale={ok}, requested scale={scale}. "
-                f"Use --spatial-mode fast for 2x."
+                f"--upscale {mode} supports scale={ok}, requested scale={scale}. "
+                f"Use --upscale fast for 2x."
             )
         # The HQ scaler has no dimension-query API; check the empirical caps so
         # an oversized input fails with a clear message (and before the model
@@ -132,13 +132,13 @@ def _validate_combination(width: int, height: int, scale: int, mode: str) -> Non
         if width > HQ_MAX_INPUT_W or height > HQ_MAX_INPUT_H:
             fits_fast = width <= 960 and height <= 960
             hint = (
-                "Use --spatial-mode fast for a 2x upscale (input must be <= 960x960)."
+                "Use --upscale fast for a 2x upscale (input must be <= 960x960)."
                 if fits_fast else
                 f"This input is larger than any VSR mode supports; downscale it to "
                 f"<= {HQ_MAX_INPUT_W}x{HQ_MAX_INPUT_H} (balanced/image) or <= 960x960 (fast) first."
             )
             raise SystemExit(
-                f"--spatial-mode {mode} (4x) does not support {width}x{height} input "
+                f"--upscale {mode} (4x) does not support {width}x{height} input "
                 f"(max {HQ_MAX_INPUT_W}x{HQ_MAX_INPUT_H}; a 4x output would exceed 8K). {hint}"
             )
 
@@ -353,7 +353,7 @@ class VsrSession:
         (709) EOTF but never re-encodes, darkening the output by ~2x (measured:
         709-EOTF(0.39)=0.166, a hard black crush on tagged SD clips). The MLX upload
         path (upscale_to_buffer) feeds an untagged buffer and is unaffected, which
-        is why fastdvd stays correct -- this makes the native buffer-to-buffer path
+        is why fastdvdnet stays correct -- this makes the native buffer-to-buffer path
         match it. Only the gamma tag is removed: the YCbCr matrix / range are left
         intact for the NV12 (fast) path's YUV interpretation, and output
         colorimetry comes from the encoder tag, not these scaler-input attachments.

@@ -21,7 +21,6 @@ BSVD_OPTIONS = [
         settings_backed=True,
         help='Override BSVD weights (.safetensors) for --denoise bsvd. Optional - defaults to the local --bsvd-profile weights (or $BSVD_WEIGHTS). Convert a .pth with kinovsr weights convert --param-key params.'),
     Opt(flag='--bsvd-profile',
-        aliases=('--bsvd-variant',),
         group='Denoise And Noise Maps',
         default='c64',
         choices=('c64', 'c32'),

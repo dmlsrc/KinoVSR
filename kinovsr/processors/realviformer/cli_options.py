@@ -32,7 +32,6 @@ REALVIFORMER_OPTIONS = [
         key='window',
         help="Recurrence chunk length (frames) for --upscale realviformer: the temporal state resets cold every N frames, matching the reference inference's 100-frame chunking (default 100). The reset caps the texture-lock etching that unbounded recurrence engraves on long static shots, at the cost of a texture refresh at each chunk join (the reference tool has the same one). 0 = never reset: unbounded streaming recurrence, deeper temporal lock than the released tool ever runs."),
     Opt(flag='--realviformer-flow',
-        aliases=('--realviformer-flow-mode',),
         group='Spatial Upscalers',
         default='spynet',
         choices=('spynet', 'zero', 'vt'),

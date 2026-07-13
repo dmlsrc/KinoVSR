@@ -1,4 +1,4 @@
-"""Parser behavior: canonical flags, hidden aliases, exit codes, assembly."""
+"""Parser behavior: canonical flags, retired spellings, exit codes, assembly."""
 
 import argparse
 from pathlib import Path
@@ -20,41 +20,56 @@ def parser() -> argparse.ArgumentParser:
 
 BASE = ["--video", "clip.mp4", "--output-dir", "out"]
 
+RETIRED_FLAGS = (
+    "--spatial-mode",
+    "--restore-flow-mode",
+    "--basicvsrpp-flow-mode",
+    "--realbasicvsr-flow-mode",
+    "--realviformer-flow-mode",
+    "--basicvsrpp-variant",
+    "--bsvd-variant",
+    "--toflow-variant",
+    "--pvdd-variant",
+    "--fastdvd-variant",
+    "--fastdvd-weights",
+    "--realesrgan-denoise",
+    "--realbasicvsr-dynamic-refine-thres",
+    "--deblock-weights",
+)
 
-class TestAliases:
-    def test_canonical_and_alias_hit_the_same_dest(self, parser):
-        canon = parser.parse_args(
+
+class TestCanonicalVocabulary:
+    def test_canonical_flags_land_on_expected_destinations(self, parser):
+        args = parser.parse_args(
             [*BASE, "--upscale", "safmn", "--basicvsrpp-flow", "vt",
              "--fastdvdnet-profile", "standard",
              "--realesrgan-denoise-strength", "0.3",
              "--realbasicvsr-clean-threshold", "12"])
-        legacy = parser.parse_args(
-            [*BASE, "--spatial-mode", "safmn", "--basicvsrpp-flow-mode", "vt",
-             "--fastdvd-variant", "standard",
-             "--realesrgan-denoise", "0.3",
-             "--realbasicvsr-dynamic-refine-thres", "12"])
-        for dest in ("upscale", "basicvsrpp_flow", "fastdvdnet_profile",
-                     "realesrgan_denoise_strength",
-                     "realbasicvsr_clean_threshold"):
-            assert getattr(canon, dest) == getattr(legacy, dest)
+        assert args.upscale == "safmn"
+        assert args.basicvsrpp_flow == "vt"
+        assert args.fastdvdnet_profile == "standard"
+        assert args.realesrgan_denoise_strength == 0.3
+        assert args.realbasicvsr_clean_threshold == 12
 
-    def test_alias_absent_leaves_canonical_default(self, parser):
+    def test_canonical_defaults(self, parser):
         args = parser.parse_args(BASE)
         assert args.upscale == "balanced"
         assert args.fastdvdnet_profile == "clipped"
 
-    def test_help_shows_canonical_names_only(self, parser):
+    def test_help_shows_canonical_names(self, parser):
         text = parser.format_help()
-        for hidden in ("--spatial-mode", "--basicvsrpp-flow-mode",
-                       "--fastdvd-variant", "--fastdvd-weights",
-                       "--realbasicvsr-dynamic-refine-thres",
-                       "--deblock-weights"):
-            assert hidden not in text, hidden
         for canonical in ("--upscale", "--fastdvdnet-profile",
                           "--stdf-weights", "--fbcnn-weights",
                           "--realesrgan-denoise-strength", "--base-config",
                           "--verbose", "--mc-flow "):
             assert canonical in text, canonical
+
+    @pytest.mark.parametrize("flag", RETIRED_FLAGS)
+    def test_retired_flags_are_rejected(self, parser, capsys, flag):
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args([*BASE, flag, "unused"])
+        assert exc.value.code == 2
+        capsys.readouterr()
 
 
 class TestExitCodes:
@@ -97,15 +112,19 @@ class TestExitCodes:
 
 
 class TestChains:
-    def test_family_alias_normalizes(self):
-        assert normalize_chain("fastdvd,mc") == "fastdvdnet,mc"
+    def test_chain_whitespace_normalizes(self):
         assert normalize_chain("off") == "off"
         assert normalize_chain("mc, bsvd") == "mc,bsvd"
 
-    def test_assemble_normalizes_denoise_chain(self, parser):
-        args = parser.parse_args([*BASE, "--denoise", "fastdvd,bsvd"])
+    def test_assemble_normalizes_canonical_denoise_chain(self, parser):
+        args = parser.parse_args([*BASE, "--denoise", "fastdvdnet, bsvd"])
         inv = assemble(args, base=Settings())
         assert inv.options.denoise == "fastdvdnet,bsvd"
+
+    def test_removed_family_token_is_rejected(self, parser):
+        args = parser.parse_args([*BASE, "--denoise", "fastdvd"])
+        with pytest.raises(ConfigError, match="fastdvd"):
+            assemble(args, base=Settings())
 
 
 class TestSettingsTrifecta:
@@ -134,6 +153,17 @@ class TestSettingsTrifecta:
         inv = assemble(args, base=Settings())
         assert inv.settings.basicvsrpp_weights == "/w/b.st"
 
+    @pytest.mark.parametrize(("flag", "token", "selector"), [
+        ("--basicvsrpp-weights", "reds4", "--basicvsrpp-profile"),
+        ("--restore-weights", "denoise", "--restore"),
+        ("--nafnet-weights", "gopro", "--nafnet"),
+    ])
+    def test_profile_tokens_are_rejected_in_weight_flags(
+            self, parser, flag, token, selector):
+        args = parser.parse_args([*BASE, flag, token])
+        with pytest.raises(ConfigError, match=selector):
+            assemble(args, base=Settings())
+
     def test_unknown_settings_key_is_an_error(self, parser, tmp_path: Path):
         toml = tmp_path / "s.toml"
         toml.write_text("[settings]\nvebrose = true\n")
@@ -157,29 +187,21 @@ class TestSettingsTrifecta:
         assert inv.config["denoise"]["processor"] == "bsvd"
 
 
-class TestDeblockWeightsCompat:
-    def test_fills_chained_families_without_family_value(self, parser):
+class TestDeblockWeights:
+    def test_family_weight_flags_are_independent(self, parser):
         args = parser.parse_args(
             [*BASE, "--deblock", "stdf,fbcnn",
-             "--deblock-weights", "/w/legacy.st"])
-        inv = assemble(args, base=Settings())
-        assert inv.settings.stdf_weights == "/w/legacy.st"
-        assert inv.settings.fbcnn_weights == "/w/legacy.st"
-
-    def test_family_flag_wins_over_legacy_fill(self, parser):
-        args = parser.parse_args(
-            [*BASE, "--deblock", "stdf,fbcnn",
-             "--deblock-weights", "/w/legacy.st",
+             "--stdf-weights", "/w/stdf.st",
              "--fbcnn-weights", "/w/fb.st"])
         inv = assemble(args, base=Settings())
-        assert inv.settings.stdf_weights == "/w/legacy.st"
+        assert inv.settings.stdf_weights == "/w/stdf.st"
         assert inv.settings.fbcnn_weights == "/w/fb.st"
 
-    def test_no_fill_outside_the_chain(self, parser):
+    def test_family_weight_does_not_fill_another_family(self, parser):
         args = parser.parse_args(
-            [*BASE, "--deblock", "stdf", "--deblock-weights", "/w/legacy.st"])
+            [*BASE, "--deblock", "stdf", "--stdf-weights", "/w/stdf.st"])
         inv = assemble(args, base=Settings())
-        assert inv.settings.stdf_weights == "/w/legacy.st"
+        assert inv.settings.stdf_weights == "/w/stdf.st"
         assert inv.settings.fbcnn_weights is None
 
 

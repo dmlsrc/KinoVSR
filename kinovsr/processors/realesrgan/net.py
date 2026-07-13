@@ -63,7 +63,7 @@ def wdn_path_for(weights: str | Path | None) -> Path:
     wdn = src.with_name(name)
     if wdn == src or not wdn.exists():
         raise FileNotFoundError(
-            f"--realesrgan-denoise < 1 needs the wdn companion beside "
+            f"--realesrgan-denoise-strength < 1 needs the wdn companion beside "
             f"{src.name} (expected {name}); only realesr-general-x4v3 has one")
     return wdn
 

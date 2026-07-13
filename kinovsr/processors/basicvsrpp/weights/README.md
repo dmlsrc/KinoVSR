@@ -1,7 +1,7 @@
 # BasicVSR++ weights (not bundled)
 
 Not committed (too large) -- download + convert; the `.safetensors` are gitignored.
-`--spatial-mode basicvsrpp --basicvsrpp-variant <token>` (default `vimeo90k_bd`).
+`--upscale basicvsrpp --basicvsrpp-profile <token>` (default `vimeo90k_bd`).
 
 Direct download and the sha256 of the source `.pth`:
 

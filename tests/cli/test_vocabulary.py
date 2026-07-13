@@ -1,9 +1,9 @@
 """Structural conformance of the option registry to the vocabulary.
 
 Planning 07-cli-vocabulary.md: the same key name means the same concept in
-every family, canonical flags are the composition of family and key, legacy
-spellings are hidden aliases, and settings-backed flags stay None-default so
-the env/TOML trifecta layers show through.
+every family, canonical flags are the composition of family and key, and
+settings-backed flags stay None-default so the env/TOML trifecta layers show
+through.
 """
 
 import subprocess
@@ -61,35 +61,9 @@ def test_settings_backed_dests_are_settings_fields():
             assert opt.resolved_dest in names, opt.flag
 
 
-def test_aliases_differ_and_map_to_canonical_dests():
-    canonical_flags = {o.flag for o in REGISTRY}
-    for opt in REGISTRY:
-        for alias in opt.aliases:
-            assert alias != opt.flag
-            assert alias not in canonical_flags, (
-                f"{alias} is both an alias and a canonical flag")
-
-
-def test_every_expected_legacy_spelling_is_carried():
-    """The renames table from planning 07 - each legacy flag parses."""
-    alias_map = {a: o.flag for o in REGISTRY for a in o.aliases}
-    expected = {
-        "--spatial-mode": "--upscale",
-        "--restore-flow-mode": "--restore-flow",
-        "--basicvsrpp-flow-mode": "--basicvsrpp-flow",
-        "--realbasicvsr-flow-mode": "--realbasicvsr-flow",
-        "--realviformer-flow-mode": "--realviformer-flow",
-        "--basicvsrpp-variant": "--basicvsrpp-profile",
-        "--bsvd-variant": "--bsvd-profile",
-        "--toflow-variant": "--toflow-profile",
-        "--pvdd-variant": "--pvdd-profile",
-        "--fastdvd-variant": "--fastdvdnet-profile",
-        "--fastdvd-weights": "--fastdvdnet-weights",
-        "--realesrgan-denoise": "--realesrgan-denoise-strength",
-        "--realbasicvsr-dynamic-refine-thres": "--realbasicvsr-clean-threshold",
-    }
-    for legacy, canonical in expected.items():
-        assert alias_map.get(legacy) == canonical
+def test_registry_flags_are_unique():
+    flags = [opt.flag for opt in REGISTRY]
+    assert len(flags) == len(set(flags))
 
 
 def test_shared_and_family_keys_do_not_overlap():

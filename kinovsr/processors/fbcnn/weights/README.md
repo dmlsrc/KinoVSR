@@ -19,7 +19,7 @@ kinovsr weights convert fbcnn_color.pth \
   -o kinovsr/processors/fbcnn/weights/fbcnn_color.safetensors --strip-prefix ''
 ```
 
-`--deblock fbcnn` finds it here, or point `$FBCNN_WEIGHTS` / `--deblock-weights` at any
+`--deblock fbcnn` finds it here, or point `$FBCNN_WEIGHTS` / `--fbcnn-weights` at any
 path. `gray` and `gray_double` are listed in `net.py`'s `_VARIANTS` but the RGB driver
 only uses `color`.
 

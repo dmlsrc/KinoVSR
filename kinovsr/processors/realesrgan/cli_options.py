@@ -18,7 +18,6 @@ REALESRGAN_OPTIONS = [
         key='profile',
         help='Which Real-ESRGAN model for --upscale realesrgan. general (default; SRVGG, fast/gentle), x4plus (RRDBNet crisp/GAN, ~20x slower), realesrnet / bsrnet (MSE, faithful/soft), bsrgan, x2plus (2x output), anime / animevideo (anime), esrgan (original ESRGAN). Only general is bundled; the rest download + convert (see kinovsr/processors/realesrgan/weights/README.md). Ignored when --realesrgan-weights is given.'),
     Opt(flag='--realesrgan-denoise-strength',
-        aliases=('--realesrgan-denoise',),
         group='Spatial Upscalers',
         type=float,
         default=1.0,

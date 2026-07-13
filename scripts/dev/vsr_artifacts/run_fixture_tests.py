@@ -59,7 +59,7 @@ def _load_numpy() -> Any:
 REPO = Path(__file__).resolve().parents[3]
 
 DEFAULT_BASE_FLAGS = [
-    "--spatial-mode", "none",
+    "--upscale", "none",
     "--gop-align",
     "--snap-start",
     "--start", "0",
