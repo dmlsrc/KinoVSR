@@ -4,12 +4,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
+import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 
 def test_pth_converter_refuses_ambiguous_params_dict(tmp_path):
-    torch = pytest.importorskip("torch")
     ckpt = tmp_path / "ambiguous.pth"
     out = tmp_path / "ambiguous.safetensors"
     torch.save(

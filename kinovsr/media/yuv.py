@@ -23,7 +23,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.native.compat import Quartz, require_pyobjc
+from kinovsr.native.compat import Quartz
 
 # 10-bit 4:2:2 biplanar, the format the HEVC 4:2:2 profile consumes directly.
 PIX_422YCBCR10_VIDEO = Quartz.kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
@@ -120,7 +120,6 @@ def rgb_to_yuv422_10(rgb: Any, dst_buffer: Any, matrix: Any, full_range: bool = 
     The 10-bit samples are left-justified (<< 6) in their 16-bit words, which is what
     the BiPlanar10 formats expect. Chroma is box-averaged to 4:2:2.
     """
-    require_pyobjc()
     Kr, Kb = coef_for_matrix(matrix)
     luma, chroma = _compiled_planes(Kr, Kb, full_range)(rgb)
     _write_planes(dst_buffer, (luma, chroma))

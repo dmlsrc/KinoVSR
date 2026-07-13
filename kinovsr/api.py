@@ -57,12 +57,7 @@ def resolve_mlx_cache_limit_gb(settings: Settings) -> float:
 
 
 def _runtime_setup(settings: Settings) -> None:
-    """Environment setup shared by every processing entry: the PyObjC
-    presence check and the MLX cache cap, applied here (not in the CLI)
-    so API and console behavior match."""
-    from kinovsr import require_pyobjc
-
-    require_pyobjc()
+    """Apply the MLX cache cap shared by API and console processing."""
     limit = resolve_mlx_cache_limit_gb(settings)
     if limit > 0:
         import mlx.core as mx

@@ -2,18 +2,16 @@
 
 Self-contained: the fixture clip is muxed by PyAV itself (mpeg4 in MP4, fixed
 GOP, tagged 601), so no binary fixtures and no dependency on files AVFoundation
-can or cannot read. Skips cleanly when PyAV is not installed (the 'ffmpeg'
-extra is optional).
+can or cannot read.
 """
 import math
 
+import av
+import mlx.core as mx
 import pytest
 
-av = pytest.importorskip("av")
-import mlx.core as mx  # noqa: E402  (after importorskip, the standard pattern)
-
-from kinovsr.media import ffmpeg_reader as fr  # noqa: E402
-from kinovsr.media.pixel_buffers import (  # noqa: E402
+from kinovsr.media import ffmpeg_reader as fr
+from kinovsr.media.pixel_buffers import (
     PIX_BGRA,
     PIX_RGBAHALF,
     read_buffer_rgb_f32,

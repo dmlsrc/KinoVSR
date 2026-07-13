@@ -21,9 +21,10 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import cv2 as cv
+import numpy as np
 
 from kinovsr.ui.console import get_console
 
@@ -38,26 +39,6 @@ from .config import (
 
 def _print(*parts: object) -> None:
     get_console().print(*parts, markup=False, highlight=False)
-
-if TYPE_CHECKING:
-    import numpy as np
-
-np: Any = None
-
-
-def _load_numpy() -> Any:
-    global np
-    if np is None:
-        try:
-            import numpy as _np
-        except ModuleNotFoundError as exc:
-            raise SystemExit(
-                "NumPy is required for kinovsr metrics faces. "
-                "Install the developer extras for evaluation tools."
-            ) from exc
-        np = _np
-    return np
-
 
 TOOL_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = TOOL_DIR / "weights" / "face_detection_yunet_2023mar.onnx"
@@ -488,7 +469,6 @@ def _normalize_config(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def run_eval(args: argparse.Namespace) -> list[dict[str, Any]]:
-    _load_numpy()
     variants = args.variants
     if args.baseline not in variants:
         raise SystemExit(f"baseline {args.baseline!r} is not configured")
@@ -564,4 +544,3 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def run_faces(argv: list[str] | None = None) -> int:
     run_eval(_normalize_config(parse_args(argv)))
     return 0
-

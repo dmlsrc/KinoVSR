@@ -47,8 +47,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "av>=18.0",
-    # NumPy is a dev/test/diagnostic oracle, not a runtime dependency. Product
-    # code that needs it must import it dynamically through kinovsr._optional.
+    # NumPy is a dev/test/diagnostic oracle, not a core runtime dependency.
     "numpy>=2.4.6",
     "opencv-python-headless>=5.0",
     "pytest>=9.1.0",
@@ -68,6 +67,7 @@ ffmpeg = [
 ]
 eval = [
     "av>=18.0",
+    "numpy>=2.4.6",
     "opencv-python-headless>=5.0",
 ]
 

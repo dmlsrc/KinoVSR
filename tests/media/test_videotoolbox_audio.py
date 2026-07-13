@@ -3,7 +3,6 @@
 Pins the interleaved PCM bytes AudioTrack hands to CMSampleBuffers, and the
 save_wav output, on a deterministic waveform. Runs with both a numpy and an mlx
 input waveform; both must match the golden captured from the numpy version.
-Skipped where pyobjc / CoreMedia is unavailable.
 """
 from __future__ import annotations
 
@@ -12,18 +11,6 @@ import hashlib
 import mlx.core as mx
 import numpy as np
 import pytest
-
-
-def _have_pyobjc() -> bool:
-    try:
-        from kinovsr.native import compat as _compat
-        _compat.require_pyobjc()
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _have_pyobjc(), reason="pyobjc / CoreMedia unavailable")
 
 
 def _waveform_np():

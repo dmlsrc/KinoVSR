@@ -9,8 +9,7 @@ recovered RGB) for every (frame dtype, destination format) pair.
 Each case runs with BOTH a numpy frame and the equivalent mlx frame: the hash
 must match the golden for both, which proves (a) chroma is unchanged vs the
 numpy implementation and (b) the mlx path is byte-faithful to the numpy path.
-Captured from the numpy implementation. Skipped where pyobjc/VideoToolbox is
-unavailable.
+Captured from the numpy implementation.
 """
 from __future__ import annotations
 
@@ -23,16 +22,6 @@ import pytest
 from kinovsr.media import pixel_buffers as pb
 
 _H = _W = 8
-
-
-def _have_pyobjc() -> bool:
-    try:
-        from kinovsr.native import compat as _compat
-        _compat.require_pyobjc()
-        return True
-    except Exception:
-        return False
-
 
 def _np_frame(kind: str) -> np.ndarray:
     if kind == "u8":
@@ -60,7 +49,6 @@ _CASES = [
 ]
 
 
-@pytest.mark.skipif(not _have_pyobjc(), reason="pyobjc / VideoToolbox unavailable")
 @pytest.mark.parametrize("container", ["numpy", "mlx"])
 @pytest.mark.parametrize("_case_id,kind,fmt_name,golden", _CASES, ids=[c[0] for c in _CASES])
 def test_upload_chroma_roundtrip(container, _case_id, kind, fmt_name, golden):
@@ -73,7 +61,6 @@ def test_upload_chroma_roundtrip(container, _case_id, kind, fmt_name, golden):
     assert hashlib.sha256(bytes(memoryview(mx.contiguous(rgb)))).hexdigest()[:24] == golden
 
 
-@pytest.mark.skipif(not _have_pyobjc(), reason="pyobjc / VideoToolbox unavailable")
 def test_retype_range_copy_reinterprets_not_rescales():
     """--source-range machinery: same bytes, different range interpretation.
 

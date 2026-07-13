@@ -2,7 +2,7 @@
 case: with no stage, the output payload IS the borrowed input buffer unless
 the session copies it. The default (retain_outputs=True) must hand back a
 fresh owned buffer; retain_outputs=False is the zero-copy opt-out that
-yields the borrowed input as-is. Skipped without pyobjc.
+yields the borrowed input as-is.
 """
 from __future__ import annotations
 
@@ -22,16 +22,6 @@ from kinovsr.processors import (
 from kinovsr.settings import Settings
 
 pytestmark = pytest.mark.integration
-
-
-def _have_pyobjc() -> bool:
-    try:
-        from kinovsr.native import compat as _compat
-        _compat.require_pyobjc()
-        return True
-    except Exception:
-        return False
-
 
 def _cv_spec() -> StreamSpec:
     return StreamSpec(
@@ -55,7 +45,6 @@ def _cv_unit():
     return FrameUnit(payload=buf, pts=0, duration=960), buf
 
 
-@pytest.mark.skipif(not _have_pyobjc(), reason="pyobjc unavailable")
 def test_default_session_hands_back_owned_cv_outputs():
     unit, buf = _cv_unit()
     session = open_pipeline({"pipeline": []}, _cv_spec(), settings=Settings())
@@ -66,7 +55,6 @@ def test_default_session_hands_back_owned_cv_outputs():
     assert out[0].payload is not buf
 
 
-@pytest.mark.skipif(not _have_pyobjc(), reason="pyobjc unavailable")
 def test_zero_copy_session_aliases_the_borrowed_input():
     unit, buf = _cv_unit()
     session = open_pipeline({"pipeline": []}, _cv_spec(), settings=Settings())

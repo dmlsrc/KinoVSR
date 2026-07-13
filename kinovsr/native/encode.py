@@ -48,7 +48,7 @@ from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media.audio import AudioTrack
 from kinovsr.reporting import NullReporter, Reporter
 
-from .compat import autorelease_pool, require_pyobjc
+from .compat import autorelease_pool
 from .temporal import VtfrcSession
 from .vsr import VsrSession, scale_for_mode
 from .writer import HEVC_PROFILE_MAIN10, HEVC_PROFILE_MAIN422_10, AVWriter
@@ -208,7 +208,6 @@ def encode_video_videotoolbox(
     HW append; the AVAssetWriter's pump runs on its own GCD queue, so
     the second encode is largely parallel to the primary.
     """
-    require_pyobjc()
     if reporter is None:
         reporter = NullReporter()
     output_path = Path(output_path)

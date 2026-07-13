@@ -23,8 +23,6 @@ from pathlib import Path
 import mlx.core as mx
 import torch
 
-from kinovsr._optional import require_numpy
-
 CONV_KEYS = {
     "conv_root.weight",
     "block1.conv1.weight",
@@ -35,7 +33,6 @@ CONV_KEYS = {
 
 
 def main() -> int:
-    require_numpy("kinovsr/eval/models/musiq/convert_musiq.py")
     src = Path(sys.argv[1])
     dst = Path(sys.argv[2]) if len(sys.argv) > 2 else (
         Path(__file__).resolve().parent / "weights" / "musiq_koniq.safetensors")

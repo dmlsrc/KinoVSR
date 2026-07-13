@@ -8,6 +8,8 @@ spatial scaling; runs skip cleanly where it is unsupported.
 
 from fractions import Fraction
 
+import av
+import mlx.core as mx
 import pytest
 
 from kinovsr.processors import (
@@ -83,11 +85,6 @@ class TestSpec:
             MetalFxSpatialUpscaler(scale=5)
 
 
-@pytest.fixture(scope="module")
-def mx():
-    return pytest.importorskip("mlx.core")
-
-
 def skip_if_unsupported(exc: MediaError):
     if "not supported" in str(exc):
         pytest.skip(f"MetalFX unavailable: {exc}")
@@ -96,7 +93,7 @@ def skip_if_unsupported(exc: MediaError):
 
 @pytest.mark.integration
 class TestDriver:
-    def test_per_frame_shapes_and_range(self, mx):
+    def test_per_frame_shapes_and_range(self):
         frame = mx.random.uniform(shape=(48, 64, 3)).astype(mx.float32)
         for scale in (2, 3, 4):
             up = MetalFxSpatialUpscaler(scale=scale)
@@ -111,7 +108,7 @@ class TestDriver:
             assert up.flush() == []
             up.close()
 
-    def test_fp16_roundtrip_and_determinism(self, mx):
+    def test_fp16_roundtrip_and_determinism(self):
         frame = mx.random.uniform(shape=(48, 64, 3)).astype(mx.float16)
         up = MetalFxSpatialUpscaler(scale=2)
         try:
@@ -123,7 +120,7 @@ class TestDriver:
         assert bool(mx.array_equal(a, b))
         up.close()
 
-    def test_unaligned_output_rows_read_back_correctly(self, mx):
+    def test_unaligned_output_rows_read_back_correctly(self):
         # Readback rows are ow*8 bytes with no padding. On Apple-family
         # GPUs the texture-to-buffer copy alignment (16 B, feature-set
         # tables) constrains the buffer OFFSET (always 0 here), and blit
@@ -145,7 +142,7 @@ class TestDriver:
             assert bool(mx.all(col_mean[1:] >= col_mean[:-1] - 1e-3))
             up.close()
 
-    def test_geometry_change_mid_stream_raises(self, mx):
+    def test_geometry_change_mid_stream_raises(self):
         up = MetalFxSpatialUpscaler(scale=2)
         try:
             up.feed(mx.zeros((48, 64, 3), dtype=mx.float32))
@@ -157,7 +154,7 @@ class TestDriver:
 
 
 @pytest.mark.integration
-def test_end_to_end_upscale_through_the_chain(mx):
+def test_end_to_end_upscale_through_the_chain():
     from kinovsr.pipeline import resolve_pipeline, run_plan
 
     config = {
@@ -179,8 +176,6 @@ def test_end_to_end_upscale_through_the_chain(mx):
 
 @pytest.mark.integration
 def test_flag_cli_end_to_end(tmp_path):
-    av = pytest.importorskip("av")
-
     from kinovsr.cli.main import main
 
     w, h, n, fps = 160, 128, 6, 25

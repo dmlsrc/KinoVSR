@@ -12,11 +12,10 @@ probe decides native vs ffmpeg; the writer is AVAssetWriter).
 
 import math
 
+import av
 import pytest
 
-av = pytest.importorskip("av")
-
-from kinovsr.cli.main import main  # noqa: E402
+from kinovsr.cli.main import main
 
 pytestmark = pytest.mark.integration
 

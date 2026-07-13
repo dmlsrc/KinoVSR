@@ -15,7 +15,7 @@ import mlx.core as mx
 
 from kinovsr.config.helpers import reject_unknown_keys, typed_value
 from kinovsr.media import pixel_buffers as _pb
-from kinovsr.native.compat import Foundation, Quartz, require_pyobjc
+from kinovsr.native.compat import Foundation, Quartz
 from kinovsr.processors.capabilities import Capability, CapabilitySpec
 from kinovsr.processors.feed_driver import (
     LUMA_CHROMA_KEYS,
@@ -37,7 +37,6 @@ class SpatialDenoiser:
     """Per-frame CoreImage CINoiseReduction. Spatial only; no temporal state."""
 
     def __init__(self, strength: float = 0.5):
-        require_pyobjc()
         # CINoiseReduction's inputNoiseLevel is ~0.0-0.1 in practice; map strength
         # onto a gentle range so strength=0.5 is a moderate clean.
         self.noise_level = 0.01 + 0.04 * float(strength)

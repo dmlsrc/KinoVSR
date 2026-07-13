@@ -14,10 +14,10 @@ encoder) runs unchanged:
 
 Frames exit as IOSurface-backed CVPixelBuffers built with the same helpers the
 native path uses, decoded via libavcodec and converted by libswscale honoring
-(or, for the forced-color path, overriding) the stream's color tags. PyAV is
-lazy-imported so the native path never touches it; install the `ffmpeg` extra
-to enable this module. No numpy: plane bytes cross into MLX through the buffer
-protocol.
+(or, for the forced-color path, overriding) the stream's color tags. This
+module is imported only when the ffmpeg reader is selected; install the
+`ffmpeg` extra to enable it. No numpy: plane bytes cross into MLX through the
+buffer protocol.
 
 Rotation/flip display matrices propagate as CGAffineTransforms matching the
 AVFoundation preferredTransform convention (verified component-wise against
@@ -30,25 +30,14 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import av
 import mlx.core as mx
 
 from . import pixel_buffers as _pb
 from .pixel_buffers import PIX_BGRA, PIX_RGBAHALF
 
 
-def _av():
-    try:
-        import av
-    except ImportError as e:   # pragma: no cover - environment-dependent
-        raise RuntimeError(
-            "the ffmpeg compatibility reader needs PyAV; install the 'ffmpeg' "
-            "extra (uv pip install 'av>=18')"
-        ) from e
-    return av
-
-
 def _open_video(path: Path):
-    av = _av()
     container = av.open(str(path))
     streams = [s for s in container.streams if s.type == "video"]
     if not streams:
@@ -353,7 +342,6 @@ def iter_forced_color_chunks(
     """Forced-matrix read: override the YCbCr matrix / range at YUV->RGB time
     (libswscale src_colorspace/src_color_range), the --source-color fix for
     untagged or mis-tagged material."""
-    av = _av()
     m = str(matrix_cv)
     cs = av.video.reformatter.Colorspace.ITU709 if "709" in m else \
         av.video.reformatter.Colorspace.ITU601
@@ -369,7 +357,6 @@ def read_audio_track(path: Path) -> Any | None:
     """Decode the first audio stream to an in-memory AudioTrack (fp32 PCM),
     the same object the native audio path produces. None when no audio."""
     from .audio import AudioTrack
-    av = _av()
     container = av.open(str(path))
     try:
         astreams = [s for s in container.streams if s.type == "audio"]

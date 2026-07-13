@@ -13,7 +13,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.native.compat import CoreMedia, Foundation, Quartz, require_pyobjc
+from kinovsr.native.compat import CoreMedia, Foundation, Quartz
 
 # FourCC pixel-format constants ----------------------------------------------
 #
@@ -45,7 +45,6 @@ _srgb: Any = None
 
 def ci_context() -> Any:
     """Shared CIContext for all RGB <-> CVPixelBuffer conversions."""
-    require_pyobjc()
     global _ci_context
     if _ci_context is None:
         _ci_context = Quartz.CIContext.contextWithOptions_(None)
@@ -67,7 +66,6 @@ def clear_ci_caches() -> None:
 
 def srgb_colorspace() -> Any:
     """Shared sRGB CGColorSpace handle (cheap to create but reused for clarity)."""
-    require_pyobjc()
     global _srgb
     if _srgb is None:
         _srgb = Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB)
@@ -110,7 +108,6 @@ def make_pixel_buffer_from_attrs(width: int, height: int, attrs: dict) -> Any:
     Used as a fallback when a CVPixelBufferPool isn't available (e.g., before
     AVAssetWriter has been started); pools are preferred for hot paths.
     """
-    require_pyobjc()
     fmt = resolve_pixel_format(attrs)
     err, pb = Quartz.CVPixelBufferCreate(None, width, height, fmt, attrs, None)
     if err != 0:
@@ -126,7 +123,6 @@ def make_pool_from_attrs(attrs: dict) -> Any | None:
     Caller should fall back to make_pixel_buffer_from_attrs if this returns
     None - some attribute combos don't pool cleanly.
     """
-    require_pyobjc()
     err, pool = Quartz.CVPixelBufferPoolCreate(None, None, attrs, None)
     if err != 0 or pool is None:
         return None
@@ -135,7 +131,6 @@ def make_pool_from_attrs(attrs: dict) -> Any | None:
 
 def pool_create_buffer(pool: Any) -> Any | None:
     """Pull a fresh buffer from a CVPixelBufferPool. None on failure."""
-    require_pyobjc()
     err, pb = Quartz.CVPixelBufferPoolCreatePixelBuffer(None, pool, None)
     if err != 0 or pb is None:
         return None
@@ -155,7 +150,6 @@ def flush_pool(pool: Any) -> None:
     """
     if pool is None:
         return
-    require_pyobjc()
     # kCVPixelBufferPoolFlushExcessBuffers = 1
     Quartz.CVPixelBufferPoolFlush(pool, 1)
 
@@ -183,7 +177,6 @@ def copy_pixel_buffer(pb: Any) -> Any:
     session consumer an OWNED output that stays valid after the source buffer
     is recycled or overwritten by the input owner.
     """
-    require_pyobjc()
     fmt = Quartz.CVPixelBufferGetPixelFormatType(pb)
     w = Quartz.CVPixelBufferGetWidth(pb)
     h = Quartz.CVPixelBufferGetHeight(pb)
@@ -247,7 +240,6 @@ def write_fp16_rgba(rgba_fp16: Any, pb: Any) -> None:
     objc.varlist whose `.as_buffer(n)` is a writable memoryview into the IOSurface
     plane; the source bytes come straight from the frame's buffer.
     """
-    require_pyobjc()
     h, w = int(rgba_fp16.shape[0]), int(rgba_fp16.shape[1])
     # Zero-copy view of the frame's buffer; the single mv[:] = src memcpy below
     # goes straight from MLX's unified memory into the IOSurface plane, with no
@@ -291,7 +283,6 @@ def upload_frame_to_buffer(frame: Any, pb: Any) -> None:
     in MLX and the bytes come from the array buffer, so no numpy - and the
     CoreImage / memcpy calls are unchanged, so chroma is byte-for-byte identical.
     """
-    require_pyobjc()
     pix_fmt = Quartz.CVPixelBufferGetPixelFormatType(pb)
     h, w = int(frame.shape[0]), int(frame.shape[1])
 
@@ -339,7 +330,6 @@ def read_pixel_buffer_rgb(pb: Any) -> Any:
     source format (NV12, RGBAHalf, BGRA, ...) is handled uniformly. Slower
     than a direct memcpy for the trivial cases but correct everywhere.
     """
-    require_pyobjc()
     w = Quartz.CVPixelBufferGetWidth(pb)
     h = Quartz.CVPixelBufferGetHeight(pb)
     ci_image = Quartz.CIImage.alloc().initWithCVPixelBuffer_(pb)
@@ -360,7 +350,6 @@ def read_rgbahalf_rgb(pb: Any) -> Any:
     whatever the buffer holds - gamma-encoded RGB in roughly [0, 1] for SDR.
     The round trip is byte-exact against write_fp16_rgba.
     """
-    require_pyobjc()
     w = Quartz.CVPixelBufferGetWidth(pb)
     h = Quartz.CVPixelBufferGetHeight(pb)
     Quartz.CVPixelBufferLockBaseAddress(pb, 1)
@@ -388,7 +377,6 @@ def read_buffer_rgb_f32(pb: Any) -> Any:
     the decode is RGBAHalf (balanced/image/none) and degrade gracefully to
     8-bit for NV12 (fast).
     """
-    require_pyobjc()
     if Quartz.CVPixelBufferGetPixelFormatType(pb) == PIX_RGBAHALF:
         return read_rgbahalf_rgb(pb)
     return read_pixel_buffer_rgb(pb).astype(mx.float32) / 255.0

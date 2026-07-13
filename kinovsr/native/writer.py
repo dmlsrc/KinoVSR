@@ -26,7 +26,6 @@ from .compat import (
     autorelease_pool,
     av,
     libdispatch,
-    require_pyobjc,
 )
 
 # HEVC profile identifiers (Apple-stable strings; not exposed as PyObjC consts)
@@ -46,7 +45,6 @@ def hevc_video_settings(
     ``pixel_aspect`` preserves anamorphic source display geometry while the
     encoded raster stays in model/VSR pixel coordinates.
     """
-    require_pyobjc()
     settings = {
         av.AVVideoCodecKey: av.AVVideoCodecTypeHEVC,
         av.AVVideoWidthKey: width,
@@ -118,7 +116,6 @@ class AVWriter:
         cv_color: tuple | None = None,
         full_range: bool = False,
     ):
-        require_pyobjc()
         # Every AVFoundation-touching phase of a writer's life (construction,
         # append, finish) leaves autoreleased objects behind that hold the
         # hardware-encoder session. A long-lived host process without a

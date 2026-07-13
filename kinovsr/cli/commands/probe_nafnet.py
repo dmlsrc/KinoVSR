@@ -61,10 +61,7 @@ def _parse_frames(spec: str) -> list[int]:
 
 
 def _read_frames(video: Path, wanted: list[int]) -> dict[int, mx.array]:
-    try:
-        import av
-    except Exception as exc:  # pragma: no cover - environment dependent
-        raise SystemExit("PyAV is required for this probe; install the ffmpeg extra: uv pip install kinovsr[ffmpeg]") from exc
+    import av
 
     wanted_set = set(wanted)
     frames: dict[int, mx.array] = {}

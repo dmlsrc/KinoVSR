@@ -22,21 +22,9 @@ import json
 import re
 import struct
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from kinovsr._optional import require_numpy
-
-if TYPE_CHECKING:
-    import numpy as np
-
-np: Any = None
-
-
-def _load_numpy() -> Any:
-    global np
-    if np is None:
-        np = require_numpy("kinovsr/toflow/convert_t7_to_safetensors.py")
-    return np
+import numpy as np
 
 _PARAMS_BY_TYPE = {
     "nn.Mul": ("weight",),
@@ -103,7 +91,6 @@ _T7_LEGACY_RECUR_FUNCTION = 7
 _T7_RECUR_FUNCTION = 8
 
 def _tensor_dtypes() -> dict[bytes, Any]:
-    np = _load_numpy()
     return {
         b"torch.ByteTensor": np.uint8,
         b"torch.CharTensor": np.int8,
@@ -122,7 +109,6 @@ def _tensor_dtypes() -> dict[bytes, Any]:
 
 
 def _storage_dtypes() -> dict[bytes, Any]:
-    np = _load_numpy()
     return {
         b"torch.ByteStorage": np.uint8,
         b"torch.CharStorage": np.int8,
@@ -443,7 +429,6 @@ def _count_types(node: dict, counts: dict[str, int]) -> None:
 
 
 def main() -> int:
-    _load_numpy()
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,

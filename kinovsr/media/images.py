@@ -25,7 +25,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.native.compat import Foundation, Quartz, autorelease_pool, require_pyobjc
+from kinovsr.native.compat import Foundation, Quartz, autorelease_pool
 
 from .pixel_buffers import ci_context, srgb_colorspace
 
@@ -98,7 +98,6 @@ def load_image_rgb(path: str | Path) -> mx.array:
     sources decode to 3-channel sRGB. Raises FileNotFoundError for a missing
     path, ValueError for an undecodable file.
     """
-    require_pyobjc()
     if not Path(path).exists():
         raise FileNotFoundError(f"Image not found: {path}")
     with autorelease_pool():
@@ -121,7 +120,6 @@ def resize_lanczos(img: Any, width: int, height: int) -> mx.array:
     output is taken over an exact integer rect so the shape is precisely
     (height, width, 3).
     """
-    require_pyobjc()
     a = mx.array(img)
     src_h, src_w = int(a.shape[0]), int(a.shape[1])
     if (src_w, src_h) == (int(width), int(height)):
@@ -153,7 +151,6 @@ def save_image(img: Any, path: str | Path) -> Path:
     suffix (.png -> PNG, .jpg/.jpeg -> JPEG, .tif/.tiff -> TIFF, .heic -> HEIF);
     anything else defaults to PNG. Returns the path written.
     """
-    require_pyobjc()
     path = Path(path)
     uti = _UTI_BY_SUFFIX.get(path.suffix.lower(), "public.png")
     with autorelease_pool():
@@ -181,7 +178,6 @@ def draw_labels(
     downward, like Pillow). Returns a new (H, W, 3) uint8 array. AppKit is
     imported lazily so the runtime image path (load/resize/save) never loads it.
     """
-    require_pyobjc()
     import AppKit  # lazy: diagnostic contact-sheet tooling only
 
     a = mx.array(img)

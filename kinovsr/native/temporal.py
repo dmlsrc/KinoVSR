@@ -25,7 +25,7 @@ from typing import Any
 
 from kinovsr.media import pixel_buffers as _pb
 
-from .compat import require_pyobjc, vt
+from .compat import vt
 
 
 class VtfrcSession:
@@ -64,7 +64,6 @@ class VtfrcSession:
         *,
         mode: str = MODE_NORMAL,
     ):
-        require_pyobjc()
         if source_fps <= 0 or target_fps <= 0:
             raise ValueError(
                 f"source_fps and target_fps must be positive; got {source_fps}, {target_fps}"

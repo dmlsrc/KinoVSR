@@ -18,7 +18,7 @@ from typing import Any
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.settings import default_settings
 
-from .compat import Quartz, require_pyobjc, vt
+from .compat import Quartz, vt
 
 
 @contextmanager
@@ -81,7 +81,6 @@ def _validate_combination(width: int, height: int, scale: int, mode: str) -> Non
     additionally restricts input size to <= 960x960). Failing fast here gives
     a clear error message instead of an opaque init/startSession failure.
     """
-    require_pyobjc()
     if mode == "fast":
         cls = vt.VTLowLatencySuperResolutionScalerConfiguration
         if not cls.isSupported():
@@ -128,7 +127,6 @@ def _validate_combination(width: int, height: int, scale: int, mode: str) -> Non
 
 def _wait_for_model_download(config: Any) -> None:
     """Block until HQ VSR's downloadable model is ready, printing progress."""
-    require_pyobjc()
     status = config.configurationModelStatus()
     if status == vt.VTSuperResolutionScalerConfigurationModelStatusReady:
         return
@@ -176,7 +174,6 @@ class VsrSession:
     """
 
     def __init__(self, in_w: int, in_h: int, mode: str, fps: float = 24.0):
-        require_pyobjc()
         if mode not in ("fast", "balanced", "image"):
             raise ValueError(f"VsrSession only supports VideoToolbox modes, got {mode!r}")
         scale = scale_for_mode(mode)

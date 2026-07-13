@@ -32,6 +32,10 @@ import pickletools
 import sys
 from pathlib import Path
 
+import mlx.core as mx
+import torch
+from safetensors.torch import save_file
+
 # Pickle opcodes that push the module/name strings a STACK_GLOBAL then consumes.
 _STR_OPS = {
     "SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8", "UNICODE",
@@ -135,12 +139,6 @@ def main() -> int:
 
     # ---- 2. safe load (restricted unpickler, no code execution) ------------
     try:
-        import torch
-    except ImportError:
-        print("error: this reference converter needs PyTorch; install the dev "
-              "extras (uv pip install -e '.[dev]').", file=sys.stderr)
-        return 1
-    try:
         obj = torch.load(str(src), map_location="cpu", weights_only=True)
     except Exception as e:
         print(f"error: torch.load(weights_only=True) refused/failed: {e}", file=sys.stderr)
@@ -212,23 +210,13 @@ def main() -> int:
               f"{'...' if len(dropped) > 6 else ''}")
 
     # ---- 5. save + verify it loads in MLX ----------------------------------
-    try:
-        from safetensors.torch import save_file
-    except ImportError:
-        print("error: the safetensors package is required here (its own "
-              "package, not part of torch; install the dev extras).", file=sys.stderr)
-        return 1
     out.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(out))
-    try:
-        import mlx.core as mx
-        loaded = mx.load(str(out))
-        ok = len(loaded) == len(tensors)
-        sample = next(iter(loaded.items()))
-        print(f"[verify] mlx.core.load OK: {len(loaded)} arrays "
-              f"(e.g. {sample[0]} {tuple(sample[1].shape)} {sample[1].dtype}); match={ok}")
-    except ImportError:
-        print("[verify] (mlx not importable here; safetensors written, but MLX load unverified)")
+    loaded = mx.load(str(out))
+    ok = len(loaded) == len(tensors)
+    sample = next(iter(loaded.items()))
+    print(f"[verify] mlx.core.load OK: {len(loaded)} arrays "
+          f"(e.g. {sample[0]} {tuple(sample[1].shape)} {sample[1].dtype}); match={ok}")
     print(f"[done] {out}")
     return 0
 

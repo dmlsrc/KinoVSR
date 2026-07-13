@@ -19,7 +19,7 @@ import mlx.core as mx
 from kinovsr.config.helpers import reject_unknown_keys, typed_value
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.modeling.vsr_blocks import compiled_spynet_flow
-from kinovsr.native.compat import Foundation, Quartz, autorelease_pool, require_pyobjc, vt
+from kinovsr.native.compat import Foundation, Quartz, autorelease_pool, vt
 from kinovsr.native.vsr import _suppress_native_stderr
 from kinovsr.processors.capabilities import (
     Capability,
@@ -142,7 +142,6 @@ class McTemporalDenoiser:
         map_floor: float = 0.0, gate: str = "smooth",
         flow: str = "vt", flow_weights: Any = None,
     ):
-        require_pyobjc()
         self.w, self.h = int(width), int(height)
         # flow: the motion engine. "vt" (default) = VTOpticalFlow Quality on
         # CPU/AMX (~17 ms fixed, zero GPU contention, mediocre accuracy with

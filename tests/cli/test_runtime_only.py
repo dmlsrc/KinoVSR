@@ -1,10 +1,10 @@
 """Runtime-only environment contract (M2 acceptance).
 
-NumPy is a dev-only dependency and PyAV is the optional ffmpeg extra: a
-clean runtime environment must import kinovsr and render ``kinovsr
---help`` without either. The subprocess installs a meta-path blocker
-BEFORE any import, which is the reliable way to prove absence (the test
-process itself already has numpy loaded).
+NumPy and OpenCV belong to optional evaluation/developer extras, and PyAV to
+the optional ffmpeg/evaluation extras: a clean core runtime environment must
+import kinovsr and render ``kinovsr --help`` without them. The subprocess
+installs a meta-path blocker BEFORE any import, which is the reliable way to
+prove absence (the test process itself already has numpy loaded).
 """
 
 import subprocess

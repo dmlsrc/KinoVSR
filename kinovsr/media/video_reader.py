@@ -27,7 +27,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from kinovsr.native.compat import CoreMedia, Foundation, Quartz, av, require_pyobjc, vt
+from kinovsr.native.compat import CoreMedia, Foundation, Quartz, av, vt
 
 from . import pixel_buffers as _pb
 
@@ -110,7 +110,6 @@ def probe_video(path: Path) -> tuple[int, int, float, int, Any, tuple[int, int] 
     exact for constant-frame-rate content (everything VSR consumes).
     ``pixel_aspect`` carries anamorphic display geometry to the writer.
     """
-    require_pyobjc()
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)
@@ -141,7 +140,6 @@ def keyframe_display_indices(path: Path) -> list[int]:
     with a single keyframe (open-ended GOP) returns ``[0]``.
     """
     import math
-    require_pyobjc()
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)
@@ -188,7 +186,6 @@ def coded_frame_sizes(path: Path) -> list[int]:
     when the track cannot be walked.
     """
     import math
-    require_pyobjc()
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)
@@ -232,7 +229,6 @@ def probe_color(path: Path) -> dict:
     hard-coded BT.709. See kinovsr/color.py.
     """
     from . import color
-    require_pyobjc()
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)
@@ -316,7 +312,6 @@ def iter_forced_color_chunks(
     to the YUV->RGB conversion under a different range identity via a
     byte-identical retype copy; None or equal-to-container means no override.
     """
-    require_pyobjc()
     yuv_fmt = _YUV10_FULL if full_range else _YUV10_VIDEO
     retype_fmt = None
     if reinterpret_full_range is not None and reinterpret_full_range != full_range:
@@ -370,7 +365,6 @@ def iter_video_buffer_chunks(
     buffer is released immediately after the image buffer is extracted; the
     image buffer stays valid until the consumer drops its reference.
     """
-    require_pyobjc()
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)

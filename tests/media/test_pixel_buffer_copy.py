@@ -2,7 +2,6 @@
 session consumer an OWNED output (finding #1). Proves the copy is a distinct
 buffer whose contents survive the source being overwritten - packed
 (RGBAHalf) and planar (NV12) both, so both plane-copy paths are covered.
-Skipped where pyobjc/VideoToolbox is unavailable.
 """
 from __future__ import annotations
 
@@ -15,16 +14,6 @@ from kinovsr.media import pixel_buffers as pb
 pytestmark = pytest.mark.integration
 
 _H = _W = 8
-
-
-def _have_pyobjc() -> bool:
-    try:
-        from kinovsr.native import compat as _compat
-        _compat.require_pyobjc()
-        return True
-    except Exception:
-        return False
-
 
 def _make(fmt_name: str):
     from kinovsr.native.compat import Quartz
@@ -46,7 +35,6 @@ def _rgb_bytes(buf) -> bytes:
     return bytes(memoryview(mx.contiguous(pb.read_pixel_buffer_rgb(buf))))
 
 
-@pytest.mark.skipif(not _have_pyobjc(), reason="pyobjc unavailable")
 @pytest.mark.parametrize("fmt_name", ["PIX_RGBAHALF", "PIX_NV12"])
 def test_copy_is_distinct_and_owns_its_pixels(fmt_name):
     src = _make(fmt_name)

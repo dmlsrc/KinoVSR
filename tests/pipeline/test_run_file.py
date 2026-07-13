@@ -9,18 +9,16 @@ video and audio timelines must agree.
 
 import logging
 import math
+from fractions import Fraction
 from pathlib import Path
 
+import av
 import pytest
 
-av = pytest.importorskip("av")
-
-from fractions import Fraction  # noqa: E402
-
-from kinovsr.pipeline import FileSource, run_file  # noqa: E402
-from kinovsr.processors.errors import MediaError  # noqa: E402
-from kinovsr.processors.specs import Domain, DType, Layout  # noqa: E402
-from kinovsr.settings import Settings  # noqa: E402
+from kinovsr.pipeline import FileSource, run_file
+from kinovsr.processors.errors import MediaError
+from kinovsr.processors.specs import Domain, DType, Layout
+from kinovsr.settings import Settings
 
 pytestmark = pytest.mark.integration
 

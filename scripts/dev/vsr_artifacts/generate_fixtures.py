@@ -24,31 +24,11 @@ import zlib
 from contextlib import suppress
 from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
 
 import av
 import cv2
+import numpy as np
 from config import config_get, config_section, listify, load_config, resolve_path
-
-if TYPE_CHECKING:
-    import numpy as np
-
-np: Any = None
-
-
-def _load_numpy() -> Any:
-    global np
-    if np is None:
-        try:
-            import numpy as _np
-        except ModuleNotFoundError as exc:
-            raise SystemExit(
-                "NumPy is required for scripts/dev/vsr_artifacts/generate_fixtures.py. "
-                "Install the developer extras for fixture generation."
-            ) from exc
-        np = _np
-    return np
-
 
 MODE_ORDER = [
     "reencode_only",
@@ -897,7 +877,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    _load_numpy()
     manifest = build_fixtures(_normalise_config(parse_args()))
     print(f"[fixtures] wrote {len(manifest['outputs'])} clips", flush=True)
     return 0
