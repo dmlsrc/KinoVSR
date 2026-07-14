@@ -6,11 +6,13 @@ import pytest
 
 from kinovsr.cli.args import build_parser
 from kinovsr.cli.assemble_pipeline import assemble_pipeline
+from kinovsr.config import ConfigError
 from kinovsr.pipeline import resolve_pipeline
 from kinovsr.processors import (
     Geometry,
     StreamSpec,
     TimelineSpec,
+    UnknownStageError,
     frame_spec_for_matrix,
 )
 from kinovsr.settings import Settings
@@ -69,6 +71,17 @@ class TestDefaultsAndOrder:
         config = asm("--denoise", "mc,bsvd")
         assert config["pipeline"] == ["denoise_mc", "denoise_bsvd",
                                       "upscale"]
+        assert config["denoise_mc"]["capability"] == "denoise"
+        assert config["denoise_bsvd"]["capability"] == "denoise"
+
+    @pytest.mark.parametrize("argv", [
+        ["--denoise", "stdf"],
+        ["--deblock", "bsvd"],
+    ])
+    def test_wrong_slot_family_fails_preflight(self, argv):
+        with pytest.raises(UnknownStageError, match="does not offer"):
+            resolve_pipeline(
+                asm(*argv), input_spec=spec(), settings=Settings())
 
     def test_geometry_then_cut_precede_the_slots(self):
         config = asm("--crop-bars", "16,16,0,0", "--square-pixels",
@@ -116,6 +129,17 @@ class TestDialRouting:
                      "--bsvd-strength", "0.7")
         assert config["denoise_mc"]["strength"] == 0.4
         assert config["denoise_bsvd"]["strength"] == 0.7
+
+    def test_shared_strength_list_distributes_positionally(self):
+        config = asm("--denoise", "mc,bsvd",
+                     "--denoise-strength", "0.3,0.7")
+        assert config["denoise_mc"]["strength"] == 0.3
+        assert config["denoise_bsvd"]["strength"] == 0.7
+
+    def test_shared_strength_list_requires_matching_arity(self):
+        with pytest.raises(ConfigError, match="3 values for 2"):
+            asm("--denoise", "mc,bsvd",
+                "--denoise-strength", "0.2,0.4,0.6")
 
     def test_noise_map_reaches_capable_denoisers(self):
         config = asm("--denoise", "spatial,bsvd", "--noise-map", "auto",

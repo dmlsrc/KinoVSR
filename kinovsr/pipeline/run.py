@@ -663,8 +663,12 @@ def run_file(
             context_frames = start - read_start
             kf_rel = sorted({k - read_start for k in keyframes
                              if read_start <= k < end_abs})
-            windowing = plan_gop_windows(
-                kf_rel, end_abs - read_start, gop_min_window, gop_max_window)
+            try:
+                windowing = plan_gop_windows(
+                    kf_rel, end_abs - read_start,
+                    gop_min_window, gop_max_window)
+            except ValueError as exc:
+                raise MediaError(f"invalid GOP window bounds: {exc}") from exc
 
     source = FileSource(
         video, layout=layout, start=start, end=end,

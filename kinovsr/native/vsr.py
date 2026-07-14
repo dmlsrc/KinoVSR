@@ -22,6 +22,7 @@ from kinovsr.settings import default_settings
 from .frameworks import Quartz, vt
 
 _log = logging.getLogger(__name__)
+_NATIVE_STDERR_LOCK = threading.RLock()
 
 
 @contextmanager
@@ -39,16 +40,21 @@ def _suppress_native_stderr():
     if default_settings().verbose:
         yield
         return
-    sys.stderr.flush()
-    saved_fd = os.dup(2)
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    try:
-        os.dup2(devnull_fd, 2)
-        yield
-    finally:
-        os.dup2(saved_fd, 2)
-        os.close(devnull_fd)
-        os.close(saved_fd)
+    # fd 2 is process-global. Serialize the complete save/redirect/restore
+    # interval so two session starts cannot save and later restore each
+    # other's temporary /dev/null state. RLock keeps nested construction in
+    # one thread safe as well.
+    with _NATIVE_STDERR_LOCK:
+        sys.stderr.flush()
+        saved_fd = os.dup(2)
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull_fd, 2)
+            yield
+        finally:
+            os.dup2(saved_fd, 2)
+            os.close(devnull_fd)
+            os.close(saved_fd)
 
 
 def scale_for_mode(mode: str) -> int:

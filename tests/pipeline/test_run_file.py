@@ -388,6 +388,22 @@ class TestGopAlign:
         with pytest.raises(MediaError, match="context_frames"):
             FileSource(clip, start=2, end=8, context_frames=4)
 
+    @pytest.mark.parametrize(("minimum", "maximum"), [
+        (0, 0),
+        (-1, 16),
+        (16, 0),
+        (32, 16),
+    ])
+    def test_invalid_window_bounds_fail_before_output(
+            self, clip, tmp_path, minimum, maximum):
+        output = tmp_path / f"invalid_{minimum}_{maximum}.mp4"
+        with pytest.raises(MediaError, match="invalid GOP window bounds"):
+            run_file(
+                {"pipeline": []}, video=clip, output=output,
+                settings=SETTINGS, gop_align=True,
+                gop_min_window=minimum, gop_max_window=maximum)
+        assert not output.exists()
+
     def test_gop_align_drops_context_outputs(self, clip, tmp_path):
         # start mid-GOP: the enclosing keyframe (8) extends the read, the
         # [8, 12) context is processed but never written.

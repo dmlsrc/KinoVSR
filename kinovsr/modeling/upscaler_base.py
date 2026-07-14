@@ -30,16 +30,39 @@ def plan_gop_windows(keyframes: list[int], n_frames: int,
     at the internal, non-keyframe splits only. A clip with no usable keyframe run
     (e.g. a single-keyframe open GOP) falls back to fixed max_window+trim tiling.
     """
-    if max_window < min_window:
-        max_window = min_window
+    if isinstance(n_frames, bool) or not isinstance(n_frames, int):
+        raise ValueError("n_frames must be an integer")
+    if n_frames < 0:
+        raise ValueError("n_frames must be >= 0")
+    for name, value in (
+            ("min_window", min_window), ("max_window", max_window)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer")
+        if value <= 0:
+            raise ValueError(f"{name} must be > 0")
+    if min_window > max_window:
+        raise ValueError("min_window must be <= max_window")
+    if any(isinstance(k, bool) or not isinstance(k, int)
+           for k in keyframes):
+        raise ValueError("keyframes must contain integers")
+    if n_frames == 0:
+        return []
+
     kf = sorted({k for k in keyframes if 0 <= k < n_frames})
     if not kf or kf[0] != 0:
         kf = [0, *kf]
     trim = 2
     out: list[tuple[int, int, int, int]] = []
     pos = 0
+    # Keyframes and output position are monotonic. Keep one forward cursor
+    # instead of rescanning kf from index zero for every window (quadratic on
+    # dense all-I sources).
+    kf_cursor = 1
     while pos < n_frames:
-        close = next((k for k in kf if k > pos and k - pos >= min_window), n_frames)
+        target = pos + min_window
+        while kf_cursor < len(kf) and kf[kf_cursor] < target:
+            kf_cursor += 1
+        close = kf[kf_cursor] if kf_cursor < len(kf) else n_frames
         if close - pos <= max_window:
             # one keyframe-anchored window; include the closing keyframe in proc
             proc_end = min(close + 1, n_frames) if close < n_frames else n_frames
@@ -55,7 +78,11 @@ def plan_gop_windows(keyframes: list[int], n_frames: int,
                     p_end = min(close, sub_end + trim)
                 out.append((p_start, p_end, sub, sub_end))
                 sub = sub_end
+        previous = pos
         pos = close
+        if pos <= previous:
+            raise RuntimeError(
+                "GOP planner did not advance; invalid window bounds")
     return out
 
 

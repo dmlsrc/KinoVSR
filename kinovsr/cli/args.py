@@ -120,6 +120,13 @@ def validate_args(parser: argparse.ArgumentParser,
         parser.error(
             "--save-pre-frames/--save-post-frames/--save-audio-sidecar "
             "require --output-dir")
+    if args.gop_min_window < 1:
+        parser.error("--gop-min-window must be >= 1")
+    if args.gop_max_window < 1:
+        parser.error("--gop-max-window must be >= 1")
+    if args.gop_min_window > args.gop_max_window:
+        parser.error(
+            "--gop-min-window must be <= --gop-max-window")
     if args.upscale == "realbasicvsr":
         if args.realbasicvsr_window < 1:
             parser.error("--realbasicvsr-window must be >= 1")

@@ -76,6 +76,10 @@ _STAGE_SELECTORS = (
 _GEOMETRY_FLAGS = (
     "crop_bars", "crop_aspect", "square_pixels", "sanitize_edges",
 )
+_PIPELINE_OPTIONS = (
+    ("target_fps", None),
+    ("temporal_mode", "normal"),
+)
 _UNSET = (None, False, "off", "")
 
 
@@ -90,10 +94,13 @@ def _pipeline_owned_flags(options) -> list[str]:
              if getattr(options, name, default) != default]
     owned += [name for name in _GEOMETRY_FLAGS
               if getattr(options, name, None) not in _UNSET]
+    owned += [name for name, default in _PIPELINE_OPTIONS
+              if getattr(options, name, default) != default]
     return owned
 
 
-def _source_layout(config):
+def _source_layout(config, *, source_color: str = "auto",
+                   source_range: str = "auto"):
     """The file-source layout the FIRST stage accepts (MLX preferred).
 
     The input endpoint must decode into a payload the chain's head can
@@ -103,6 +110,13 @@ def _source_layout(config):
     """
     from kinovsr.pipeline.builder import _resolve_capability
     from kinovsr.processors import Layout, get_factory
+
+    # Forced color/range reinterpretation is implemented by the RGBAHalf MLX
+    # decode route. Native VideoToolbox heads accept that upload bridge, so an
+    # explicit correction request takes precedence over their zero-copy
+    # preferred source layout.
+    if source_color != "auto" or source_range != "auto":
+        return Layout.MLX_RGB_HWC
 
     pipeline = config.get("pipeline") or []
     if not pipeline:
@@ -229,7 +243,11 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
     if assemble_flags:
         from ..assemble_pipeline import assemble_pipeline
 
-        config = assemble_pipeline(options, width=_w, height=_h)
+        try:
+            config = assemble_pipeline(options, width=_w, height=_h)
+        except ConfigError as exc:
+            _log.error("config error: %s", exc)
+            return 2
 
     try:
         result = process_video_file(
@@ -259,7 +277,11 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
             cut_log=options.cut_log,
             skip_post_mp4=options.skip_post_mp4,
             noise_map_debug=options.noise_map_debug,
-            layout=_source_layout(config),
+            layout=_source_layout(
+                config,
+                source_color=options.source_color,
+                source_range=options.source_range,
+            ),
             reader=reader,
         )
     except (ConfigError, MediaError, PipelineError) as exc:

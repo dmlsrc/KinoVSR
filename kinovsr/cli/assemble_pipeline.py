@@ -30,6 +30,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from kinovsr.config import ConfigError
+
 from .options import PP_STAGE_NAMES
 
 # --upscale values that select the native VideoToolbox scaler; everything
@@ -83,6 +85,29 @@ def _coerce(opt: Any, value: Any) -> Any:
         except ValueError:
             return value
     return value
+
+
+def _slot_values(opt: Any, raw_value: Any,
+                 stage_names: list[str]) -> list[Any]:
+    """Type and distribute a shared slot value over its selected stages.
+
+    One scalar broadcasts. A comma list is positional and must have exactly
+    one value per stage, matching the CLI help contract.
+    """
+    if not stage_names:
+        return []
+    if not isinstance(raw_value, str) or "," not in raw_value:
+        value = _coerce(opt, raw_value)
+        return [value] * len(stage_names)
+    tokens = [token.strip() for token in raw_value.split(",")]
+    if any(not token for token in tokens):
+        raise ConfigError(
+            f"{opt.flag} contains an empty positional value")
+    if len(tokens) != len(stage_names):
+        raise ConfigError(
+            f"{opt.flag} has {len(tokens)} values for "
+            f"{len(stage_names)} selected stages")
+    return [_coerce(opt, token) for token in tokens]
 
 
 def _bump_even(edges: list[int], width: int, height: int) -> list[int]:
@@ -191,15 +216,17 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
             add("deflicker", {"processor": "deflicker"}, slot="deflicker")
         elif slot == "deblock" and options.deblock != "off":
             for family in chain(options.deblock):
-                table = {"processor": family}
-                if family == "toflow":
-                    table["capability"] = "deblock"
+                table = {
+                    "processor": family,
+                    "capability": "deblock",
+                }
                 add(f"deblock_{family}", table, slot="deblock")
         elif slot == "denoise" and options.denoise != "off":
             for family in chain(options.denoise):
-                table = {"processor": family}
-                if family == "toflow":
-                    table["capability"] = "denoise"
+                table = {
+                    "processor": family,
+                    "capability": "denoise",
+                }
                 add(f"denoise_{family}", table, slot="denoise")
         elif slot == "nafnet" and options.nafnet != "off":
             capability, profile = _NAFNET[options.nafnet]
@@ -258,8 +285,10 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
         if family in ("denoise", "deblock", "restore"):
             if key is None or key == "first":
                 continue                  # the selector / ordering itself
-            for name in members(family):
-                config[name][key] = value
+            names = members(family)
+            for name, slot_value in zip(
+                    names, _slot_values(opt, raw_value, names), strict=True):
+                config[name][key] = slot_value
             continue
         if family == "toflow_sr":
             up = config.get("upscale")

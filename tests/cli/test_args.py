@@ -98,6 +98,18 @@ class TestExitCodes:
         assert exc.value.code == 2
         capsys.readouterr()
 
+    @pytest.mark.parametrize("flags", [
+        ["--gop-min-window", "0"],
+        ["--gop-max-window", "0"],
+        ["--gop-min-window", "20", "--gop-max-window", "10"],
+    ])
+    def test_invalid_gop_windows_exit_two(self, parser, capsys, flags):
+        args = parser.parse_args([*BASE, "--gop-align", *flags])
+        with pytest.raises(SystemExit) as exc:
+            validate_args(parser, args)
+        assert exc.value.code == 2
+        capsys.readouterr()
+
     def test_probe_noise_waives_output_dir(self, parser):
         args = parser.parse_args(["--video", "clip.mp4", "--probe-noise"])
         validate_args(parser, args)
@@ -208,10 +220,10 @@ class TestDeblockWeights:
 class TestTypedSourceLayout:
     """The typed route decodes into a layout the chain's head accepts."""
 
-    def _pick(self, config):
+    def _pick(self, config, **kwargs):
         from kinovsr.cli.commands.run import _source_layout
 
-        return _source_layout(config)
+        return _source_layout(config, **kwargs)
 
     def test_native_head_gets_a_cv_layout(self):
         from kinovsr.processors import Layout
@@ -235,6 +247,17 @@ class TestTypedSourceLayout:
                        "capability": "upscale", "profile": "fast"}}
         assert self._pick(balanced) is Layout.CV_RGBA_HALF
         assert self._pick(fast) is Layout.CV_NV12
+
+    def test_forced_color_or_range_uses_the_mlx_decode_bridge(self):
+        from kinovsr.processors import Layout
+
+        balanced = {"pipeline": ["up"],
+                    "up": {"processor": "videotoolbox",
+                           "capability": "upscale", "profile": "balanced"}}
+        assert self._pick(
+            balanced, source_color="bt601") is Layout.MLX_RGB_HWC
+        assert self._pick(
+            balanced, source_range="full") is Layout.MLX_RGB_HWC
 
     def test_preprocessed_upscale_head_stays_mlx(self):
         # With an MLX stage ahead of the upscale, the head is that stage:
@@ -276,7 +299,8 @@ class TestPipelineOwnedFlags:
             "restore": "off", "nafnet": "off", "deflicker": "off",
             "cut_detect": "off", "crop_bars": None, "crop_aspect": None,
             "square_pixels": False, "sanitize_edges": None, "snap_start": False,
-            "gop_align": False}
+            "gop_align": False, "target_fps": None,
+            "temporal_mode": "normal"}
         base.update(overrides)
         return _pipeline_owned_flags(SimpleNamespace(**base))
 
@@ -300,3 +324,23 @@ class TestPipelineOwnedFlags:
         # [pipeline] config instead of being rejected.
         assert self._flags(gop_align=True) == []
         assert self._flags(snap_start=True) == []
+
+    def test_target_fps_is_rejected_with_an_explicit_pipeline(self):
+        assert "target_fps" in self._flags(target_fps=50.0)
+        assert "temporal_mode" in self._flags(temporal_mode="high")
+
+    def test_typed_command_returns_config_error_for_target_fps(self):
+        from types import SimpleNamespace
+
+        from kinovsr.cli.commands.run import _run_typed
+
+        options = SimpleNamespace(
+            output_dir="unused",
+            target_fps=50.0,
+            temporal_mode="normal",
+        )
+        invocation = SimpleNamespace(
+            options=options,
+            config={"pipeline": []},
+        )
+        assert _run_typed(invocation) == 2
