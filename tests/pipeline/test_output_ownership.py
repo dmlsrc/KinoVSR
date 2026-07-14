@@ -23,10 +23,10 @@ from kinovsr.settings import Settings
 
 pytestmark = pytest.mark.integration
 
-def _cv_spec() -> StreamSpec:
+def _cv_spec(matrix: str = "bt709") -> StreamSpec:
     return StreamSpec(
         frame=frame_spec_for_matrix(
-            "bt709", full_range=False, geometry=Geometry(8, 8),
+            matrix, full_range=False, geometry=Geometry(8, 8),
             layout=Layout.CV_RGBA_HALF),
         timeline=TimelineSpec(
             time_base=Fraction(1, 24000), cadence=Fraction(25)))
@@ -63,6 +63,62 @@ def test_zero_copy_session_aliases_the_borrowed_input():
     assert len(out) == 1
     # Zero-copy: the pass-through payload IS the borrowed input buffer.
     assert out[0].payload is buf
+
+
+@pytest.mark.parametrize("matrix_token", ["bt709", "bt2020"])
+def test_retained_copy_reconciles_modeled_attachments_to_output_spec(matrix_token):
+    from kinovsr.native.frameworks import Quartz
+
+    unit, buf = _cv_unit()
+    conflicting = {
+        Quartz.kCVImageBufferColorPrimariesKey:
+            Quartz.kCVImageBufferColorPrimaries_P3_D65,
+        Quartz.kCVImageBufferTransferFunctionKey:
+            Quartz.kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+        Quartz.kCVImageBufferYCbCrMatrixKey:
+            Quartz.kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+        Quartz.kCVImageBufferPixelAspectRatioKey: {
+            Quartz.kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 4,
+            Quartz.kCVImageBufferPixelAspectRatioVerticalSpacingKey: 3,
+        },
+        "KinoVSRTestUnmodeled": "preserved",
+    }
+    for key, value in conflicting.items():
+        Quartz.CVBufferSetAttachment(
+            buf, key, value, Quartz.kCVAttachmentMode_ShouldPropagate
+        )
+
+    session = open_pipeline(
+        {"pipeline": []}, _cv_spec(matrix_token), settings=Settings()
+    )
+    with session, session.process([unit]) as run:
+        retained = list(run)[0].payload
+    attachments = dict(
+        Quartz.CVBufferCopyAttachments(
+            retained, Quartz.kCVAttachmentMode_ShouldPropagate
+        )
+        or {}
+    )
+
+    expected_primaries = (
+        Quartz.kCVImageBufferColorPrimaries_ITU_R_2020
+        if matrix_token == "bt2020"
+        else Quartz.kCVImageBufferColorPrimaries_ITU_R_709_2
+    )
+    expected_matrix = (
+        Quartz.kCVImageBufferYCbCrMatrix_ITU_R_2020
+        if matrix_token == "bt2020"
+        else Quartz.kCVImageBufferYCbCrMatrix_ITU_R_709_2
+    )
+    assert attachments[Quartz.kCVImageBufferColorPrimariesKey] == expected_primaries
+    assert attachments[Quartz.kCVImageBufferTransferFunctionKey] == (
+        Quartz.kCVImageBufferTransferFunction_ITU_R_709_2
+    )
+    assert attachments[Quartz.kCVImageBufferYCbCrMatrixKey] == expected_matrix
+    aspect = attachments[Quartz.kCVImageBufferPixelAspectRatioKey]
+    assert aspect[Quartz.kCVImageBufferPixelAspectRatioHorizontalSpacingKey] == 1
+    assert aspect[Quartz.kCVImageBufferPixelAspectRatioVerticalSpacingKey] == 1
+    assert attachments["KinoVSRTestUnmodeled"] == "preserved"
 
 
 def test_run_plan_is_retain_safe_by_default():

@@ -511,7 +511,7 @@ class TestBuildRollbackUnderInterrupts:
                                 settings=SETTINGS)
         with pytest.raises(RuntimeError, match="weights exploded"):
             build_processors(plan, PipelineContext(settings=SETTINGS))
-        assert closed == ["first", "second"]
+        assert closed == ["second", "first"]
 
     def test_interrupt_during_rollback_finishes_then_chains(self, families):
         closed = []
@@ -540,14 +540,14 @@ class TestBuildRollbackUnderInterrupts:
                                 settings=SETTINGS)
         with pytest.raises(KeyboardInterrupt) as exc:
             build_processors(plan, PipelineContext(settings=SETTINGS))
-        assert closed == ["first", "second"]  # rollback finished anyway
+        assert closed == ["second", "first"]  # rollback finished anyway
         # the build error is preserved on the delivered interrupt's chain
         assert any(isinstance(c, RuntimeError) and "weights exploded" in str(c)
                    for c in _ctx_chain(exc.value))
 
     def test_all_rollback_interrupts_are_preserved(self, families):
-        # Two built stages raise interrupts on close during rollback: the
-        # first wins, and the SECOND is still reachable (re-review #7-low).
+        # Two built stages raise interrupts on close during rollback: the first
+        # in reverse ownership order wins, and the other remains reachable.
         def make_session(name, error=None):
             class Session(Passthrough):
                 def close(self, context):
@@ -570,8 +570,8 @@ class TestBuildRollbackUnderInterrupts:
         module.fakeinterp.build = failing_build
         plan = resolve_pipeline(config, input_spec=stream(),
                                 settings=SETTINGS)
-        with pytest.raises(KeyboardInterrupt, match="build-first") as exc:
+        with pytest.raises(SystemExit, match="build-second") as exc:
             build_processors(plan, PipelineContext(settings=SETTINGS))
         chain = [str(c) for c in _ctx_chain(exc.value)]
-        assert any("build-second" in s for s in chain)   # later interrupt kept
+        assert any("build-first" in s for s in chain)   # later interrupt kept
         assert any("weights exploded" in s for s in chain)  # build error kept

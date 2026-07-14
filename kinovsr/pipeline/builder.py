@@ -392,7 +392,7 @@ def build_processors(
         # between a bracket's two halves leaks neither.
         closables = [(s.name, p) for s, p in built]
         closables += [(f"{n}:post", p) for n, p in pending_posts.items()]
-        for stage_name, processor in closables:
+        for stage_name, processor in reversed(closables):
             try:
                 processor.close(context.for_stage(stage_name))
             except Exception as exc:  # noqa: BLE001 - collected, chained below

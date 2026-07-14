@@ -314,7 +314,7 @@ class TestCleanup:
         a, b = Recorder("a", log), Recorder("b", log)
         list(run_chain(chain(a, b), units(2), CONTEXT))
         assert [x for x in log if x[1] == "close"] == [
-            ("a", "close", ""), ("b", "close", "")]
+            ("b", "close", ""), ("a", "close", "")]
 
     def test_cancel_mid_run_closes_exactly_once(self):
         log = []
@@ -323,7 +323,7 @@ class TestCleanup:
         assert next(stream).pts == 0
         stream.close()
         closes = [x for x in log if x[1] == "close"]
-        assert closes == [("a", "close", ""), ("b", "close", "")]
+        assert closes == [("b", "close", ""), ("a", "close", "")]
 
     def test_stage_exception_is_wrapped_and_still_closes_all(self):
         log = []
@@ -332,7 +332,24 @@ class TestCleanup:
         with pytest.raises(PipelineRuntimeError, match=r"\[boom\].*kaboom"):
             list(run_chain(chain(boom, after), units(4), CONTEXT))
         closes = [x[0] for x in log if x[1] == "close"]
-        assert closes == ["boom", "after"]
+        assert closes == ["after", "boom"]
+
+    def test_retained_copy_failure_closes_in_reverse_ownership_order(self):
+        from kinovsr.pipeline.ownership import OwnedCvOutputs
+
+        log = []
+        a, b = Recorder("a", log), Recorder("b", log)
+        outputs = OwnedCvOutputs(run_chain(chain(a, b), units(2), CONTEXT))
+
+        def fail_copy(_payload):
+            raise ValueError("retained copy failed")
+
+        outputs._copy = fail_copy
+        with pytest.raises(ValueError, match="retained copy failed"):
+            next(outputs)
+
+        closes = [x[0] for x in log if x[1] == "close"]
+        assert closes == ["b", "a"]
 
     def test_close_failure_on_success_path_is_raised(self):
         class BadClose(Recorder):
@@ -360,20 +377,20 @@ class TestCleanup:
                    for c in _context_chain(exc.value))
 
     def test_every_close_failure_is_preserved(self):
-        # Two stages both fail to close on the success path: the first wins,
-        # and the SECOND rides the context chain rather than vanishing.
+        # Two stages both fail to close on the success path: the first in
+        # reverse ownership order wins, and the other stays on its chain.
         class BadClose(Recorder):
             def close(self, context):
                 super().close(context)
                 raise RuntimeError(f"{self.name}-close failed")
 
         a, b = BadClose("a"), BadClose("b")
-        with pytest.raises(PipelineRuntimeError, match=r"\[a\].*close") as exc:
+        with pytest.raises(PipelineRuntimeError, match=r"\[b\].*close") as exc:
             list(run_chain(chain(a, b), units(2), CONTEXT))
         # both stages still closed, and both failures are reachable
         assert [x for x in a.log if x[1] == "close"] == [("a", "close", "")]
         assert [x for x in b.log if x[1] == "close"] == [("b", "close", "")]
-        assert any("b-close failed" in str(c)
+        assert any("a-close failed" in str(c)
                    for c in _context_chain(exc.value))
 
 
@@ -411,7 +428,7 @@ class TestOwnershipBeforeIteration:
         stream = run_chain(chain(a, b), units(5), CONTEXT)
         stream.close()  # never iterated
         closes = [x for x in log if x[1] == "close"]
-        assert closes == [("a", "close", ""), ("b", "close", "")]
+        assert closes == [("b", "close", ""), ("a", "close", "")]
         assert list(stream) == []  # closed run yields nothing
         assert closes == [x for x in log if x[1] == "close"]  # still once
 
@@ -468,7 +485,7 @@ class TestCleanupUnderInterrupts:
         with pytest.raises(KeyboardInterrupt):
             stream.close()
         closes = [x[0] for x in log if x[1] == "close"]
-        assert closes == ["first", "second"]
+        assert closes == ["second", "first"]
 
     def test_abandonment_before_first_pull_closes(self):
         log = []
@@ -534,18 +551,18 @@ class TestCleanupPrecedence:
         assert _context_is_acyclic(exc.value)
 
     def test_all_close_interrupts_are_preserved(self):
-        # Two stages raise interrupts on close: the first wins precedence, and
-        # the second is still reachable on the chain (re-review #7).
+        # Two stages raise interrupts on close: the first in reverse ownership
+        # order wins, and the other remains reachable (re-review #7).
         class InterruptClose(Recorder):
             def close(self, context):
                 super().close(context)
                 raise KeyboardInterrupt(f"{self.name}-interrupt")
 
         a, b = InterruptClose("a"), InterruptClose("b")
-        with pytest.raises(KeyboardInterrupt, match="a-interrupt") as exc:
+        with pytest.raises(KeyboardInterrupt, match="b-interrupt") as exc:
             list(run_chain(chain(a, b), units(2), CONTEXT))
         assert _context_is_acyclic(exc.value)
-        assert any("b-interrupt" in str(c)
+        assert any("a-interrupt" in str(c)
                    for c in _context_chain(exc.value))
 
     def test_first_cleanup_failure_wins_on_explicit_close(self):

@@ -72,7 +72,13 @@ values, so they are never an ownership question. CVPixelBuffers are, and
   outputs pass through as the immutable values they are; for a
   CVPixelBuffer layout, `process()` yields a fresh deep copy of each
   output, so you can retain it indefinitely - even after you feed or
-  recycle the next input.
+  recycle the next input. The copy preserves Core Video attachments marked
+  `ShouldPropagate` (including processor-produced color/HDR/display metadata)
+  with their propagation policy. Attachments marked `ShouldNotPropagate` are
+  private to the borrowed buffer and are intentionally not copied. The
+  `StreamSpec` remains authoritative: the retained copy rewrites modeled
+  matrix, primaries, transfer, and pixel-aspect attachments from the output
+  spec after propagating all other public native metadata.
 - **`retain_outputs=False` is the zero-copy opt-out.** Then outputs are
   yielded exactly as produced: a CV payload may alias a borrowed input
   (a pass-through or identity stage yields the input buffer unchanged)

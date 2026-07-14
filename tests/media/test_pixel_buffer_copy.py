@@ -5,6 +5,8 @@ buffer whose contents survive the source being overwritten - packed
 """
 from __future__ import annotations
 
+import struct
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -52,3 +54,73 @@ def test_copy_is_distinct_and_owns_its_pixels(fmt_name):
     pb.upload_frame_to_buffer(_frame(0.25), src)
     assert _rgb_bytes(src) != before          # source really changed
     assert _rgb_bytes(dst) == before          # copy is unaffected
+
+
+def test_copy_propagates_public_attachments_and_drops_private_ones():
+    from kinovsr.native.frameworks import Foundation, Quartz
+
+    src = _make("PIX_RGBAHALF")
+    mastering = struct.pack(
+        ">HHHHHHHHII",
+        8_500, 39_850,
+        6_550, 2_300,
+        35_400, 14_600,
+        15_635, 16_450,
+        10_000_000, 50,
+    )
+    content_light = struct.pack(">HH", 1_000, 400)
+    propagated = {
+        Quartz.kCVImageBufferColorPrimariesKey:
+            Quartz.kCVImageBufferColorPrimaries_P3_D65,
+        Quartz.kCVImageBufferTransferFunctionKey:
+            Quartz.kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+        Quartz.kCVImageBufferYCbCrMatrixKey:
+            Quartz.kCVImageBufferYCbCrMatrix_ITU_R_2020,
+        Quartz.kCVImageBufferMasteringDisplayColorVolumeKey:
+            Foundation.NSData.dataWithBytes_length_(mastering, len(mastering)),
+        Quartz.kCVImageBufferContentLightLevelInfoKey:
+            Foundation.NSData.dataWithBytes_length_(content_light, len(content_light)),
+        Quartz.kCVImageBufferCleanApertureKey: {
+            Quartz.kCVImageBufferCleanApertureWidthKey: 8,
+            Quartz.kCVImageBufferCleanApertureHeightKey: 8,
+            Quartz.kCVImageBufferCleanApertureHorizontalOffsetKey: 0,
+            Quartz.kCVImageBufferCleanApertureVerticalOffsetKey: 0,
+        },
+        Quartz.kCVImageBufferPixelAspectRatioKey: {
+            Quartz.kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 4,
+            Quartz.kCVImageBufferPixelAspectRatioVerticalSpacingKey: 3,
+        },
+        "KinoVSRTestPropagated": "kept",
+    }
+    for key, value in propagated.items():
+        Quartz.CVBufferSetAttachment(
+            src, key, value, Quartz.kCVAttachmentMode_ShouldPropagate
+        )
+    Quartz.CVBufferSetAttachment(
+        src,
+        "KinoVSRTestPrivate",
+        "dropped",
+        Quartz.kCVAttachmentMode_ShouldNotPropagate,
+    )
+    source_attachments = dict(
+        Quartz.CVBufferCopyAttachments(
+            src, Quartz.kCVAttachmentMode_ShouldPropagate
+        )
+        or {}
+    )
+    assert set(propagated) <= set(source_attachments)
+
+    dst = pb.copy_pixel_buffer(src)
+    copied = dict(
+        Quartz.CVBufferCopyAttachments(
+            dst, Quartz.kCVAttachmentMode_ShouldPropagate
+        )
+        or {}
+    )
+
+    for key, value in propagated.items():
+        assert copied[key] == value
+    private = Quartz.CVBufferCopyAttachments(
+        dst, Quartz.kCVAttachmentMode_ShouldNotPropagate
+    )
+    assert not private or "KinoVSRTestPrivate" not in private

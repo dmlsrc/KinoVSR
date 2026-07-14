@@ -236,7 +236,34 @@ def _copy_plane_bytes(src_base: Any, src_bpr: int,
         dst[r * dst_bpr:r * dst_bpr + n] = src[r * src_bpr:r * src_bpr + n]
 
 
-def copy_pixel_buffer(pb: Any) -> Any:
+def _apply_frame_spec_attachments(pb: Any, frame_spec: Any) -> None:
+    """Make modeled output identity override propagated native metadata."""
+    from .color import resolve_frame_spec
+
+    primaries, transfer, matrix, _full_range = resolve_frame_spec(frame_spec)
+    for key, value in (
+        (Quartz.kCVImageBufferYCbCrMatrixKey, matrix),
+        (Quartz.kCVImageBufferColorPrimariesKey, primaries),
+        (Quartz.kCVImageBufferTransferFunctionKey, transfer),
+    ):
+        Quartz.CVBufferSetAttachment(
+            pb, key, value, Quartz.kCVAttachmentMode_ShouldPropagate
+        )
+    pixel_aspect = frame_spec.geometry.pixel_aspect
+    Quartz.CVBufferSetAttachment(
+        pb,
+        Quartz.kCVImageBufferPixelAspectRatioKey,
+        {
+            Quartz.kCVImageBufferPixelAspectRatioHorizontalSpacingKey:
+                int(pixel_aspect.numerator),
+            Quartz.kCVImageBufferPixelAspectRatioVerticalSpacingKey:
+                int(pixel_aspect.denominator),
+        },
+        Quartz.kCVAttachmentMode_ShouldPropagate,
+    )
+
+
+def copy_pixel_buffer(pb: Any, *, frame_spec: Any = None) -> Any:
     """Deep-copy a CVPixelBuffer into a fresh IOSurface-backed buffer.
 
     Format-agnostic: copies every plane row by row, so it handles packed
@@ -271,6 +298,13 @@ def copy_pixel_buffer(pb: Any) -> Any:
     finally:
         Quartz.CVPixelBufferUnlockBaseAddress(dst, 0)
         Quartz.CVPixelBufferUnlockBaseAddress(pb, 1)
+    # Preserve native metadata that the producing buffer explicitly marked for
+    # downstream ownership. Processor-produced values already present on ``pb``
+    # therefore win; non-propagating/private attachments intentionally stay with
+    # the borrowed source buffer.
+    Quartz.CVBufferPropagateAttachments(pb, dst)
+    if frame_spec is not None:
+        _apply_frame_spec_attachments(dst, frame_spec)
     return dst
 
 

@@ -275,14 +275,15 @@ class ChainRun:
         """Close every stage exactly once; report failures instead of
         raising so callers own delivery precedence. Returns EVERY ordinary
         close error and EVERY cleanup interrupt (both wrapped/collected in
-        chain order) - no stage's failure is dropped when a later stage also
-        fails, and the first interrupt still wins precedence downstream."""
+        reverse ownership order) - no stage's failure is dropped when an
+        earlier-owned stage also fails, and the first interrupt still wins
+        precedence downstream."""
         if self._closed:
             return [], []
         self._closed = True
         close_errors: list[Exception] = []
         interrupts: list[BaseException] = []
-        for stage, processor in self._built:
+        for stage, processor in reversed(self._built):
             try:
                 processor.close(self._context.for_stage(stage.name))
             except Exception as exc:  # noqa: BLE001 - collected, not lost
@@ -304,8 +305,8 @@ def run_chain(
     Returns a :class:`ChainRun`: iterate for units, ``close()`` to cancel
     (valid even before the first pull), or use it as a context manager.
     Every stage instance closes exactly once - on completion, error,
-    cancellation, or abandonment - in chain order, with per-stage
-    contexts.
+    cancellation, or abandonment - in reverse chain ownership order, with
+    per-stage contexts.
     """
     return ChainRun(built, units, context)
 
