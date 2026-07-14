@@ -377,20 +377,29 @@ class FileSource:
                     duration=self._grid_ticks(index + 1) - pts)
                 index += 1
 
-    def audio_track(self) -> Any:
-        """Read the source's audio for carry, or None when it has none.
+    def audio_track(self, *, max_duration: Fraction | None = None) -> Any:
+        """Open the source's bounded audio window, or None when absent.
 
-        The carry covers exactly the video window: a windowed run trims
-        the track to [start, end) in seconds, so shortened video never
-        ships beside full-length audio.
+        Exact rational frame boundaries and an optional output-duration cap
+        are resolved before either backend allocates or decodes PCM.
         """
         from kinovsr.media.audio import read_audio_track_from_video
 
-        track = read_audio_track_from_video(self.path, self._vr)
-        if track is None or (self.start, self.end) == (0, self._total):
-            return track
-        return track.trimmed(self.start / self.source_fps,
-                             self.end / self.source_fps)
+        start_sec = Fraction(self.start) / self.source_cadence
+        end_sec = Fraction(self.end) / self.source_cadence
+        try:
+            return read_audio_track_from_video(
+                self.path,
+                self._vr,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                max_duration_sec=max_duration,
+            )
+        except MediaError:
+            raise
+        except RuntimeError as exc:
+            raise MediaError(
+                f"failed to open bounded audio from {self.path}: {exc}") from exc
 
 
 class FileSink:
@@ -1474,12 +1483,14 @@ def _run_file_reserved(
         raise MediaError(
             f"the output cap must be at least one frame; got "
             f"{max_output_frames}")
-    track = source.audio_track() if audio else None
-    if track is not None and max_output_frames is not None:
-        # Capped video must not ship beside longer audio: trim the carry
-        # to the capped output duration (a cap past the natural end is a
-        # no-op; trimmed() clamps).
-        track = track.trimmed(0.0, max_output_frames / float(out_cadence))
+    audio_duration = (
+        Fraction(max_output_frames) / out_cadence
+        if max_output_frames is not None else None
+    )
+    track = (
+        source.audio_track(max_duration=audio_duration)
+        if audio else None
+    )
     if plan.get("audio sidecar") is not None and track is not None:
         # A WAV sidecar of the (trimmed) carried track, beside the output.
         track.save_wav(transaction.temp_file("audio sidecar"))

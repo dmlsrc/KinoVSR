@@ -138,6 +138,18 @@ rounding. Audio carry also requires the source audio and video tracks to
 share an origin. A staggered-track file is rejected before any output is
 reserved; timestamp-aware audio padding and trimming are not implemented, so
 rebasing both tracks independently would silently destroy their offset.
+A file carry resolves the exact rational audio sample window before decode.
+Native and compatibility readers then pull approximately 250 ms of float PCM
+only when each writer reports readiness; post and comparison writers own
+independent cursors, and a WAV sidecar uses a separate cursor with a 4 MiB PCM
+pull limit. Memory therefore follows the selected window's active chunk and
+codec state rather than the complete source duration. Timestamp gaps in
+compatibility inputs are retained as bounded silence instead of concatenating
+post-gap sound early.
+Custom reader adapters that carry audio must implement the bounded
+`read_audio_track_window(...)` capability; the former whole-track
+`read_audio_track(path)` hook is rejected for file carry rather than allowed to
+bypass the memory contract.
 A public stream-side
 file sink that a host could feed with its own `AudioTrack` stays
 deferred until a real out-of-tree adapter proves its shape; today,

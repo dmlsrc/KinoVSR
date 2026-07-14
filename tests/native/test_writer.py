@@ -59,6 +59,7 @@ def _writer(*, native: _NativeWriter | None = None) -> AVWriter:
     result._audio_done = threading.Event()
     result._audio_done.set()
     result._audio_progress = [0]
+    result._audio_complete = False
     result._explicit_end_ticks = 1
     result._yuv_feed = False
     result.writer = native or _NativeWriter()
@@ -149,6 +150,167 @@ def test_audio_callback_failure_reaches_finish_caller(monkeypatch):
         result.finish()
     assert native.cancel_count == 1
     assert result.audio_input.stopped == 1
+
+
+def test_audio_pump_accepts_a_short_final_pull(monkeypatch):
+    result = _writer()
+    result._audio_done.clear()
+    appended = []
+
+    class _AudioInput:
+        finished = 0
+
+        @staticmethod
+        def isReadyForMoreMediaData():
+            return True
+
+        @staticmethod
+        def appendSampleBuffer_(sample):
+            appended.append(sample)
+            return True
+
+        @classmethod
+        def markAsFinished(cls):
+            cls.finished += 1
+
+    class _Track:
+        n_samples = 4
+
+        @staticmethod
+        def make_sample_buffer(start, end):
+            if start >= 3:
+                return None
+            return start, min(end, 3)
+
+    monkeypatch.setattr(
+        writer_module,
+        "CoreMedia",
+        SimpleNamespace(
+            CMSampleBufferGetNumSamples=lambda sample: sample[1] - sample[0],
+        ),
+    )
+    result.audio_input = _AudioInput()
+    result.audio_track = _Track()
+
+    result._pump_audio(n_samples=4, chunk_frames=4)
+
+    assert appended == [(0, 3)]
+    assert result._audio_progress == [3]
+    assert result._audio_complete
+    assert result._audio_done.is_set()
+    assert result.audio_input.finished == 1
+
+
+def test_audio_pump_does_not_decode_under_backpressure():
+    result = _writer()
+    result._audio_done.clear()
+    pulls = []
+
+    class _AudioInput:
+        @staticmethod
+        def isReadyForMoreMediaData():
+            return False
+
+    class _Track:
+        n_samples = 4
+
+        @staticmethod
+        def make_sample_buffer(start, end):
+            pulls.append((start, end))
+
+    result.audio_input = _AudioInput()
+    result.audio_track = _Track()
+
+    result._pump_audio(n_samples=4, chunk_frames=4)
+
+    assert pulls == []
+    assert not result._audio_done.is_set()
+
+
+def test_final_append_marks_audio_finished_before_readiness_drops(monkeypatch):
+    result = _writer()
+    result._audio_done.clear()
+
+    class _AudioInput:
+        def __init__(self):
+            self.ready = True
+            self.finished = 0
+
+        def isReadyForMoreMediaData(self):
+            return self.ready
+
+        def appendSampleBuffer_(self, _sample):
+            self.ready = False
+            return True
+
+        def markAsFinished(self):
+            self.finished += 1
+
+    class _Track:
+        n_samples = 4
+
+        @staticmethod
+        def make_sample_buffer(start, end):
+            return start, end
+
+    monkeypatch.setattr(
+        writer_module,
+        "CoreMedia",
+        SimpleNamespace(
+            CMSampleBufferGetNumSamples=lambda sample: sample[1] - sample[0],
+        ),
+    )
+    result.audio_input = _AudioInput()
+    result.audio_track = _Track()
+
+    result._pump_audio(n_samples=4, chunk_frames=4)
+
+    assert result._audio_progress == [4]
+    assert result.audio_input.finished == 1
+    assert result._audio_complete
+    assert result._audio_done.is_set()
+
+
+def test_audio_pump_bounds_a_one_hour_track_to_ready_chunk(monkeypatch):
+    result = _writer()
+    result._audio_done.clear()
+    pulls = []
+
+    class _AudioInput:
+        def __init__(self):
+            self.ready = True
+
+        def isReadyForMoreMediaData(self):
+            return self.ready
+
+        def appendSampleBuffer_(self, _sample):
+            self.ready = False
+            return True
+
+    class _Track:
+        n_samples = 48_000 * 3600
+
+        @staticmethod
+        def make_sample_buffer(start, end):
+            pulls.append((start, end))
+            return start, end
+
+    monkeypatch.setattr(
+        writer_module,
+        "CoreMedia",
+        SimpleNamespace(
+            CMSampleBufferGetNumSamples=lambda sample: sample[1] - sample[0],
+        ),
+    )
+    result.audio_input = _AudioInput()
+    result.audio_track = _Track()
+
+    result._pump_audio(n_samples=_Track.n_samples, chunk_frames=12_000)
+
+    assert pulls == [(0, 12_000)]
+    assert result._audio_progress == [12_000]
+    assert not result._audio_complete
+    assert not result._audio_done.is_set()
 
 
 def test_missing_finish_callback_times_out_and_cancels(monkeypatch):
@@ -247,6 +409,7 @@ def test_cancelled_audio_callback_does_not_touch_track():
     result = _writer(native=native)
     result._audio_done.clear()
     touched = []
+    closed = []
 
     class _AudioInput:
         def isReadyForMoreMediaData(self):
@@ -262,10 +425,15 @@ def test_cancelled_audio_callback_does_not_touch_track():
         def make_sample_buffer(start, end):
             touched.append((start, end))
 
+        @staticmethod
+        def close():
+            closed.append(True)
+
     result.audio_input = _AudioInput()
     result.audio_track = _Track()
     result.cancel()
     result._pump_audio(n_samples=4, chunk_frames=4)
 
     assert touched == []
+    assert closed == [True]
     assert result._audio_done.is_set()

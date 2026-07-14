@@ -178,6 +178,15 @@ class AVWriter:
         cv_color: tuple | None,
         full_range: bool,
     ) -> None:
+        if audio_track is not None:
+            # File-backed tracks own a mutable decoder cursor. A post writer
+            # and comparison writer can pump concurrently, so each writer
+            # must receive an independent lazy cursor. In-memory tracks are
+            # immutable and return themselves here.
+            audio_track = audio_track.fork()
+        # Own the fork immediately so every later construction failure can
+        # close it through cancel(), including startWriting failures.
+        self.audio_track = audio_track
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists():
             output_path.unlink()
@@ -291,6 +300,7 @@ class AVWriter:
         # Audio pump (GCD pull pattern) --------------------------------------
         self._audio_done = threading.Event()
         self._audio_progress = [0]
+        self._audio_complete = False
         if audio_track is not None:
             self._audio_queue = libdispatch.dispatch_queue_create(
                 f"kinovsr.audio.{label}".encode(), None,
@@ -337,25 +347,44 @@ class AVWriter:
         """
         try:
             while (self._accepting_callbacks()
+                   and not self._audio_complete
                    and self.audio_input.isReadyForMoreMediaData()):
                 pos = self._audio_progress[0]
                 if pos >= n_samples:
                     self.audio_input.markAsFinished()
+                    self._audio_complete = True
                     return
                 end = min(pos + chunk_frames, n_samples)
                 sb = self.audio_track.make_sample_buffer(pos, end)
-                if sb is None or not self.audio_input.appendSampleBuffer_(sb):
+                if sb is None:
+                    self.audio_input.markAsFinished()
+                    self._audio_complete = True
+                    return
+                if not self.audio_input.appendSampleBuffer_(sb):
                     raise RuntimeError(
                         f"[{self.label}] audio appendSampleBuffer failed at "
                         f"{pos}: status={self.writer.status()} "
                         f"error={self.writer.error()}")
-                self._audio_progress[0] = end
+                appended = int(CoreMedia.CMSampleBufferGetNumSamples(sb))
+                if appended <= 0 or appended > end - pos:
+                    raise RuntimeError(
+                        f"[{self.label}] audio source returned invalid sample "
+                        f"count {appended} for [{pos}, {end})")
+                self._audio_progress[0] = pos + appended
+                if self._audio_progress[0] >= n_samples:
+                    # Readiness can flip false immediately after the final
+                    # append. Mark completion now rather than relying on one
+                    # more loop iteration/callback that may never arrive.
+                    self.audio_input.markAsFinished()
+                    self._audio_complete = True
+                    return
         except BaseException as exc:  # callback failures cross via shared state
             self._record_failure(exc)
         finally:
             # A callback can be invoked again while more data becomes ready.
             # Signal only on completion, failure, or cancellation.
-            if (self._audio_progress[0] >= n_samples
+            if (self._audio_complete
+                    or self._audio_progress[0] >= n_samples
                     or not self._accepting_callbacks()
                     or self._failure is not None):
                 self._audio_done.set()
@@ -518,6 +547,10 @@ class AVWriter:
         finally:
             with self._state_lock:
                 self._native_finish_done = None
+            audio_track = getattr(self, "audio_track", None)
+            if audio_track is not None:
+                with contextlib.suppress(BaseException):
+                    audio_track.close()
             self._finish_done.set()
 
     def cancel(self) -> None:
@@ -536,6 +569,10 @@ class AVWriter:
         audio_done = getattr(self, "_audio_done", None)
         if audio_done is not None:
             audio_done.set()
+        audio_track = getattr(self, "audio_track", None)
+        if audio_track is not None:
+            with contextlib.suppress(BaseException):
+                audio_track.close()
         writer = getattr(self, "writer", None)
         if do_native_cancel and writer is not None:
             with contextlib.suppress(BaseException):

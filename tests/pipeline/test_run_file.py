@@ -161,6 +161,11 @@ def _stream_seconds(path):
         return video_s, audio_s, frames, (video.width, video.height)
 
 
+def _decoded_audio_samples(path):
+    with av.open(str(path)) as container:
+        return sum(frame.samples for frame in container.decode(audio=0))
+
+
 class TestFileSource:
     @pytest.mark.parametrize(("layout", "expected"), [
         (Layout.MLX_RGB_HWC, 1),
@@ -474,6 +479,38 @@ class TestFileSource:
         track = source.audio_track()
         expected = round(8 / FPS * SAMPLE_RATE)
         assert abs(track.n_samples - expected) <= 2
+        assert track._source is None
+
+    def test_unbounded_reader_audio_hook_is_a_typed_public_error(
+            self, clip_with_audio, tmp_path):
+        from kinovsr.media import video_reader
+
+        calls = []
+
+        class LegacyAdapter:
+            def __getattr__(self, name):
+                return getattr(video_reader, name)
+
+            @staticmethod
+            def read_audio_track(path):
+                calls.append(path)
+                raise AssertionError("unbounded decoder must not run")
+
+        output = tmp_path / "legacy.mp4"
+        with pytest.raises(
+                MediaError, match="refusing unbounded read_audio_track"):
+            run_file(
+                {"pipeline": []},
+                video=clip_with_audio,
+                output=output,
+                settings=SETTINGS,
+                audio=True,
+                reader=LegacyAdapter(),
+            )
+
+        assert calls == []
+        assert not output.exists()
+        assert not list(tmp_path.glob("*.partial"))
 
     def test_run_file_refuses_output_over_input(self, clip_with_audio,
                                                 tmp_path):
@@ -516,6 +553,57 @@ def test_audio_sidecar_written_beside_the_output(clip_with_audio, tmp_path):
     rate, samples = read_wav(sidecar)
     assert rate == SAMPLE_RATE
     assert samples.shape[0] >= 1
+    assert samples.shape[1] == N * SAMPLE_RATE // FPS
+
+
+def test_windowed_audio_replays_to_sidecar_post_and_comparison(
+        clip_with_audio, tmp_path):
+    """Every consumer receives an independent cursor over identical samples."""
+    from kinovsr.media.audio import read_wav
+
+    out = tmp_path / "out.mp4"
+    comparison = tmp_path / "comparison.mp4"
+    result = run_file(
+        {"pipeline": []},
+        video=clip_with_audio,
+        output=out,
+        settings=SETTINGS,
+        start=4,
+        max_frames=8,
+        audio=True,
+        audio_codec="alac",
+        save_audio_sidecar=True,
+        comparison=comparison,
+    )
+    expected = 8 * SAMPLE_RATE // FPS
+    rate, sidecar = read_wav(out.with_name("out_audio.wav"))
+
+    assert result.frames_out == 8
+    assert rate == SAMPLE_RATE and sidecar.shape[1] == expected
+    assert _decoded_audio_samples(out) == expected
+    assert _decoded_audio_samples(comparison) == expected
+
+
+def test_aac_audio_window_preserves_decoded_onset_and_count(
+        clip_with_audio, tmp_path):
+    out = tmp_path / "aac.mp4"
+    run_file(
+        {"pipeline": []},
+        video=clip_with_audio,
+        output=out,
+        settings=SETTINGS,
+        start=4,
+        max_frames=8,
+        audio=True,
+        audio_codec="aac",
+    )
+
+    expected = 8 * SAMPLE_RATE // FPS
+    assert abs(_decoded_audio_samples(out) - expected) <= 1024
+    with av.open(str(out)) as container:
+        first = next(container.decode(audio=0))
+        assert first.pts is not None
+        assert Fraction(first.pts) * Fraction(first.time_base) == 0
 
 
 class TestForcedColor:

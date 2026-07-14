@@ -5,6 +5,9 @@ GOP, tagged 601), so no binary fixtures and no dependency on files AVFoundation
 can or cannot read.
 """
 import math
+import subprocess
+import sys
+from array import array
 from fractions import Fraction
 from types import SimpleNamespace
 
@@ -153,7 +156,7 @@ def test_audio_track_decodes(tmp_path):
     vs.width, vs.height = W, H
     vs.pix_fmt = "yuv420p"
     asr = out.add_stream("aac", rate=48000, layout="mono")
-    dur_s = 1.0
+    dur_s = 3.0
     n_samp = int(48000 * dur_s)
     import array
     sine = array.array("f", (0.25 * math.sin(2 * math.pi * 440 * i / 48000)
@@ -182,6 +185,195 @@ def test_audio_track_decodes(tmp_path):
     assert at.sample_rate == 48000 and at.channels == 1
     # AAC pads to frame boundaries; length within ~2 AAC frames of the source
     assert abs(at.n_samples - n_samp) < 4096
+
+    window = fr.read_audio_track_window(
+        path,
+        start_sec=Fraction(1, 4),
+        end_sec=Fraction(3, 4),
+        max_duration_sec=Fraction(1, 4),
+    )
+    assert window is not None
+    assert window.n_samples == 12_000
+    assert window._source is None
+    try:
+        window_raw = window._read_interleaved(0, window.n_samples)
+    finally:
+        window.close()
+    assert len(window_raw) == 48_000
+
+    # Seeking with packet preroll must be sample-aligned and numerically
+    # equivalent to decoding the full track then slicing. Separate codec
+    # instances can differ by a few float32 rounding ulps.
+    with av.open(str(path)) as container:
+        stream = container.streams.audio[0]
+        resampler = av.AudioResampler(
+            format="fltp", layout=stream.layout, rate=stream.rate)
+        decoded = []
+        for frame in container.decode(stream):
+            for resampled in resampler.resample(frame):
+                decoded.append(
+                    mx.array(memoryview(resampled.planes[0]).cast("B"))
+                    .view(mx.float32)[:resampled.samples])
+    expected = mx.concatenate(decoded)[12_000:24_000]
+    actual = mx.array(memoryview(window_raw).cast("f"))
+    assert mx.max(mx.abs(actual - expected)).item() < 1e-5
+
+    late = fr.read_audio_track_window(
+        path,
+        start_sec=Fraction(2),
+        end_sec=Fraction(9, 4),
+    )
+    assert late is not None and late.n_samples == 12_000
+    try:
+        late_raw = late._read_interleaved(0, late.n_samples)
+    finally:
+        late.close()
+    late_expected = mx.concatenate(decoded)[96_000:108_000]
+    late_actual = mx.array(memoryview(late_raw).cast("f"))
+    assert mx.max(mx.abs(late_actual - late_expected)).item() < 1e-5
+
+
+def _write_mkv_audio_timeline(path, spans, *, video_frames=0):
+    """Mux AAC spans whose starts are absolute 48 kHz sample positions."""
+    out = av.open(str(path), "w")
+    video = None
+    if video_frames:
+        video = out.add_stream("mpeg4", rate=25)
+        video.width = video.height = 64
+        video.pix_fmt = "yuv420p"
+        video.options = {"bf": "0"}
+    audio = out.add_stream("aac", rate=48_000, layout="mono")
+    for start, count in spans:
+        for offset in range(0, count, 1024):
+            n = min(1024, count - offset)
+            samples = array("f", [0.25]) * n
+            frame = av.AudioFrame(format="fltp", layout="mono", samples=n)
+            frame.sample_rate = 48_000
+            frame.pts = start + offset
+            frame.time_base = Fraction(1, 48_000)
+            frame.planes[0].update(samples.tobytes())
+            for packet in audio.encode(frame):
+                out.mux(packet)
+    for packet in audio.encode():
+        out.mux(packet)
+    if video is not None:
+        for _ in range(video_frames):
+            frame = av.VideoFrame(64, 64, "gray")
+            frame.planes[0].update(bytes(64 * 64))
+            for packet in video.encode(frame.reformat(format="yuv420p")):
+                out.mux(packet)
+        for packet in video.encode():
+            out.mux(packet)
+    out.close()
+
+
+def test_audio_window_handles_coarse_mkv_clock_without_fake_gaps(tmp_path):
+    path = tmp_path / "coarse.mkv"
+    _write_mkv_audio_timeline(path, [(0, 48_000)])
+
+    track = fr.read_audio_track_window(path, end_sec=Fraction(1))
+    assert track is not None
+    try:
+        raw = track._read_interleaved(0, 48_000)
+    finally:
+        track.close()
+
+    assert len(raw) == 48_000 * 4
+
+
+def test_audio_window_preserves_timestamp_gap_as_bounded_silence(tmp_path):
+    path = tmp_path / "gap.mkv"
+    _write_mkv_audio_timeline(
+        path,
+        [(0, 24_000), (48_000, 48_000)],
+        video_frames=50,
+    )
+
+    track = fr.read_audio_track_window(path, end_sec=Fraction(2))
+    assert track is not None
+    try:
+        raw = track._read_interleaved(0, 96_000)
+    finally:
+        track.close()
+
+    assert len(raw) == 96_000 * 4
+    samples = memoryview(raw).cast("f")
+    assert all(sample == 0.0 for sample in samples[30_000:42_000])
+    assert max(abs(sample) for sample in samples[55_000:56_000]) > 0.01
+
+
+def test_audio_window_ends_cleanly_when_audio_is_shorter_than_video(tmp_path):
+    path = tmp_path / "short.mkv"
+    _write_mkv_audio_timeline(path, [(0, 24_000)], video_frames=50)
+
+    track = fr.read_audio_track_window(path, end_sec=Fraction(2))
+    assert track is not None
+    try:
+        raw = track._read_interleaved(0, 96_000)
+        actual = len(raw) // 4
+        assert 24_000 <= actual < 30_000
+        assert track._read_interleaved(actual, 96_000) == b""
+    finally:
+        track.close()
+
+
+def test_late_audio_window_work_does_not_scale_with_source_duration(tmp_path):
+    results = []
+    paths = []
+    for duration in (300, 3600):
+        path = tmp_path / f"sparse-{duration}.mkv"
+        _write_mkv_audio_timeline(
+            path,
+            [(0, 1024), ((duration - 1) * 48_000, 48_000)],
+        )
+        track = fr.read_audio_track_window(
+            path,
+            start_sec=Fraction(duration - 10),
+            end_sec=Fraction(duration),
+        )
+        assert track is not None and track._source is None
+        try:
+            raw = track._read_interleaved(0, 10 * 48_000)
+            decoded = track._source._decoded_frame_count
+        finally:
+            track.close()
+        results.append((len(raw), decoded))
+        paths.append((path, duration))
+
+    expected_bytes = 10 * 48_000 * 4
+    assert [size for size, _ in results] == [expected_bytes, expected_bytes]
+    assert max(decoded for _, decoded in results) <= 64
+    assert abs(results[0][1] - results[1][1]) <= 1
+
+    probe = (
+        "import resource,sys;"
+        "from fractions import Fraction;"
+        "from pathlib import Path;"
+        "from kinovsr.media.ffmpeg_reader import read_audio_track_window;"
+        "d=int(sys.argv[2]);"
+        "t=read_audio_track_window(Path(sys.argv[1]),"
+        "start_sec=Fraction(d-10),end_sec=Fraction(d));"
+        "raw=t._read_interleaved(0,10*48000);"
+        "print(len(raw),t._source._decoded_frame_count,"
+        "resource.getrusage(resource.RUSAGE_SELF).ru_maxrss);"
+        "t.close()"
+    )
+    process_results = []
+    for path, duration in paths:
+        completed = subprocess.run(
+            [sys.executable, "-c", probe, str(path), str(duration)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        process_results.append(
+            tuple(int(value) for value in completed.stdout.splitlines()[-1].split()))
+
+    assert [item[0] for item in process_results] == [
+        expected_bytes, expected_bytes]
+    assert max(item[1] for item in process_results) <= 64
+    # Fresh-process max RSS must not scale with the 12x source-duration delta.
+    assert abs(process_results[0][2] - process_results[1][2]) <= 64 * 1024 * 1024
 
 
 def test_coded_frame_sizes(clip):

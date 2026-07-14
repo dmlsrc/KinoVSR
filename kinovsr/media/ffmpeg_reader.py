@@ -10,7 +10,7 @@ encoder) runs unchanged:
 
     probe_video / probe_color / keyframe_display_indices
     iter_video_buffer_chunks / iter_forced_color_chunks
-    read_audio_track
+    read_audio_track_window / read_audio_track
 
 Frames exit as IOSurface-backed CVPixelBuffers built with the same helpers the
 native path uses, decoded via libavcodec and converted by libswscale honoring
@@ -408,6 +408,18 @@ def iter_forced_color_chunks(
 
 
 # ---------------------------------------------------------------- audio
+def _audio_origin(container: Any, stream: Any) -> Fraction | None:
+    first = stream.start_time
+    if first is None:
+        for packet in container.demux(stream):
+            if packet.pts is not None and packet.size > 0:
+                first = packet.pts
+                break
+    if first is None:
+        return None
+    return Fraction(int(first)) * Fraction(stream.time_base)
+
+
 def probe_audio_timing(path: Path) -> AudioTiming | None:
     """Return the first audio-stream PTS without decoding any packets."""
     container = av.open(str(path))
@@ -418,51 +430,279 @@ def probe_audio_timing(path: Path) -> AudioTiming | None:
             return None
         stream = streams[0]
         time_base = Fraction(stream.time_base)
-        first = stream.start_time
-        if first is None:
-            for packet in container.demux(stream):
-                if packet.pts is not None and packet.size > 0:
-                    first = packet.pts
-                    break
-        if first is None:
+        origin = _audio_origin(container, stream)
+        if origin is None:
             return None
         return AudioTiming(
-            first_pts=Fraction(int(first)) * time_base,
+            first_pts=origin,
             source_tick=time_base,
         )
     finally:
         container.close()
 
 
-def read_audio_track(path: Path) -> Any | None:
-    """Decode the first audio stream to an in-memory AudioTrack (fp32 PCM),
-    the same object the native audio path produces. None when no audio."""
-    from .audio import AudioTrack
+def _audio_segment_start(
+    reported_start: int,
+    cumulative_start: int | None,
+    tick_samples: Fraction,
+    path: Path,
+) -> int:
+    """Snap timestamp quantization but reject a real backward edit."""
+    if cumulative_start is None:
+        return reported_start
+    tolerance = max(
+        1,
+        (tick_samples.numerator + tick_samples.denominator - 1)
+        // tick_samples.denominator,
+    )
+    delta = reported_start - cumulative_start
+    if abs(delta) <= tolerance:
+        return cumulative_start
+    if delta < 0:
+        raise RuntimeError(
+            f"audio stream in {path} overlaps by {-delta} samples at "
+            f"sample {cumulative_start}")
+    return reported_start
+
+
+def _audio_sample_position(
+    pts: int,
+    time_base: Fraction,
+    origin: Fraction,
+    sample_rate: int,
+) -> int:
+    return round((Fraction(pts) * time_base - origin) * sample_rate)
+
+
+class _FFmpegAudioSource:
+    """Seekable, bounded PyAV PCM cursor for a single writer/sidecar."""
+
+    def __init__(
+        self,
+        path: Path,
+        sample_rate: int,
+        channels: int,
+        layout: str,
+        origin: Fraction,
+    ) -> None:
+        self._path = path
+        self._sample_rate = sample_rate
+        self._channels = channels
+        self._layout = layout
+        self._origin = origin
+        self._bytes_per_frame = 4 * channels
+        self._container: Any = None
+        self._stream: Any = None
+        self._segments: Any = None
+        self._pending: tuple[int, int, bytes] | None = None
+        self._cursor: int | None = None
+        self._decoded_frame_count = 0
+
+    def _close_cursor(self) -> None:
+        if self._container is not None:
+            self._container.close()
+        self._container = None
+        self._stream = None
+        self._segments = None
+        self._pending = None
+        self._cursor = None
+
+    def _segment_iter(self, resampler: Any) -> Iterator[tuple[int, int, bytes]]:
+        assert self._container is not None
+        assert self._stream is not None
+        fallback_start: int | None = None
+
+        def converted(frame: Any) -> tuple[int, int, bytes]:
+            nonlocal fallback_start
+            self._decoded_frame_count += 1
+            if frame.pts is not None and frame.time_base is not None:
+                time_base = Fraction(frame.time_base)
+                reported_start = _audio_sample_position(
+                    frame.pts,
+                    time_base,
+                    self._origin,
+                    self._sample_rate,
+                )
+                # Coarse container clocks independently round adjacent PTS.
+                # Snap deltas within one source tick to the cumulative sample
+                # boundary; otherwise a normal 1 ms Matroska clock invents
+                # tiny gaps/overlaps between 1024-sample AAC frames. Larger
+                # deltas remain real edits and are preserved as silence below.
+                tick = time_base * self._sample_rate
+                start = _audio_segment_start(
+                    reported_start, fallback_start, tick, self._path)
+            elif fallback_start is not None:
+                start = fallback_start
+            else:
+                raise RuntimeError(
+                    f"audio frame from {self._path} has no timestamp")
+            planes = [
+                mx.array(memoryview(plane).cast("B")).view(mx.float32)[
+                    :frame.samples]
+                for plane in frame.planes
+            ]
+            if len(planes) != self._channels:
+                raise RuntimeError(
+                    f"audio channel layout changed while decoding "
+                    f"{self._path}: expected {self._channels}, got "
+                    f"{len(planes)}")
+            raw = bytes(memoryview(mx.contiguous(mx.stack(planes, axis=1))))
+            stop = start + int(frame.samples)
+            fallback_start = stop
+            return start, stop, raw
+
+        for frame in self._container.decode(self._stream):
+            for resampled in resampler.resample(frame):
+                yield converted(resampled)
+        for resampled in resampler.resample(None):
+            yield converted(resampled)
+
+    def _reset(self, target: int) -> None:
+        self._close_cursor()
+        container = av.open(str(self._path))
+        streams = [stream for stream in container.streams
+                   if stream.type == "audio"]
+        if not streams:
+            container.close()
+            raise RuntimeError(f"no audio stream in {self._path}")
+        stream = streams[0]
+        rate = int(stream.rate or stream.codec_context.sample_rate or 0)
+        channels = len(stream.layout.channels)
+        if (rate, channels, stream.layout.name) != (
+                self._sample_rate, self._channels, self._layout):
+            container.close()
+            raise RuntimeError(
+                f"audio format changed while opening {self._path}")
+        # Compressed audio needs decoder preroll (AAC's overlapping transform
+        # is the common case). Seek a fixed one-second envelope before the
+        # requested sample, decode/discard it, and still retain only the
+        # caller's bounded PCM pull. Seeking directly to the preceding packet
+        # produces a measurable onset transient versus a full decode.
+        seek_sample = max(0, target - self._sample_rate)
+        target_time = (
+            self._origin
+            + Fraction(seek_sample, self._sample_rate)
+        )
+        timestamp = int(target_time / Fraction(stream.time_base))
+        container.seek(
+            timestamp, stream=stream, backward=True, any_frame=False)
+        resampler = av.AudioResampler(
+            format="fltp", layout=stream.layout, rate=self._sample_rate)
+        self._container = container
+        self._stream = stream
+        self._segments = iter(self._segment_iter(resampler))
+        self._pending = None
+        self._cursor = target
+
+    def read_frames(self, start_frame: int, end_frame: int) -> bytes:
+        if end_frame <= start_frame:
+            return b""
+        if self._cursor != start_frame:
+            self._reset(start_frame)
+        output = bytearray()
+        position = start_frame
+        while position < end_frame:
+            if self._pending is None or self._pending[1] <= position:
+                try:
+                    self._pending = next(self._segments)
+                except StopIteration:
+                    # Some containers omit stream.duration; the container's
+                    # duration is only an upper bound when audio ends before
+                    # video. Return a short final pull and let the writer/sidecar
+                    # close the track cleanly at the actual decoded EOF.
+                    self._cursor = position
+                    return bytes(output)
+                continue
+            segment_start, segment_stop, raw = self._pending
+            if segment_start > position:
+                # Preserve timeline discontinuities as silence instead of
+                # concatenating post-gap audio early. Limit the fill to this
+                # caller's bounded request, so a long edit never becomes a
+                # whole-track allocation.
+                gap_stop = min(segment_start, end_frame)
+                output.extend(
+                    b"\0" * ((gap_stop - position) * self._bytes_per_frame))
+                position = gap_stop
+                continue
+            take_stop = min(segment_stop, end_frame)
+            byte_start = (position - segment_start) * self._bytes_per_frame
+            byte_stop = (take_stop - segment_start) * self._bytes_per_frame
+            output.extend(raw[byte_start:byte_stop])
+            position = take_stop
+        self._cursor = end_frame
+        return bytes(output)
+
+    def close(self) -> None:
+        self._close_cursor()
+
+
+def read_audio_track_window(
+    path: Path,
+    *,
+    start_sec: Fraction | int | float = Fraction(0),
+    end_sec: Fraction | int | float | None = None,
+    max_duration_sec: Fraction | int | float | None = None,
+) -> Any | None:
+    """Open a bounded lazy PCM window from the first audio stream."""
+    from .audio import StreamingAudioTrack, _sample_window
+
     container = av.open(str(path))
     try:
         astreams = [s for s in container.streams if s.type == "audio"]
         if not astreams:
             return None
         ast = astreams[0]
-        resampler = av.AudioResampler(format="fltp", layout=ast.layout, rate=ast.rate)
-        chans: list[list] = []
-        for frame in container.decode(ast):
-            for rf in resampler.resample(frame):
-                planes = [mx.array(memoryview(p).cast("B")).view(mx.float32)[: rf.samples]
-                          for p in rf.planes]
-                chans.append(planes)
-        if not chans:
+        origin = _audio_origin(container, ast)
+        if origin is None:
+            raise RuntimeError(
+                f"audio stream in {path} has no usable presentation origin")
+        sample_rate = int(ast.rate or ast.codec_context.sample_rate or 0)
+        channels = len(ast.layout.channels)
+        if sample_rate <= 0 or channels <= 0:
             return None
-        n_ch = len(chans[0])
-        wave = mx.concatenate(
-            [mx.concatenate([c[i] for c in chans])[None] for i in range(n_ch)], axis=0)
-        return AudioTrack(wave, int(ast.rate))
+        total: int | None = None
+        if ast.duration is not None:
+            total = round(
+                Fraction(ast.duration) * Fraction(ast.time_base) * sample_rate)
+        elif container.duration is not None:
+            total = round(Fraction(container.duration, 1_000_000) * sample_rate)
+        try:
+            start, stop = _sample_window(
+                sample_rate=sample_rate,
+                total_samples=total,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                max_duration_sec=max_duration_sec,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"audio stream in {path} has no usable duration") from exc
+        if stop == start:
+            return None
+        layout = ast.layout.name
+
+        def source_factory() -> _FFmpegAudioSource:
+            return _FFmpegAudioSource(
+                path, sample_rate, channels, layout, origin)
+
+        return StreamingAudioTrack(
+            sample_rate=sample_rate,
+            channels=channels,
+            n_samples=stop - start,
+            source_factory=source_factory,
+            offset=start,
+        )
     finally:
         container.close()
+
+
+def read_audio_track(path: Path) -> Any | None:
+    """Compatibility entry point for callers requesting the complete track."""
+    return read_audio_track_window(path)
 
 
 __all__ = [
     "probe_video", "probe_video_timing", "probe_color", "keyframe_display_indices",
     "iter_video_buffer_chunks", "iter_forced_color_chunks",
-    "probe_audio_timing", "read_audio_track",
+    "probe_audio_timing", "read_audio_track", "read_audio_track_window",
 ]
