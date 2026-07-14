@@ -7,6 +7,7 @@ Being temporal (bidirectional, second-order recurrent), it does what a per-frame
 deblocker cannot: it enforces frame-to-frame consistency, so it does not pulse at
 the GOP period the way a single-frame restorer does on inter-coded video.
 """
+
 from __future__ import annotations
 
 import logging
@@ -18,7 +19,7 @@ from kinovsr.modeling.upscaler_base import WindowedUpscaler
 
 try:
     from . import net
-except ImportError:   # running directly as a script
+except ImportError:  # running directly as a script
     import net
 
 
@@ -33,11 +34,19 @@ class BasicVsrRestorer(WindowedUpscaler):
 
     SCALE = 1
 
-    def __init__(self, weights: Any = None, window: int = 14, trim: int = 2,
-                 strength: float = 1.0, flow_mode: str = "spynet", ensemble: bool = False):
+    def __init__(
+        self,
+        weights: Any = None,
+        window: int = 14,
+        trim: int = 2,
+        strength: float = 1.0,
+        flow_mode: str = "spynet",
+        ensemble: bool = False,
+    ):
         if flow_mode not in ("spynet", "zero", "vt"):
             raise ValueError(
-                f"BasicVSR++ restore flow_mode must be 'spynet', 'zero', or 'vt'; got {flow_mode!r}")
+                f"BasicVSR++ restore flow_mode must be 'spynet', 'zero', or 'vt'; got {flow_mode!r}"
+            )
         if not 0.0 <= strength <= 1.0:
             raise ValueError(f"restore strength must be in [0, 1]; got {strength!r}")
         self._p = net.load_params(net.resolve_restore_weights(weights))
@@ -45,18 +54,32 @@ class BasicVsrRestorer(WindowedUpscaler):
             raise ValueError(
                 "this checkpoint is a 4x-SR BasicVSR++ model, not a 1x-restoration one; "
                 "use --upscale basicvsrpp for SR. Restoration tokens: "
-                f"{list(net._RESTORE_VARIANTS)}")
+                f"{list(net._RESTORE_VARIANTS)}"
+            )
         self._flow_mode = flow_mode
         self._strength = float(strength)
         self._ensemble = bool(ensemble)
-        super().__init__(window=max(int(window), 2 * int(trim) + 1), trim=trim)
+        super().__init__(
+            window=max(int(window), 2 * int(trim) + 1),
+            trim=trim,
+            vt_flow_geometries=(
+                2 if flow_mode == "vt" and ensemble else 1 if flow_mode == "vt" else 0
+            ),
+        )
 
     def _upscale_window(self, frames: list) -> list:
         fn = net.restore_ensemble if self._ensemble else net.restore
-        out = fn(frames, self._p, flow_mode=self._flow_mode)
+        out = fn(
+            frames,
+            self._p,
+            flow_mode=self._flow_mode,
+            vt_flow_services=self._vt_flow_services,
+        )
         if self._strength != 1.0:
             s = self._strength
-            out = [mx.clip(s * o + (1.0 - s) * f, 0.0, 1.0) for o, f in zip(out, frames, strict=True)]
+            out = [
+                mx.clip(s * o + (1.0 - s) * f, 0.0, 1.0) for o, f in zip(out, frames, strict=True)
+            ]
             for o in out:
                 mx.eval(o)
         return out
@@ -74,5 +97,7 @@ if __name__ == "__main__":
         emitted.extend(r.feed(mx.random.uniform(shape=(60, 80, 3)), token=i))
     emitted.extend(r.flush())
     toks = [t for _, t in emitted]
-    _log.info(f"restore: emitted {len(emitted)}/14, order ok: {toks == list(range(14))}, "
-          f"frame shape {tuple(emitted[0][0].shape)}")
+    _log.info(
+        f"restore: emitted {len(emitted)}/14, order ok: {toks == list(range(14))}, "
+        f"frame shape {tuple(emitted[0][0].shape)}"
+    )

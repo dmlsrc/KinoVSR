@@ -10,6 +10,7 @@ Convention: NHWC throughout. Conv weights are pre-transposed to MLX's (O,kH,kW,I
 by each net's load_params; flow is (N,H,W,2) = (x-offset, y-offset), matching
 flow_warp.
 """
+
 from __future__ import annotations
 
 import math
@@ -18,6 +19,7 @@ from typing import Any
 import mlx.core as mx
 
 from .compile_cache import cached as _cached
+from .vt_flow import VtFlowServices, vt_flow_services_scope
 
 
 def relu(x: Any) -> Any:
@@ -49,7 +51,9 @@ def _bilinear(x: Any, sy: Any, sx: Any, pad: str = "border") -> Any:
 
     def g(yi: Any, xi: Any) -> Any:
         idx = (mx.clip(yi, 0, h - 1) * w + mx.clip(xi, 0, w - 1)).reshape(n, oh * ow, 1)
-        v = mx.take_along_axis(flat, mx.broadcast_to(idx, (n, oh * ow, c)), axis=1).reshape(n, oh, ow, c)
+        v = mx.take_along_axis(flat, mx.broadcast_to(idx, (n, oh * ow, c)), axis=1).reshape(
+            n, oh, ow, c
+        )
         if pad == "zeros":
             valid = ((yi >= 0) & (yi <= h - 1) & (xi >= 0) & (xi <= w - 1)).astype(x.dtype)
             v = v * valid[..., None]
@@ -60,13 +64,15 @@ def _bilinear(x: Any, sy: Any, sx: Any, pad: str = "border") -> Any:
     v10 = g(y0i + 1, x0i)
     v11 = g(y0i + 1, x0i + 1)
     out = (1 - ly) * (1 - lx) * v00 + (1 - ly) * lx * v01 + ly * (1 - lx) * v10 + ly * lx * v11
-    return out.astype(x.dtype)   # fp32 grid weights would otherwise upcast features
+    return out.astype(x.dtype)  # fp32 grid weights would otherwise upcast features
 
 
 def flow_warp(x: Any, flow: Any, pad: str = "zeros") -> Any:
     """Warp x (N,H,W,C) by flow (N,H,W,2): out[p] = x[p + flow[p]]."""
     n, h, w, _ = x.shape
-    gy, gx = mx.meshgrid(mx.arange(h, dtype=mx.float32), mx.arange(w, dtype=mx.float32), indexing="ij")
+    gy, gx = mx.meshgrid(
+        mx.arange(h, dtype=mx.float32), mx.arange(w, dtype=mx.float32), indexing="ij"
+    )
     sx = gx[None] + flow[..., 0]
     sy = gy[None] + flow[..., 1]
     return _bilinear(x, sy, sx, pad)
@@ -84,13 +90,12 @@ def box3(x: Any) -> Any:
     acc = None
     for i in range(3):
         for j in range(3):
-            t = xp[:, i:i + h, j:j + w, :]
+            t = xp[:, i : i + h, j : j + w, :]
             acc = t if acc is None else acc + t
     return (acc / 9.0).astype(x.dtype)
 
 
-def history_improve_gate(curr: Any, prev: Any, flow: Any, dtype: Any,
-                         strength: float = 1.0) -> Any:
+def history_improve_gate(curr: Any, prev: Any, flow: Any, dtype: Any, strength: float = 1.0) -> Any:
     """Per-pixel history-admission gate in [0, strength], shape (N,H,W,1).
 
     Admits recurrent history only where the flow warp measurably IMPROVES the
@@ -158,7 +163,7 @@ def make_lanczos_plan(n_in: int, n_out: int) -> tuple:
         pt = math.pi * t
         return 3.0 * math.sin(pt) * math.sin(pt / 3.0) / (pt * pt)
 
-    k_scale = min(1.0, scale)      # stretch the kernel when downscaling
+    k_scale = min(1.0, scale)  # stretch the kernel when downscaling
     idx_rows: list = [[] for _ in range(taps)]
     w_rows: list = [[] for _ in range(taps)]
     for j in range(n_out):
@@ -216,8 +221,7 @@ def pad_spynet_gates(p: dict) -> None:
         k = f"spynet.basic_module.{lvl}.basic_module.0.conv.weight"
         if k in p and p[k].shape[-1] == 8:
             w = p[k]
-            p[k] = mx.concatenate(
-                [w, mx.zeros((*w.shape[:3], 8), dtype=w.dtype)], axis=-1)
+            p[k] = mx.concatenate([w, mx.zeros((*w.shape[:3], 8), dtype=w.dtype)], axis=-1)
 
 
 def _spynet_basic_module(x: Any, p: dict, lvl: int) -> Any:
@@ -253,7 +257,7 @@ def spynet_flow(p: dict, ref: Any, supp: Any) -> Any:
         flow_up = resize(flow, flow.shape[1] * 2, flow.shape[2] * 2, True) * 2.0
         flow_up = _replicate_pad_to(flow_up, refs[lvl].shape[1], refs[lvl].shape[2])
         warped = flow_warp(supps[lvl], flow_up, "border")
-        parts = [refs[lvl], warped, flow_up]                          # (N,h,w,8)
+        parts = [refs[lvl], warped, flow_up]  # (N,h,w,8)
         if inp_pad:
             parts.append(mx.zeros((*refs[lvl].shape[:3], inp_pad), dtype=ref.dtype))
         inp = mx.concatenate(parts, axis=-1)
@@ -272,7 +276,9 @@ def compiled_spynet_flow(p: dict, ref: Any, supp: Any) -> Any:
     fp16 path reorders ops so the flow shifts ~0.02 vs op-by-op (fp32 reorders <3e-4).
     That moves the final SR by <=0.012 max / ~6e-4 mean on [0,1] -- fp16 noise on a net
     that is already an fp16 approximation of the fp32 reference. Keyed by id(p)."""
-    fn = _cached(_SPYNET_COMPILE_CACHE, id(p), lambda: mx.compile(lambda r, s: spynet_flow(p, r, s)))
+    fn = _cached(
+        _SPYNET_COMPILE_CACHE, id(p), lambda: mx.compile(lambda r, s: spynet_flow(p, r, s))
+    )
     return fn(ref, supp)
 
 
@@ -305,8 +311,11 @@ def compiled_resblocks(x: Any, p: dict, prefix: str) -> Any:
     closes over p so its id stays stable. Do NOT call this from inside another
     mx.compile'd step (it would nest compiles) -- call _resblocks_with_input there.
     """
-    fn = _cached(_RESBLOCKS_COMPILE_CACHE, (id(p), prefix),
-                 lambda: mx.compile(lambda x: _resblocks_with_input(x, p, prefix)))
+    fn = _cached(
+        _RESBLOCKS_COMPILE_CACHE,
+        (id(p), prefix),
+        lambda: mx.compile(lambda x: _resblocks_with_input(x, p, prefix)),
+    )
     return fn(x)
 
 
@@ -323,23 +332,10 @@ def _pixelshuffle_pack(x: Any, p: dict, prefix: str, r: int = 2) -> Any:
     return _pixel_shuffle(conv(x, p, f"{prefix}.upsample_conv"), r)
 
 
-# VTOpticalFlow sessions for flow_mode="vt", cached per frame geometry. The
-# McTemporalDenoiser owns the session plumbing (Quality tier + the mandatory
-# synthetic-shift self-test that catches VT's silent-zero sizes/orientations);
-# strength/window are irrelevant here, it is used purely as a flow service.
-_VT_FLOW_CACHE: dict = {}
-
-
-def _vt_flow_service(w: int, h: int):
-    key = (int(w), int(h))
-    if key not in _VT_FLOW_CACHE:
-        from kinovsr.processors.mc import McTemporalDenoiser   # noqa: I001  # lazy: pyobjc + VT session
-        _VT_FLOW_CACHE[key] = McTemporalDenoiser(
-            w, h, strength=0.0, window=1, self_test=True)
-    return _VT_FLOW_CACHE[key]
-
-
-def _vt_flows(frames: list) -> tuple:
+def _vt_flows(
+    frames: list,
+    services: VtFlowServices | None = None,
+) -> tuple:
     """VTOpticalFlow for both propagation directions, in _compute_flows'
     conventions: flows_forward[i] pulls frame i into frame i+1's geometry
     (anchored at i+1); flows_backward[i] pulls frame i+1 into frame i's.
@@ -348,40 +344,53 @@ def _vt_flows(frames: list) -> tuple:
     (source=a, next=b) negated is the pull-flow anchored at b -- the mc
     denoiser's own empirically validated convention (warp(ref, -fwd)).
     """
+    if not frames:
+        return [], []
     if frames[0].shape[0] != 1:
         raise ValueError("flow_mode='vt' supports batch-1 frames only")
+    if len(frames) == 1:
+        return [], []
     h, w = int(frames[0].shape[1]), int(frames[0].shape[2])
-    svc = _vt_flow_service(w, h)
-    dt = frames[0].dtype
-    ff, fb = [], []
-    for i in range(len(frames) - 1):
-        a = frames[i][0].astype(mx.float32)
-        b = frames[i + 1][0].astype(mx.float32)
-        fwd_ab, _ = svc._compute_flows(b, [a])[0]   # source=a, next=b
-        fwd_ba, _ = svc._compute_flows(a, [b])[0]   # source=b, next=a
-        ff.append((-fwd_ab)[None].astype(dt))
-        fb.append((-fwd_ba)[None].astype(dt))
-        mx.eval(ff[-1], fb[-1])
-    return ff, fb
+    with (
+        vt_flow_services_scope(services, max_geometries=1) as flow_services,
+        flow_services.borrow(w, h) as svc,
+    ):
+        dt = frames[0].dtype
+        ff, fb = [], []
+        for i in range(len(frames) - 1):
+            a = frames[i][0].astype(mx.float32)
+            b = frames[i + 1][0].astype(mx.float32)
+            fwd_ab, _ = svc._compute_flows(b, [a])[0]
+            fwd_ba, _ = svc._compute_flows(a, [b])[0]
+            ff.append((-fwd_ab)[None].astype(dt))
+            fb.append((-fwd_ba)[None].astype(dt))
+            mx.eval(ff[-1], fb[-1])
+        return ff, fb
 
 
-def _compute_flows(frames: list, p: dict, flow_mode: str = "spynet") -> tuple:
+def _compute_flows(
+    frames: list,
+    p: dict,
+    flow_mode: str = "spynet",
+    vt_flow_services: VtFlowServices | None = None,
+) -> tuple:
     """flows_forward[i] = flow(i+1 -> i); flows_backward[i] = flow(i -> i+1).
 
     Each flow is materialized as computed: SPyNet upsizes to a multiple of 32 and
     builds the BasicSR pyramid, so holding all 2*(T-1) of them as one lazy graph
     spikes memory; per-flow eval keeps only the small (H,W,2) results alive."""
     if flow_mode == "zero":
-        zeros = [mx.zeros((*frames[0].shape[:3], 2), dtype=frames[0].dtype)
-                 for _ in range(len(frames) - 1)]
+        zeros = [
+            mx.zeros((*frames[0].shape[:3], 2), dtype=frames[0].dtype)
+            for _ in range(len(frames) - 1)
+        ]
         if zeros:
             mx.eval(*zeros)
         return list(zeros), list(zeros)
     if flow_mode == "vt":
-        return _vt_flows(frames)
+        return _vt_flows(frames, vt_flow_services)
     if flow_mode != "spynet":
-        raise ValueError(
-            f"unknown flow_mode {flow_mode!r}; expected 'spynet', 'zero', or 'vt'")
+        raise ValueError(f"unknown flow_mode {flow_mode!r}; expected 'spynet', 'zero', or 'vt'")
     fb, ff = [], []
     for i in range(len(frames) - 1):
         b = compiled_spynet_flow(p, frames[i], frames[i + 1])

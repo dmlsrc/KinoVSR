@@ -6,6 +6,7 @@ a clip. The sliding-window feed()/flush() machinery lives in ../upscaler_base;
 this wrapper loads the weights, exposes the cleaning-loop knobs, and upscales each
 window.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -14,7 +15,7 @@ from kinovsr.modeling.upscaler_base import WindowedUpscaler
 
 try:
     from . import net
-except ImportError:   # running directly as a script
+except ImportError:  # running directly as a script
     import net
 
 
@@ -41,7 +42,8 @@ class RealBasicVsrUpscaler(WindowedUpscaler):
     ):
         if flow_mode not in ("spynet", "zero", "vt"):
             raise ValueError(
-                f"RealBasicVSR flow_mode must be 'spynet', 'zero', or 'vt'; got {flow_mode!r}")
+                f"RealBasicVSR flow_mode must be 'spynet', 'zero', or 'vt'; got {flow_mode!r}"
+            )
         if history_gate not in ("off", "improve"):
             raise ValueError(
                 f"RealBasicVSR history_gate must be 'off' or 'improve'; got {history_gate!r}"
@@ -69,7 +71,11 @@ class RealBasicVsrUpscaler(WindowedUpscaler):
         self._flow_mode = flow_mode
         self._history_strength = float(history_strength)
         self._history_gate = history_gate
-        super().__init__(window=w, trim=t)
+        super().__init__(
+            window=w,
+            trim=t,
+            vt_flow_geometries=1 if flow_mode == "vt" else 0,
+        )
 
     def _upscale_window(self, frames: list) -> list:
         return net.upscale(
@@ -82,4 +88,5 @@ class RealBasicVsrUpscaler(WindowedUpscaler):
             flow_mode=self._flow_mode,
             history_strength=self._history_strength,
             history_gate=self._history_gate,
+            vt_flow_services=self._vt_flow_services,
         )

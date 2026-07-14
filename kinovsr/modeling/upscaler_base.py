@@ -5,6 +5,7 @@ is the sliding-window feed()/flush() driver shared by the clip-recurrent nets
 (BasicVSR++, RealBasicVSR); the per-frame RealESRGAN wrapper uses only
 `to_rgb_batch`, since each frame upscales independently.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -12,8 +13,9 @@ from typing import Any
 import mlx.core as mx
 
 
-def plan_gop_windows(keyframes: list[int], n_frames: int,
-                     min_window: int, max_window: int) -> list[tuple[int, int, int, int]]:
+def plan_gop_windows(
+    keyframes: list[int], n_frames: int, min_window: int, max_window: int
+) -> list[tuple[int, int, int, int]]:
     """Plan GOP-aligned recurrent windows from source keyframe positions.
 
     Returns a list of (proc_start, proc_end, emit_start, emit_end) specs. `proc` is
@@ -34,16 +36,14 @@ def plan_gop_windows(keyframes: list[int], n_frames: int,
         raise ValueError("n_frames must be an integer")
     if n_frames < 0:
         raise ValueError("n_frames must be >= 0")
-    for name, value in (
-            ("min_window", min_window), ("max_window", max_window)):
+    for name, value in (("min_window", min_window), ("max_window", max_window)):
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{name} must be an integer")
         if value <= 0:
             raise ValueError(f"{name} must be > 0")
     if min_window > max_window:
         raise ValueError("min_window must be <= max_window")
-    if any(isinstance(k, bool) or not isinstance(k, int)
-           for k in keyframes):
+    if any(isinstance(k, bool) or not isinstance(k, int) for k in keyframes):
         raise ValueError("keyframes must contain integers")
     if n_frames == 0:
         return []
@@ -81,8 +81,7 @@ def plan_gop_windows(keyframes: list[int], n_frames: int,
         previous = pos
         pos = close
         if pos <= previous:
-            raise RuntimeError(
-                "GOP planner did not advance; invalid window bounds")
+            raise RuntimeError("GOP planner did not advance; invalid window bounds")
     return out
 
 
@@ -115,18 +114,36 @@ class WindowedUpscaler:
 
     SCALE = 4
 
-    def __init__(self, window: int, trim: int):
+    def __init__(
+        self,
+        window: int,
+        trim: int,
+        *,
+        vt_flow_geometries: int = 0,
+    ):
         self._T = int(trim)
         self._W = int(window)
         self._schedule: list | None = None
+        self._vt_flow_services: Any = None
+        if vt_flow_geometries:
+            from kinovsr.modeling.vt_flow import VtFlowServices
+
+            self._vt_flow_services = VtFlowServices(vt_flow_geometries)
         self.reset()
 
+    def close(self) -> None:
+        """Release buffered frames and this driver's native flow services."""
+        self.reset()
+        services, self._vt_flow_services = self._vt_flow_services, None
+        if services is not None:
+            services.close()
+
     def reset(self) -> None:
-        self._frames: list = []     # sliding LR buffer (1,H,W,3)
+        self._frames: list = []  # sliding LR buffer (1,H,W,3)
         self._tokens: list = []
-        self._base = 0              # global index of _frames[0]
-        self._emitted = 0           # global index of the next frame to emit
-        self._sched_i = 0           # next schedule window to run (schedule mode)
+        self._base = 0  # global index of _frames[0]
+        self._emitted = 0  # global index of the next frame to emit
+        self._sched_i = 0  # next schedule window to run (schedule mode)
 
     def set_schedule(self, schedule: list | None) -> None:
         """Switch to GOP-aligned windowing: a list of (proc_start, proc_end,
@@ -182,11 +199,14 @@ class WindowedUpscaler:
                 break
             pe, ee = (min(p1, total), min(e1, total)) if final else (p1, e1)
             if p0 < pe and e0 < ee:
-                sr = self._upscale_window(self._frames[p0 - self._base:pe - self._base])
+                sr = self._upscale_window(self._frames[p0 - self._base : pe - self._base])
                 out.extend((sr[g - p0][0], self._tokens[g - self._base]) for g in range(e0, ee))
             self._sched_i += 1
-        keep_from = (self._schedule[self._sched_i][0] if self._sched_i < len(self._schedule)
-                     else self._base + len(self._frames))
+        keep_from = (
+            self._schedule[self._sched_i][0]
+            if self._sched_i < len(self._schedule)
+            else self._base + len(self._frames)
+        )
         drop = keep_from - self._base
         if drop > 0:
             self._frames = self._frames[drop:]
@@ -198,7 +218,7 @@ class WindowedUpscaler:
         # Both window nets (BasicVSR++ _upsample, RealBasicVSR _basicvsr) mx.eval each
         # output frame as it is produced, so the frames arrive materialized -- no extra
         # sync barrier here.
-        sr = self._upscale_window(self._frames[ws - self._base:we - self._base])
+        sr = self._upscale_window(self._frames[ws - self._base : we - self._base])
         end = we if last else we - self._T
         out = [(sr[g - ws][0], self._tokens[g - self._base]) for g in range(self._emitted, end)]
         self._emitted = end

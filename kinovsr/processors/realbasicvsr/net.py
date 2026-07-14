@@ -5,6 +5,7 @@ front-end followed by the first-order BasicVSR recurrent core. The checkpoint is
 loaded in NHWC layout, but follows the OpenMMLab key names after stripping
 ``generator_ema.`` at conversion time.
 """
+
 from __future__ import annotations
 
 import logging
@@ -38,31 +39,42 @@ _FWD_COMPILE_CACHE: dict = {}
 
 
 def _compiled_clean(p: dict):
-    return _cached(_CLEAN_COMPILE_CACHE, id(p), lambda: mx.compile(
-        lambda f: conv(_resblocks_with_input(f, p, "image_cleaning.0"), p, "image_cleaning.1")))
+    return _cached(
+        _CLEAN_COMPILE_CACHE,
+        id(p),
+        lambda: mx.compile(
+            lambda f: conv(_resblocks_with_input(f, p, "image_cleaning.0"), p, "image_cleaning.1")
+        ),
+    )
 
 
 def _compiled_fwd(p: dict):
     """Compiled forward output step: (frame, warped feat_prop, backward feat) ->
     (new feat_prop, HR residual). The cheap base-resize + residual scale + clip stay
     outside so residual_strength is not baked into the graph."""
+
     def make():
         def step(frame, feat_prop, backward_feat):
             parts = [frame, feat_prop]
-            fpad = (p["basicvsr.forward_resblocks.main.0.weight"].shape[-1]
-                    - sum(t.shape[-1] for t in parts))
-            if fpad:                          # gate-padded weight (_pad_backbone_gates)
+            fpad = p["basicvsr.forward_resblocks.main.0.weight"].shape[-1] - sum(
+                t.shape[-1] for t in parts
+            )
+            if fpad:  # gate-padded weight (_pad_backbone_gates)
                 parts.append(mx.zeros((*feat_prop.shape[:3], fpad), dtype=feat_prop.dtype))
             fp = _resblocks_with_input(
-                mx.concatenate(parts, axis=-1), p, "basicvsr.forward_resblocks")
+                mx.concatenate(parts, axis=-1), p, "basicvsr.forward_resblocks"
+            )
             out = mx.concatenate([backward_feat, fp], axis=-1)
             out = lrelu(conv(out, p, "basicvsr.fusion", pad=0))
             out = lrelu(_pixelshuffle_pack(out, p, "basicvsr.upsample1"))
             out = lrelu(_pixelshuffle_pack(out, p, "basicvsr.upsample2"))
             out = lrelu(conv(out, p, "basicvsr.conv_hr"))
             return fp, conv(out, p, "basicvsr.conv_last")
+
         return mx.compile(step)
+
     return _cached(_FWD_COMPILE_CACHE, id(p), make)
+
 
 _WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 # Only one bundled checkpoint, but exposed as a token for a uniform --weights API.
@@ -84,9 +96,7 @@ def _load_safetensors(path: Path) -> dict:
         return mx.load(str(path))
     shards = sorted(path.parent.glob(f"{path.stem}.shard*{path.suffix}"))
     if not shards:
-        raise FileNotFoundError(
-            f"{path} (no file, and no {path.stem}.shard*{path.suffix} shards)"
-        )
+        raise FileNotFoundError(f"{path} (no file, and no {path.stem}.shard*{path.suffix} shards)")
     w = {}
     for s in shards:
         w.update(mx.load(str(s)))
@@ -116,13 +126,13 @@ def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict
         if selected_prefix:
             if not k.startswith(selected_prefix):
                 continue
-            k = k[len(selected_prefix):]
+            k = k[len(selected_prefix) :]
         elif k.startswith(("generator.", "generator_ema.")):
             continue
         if k == "step_counter":
             continue
         if k.startswith("basicvsr.spynet."):
-            k = k[len("basicvsr."):]
+            k = k[len("basicvsr.") :]
         if k in ("spynet.mean", "spynet.std"):
             a = v.reshape(1, 1, 1, 3)
         elif v.ndim == 4:
@@ -135,7 +145,7 @@ def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict
     missing = [k for k in required if k not in p]
     if missing:
         raise ValueError(f"{src} is not a RealBasicVSR generator checkpoint; missing {missing}")
-    pad_spynet_gates(p)                     # SPyNet first convs 8->16 (see vsr_blocks)
+    pad_spynet_gates(p)  # SPyNet first convs 8->16 (see vsr_blocks)
     _pad_backbone_gates(p)
     return p
 
@@ -152,8 +162,7 @@ def _pad_backbone_gates(p: dict) -> None:
             cin = w.shape[-1]
             if cin > 4 and cin % 16:
                 pad = 16 - cin % 16
-                p[k] = mx.concatenate(
-                    [w, mx.zeros((*w.shape[:3], pad), dtype=w.dtype)], axis=-1)
+                p[k] = mx.concatenate([w, mx.zeros((*w.shape[:3], pad), dtype=w.dtype)], axis=-1)
 
 
 def _clean(frames: list, p: dict, dynamic_refine_thres: float, max_iters: int) -> list:
@@ -175,7 +184,7 @@ def _clean(frames: list, p: dict, dynamic_refine_thres: float, max_iters: int) -
     return cleaned
 
 
-_FC_LO, _FC_HI = 1.0, 4.0   # fwd-bwd error ratio: <=LO fully trusts, >=HI drops
+_FC_LO, _FC_HI = 1.0, 4.0  # fwd-bwd error ratio: <=LO fully trusts, >=HI drops
 
 
 def _flow_consistency_mask(flow_use: Any, flow_rev: Any, dtype: Any) -> Any:
@@ -201,14 +210,26 @@ def _flow_consistency_mask(flow_use: Any, flow_rev: Any, dtype: Any) -> Any:
     return m[..., None].astype(dtype)
 
 
-def _basicvsr(frames: list, p: dict, residual_strength: float,
-              flow_consistency: float = 0.0, flow_mode: str = "spynet",
-              history_strength: float = 1.0, history_gate: str = "off") -> list:
+def _basicvsr(
+    frames: list,
+    p: dict,
+    residual_strength: float,
+    flow_consistency: float = 0.0,
+    flow_mode: str = "spynet",
+    history_strength: float = 1.0,
+    history_gate: str = "off",
+    vt_flow_services: Any = None,
+) -> list:
     n, h, w, _ = frames[0].shape
     mid = int(p["basicvsr.backward_resblocks.main.0.bias"].shape[0])
     dt = frames[0].dtype
 
-    flows_forward, flows_backward = _compute_flows(frames, p, flow_mode=flow_mode)
+    flows_forward, flows_backward = _compute_flows(
+        frames,
+        p,
+        flow_mode=flow_mode,
+        vt_flow_services=vt_flow_services,
+    )
 
     # Precompute soft occlusion masks (flow-only, independent of feat_prop). With
     # strength s, mask = 1 - s*(1 - m_raw): s=0 reproduces the reference (no
@@ -238,10 +259,16 @@ def _basicvsr(frames: list, p: dict, residual_strength: float,
     gate_f: list = []
     if use_gate:
         for i in range(len(frames) - 1):
-            gate_b.append(history_improve_gate(
-                frames[i], frames[i + 1], flows_backward[i], dt, history_strength))
-            gate_f.append(history_improve_gate(
-                frames[i + 1], frames[i], flows_forward[i], dt, history_strength))
+            gate_b.append(
+                history_improve_gate(
+                    frames[i], frames[i + 1], flows_backward[i], dt, history_strength
+                )
+            )
+            gate_f.append(
+                history_improve_gate(
+                    frames[i + 1], frames[i], flows_forward[i], dt, history_strength
+                )
+            )
             mx.eval(gate_b[-1], gate_f[-1])
 
     feat_prop = mx.zeros((n, h, w, mid), dtype=dt)
@@ -256,9 +283,10 @@ def _basicvsr(frames: list, p: dict, residual_strength: float,
             elif use_scalar:
                 feat_prop = feat_prop * float(history_strength)
         parts = [frames[i], feat_prop]
-        bpad = (p["basicvsr.backward_resblocks.main.0.weight"].shape[-1]
-                - sum(t.shape[-1] for t in parts))
-        if bpad:                              # gate-padded weight (_pad_backbone_gates)
+        bpad = p["basicvsr.backward_resblocks.main.0.weight"].shape[-1] - sum(
+            t.shape[-1] for t in parts
+        )
+        if bpad:  # gate-padded weight (_pad_backbone_gates)
             parts.append(mx.zeros((*feat_prop.shape[:3], bpad), dtype=feat_prop.dtype))
         feat_prop = compiled_resblocks(
             mx.concatenate(parts, axis=-1),
@@ -298,6 +326,7 @@ def upscale(
     flow_mode: str = "spynet",
     history_strength: float = 1.0,
     history_gate: str = "off",
+    vt_flow_services: Any = None,
 ) -> list:
     """Upscale an LR clip 4x.
 
@@ -315,8 +344,16 @@ def upscale(
     dt = p["basicvsr.conv_last.weight"].dtype
     frames = [mx.clip(f, 0.0, 1.0).astype(dt) for f in frames]
     cleaned = _clean(frames, p, dynamic_refine_thres, clean_iters)
-    return _basicvsr(cleaned, p, residual_strength, flow_consistency, flow_mode,
-                     history_strength, history_gate)
+    return _basicvsr(
+        cleaned,
+        p,
+        residual_strength,
+        flow_consistency,
+        flow_mode,
+        history_strength,
+        history_gate,
+        vt_flow_services,
+    )
 
 
 _log = logging.getLogger(__name__)

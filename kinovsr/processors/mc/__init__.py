@@ -19,6 +19,7 @@ import mlx.core as mx
 from kinovsr.config.helpers import reject_unknown_keys, typed_value
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.modeling.vsr_blocks import compiled_spynet_flow
+from kinovsr.modeling.vt_flow import _append_cleanup_context
 from kinovsr.native.frameworks import Foundation, Quartz, autorelease_pool, vt
 from kinovsr.native.vsr import _suppress_native_stderr
 from kinovsr.processors.capabilities import (
@@ -56,27 +57,24 @@ from kinovsr.settings import Settings, default_settings
 # its references, just no more than this many flows concurrently.
 _MAX_CONCURRENT_FLOWS = 2
 
-# Cache the sampling grid per resolution; it's constant across frames.
-_GRID: dict[tuple[int, int], tuple[Any, Any]] = {}
-
 
 def _grid(h: int, w: int) -> tuple[Any, Any]:
-    g = _GRID.get((h, w))
-    if g is None:
-        ys, xs = mx.meshgrid(mx.arange(h), mx.arange(w), indexing="ij")
-        g = (ys.astype(mx.float32), xs.astype(mx.float32))
-        _GRID[(h, w)] = g
-    return g
+    ys, xs = mx.meshgrid(mx.arange(h), mx.arange(w), indexing="ij")
+    return ys.astype(mx.float32), xs.astype(mx.float32)
 
 
-def warp(img: Any, flow: Any) -> Any:
+def warp(
+    img: Any,
+    flow: Any,
+    grid: tuple[Any, Any] | None = None,
+) -> Any:
     """Backward-warp an (H,W,C) f32 image by an (H,W,2) px flow field.
 
     out[p] = bilinear_sample(img, p + flow[p]). Used to pull a reference frame
     into alignment with the current one. Out-of-bounds samples clamp to edge.
     """
     h, w, c = img.shape
-    ys, xs = _grid(h, w)
+    ys, xs = grid if grid is not None else _grid(h, w)
     sx = mx.clip(xs + flow[..., 0], 0, w - 1)
     sy = mx.clip(ys + flow[..., 1], 0, h - 1)
     x0 = mx.floor(sx).astype(mx.int32)
@@ -93,7 +91,6 @@ def warp(img: Any, flow: Any) -> Any:
     top = g(y0, x0) * (1 - wx) + g(y0, x1) * wx
     bot = g(y1, x0) * (1 - wx) + g(y1, x1) * wx
     return top * (1 - wy) + bot * wy
-
 
 
 def _box_mean(x: Any, k: int) -> Any:
@@ -132,15 +129,26 @@ class McTemporalDenoiser:
     # and for two noise-carrying frames E[|N(0, sqrt(2) sigma)|] = sqrt(4/pi) sigma.
     RESID_FROM_SIGMA = 1.1283791670955126
 
-    MAP_WARMUP = 9   # frames observed before estimating a spatial noise map
+    MAP_WARMUP = 9  # frames observed before estimating a spatial noise map
 
     def __init__(
-        self, width: int, height: int, strength: float = 0.5,
-        window: int = 0, clamp: bool = False, occlusion: bool = False,
-        confidence: bool = False, sigma: float = 0.06, self_test: bool = True,
-        noise_map: Any = None, map_refresh: int = 64, pulse: Any = None,
-        map_floor: float = 0.0, gate: str = "smooth",
-        flow: str = "vt", flow_weights: Any = None,
+        self,
+        width: int,
+        height: int,
+        strength: float = 0.5,
+        window: int = 0,
+        clamp: bool = False,
+        occlusion: bool = False,
+        confidence: bool = False,
+        sigma: float = 0.06,
+        self_test: bool = True,
+        noise_map: Any = None,
+        map_refresh: int = 64,
+        pulse: Any = None,
+        map_floor: float = 0.0,
+        gate: str = "smooth",
+        flow: str = "vt",
+        flow_weights: Any = None,
     ):
         self.w, self.h = int(width), int(height)
         # flow: the motion engine. "vt" (default) = VTOpticalFlow Quality on
@@ -152,7 +160,7 @@ class McTemporalDenoiser:
         # of MLX GPU time. Flow errors only lower the ceiling either way:
         # the residual gate audits every warp before it blends.
         self.flow_source = str(flow)
-        self.strength = float(strength)   # max blend weight toward a reference
+        self.strength = float(strength)  # max blend weight toward a reference
         self.window = max(0, int(window))
         self.clamp = bool(clamp)
         self.occlusion = bool(occlusion)
@@ -162,7 +170,7 @@ class McTemporalDenoiser:
         # exp(-(resid/sigma)^2): larger = tolerate a bigger current-vs-history
         # difference before throttling the blend, so noise (which inflates that
         # residual) stops gating its own removal -> stronger denoise, more ghosting.
-        self.sigma = float(sigma)   # residual rejection scale (luma, [0,1])
+        self.sigma = float(sigma)  # residual rejection scale (luma, [0,1])
         # gate: what a reference's residual is measured AGAINST.
         # "smooth" (default): the residual anchor is a 3x3 box mean of the
         # current frame, with the gate width recalibrated so the mean
@@ -191,21 +199,29 @@ class McTemporalDenoiser:
         # user sigma floor under the map (static grain does not flicker, so the
         # temporal estimate reads low on it; the floor keeps a base gate width)
         self._map_floor = max(0.0, float(map_floor))
-        self._sigma_plane: Any = None    # (H,W,1) residual-units plane, or None
-        self._recent: list[Any] = []     # rolling frames for estimate/refresh
+        self._sigma_plane: Any = None  # (H,W,1) residual-units plane, or None
+        self._recent: list[Any] = []  # rolling frames for estimate/refresh
         self._since_refresh = 0
-        self._gain = 1.0                 # current per-frame pulse gain
+        self._gain = 1.0  # current per-frame pulse gain
         self.last_noise_map: Any = None  # fp32 (H,W,1) sigma actually used (debug)
         self._pulse_log: list[float] = []
-        self.clamp_k = 5         # neighborhood window for color clamping
+        self.clamp_k = 5  # neighborhood window for color clamping
         self.clamp_gamma = 1.25  # box half-width in std units
-        self.occ_tau = 1.5       # FB-consistency tolerance (pixels)
-        self.conf_scale = 10.0   # flow magnitude (px) at which confidence ~1/e
+        self.occ_tau = 1.5  # FB-consistency tolerance (pixels)
+        self.conf_scale = 10.0  # flow magnitude (px) at which confidence ~1/e
         # gate-openness run stat: mean realized blend weight / strength =
         # the fraction of the possible temporal denoise the flow actually
         # unlocked (flow-limited clips read low)
         self._w_sum = 0.0
         self._w_n = 0
+        self._warp_grid = _grid(self.h, self.w)
+        self._src_attrs: Any = None
+        self._dst_attrs: Any = None
+        self._workers: list[dict[str, Any]] = []
+        self._curr_buf: Any = None
+        self._pool: ThreadPoolExecutor | None = None
+        self._prev: Any = None
+        self._hist: list[Any] = []
         if self.flow_source == "spynet":
             path = flow_weights or default_settings().spynet_weights
             if not path:
@@ -214,13 +230,14 @@ class McTemporalDenoiser:
                 from pathlib import Path as _P
 
                 import kinovsr.modeling as _modeling
-                path = (_P(_modeling.__file__).parent / "spynet"
-                        / "weights" / "spynet_stock_20210409.safetensors")
+
+                path = (
+                    _P(_modeling.__file__).parent
+                    / "spynet"
+                    / "weights"
+                    / "spynet_stock_20210409.safetensors"
+                )
             self._spynet_p = dict(mx.load(str(path)))
-            self._prev = None
-            self._hist = []
-            self._pool = None
-            self._workers = []
             return
         cls = vt.VTOpticalFlowConfiguration
         if not cls.isSupported():
@@ -230,30 +247,29 @@ class McTemporalDenoiser:
         # latency-bound (~17 ms at any resolution) and releases the GIL during
         # the call, so N parallel sessions overlap (~1.6x for 2) rather than
         # serialize - the only real lever for the window's cost.
-        self._src_attrs: Any = None
-        self._dst_attrs: Any = None
-        self._workers = [self._make_worker(cls) for _ in range(max(1, self.window))]
-        # Single shared "current" buffer: every flow reads the same current frame,
-        # so we upload it once per frame instead of once per reference.
-        self._curr_buf = _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._src_attrs)
-        # Bounded thread pool so concurrent flows never oversubscribe (capped
-        # well below the window for large windows). None in recursive mode.
-        self._pool = (
-            ThreadPoolExecutor(max_workers=min(self.window, _MAX_CONCURRENT_FLOWS))
-            if self.window > 1 else None
-        )
-        self._prev: Any = None       # previous OUTPUT frame (recursive mode)
-        self._hist: list[Any] = []   # last N INPUT frames, oldest first (FIR mode)
-        if self_test:
-            try:
+        try:
+            for _ in range(max(1, self.window)):
+                self._workers.append(self._make_worker(cls))
+            # Every flow reads the same current frame, so upload it once.
+            self._curr_buf = _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._src_attrs)
+            self._pool = (
+                ThreadPoolExecutor(max_workers=min(self.window, _MAX_CONCURRENT_FLOWS))
+                if self.window > 1
+                else None
+            )
+            if self_test:
                 self._self_test_flow()
-            except Exception:
+        except BaseException as active:
+            try:
                 self.close()
-                raise
+            except BaseException as cleanup:
+                _append_cleanup_context(active, cleanup)
+            raise
 
     def _make_worker(self, cls: Any) -> dict:
         cfg = cls.alloc().initWithFrameWidth_frameHeight_qualityPrioritization_revision_(
-            self.w, self.h,
+            self.w,
+            self.h,
             vt.VTOpticalFlowConfigurationQualityPrioritizationQuality,
             cls.defaultRevision(),
         )
@@ -264,25 +280,29 @@ class McTemporalDenoiser:
             ok, err = proc.startSessionWithConfiguration_error_(cfg, None)
         if not ok:
             raise RuntimeError(f"VTOpticalFlow startSession failed: {err}")
-        self._src_attrs = dict(cfg.sourcePixelBufferAttributes() or {})
-        self._dst_attrs = dict(cfg.destinationPixelBufferAttributes() or {})
-        return {
-            "proc": proc,
-            # Per-worker source (the reference) + flow outputs. The "next" frame
-            # (current) is a single shared buffer (see _curr_buf) - the flow only
-            # reads it, so concurrent reads are fine and we upload it once/frame.
-            "ref": _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._src_attrs),
-            "fwd": _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._dst_attrs),
-            "bwd": _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._dst_attrs),
-        }
+        try:
+            self._src_attrs = dict(cfg.sourcePixelBufferAttributes() or {})
+            self._dst_attrs = dict(cfg.destinationPixelBufferAttributes() or {})
+            return {
+                "proc": proc,
+                "ref": _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._src_attrs),
+                "fwd": _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._dst_attrs),
+                "bwd": _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._dst_attrs),
+            }
+        except BaseException as active:
+            try:
+                proc.endSession()
+            except BaseException as cleanup:
+                _append_cleanup_context(active, cleanup)
+            raise
 
     def _self_test_frames(self, shift: int) -> tuple[Any, Any]:
         ys, xs = mx.meshgrid(mx.arange(self.h), mx.arange(self.w), indexing="ij")
         xi = xs.astype(mx.int32)
         yi = ys.astype(mx.int32)
-        noise = (
-            (xi * 37 + yi * 17 + (xi // 13) * 29 + (yi // 11) * 31) % 256
-        ).astype(mx.float32) / 255.0
+        noise = ((xi * 37 + yi * 17 + (xi // 13) * 29 + (yi // 11) * 31) % 256).astype(
+            mx.float32
+        ) / 255.0
         blocks = (((xi // 8 + yi // 8) % 2).astype(mx.float32) - 0.5) * 0.25
         base = 0.5 + (noise - 0.5) * 0.65 + blocks
         xs = xs.astype(mx.float32)
@@ -361,7 +381,7 @@ class McTemporalDenoiser:
         self._recent.append(rgb_f32)
         if len(self._recent) > self.MAP_WARMUP:
             self._recent.pop(0)
-        due = (self._sigma_plane is None and len(self._recent) >= self.MAP_WARMUP)
+        due = self._sigma_plane is None and len(self._recent) >= self.MAP_WARMUP
         if not due and self._sigma_plane is not None and self._map_refresh > 0:
             self._since_refresh += 1
             due = self._since_refresh >= self._map_refresh and len(self._recent) >= 2
@@ -375,18 +395,40 @@ class McTemporalDenoiser:
             self._since_refresh = 0
 
     def close(self) -> None:
-        if self._pool is not None:
-            self._pool.shutdown(wait=True)
-            self._pool = None
+        failures: list[BaseException] = []
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            try:
+                pool.shutdown(wait=True)
+            except BaseException as exc:
+                failures.append(exc)
         for wk in self._workers:
-            if wk["proc"] is not None:
-                wk["proc"].endSession()
-                wk["proc"] = None
+            proc, wk["proc"] = wk["proc"], None
+            if proc is not None:
+                try:
+                    proc.endSession()
+                except BaseException as exc:
+                    failures.append(exc)
+            wk["ref"] = None
+            wk["fwd"] = None
+            wk["bwd"] = None
+        self._workers = []
+        self._curr_buf = None
+        self._src_attrs = None
+        self._dst_attrs = None
+        self._prev = None
+        self._hist = []
+        self._warp_grid = None
+        if failures:
+            for cleanup in failures[1:]:
+                _append_cleanup_context(failures[0], cleanup)
+            raise failures[0]
 
     def _upload(self, rgb_f32: Any, buf: Any) -> None:
         h, w = int(rgb_f32.shape[0]), int(rgb_f32.shape[1])
         rgba = mx.concatenate(
-            [rgb_f32.astype(mx.float16), mx.ones((h, w, 1), mx.float16)], axis=-1,
+            [rgb_f32.astype(mx.float16), mx.ones((h, w, 1), mx.float16)],
+            axis=-1,
         )
         _pb.write_fp16_rgba(rgba, buf)
 
@@ -396,9 +438,16 @@ class McTemporalDenoiser:
             bpr = Quartz.CVPixelBufferGetBytesPerRow(pb)
             base = Quartz.CVPixelBufferGetBaseAddress(pb)
             raw = mx.array(memoryview(base.as_buffer(self.h * bpr)))
-            flow = raw.view(mx.float16).reshape(self.h, bpr // 2)[:, : self.w * 2].reshape(
-                self.h, self.w, 2,
-            ).astype(mx.float32)
+            flow = (
+                raw.view(mx.float16)
+                .reshape(self.h, bpr // 2)[:, : self.w * 2]
+                .reshape(
+                    self.h,
+                    self.w,
+                    2,
+                )
+                .astype(mx.float32)
+            )
             mx.eval(flow)
         finally:
             Quartz.CVPixelBufferUnlockBaseAddress(pb, 1)
@@ -423,22 +472,28 @@ class McTemporalDenoiser:
                 mx.eval(fwd)
                 out.append((fwd, bwd))
             return out
-        self._upload(curr, self._curr_buf)              # once, shared by all flows
+        self._upload(curr, self._curr_buf)  # once, shared by all flows
         jobs = []
         for j, ref in enumerate(refs):
             wk = self._workers[j]
             self._upload(ref, wk["ref"])
             sf = vt.VTFrameProcessorFrame.alloc().initWithBuffer_presentationTimeStamp_(
-                wk["ref"], _pb.frame_pts(0, 24.0),
+                wk["ref"],
+                _pb.frame_pts(0, 24.0),
             )
             nf = vt.VTFrameProcessorFrame.alloc().initWithBuffer_presentationTimeStamp_(
-                self._curr_buf, _pb.frame_pts(1, 24.0),
+                self._curr_buf,
+                _pb.frame_pts(1, 24.0),
             )
             fo = vt.VTFrameProcessorOpticalFlow.alloc().initWithForwardFlow_backwardFlow_(
-                wk["fwd"], wk["bwd"],
+                wk["fwd"],
+                wk["bwd"],
             )
             pa = vt.VTOpticalFlowParameters.alloc().initWithSourceFrame_nextFrame_submissionMode_destinationOpticalFlow_(
-                sf, nf, vt.VTOpticalFlowParametersSubmissionModeRandom, fo,
+                sf,
+                nf,
+                vt.VTOpticalFlowParametersSubmissionModeRandom,
+                fo,
             )
             jobs.append((wk["proc"], pa))
 
@@ -454,7 +509,7 @@ class McTemporalDenoiser:
             for j in range(len(jobs)):
                 run(j)
         else:
-            list(self._pool.map(run, range(len(jobs))))   # <= _MAX_CONCURRENT_FLOWS in flight
+            list(self._pool.map(run, range(len(jobs))))  # <= _MAX_CONCURRENT_FLOWS in flight
         for e in errs:
             if e is not None:
                 raise RuntimeError(f"VTOpticalFlow process failed: {e}")
@@ -462,10 +517,12 @@ class McTemporalDenoiser:
         out = []
         for j in range(len(refs)):
             wk = self._workers[j]
-            out.append((
-                self._read_flow(wk["fwd"]),
-                self._read_flow(wk["bwd"]) if self.occlusion else None,
-            ))
+            out.append(
+                (
+                    self._read_flow(wk["fwd"]),
+                    self._read_flow(wk["bwd"]) if self.occlusion else None,
+                )
+            )
         return out
 
     def _weight(self, anchor: Any, warped: Any, fwd: Any, bwd: Any) -> Any:
@@ -482,11 +539,11 @@ class McTemporalDenoiser:
         if self.occlusion:
             # Round-trip: curr pixel p -> ref at p+bwd[p], then fwd should return
             # it; |bwd + fwd(at p+bwd)| ~ 0 when consistent, large at occlusion.
-            fwd_at = warp(fwd, bwd)
+            fwd_at = warp(fwd, bwd, self._warp_grid)
             fb = mx.sqrt(mx.sum((bwd + fwd_at) ** 2, axis=-1, keepdims=True) + 1e-8)
             w = w * mx.exp(-((fb / self.occ_tau) ** 2))
         if self.confidence:
-            mag = mx.sqrt(mx.sum(fwd ** 2, axis=-1, keepdims=True) + 1e-8)
+            mag = mx.sqrt(mx.sum(fwd**2, axis=-1, keepdims=True) + 1e-8)
             w = w * mx.exp(-((mag / self.conf_scale) ** 2))
         self._w_sum += float(mx.mean(w))
         self._w_n += 1
@@ -506,8 +563,11 @@ class McTemporalDenoiser:
         rgb_f32 = mx.clip(rgb_f32[..., :3].astype(mx.float32), 0.0, 1.0)
         if self._tracker is not None or self._pulse is not None:
             self._condition(rgb_f32)
-        refs = ([self._prev] if self._prev is not None else []) if self.window == 0 \
+        refs = (
+            ([self._prev] if self._prev is not None else [])
+            if self.window == 0
             else list(self._hist)
+        )
         if not refs:
             self._remember(rgb_f32, rgb_f32)
             return rgb_f32
@@ -517,15 +577,15 @@ class McTemporalDenoiser:
             var = mx.maximum(_box_mean(rgb_f32 * rgb_f32, self.clamp_k) - mean * mean, 0.0)
             std = mx.sqrt(var)
             lo, hi = mean - self.clamp_gamma * std, mean + self.clamp_gamma * std
-        flows = self._compute_flows(rgb_f32, refs)      # references run concurrently
+        flows = self._compute_flows(rgb_f32, refs)  # references run concurrently
         warpeds = []
         for ref, (fwd, _bwd) in zip(refs, flows, strict=True):
-            warped = warp(ref, -fwd)
+            warped = warp(ref, -fwd, self._warp_grid)
             if self.clamp:
                 warped = mx.clip(warped, lo, hi)
             warpeds.append(warped)
         anchor = _box_mean(rgb_f32, 3) if self.gate == "smooth" else rgb_f32
-        acc = rgb_f32                                   # current frame, weight 1
+        acc = rgb_f32  # current frame, weight 1
         wsum = mx.ones((self.h, self.w, 1))
         for warped, (fwd, bwd) in zip(warpeds, flows, strict=True):
             w = self._weight(anchor, warped, fwd, bwd)
@@ -538,13 +598,11 @@ class McTemporalDenoiser:
 
     def _remember(self, curr: Any, out: Any) -> None:
         if self.window == 0:
-            self._prev = out                            # recursive: keep output
+            self._prev = out  # recursive: keep output
         else:
-            self._hist.append(curr)                     # FIR: keep input frames
+            self._hist.append(curr)  # FIR: keep input frames
             if len(self._hist) > self.window:
                 self._hist.pop(0)
-
-
 
 
 # ===========================================================================
@@ -591,18 +649,26 @@ class _McDriver:
         config = self._config
         tracker, pulse = build_conditioning(config.noise_map)
         return McTemporalDenoiser(
-            width, height, strength=config.strength, window=config.window,
-            clamp=config.clamp, occlusion=config.occlusion,
-            confidence=config.confidence, sigma=config.sigma,
-            gate=config.gate, flow=config.flow,
+            width,
+            height,
+            strength=config.strength,
+            window=config.window,
+            clamp=config.clamp,
+            occlusion=config.occlusion,
+            confidence=config.confidence,
+            sigma=config.sigma,
+            gate=config.gate,
+            flow=config.flow,
             flow_weights=config.flow_weights,
-            noise_map=tracker, map_refresh=config.noise_map.refresh,
-            pulse=pulse, map_floor=config.noise_map.floor)
+            noise_map=tracker,
+            map_refresh=config.noise_map.refresh,
+            pulse=pulse,
+            map_floor=config.noise_map.floor,
+        )
 
     def feed(self, rgb: Any, token: Any = None) -> list:
         if self._engine is None:
-            self._engine = self._make_engine(
-                int(rgb.shape[0]), int(rgb.shape[1]))
+            self._engine = self._make_engine(int(rgb.shape[0]), int(rgb.shape[1]))
         return [(self._engine.denoise(rgb), token)]
 
     def flush(self) -> list:
@@ -624,7 +690,8 @@ class _McDriver:
                 f"[denoise] mc gate openness: "
                 f"{engine.gate_openness * 100:.1f}% of the strength ceiling "
                 f"realized (flow={engine.flow_source}; low = flow-limited, "
-                f"the lever is a better flow, not more strength)")
+                f"the lever is a better flow, not more strength)"
+            )
         return lines
 
     def debug_images(self) -> dict:
@@ -666,9 +733,21 @@ class McFactory:
         settings: Settings,
     ) -> McStageConfig:
         reject_unknown_keys(
-            raw, ("strength", "window", "sigma", "gate", "clamp",
-                  "occlusion", "confidence", "flow", "flow_weights",
-                  *LUMA_CHROMA_KEYS, *NOISE_MAP_KEYS))
+            raw,
+            (
+                "strength",
+                "window",
+                "sigma",
+                "gate",
+                "clamp",
+                "occlusion",
+                "confidence",
+                "flow",
+                "flow_weights",
+                *LUMA_CHROMA_KEYS,
+                *NOISE_MAP_KEYS,
+            ),
+        )
         strength = typed_value(raw, "strength", float, 0.5)
         if not 0.0 <= strength <= 1.0:
             raise ValueError("strength must be in [0, 1]")
@@ -686,23 +765,26 @@ class McFactory:
             raise ValueError(f"flow must be one of {_FLOW_ENGINES}")
         luma_strength, chroma_strength = parse_luma_chroma(raw)
         return McStageConfig(
-            strength=strength, window=window, sigma=sigma, gate=gate,
+            strength=strength,
+            window=window,
+            sigma=sigma,
+            gate=gate,
             clamp=typed_value(raw, "clamp", bool, False),
             occlusion=typed_value(raw, "occlusion", bool, False),
             confidence=typed_value(raw, "confidence", bool, False),
             flow=flow,
-            flow_weights=(typed_value(raw, "flow_weights", str)
-                          or settings.spynet_weights),
+            flow_weights=(typed_value(raw, "flow_weights", str) or settings.spynet_weights),
             noise_map=parse_noise_map(raw),
             luma_strength=luma_strength,
-            chroma_strength=chroma_strength)
+            chroma_strength=chroma_strength,
+        )
 
-    def build(self, config: McStageConfig, *,
-              context: PipelineContext) -> FeedFlushProcessor:
+    def build(self, config: McStageConfig, *, context: PipelineContext) -> FeedFlushProcessor:
         return FeedFlushProcessor(
             lambda: _McDriver(config),
             luma_strength=config.luma_strength,
-            chroma_strength=config.chroma_strength)
+            chroma_strength=config.chroma_strength,
+        )
 
 
 FACTORY = McFactory()
