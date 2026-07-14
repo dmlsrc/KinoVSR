@@ -192,6 +192,13 @@ class TestTimelineOrigin:
         assert out[0].pts == origin
         assert [u.pts for u in out] == [origin + m * 400 for m in range(20)]
 
+    def test_negative_host_origin_is_not_mistaken_for_file_context(self):
+        origin = -5007
+        out, _ = run_interpolation(
+            self.shifted(source_units(8), origin), 60)
+        assert out[0].pts == origin
+        assert [u.pts for u in out] == [origin + m * 400 for m in range(20)]
+
     def test_origin_survives_a_hard_cut(self):
         origin = 24000
         out, _ = run_interpolation(

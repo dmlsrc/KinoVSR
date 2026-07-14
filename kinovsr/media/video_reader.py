@@ -24,12 +24,14 @@ No ffmpeg, no numpy.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from kinovsr.native.frameworks import CoreMedia, Foundation, Quartz, av, vt
 
 from . import pixel_buffers as _pb
+from .timing import AudioTiming, VideoTiming, analyze_sample_timing
 
 
 def _first_video_track(asset: Any) -> Any:
@@ -123,28 +125,146 @@ def probe_video(path: Path) -> tuple[int, int, float, int, Any, tuple[int, int] 
     return w, h, fps, n, transform, pixel_aspect
 
 
-def keyframe_display_indices(path: Path) -> list[int]:
+def _cm_time_fraction(value: Any) -> Fraction | None:
+    """Convert a numeric CMTime to an exact Fraction, rejecting sentinels."""
+    timescale = int(value.timescale)
+    if timescale <= 0:
+        return None
+    return Fraction(int(value.value), timescale)
+
+
+def probe_video_timing(path: Path) -> VideoTiming:
+    """Read exact display PTS metadata and classify the track as CFR or VFR.
+
+    The compressed track output performs no decode. Output presentation time
+    is intentional: unlike the raw sample PTS, it includes the asset's edit
+    mapping and is the clock AVAssetReader presents to decoded consumers.
+    """
+    url = Foundation.NSURL.fileURLWithPath_(str(path))
+    asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
+    track = _first_video_track(asset)
+    _assert_decodable(track, path)
+    reader, err = av.AVAssetReader.alloc().initWithAsset_error_(asset, None)
+    if reader is None:
+        raise RuntimeError(f"AVAssetReader init failed: {err}")
+    output = av.AVAssetReaderTrackOutput.alloc().initWithTrack_outputSettings_(
+        track, None)
+    if not reader.canAddOutput_(output):
+        raise RuntimeError("AVAssetReader cannot expose compressed timing")
+    reader.addOutput_(output)
+    if not reader.startReading():
+        raise RuntimeError(f"AVAssetReader.startReading failed: {reader.error()}")
+
+    samples: list[tuple[Fraction, Fraction | None]] = []
+    natural_timescale = int(track.naturalTimeScale())
+    source_tick = (Fraction(1, natural_timescale)
+                   if natural_timescale > 0 else None)
+    while True:
+        sample = output.copyNextSampleBuffer()
+        if sample is None:
+            break
+        # AVAssetReader can return zero-sample marker buffers around edit
+        # boundaries. They are not display frames and carry invalid times.
+        if CoreMedia.CMSampleBufferGetNumSamples(sample) < 1:
+            del sample
+            continue
+        pts_time = CoreMedia.CMSampleBufferGetOutputPresentationTimeStamp(sample)
+        duration_time = CoreMedia.CMSampleBufferGetOutputDuration(sample)
+        pts = _cm_time_fraction(pts_time)
+        duration = _cm_time_fraction(duration_time)
+        if pts is not None:
+            samples.append((pts, duration if duration and duration > 0 else None))
+            if natural_timescale <= 0:
+                tick = Fraction(1, int(pts_time.timescale))
+                source_tick = tick if source_tick is None else min(source_tick, tick)
+        del sample
+
+    if reader.error() is not None:
+        raise RuntimeError(f"AVAssetReader timing scan failed: {reader.error()}")
+    if source_tick is None:
+        raise RuntimeError(f"{path.name}: video track contains no display samples")
+    try:
+        return analyze_sample_timing(
+            samples,
+            nominal_cadence=float(track.nominalFrameRate()),
+            source_tick=source_tick,
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"{path.name}: {exc}") from exc
+
+
+def probe_audio_timing(path: Path) -> AudioTiming | None:
+    """Return the first edit-adjusted audio PTS without decoding audio.
+
+    Audio carry currently owns PCM samples but not their source timestamps.
+    The file endpoint uses this metadata probe to reject staggered track
+    origins before it would silently place both tracks at output time zero.
+    """
+    url = Foundation.NSURL.fileURLWithPath_(str(path))
+    asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
+    tracks = asset.tracksWithMediaType_(av.AVMediaTypeAudio)
+    if tracks is None or len(tracks) == 0:
+        return None
+    track = tracks[0]
+    reader, err = av.AVAssetReader.alloc().initWithAsset_error_(asset, None)
+    if reader is None:
+        raise RuntimeError(f"AVAssetReader init failed: {err}")
+    output = av.AVAssetReaderTrackOutput.alloc().initWithTrack_outputSettings_(
+        track, None)
+    if not reader.canAddOutput_(output):
+        raise RuntimeError("AVAssetReader cannot expose compressed audio timing")
+    reader.addOutput_(output)
+    if not reader.startReading():
+        raise RuntimeError(f"AVAssetReader.startReading failed: {reader.error()}")
+
+    while True:
+        sample = output.copyNextSampleBuffer()
+        if sample is None:
+            break
+        if CoreMedia.CMSampleBufferGetNumSamples(sample) < 1:
+            del sample
+            continue
+        pts_time = CoreMedia.CMSampleBufferGetOutputPresentationTimeStamp(sample)
+        pts = _cm_time_fraction(pts_time)
+        timescale = int(pts_time.timescale)
+        del sample
+        if pts is not None and timescale > 0:
+            reader.cancelReading()
+            return AudioTiming(
+                first_pts=pts,
+                source_tick=Fraction(1, timescale),
+            )
+
+    if reader.error() is not None:
+        raise RuntimeError(f"AVAssetReader audio timing scan failed: {reader.error()}")
+    return None
+
+
+def keyframe_display_indices(
+    path: Path,
+    *,
+    timing: VideoTiming | None = None,
+) -> list[int]:
     """Display-order frame indices of the source's keyframes (sync samples).
 
     A compressed-passthrough pass (AVAssetReaderTrackOutput with no output
     settings) yields the coded samples in DECODE order; a sample is a keyframe iff
-    its ``kCMSampleAttachmentKey_NotSync`` attachment is absent/false. Each keyframe
-    is mapped to its DISPLAY index via its presentation timestamp
-    (``round(pts * fps)``), because the decoded frames the pipeline processes arrive
-    in display order (B-frame reordered) -- decode-order indices would not line up.
-    DecodeTimeStamp is a fallback for the rare sample whose PTS is invalid.
+    its ``kCMSampleAttachmentKey_NotSync`` attachment is absent/false. Each
+    keyframe is mapped to its display index with the same exact cadence and
+    edit-adjusted origin used by the file source; decode-order indices would
+    not line up with B-frame presentation order.
 
     No decode and no ffprobe: this reads only sample metadata, so it is cheap even
     on long clips. Used to align sliding restoration/upscaler windows to GOP
     boundaries (see the harness --gop-align path). Returns a sorted list; a clip
     with a single keyframe (open-ended GOP) returns ``[0]``.
     """
-    import math
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)
-    fps = float(track.nominalFrameRate())
-    if fps <= 0:
+    cadence = (timing.cadence if timing is not None
+               else Fraction(float(track.nominalFrameRate())).limit_denominator(1001))
+    if cadence is None or cadence <= 0:
         return [0]
     reader, err = av.AVAssetReader.alloc().initWithAsset_error_(asset, None)
     if reader is None:
@@ -155,23 +275,36 @@ def keyframe_display_indices(path: Path) -> list[int]:
     reader.addOutput_(out)
     if not reader.startReading():
         raise RuntimeError(f"AVAssetReader.startReading failed: {reader.error()}")
-    kf: set[int] = set()
+    display_pts: list[Fraction] = []
+    key_pts: list[Fraction] = []
     while True:
         sb = out.copyNextSampleBuffer()
         if sb is None:
             break
+        if CoreMedia.CMSampleBufferGetNumSamples(sb) < 1:
+            del sb
+            continue
+        pts = _cm_time_fraction(
+            CoreMedia.CMSampleBufferGetOutputPresentationTimeStamp(sb))
+        if pts is None:
+            pts = _cm_time_fraction(
+                CoreMedia.CMSampleBufferGetOutputDecodeTimeStamp(sb))
+        if pts is None:
+            del sb
+            continue
+        display_pts.append(pts)
         arr = CoreMedia.CMSampleBufferGetSampleAttachmentsArray(sb, False)
         is_key = True
         if arr and len(arr) > 0:
             is_key = not bool(arr[0].get(CoreMedia.kCMSampleAttachmentKey_NotSync))
         if is_key:
-            pts = CoreMedia.CMTimeGetSeconds(CoreMedia.CMSampleBufferGetPresentationTimeStamp(sb))
-            if math.isnan(pts):
-                pts = CoreMedia.CMTimeGetSeconds(CoreMedia.CMSampleBufferGetDecodeTimeStamp(sb))
-            if not math.isnan(pts):
-                kf.add(int(round(pts * fps)))
+            key_pts.append(pts)
         del sb
-    return sorted(kf) if kf else [0]
+    if not display_pts or not key_pts:
+        return [0]
+    origin = timing.first_pts if timing is not None else min(display_pts)
+    keyframes = {round((pts - origin) * cadence) for pts in key_pts}
+    return sorted(index for index in keyframes if index >= 0) or [0]
 
 
 def coded_frame_sizes(path: Path) -> list[int]:
@@ -297,6 +430,7 @@ def iter_forced_color_chunks(
     path: Path, out_format: int, matrix_cv: Any, full_range: bool,
     chunk_size: int = 8, *, start_frame: int = 0, end_frame: int | None = None,
     reinterpret_full_range: bool | None = None,
+    timing: VideoTiming | None = None,
 ) -> Iterator[list]:
     """Decode the source as raw 10-bit YUV, FORCE the YCbCr matrix (overriding the
     container tag / VideoToolbox's resolution-based guess), then convert to
@@ -319,8 +453,9 @@ def iter_forced_color_chunks(
     err, xfer = vt.VTPixelTransferSessionCreate(None, None)
     if err != 0 or xfer is None:
         raise RuntimeError(f"VTPixelTransferSessionCreate failed: {err}")
-    for chunk in iter_video_buffer_chunks(path, yuv_fmt, chunk_size,
-                                          start_frame=start_frame, end_frame=end_frame):
+    for chunk in iter_video_buffer_chunks(
+            path, yuv_fmt, chunk_size,
+            start_frame=start_frame, end_frame=end_frame, timing=timing):
         out: list = []
         for yuv in chunk:
             if retype_fmt is not None:
@@ -344,6 +479,7 @@ def iter_forced_color_chunks(
 def iter_video_buffer_chunks(
     path: Path, src_format: int, chunk_size: int = 8,
     *, start_frame: int = 0, end_frame: int | None = None,
+    timing: VideoTiming | None = None,
 ) -> Iterator[list]:
     """Yield lists of up to `chunk_size` decoded CVPixelBuffers in `src_format`.
 
@@ -369,7 +505,12 @@ def iter_video_buffer_chunks(
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)
     _assert_decodable(track, path)
-    fps = float(track.nominalFrameRate())
+    cadence = (timing.cadence if timing is not None
+               else Fraction(float(track.nominalFrameRate())).limit_denominator(1001))
+    if cadence is None or cadence <= 0:
+        raise RuntimeError("video track reports no usable constant cadence")
+    fps = float(cadence)
+    origin = timing.first_pts if timing is not None else Fraction()
 
     reader, err = av.AVAssetReader.alloc().initWithAsset_error_(asset, None)
     if reader is None:
@@ -382,14 +523,21 @@ def iter_video_buffer_chunks(
         # below enforces the exact start. Compute the end from the asset
         # duration when the window is open-ended.
         ts = 24000
-        start_seconds = max(0.0, (start_frame - 1) / fps)
-        start_t = CoreMedia.CMTimeMake(int(round(start_seconds * ts)), ts)
-        if end_frame is not None:
-            dur_seconds = (end_frame - start_frame + 2) / fps
-        else:
-            dur_seconds = max(0.0, CoreMedia.CMTimeGetSeconds(asset.duration()) - start_seconds)
-        dur_t = CoreMedia.CMTimeMake(int(round(dur_seconds * ts)), ts)
-        reader.setTimeRange_(CoreMedia.CMTimeRangeMake(start_t, dur_t))
+        start_seconds = float(origin) + (start_frame - 1) / fps
+        # AVAssetReader time ranges are asset-time ranges. For a legitimate
+        # negative edit origin, clamping to zero would skip source frames;
+        # leave the range open and let the exact PTS trim below do the work.
+        if start_seconds >= 0:
+            start_t = CoreMedia.CMTimeMake(int(round(start_seconds * ts)), ts)
+            if end_frame is not None:
+                dur_seconds = (end_frame - start_frame + 2) / fps
+            else:
+                dur_seconds = max(
+                    0.0,
+                    CoreMedia.CMTimeGetSeconds(asset.duration()) - start_seconds,
+                )
+            dur_t = CoreMedia.CMTimeMake(int(round(dur_seconds * ts)), ts)
+            reader.setTimeRange_(CoreMedia.CMTimeRangeMake(start_t, dur_t))
 
     # Request IOSurface-backed, Metal-compatible buffers. Feeding the decoded
     # buffer straight to VSR bypasses the VSR source pool's attributes, so we
@@ -430,10 +578,11 @@ def iter_video_buffer_chunks(
         keep = image_buf is not None
         if keep and trimming and fps > 0:
             # Frame-exact window enforcement by presentation timestamp.
-            pts_s = CoreMedia.CMTimeGetSeconds(
-                CoreMedia.CMSampleBufferGetPresentationTimeStamp(sample_buf),
-            )
-            idx = int(round(pts_s * fps))
+            pts = _cm_time_fraction(
+                CoreMedia.CMSampleBufferGetOutputPresentationTimeStamp(
+                    sample_buf))
+            idx = (round((pts - origin) * cadence)
+                   if pts is not None else 0)
             if idx < start_frame:
                 keep = False
             elif end_frame is not None and idx >= end_frame:

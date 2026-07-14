@@ -21,10 +21,13 @@ Cleanly handles arbitrary float fps both sides:
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterator
+from fractions import Fraction
 from typing import Any
 
 from kinovsr.media import pixel_buffers as _pb
+from kinovsr.media.timing import rational_cadence
 
 from .frameworks import vt
 
@@ -62,21 +65,19 @@ class VtfrcSession:
         self,
         in_w: int,
         in_h: int,
-        source_fps: float,
-        target_fps: float,
+        source_fps: Fraction | int | float,
+        target_fps: Fraction | int | float,
         *,
         mode: str = MODE_NORMAL,
     ):
-        if source_fps <= 0 or target_fps <= 0:
-            raise ValueError(
-                f"source_fps and target_fps must be positive; got {source_fps}, {target_fps}"
-            )
+        self.source_cadence = rational_cadence(source_fps)
+        self.target_cadence = rational_cadence(target_fps)
         if not vt.VTFrameRateConversionConfiguration.isSupported():
             raise SystemExit("VTFrameRateConversionConfiguration not supported on this device.")
 
         self.in_w, self.in_h = in_w, in_h
-        self.source_fps = float(source_fps)
-        self.target_fps = float(target_fps)
+        self.source_fps = float(self.source_cadence)
+        self.target_fps = float(self.target_cadence)
         self.mode = mode
 
         q = (
@@ -124,7 +125,7 @@ class VtfrcSession:
         #   M in [N * (target/source), (N+1) * (target/source))
         self._prev_src_pb: Any = None
         self._prev_src_index: int = -1   # source frame index of buffered prev
-        self._next_target_index: int = 0  # next target frame index to emit
+        self._next_target_index: int | None = None
 
     def use_dst_pool(self, pool: Any) -> None:
         """Wire AVWriter's adaptor pool for zero-copy output."""
@@ -154,31 +155,29 @@ class VtfrcSession:
         """Target frame indices M such that M's PTS falls in
         [src_index / source_fps, (src_index + 1) / source_fps).
         """
-        # Start at next_target_index so we never re-emit. The loop guards
-        # below filter the exact source-frame interval.
-        start = self._next_target_index
-        out = []
-        m = start
-        # Edge: if target_pts exactly equals (src_index+1)/source_fps we
-        # treat that as belonging to the NEXT pair (phase < 1).
-        while m / self.target_fps < (src_index + 1) / self.source_fps - 1e-9:
-            if m / self.target_fps + 1e-9 >= src_index / self.source_fps:
-                out.append(m)
-            m += 1
-            # Safety: cap iterations to avoid pathological loops.
-            if m - start > 10_000:
-                break
-        return out
+        lower = math.ceil(
+            Fraction(src_index) * self.target_cadence / self.source_cadence)
+        upper = math.ceil(
+            Fraction(src_index + 1)
+            * self.target_cadence / self.source_cadence)
+        start = lower if self._next_target_index is None else max(
+            lower, self._next_target_index)
+        if upper - start > 10_000:
+            raise RuntimeError(
+                f"pathological frame-rate ratio emits {upper - start} "
+                f"targets for source frame {src_index}")
+        return list(range(start, upper))
 
     def _phases_for_targets(self, target_indices: list[int], src_index: int) -> list[float]:
         """For each target index M, return phase = (M/target - src/source) /
         (1/source) clamped to [0, 1). Phase 0 = source frame, phase 1 = next.
         """
         phases = []
-        denom = 1.0 / self.source_fps
-        src_time = src_index / self.source_fps
+        src_time = Fraction(src_index) / self.source_cadence
+        denom = 1 / self.source_cadence
         for m in target_indices:
-            phase = (m / self.target_fps - src_time) / denom
+            phase = float(
+                (Fraction(m) / self.target_cadence - src_time) / denom)
             # Clamp to [0, 1) for robustness against float drift.
             if phase < 0.0:
                 phase = 0.0
@@ -203,6 +202,9 @@ class VtfrcSession:
         if self._prev_src_pb is None:
             self._prev_src_pb = src_pb
             self._prev_src_index = src_index
+            self._next_target_index = math.ceil(
+                Fraction(src_index)
+                * self.target_cadence / self.source_cadence)
             return
 
         target_indices = self._target_indices_in_pair(self._prev_src_index)
@@ -218,8 +220,8 @@ class VtfrcSession:
         # VT requires CMTime PTSes on the source/next frames for sequential
         # bookkeeping. We use the source-fps timescale to anchor them; the
         # output buffers don't carry PTSes (the writer assigns them).
-        prev_pts = _pb.frame_pts(self._prev_src_index, self.source_fps)
-        next_pts = _pb.frame_pts(src_index, self.source_fps)
+        prev_pts = _pb.frame_pts(self._prev_src_index, self.source_cadence)
+        next_pts = _pb.frame_pts(src_index, self.source_cadence)
         src_frame = vt.VTFrameProcessorFrame.alloc(
         ).initWithBuffer_presentationTimeStamp_(self._prev_src_pb, prev_pts)
         next_frame = vt.VTFrameProcessorFrame.alloc(
@@ -229,7 +231,7 @@ class VtfrcSession:
         # it expects valid CMTimes. Use the target-fps PTSes for clarity.
         dest_frames = []
         for m, dpb in zip(target_indices, dest_buffers, strict=True):
-            dpts = _pb.frame_pts(m, self.target_fps)
+            dpts = _pb.frame_pts(m, self.target_cadence)
             dest_frames.append(
                 vt.VTFrameProcessorFrame.alloc().initWithBuffer_presentationTimeStamp_(dpb, dpts)
             )
@@ -286,15 +288,16 @@ class VtfrcSession:
         phases = self._phases_for_targets(target_indices, self._prev_src_index)
         dest_buffers = [self._make_dst_buffer() for _ in target_indices]
 
-        prev_pts = _pb.frame_pts(self._prev_src_index, self.source_fps)
-        next_pts = _pb.frame_pts(self._prev_src_index + 1, self.source_fps)
+        prev_pts = _pb.frame_pts(self._prev_src_index, self.source_cadence)
+        next_pts = _pb.frame_pts(
+            self._prev_src_index + 1, self.source_cadence)
         src_frame = vt.VTFrameProcessorFrame.alloc(
         ).initWithBuffer_presentationTimeStamp_(self._prev_src_pb, prev_pts)
         next_frame = vt.VTFrameProcessorFrame.alloc(
         ).initWithBuffer_presentationTimeStamp_(self._prev_src_pb, next_pts)
         dest_frames = []
         for m, dpb in zip(target_indices, dest_buffers, strict=True):
-            dpts = _pb.frame_pts(m, self.target_fps)
+            dpts = _pb.frame_pts(m, self.target_cadence)
             dest_frames.append(
                 vt.VTFrameProcessorFrame.alloc().initWithBuffer_presentationTimeStamp_(dpb, dpts)
             )

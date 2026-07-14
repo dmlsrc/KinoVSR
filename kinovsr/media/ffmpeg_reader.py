@@ -27,6 +27,7 @@ the native probe at 90/180/270). >8-bit sources are read through rgb48le
 from __future__ import annotations
 
 from collections.abc import Iterator
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ import mlx.core as mx
 
 from . import pixel_buffers as _pb
 from .pixel_buffers import PIX_BGRA, PIX_RGBAHALF
+from .timing import AudioTiming, VideoTiming, analyze_sample_timing
 
 
 def _open_video(path: Path):
@@ -51,15 +53,25 @@ def _fps(stream: Any) -> float:
     return float(r) if r else 0.0
 
 
-def _pts_index(pts: int, stream: Any, fps: float) -> int:
+def _pts_index(
+    pts: int,
+    stream: Any,
+    fps: float,
+    *,
+    origin: Fraction | None = None,
+) -> int:
     """Display index of a pts, 0-based at the stream's first displayed frame.
 
     Some containers (FLV, ASF) start their display timeline at a nonzero pts;
     subtracting stream.start_time keeps keyframe indices and trim windows
     aligned with decode-order frame counting.
     """
-    start = stream.start_time or 0
-    return int(round(float((pts - start) * stream.time_base) * fps))
+    if origin is None:
+        start = stream.start_time or 0
+        seconds = Fraction(pts - start) * Fraction(stream.time_base)
+    else:
+        seconds = Fraction(pts) * Fraction(stream.time_base) - origin
+    return int(round(seconds * fps))
 
 
 def _display_transform(container: Any, vs: Any) -> Any:
@@ -115,6 +127,28 @@ def probe_video(path: Path) -> tuple[int, int, float, int, Any, tuple[int, int] 
         container.close()
 
 
+def probe_video_timing(path: Path) -> VideoTiming:
+    """Classify exact packet presentation timestamps without decoding."""
+    container, vs = _open_video(path)
+    try:
+        time_base = Fraction(vs.time_base)
+        samples: list[tuple[Fraction, Fraction | None]] = []
+        for packet in container.demux(vs):
+            if packet.pts is None or packet.size <= 0:
+                continue
+            pts = Fraction(int(packet.pts)) * time_base
+            duration = (Fraction(int(packet.duration)) * time_base
+                        if packet.duration and packet.duration > 0 else None)
+            samples.append((pts, duration))
+        try:
+            return analyze_sample_timing(
+                samples, nominal_cadence=_fps(vs), source_tick=time_base)
+        except ValueError as exc:
+            raise RuntimeError(f"{path.name}: {exc}") from exc
+    finally:
+        container.close()
+
+
 # libav color tags -> the CoreVideo token strings the native probe_color emits
 # (see color.py; the resolver matches on these exact strings).
 _PRIMARIES = {
@@ -165,7 +199,11 @@ def probe_color(path: Path) -> dict:
         container.close()
 
 
-def keyframe_display_indices(path: Path) -> list[int]:
+def keyframe_display_indices(
+    path: Path,
+    *,
+    timing: VideoTiming | None = None,
+) -> list[int]:
     """Display-order keyframe indices from packet metadata (no decode).
 
     Mirrors the native sync-sample scan: demux the coded packets (decode
@@ -175,14 +213,15 @@ def keyframe_display_indices(path: Path) -> list[int]:
     """
     container, vs = _open_video(path)
     try:
-        fps = _fps(vs)
+        fps = float(timing.cadence) if timing is not None else _fps(vs)
         if fps <= 0:
             return [0]
+        origin = timing.first_pts if timing is not None else None
         kf: set[int] = set()
         for pkt in container.demux(vs):
             if pkt.pts is None or not pkt.is_keyframe:
                 continue
-            kf.add(_pts_index(pkt.pts, vs, fps))
+            kf.add(_pts_index(pkt.pts, vs, fps, origin=origin))
         return sorted(kf) if kf else [0]
     finally:
         container.close()
@@ -297,20 +336,29 @@ def _buffer_attrs(out_format: int) -> dict:
 
 def _iter_chunks(path: Path, out_format: int, chunk_size: int,
                  start_frame: int, end_frame: int | None,
-                 reformat_kwargs: dict) -> Iterator[list]:
+                 reformat_kwargs: dict,
+                 timing: VideoTiming | None = None) -> Iterator[list]:
     container, vs = _open_video(path)
     try:
-        fps = _fps(vs)
+        fps = float(timing.cadence) if timing is not None else _fps(vs)
+        origin = (timing.first_pts if timing is not None
+                  else Fraction(int(vs.start_time or 0)) * Fraction(vs.time_base))
         attrs = _buffer_attrs(out_format)
         if start_frame > 0 and fps > 0:
             # coarse keyframe seek, then exact per-frame trim below
-            sec = max(0.0, (start_frame - 1) / fps)
-            container.seek(int(sec / vs.time_base), stream=vs, backward=True)
+            sec = float(origin) + (start_frame - 1) / fps
+            # Some edit timelines legitimately begin before zero. Seeking to
+            # zero would skip their head; decode from the beginning instead
+            # when the desired coarse seek point is negative.
+            if sec >= 0:
+                container.seek(
+                    int(sec / vs.time_base), stream=vs, backward=True)
         chunk: list = []
         for frame in container.decode(vs):
             if frame.pts is None:
                 continue
-            idx = _pts_index(frame.pts, vs, fps) if fps > 0 else 0
+            idx = (_pts_index(frame.pts, vs, fps, origin=origin)
+                   if fps > 0 else 0)
             if idx < start_frame:
                 continue
             if end_frame is not None and idx >= end_frame:
@@ -328,16 +376,19 @@ def _iter_chunks(path: Path, out_format: int, chunk_size: int,
 def iter_video_buffer_chunks(
     path: Path, src_format: int, chunk_size: int = 8,
     *, start_frame: int = 0, end_frame: int | None = None,
+    timing: VideoTiming | None = None,
 ) -> Iterator[list]:
     """Native-surface mirror: lists of CVPixelBuffers in src_format, honoring
     the stream's own color tags (libswscale reads them off each frame)."""
-    return _iter_chunks(path, src_format, chunk_size, start_frame, end_frame, {})
+    return _iter_chunks(
+        path, src_format, chunk_size, start_frame, end_frame, {}, timing)
 
 
 def iter_forced_color_chunks(
     path: Path, out_format: int, matrix_cv: Any, full_range: bool,
     chunk_size: int = 8, *, start_frame: int = 0, end_frame: int | None = None,
     reinterpret_full_range: bool | None = None,
+    timing: VideoTiming | None = None,
 ) -> Iterator[list]:
     """Forced-matrix read: override the YCbCr matrix / range at YUV->RGB time
     (libswscale src_colorspace/src_color_range), the --source-color fix for
@@ -349,10 +400,37 @@ def iter_forced_color_chunks(
     rng = av.video.reformatter.ColorRange.JPEG if rng_full \
         else av.video.reformatter.ColorRange.MPEG
     kw = {"src_colorspace": cs, "src_color_range": rng}
-    return _iter_chunks(path, out_format, chunk_size, start_frame, end_frame, kw)
+    return _iter_chunks(
+        path, out_format, chunk_size, start_frame, end_frame, kw, timing)
 
 
 # ---------------------------------------------------------------- audio
+def probe_audio_timing(path: Path) -> AudioTiming | None:
+    """Return the first audio-stream PTS without decoding any packets."""
+    container = av.open(str(path))
+    try:
+        streams = [stream for stream in container.streams
+                   if stream.type == "audio"]
+        if not streams:
+            return None
+        stream = streams[0]
+        time_base = Fraction(stream.time_base)
+        first = stream.start_time
+        if first is None:
+            for packet in container.demux(stream):
+                if packet.pts is not None and packet.size > 0:
+                    first = packet.pts
+                    break
+        if first is None:
+            return None
+        return AudioTiming(
+            first_pts=Fraction(int(first)) * time_base,
+            source_tick=time_base,
+        )
+    finally:
+        container.close()
+
+
 def read_audio_track(path: Path) -> Any | None:
     """Decode the first audio stream to an in-memory AudioTrack (fp32 PCM),
     the same object the native audio path produces. None when no audio."""
@@ -381,6 +459,7 @@ def read_audio_track(path: Path) -> Any | None:
 
 
 __all__ = [
-    "probe_video", "probe_color", "keyframe_display_indices",
-    "iter_video_buffer_chunks", "iter_forced_color_chunks", "read_audio_track",
+    "probe_video", "probe_video_timing", "probe_color", "keyframe_display_indices",
+    "iter_video_buffer_chunks", "iter_forced_color_chunks",
+    "probe_audio_timing", "read_audio_track",
 ]

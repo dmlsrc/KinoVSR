@@ -17,11 +17,13 @@ Two capabilities, both wrapping native VTFrameProcessor sessions:
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Iterable, Mapping
 from fractions import Fraction
 from typing import Any
 
 from kinovsr.config.helpers import reject_unknown_keys
+from kinovsr.media.timing import grid_ticks
 from kinovsr.processors.boundaries import Boundary
 from kinovsr.processors.capabilities import (
     Capability,
@@ -122,19 +124,23 @@ class VtInterpolateProcessor:
         self._config = config
         self._session: Any = None
         self._time_base: Fraction | None = None
-        self._source_index = 0
-        self._target_index = 0
-        # The regenerated grid is anchored at the FIRST input unit's PTS,
-        # so a stream that legitimately starts at a nonzero origin keeps
-        # its alignment with sibling streams (audio) instead of being
-        # silently re-based to zero.
+        self._source_cadence: Fraction | None = None
+        self._publication_origin_pts: int | None = None
+        self._target_index: int | None = None
+        self._input_end_pts: int | None = None
+        self._pending: FrameUnit | None = None
+        # A normal host stream keeps its first input PTS as the output origin.
+        # Negative input PTS are the file endpoint's processing-only GOP
+        # context; those indices stay negative on the target grid so frame 0
+        # is generated at the requested public in-point, not relabeled later.
         self._origin: int | None = None
 
     def _grid_ticks(self, target_index: int) -> int:
-        return round(target_index / self._config.target_fps
-                     / self._time_base)
+        return grid_ticks(
+            target_index, self._config.target_fps, self._time_base)
 
     def _emit(self, payload: Any) -> FrameUnit:
+        assert self._target_index is not None
         m = self._target_index
         self._target_index += 1
         pts = self._grid_ticks(m)
@@ -147,8 +153,11 @@ class VtInterpolateProcessor:
         from kinovsr.native.temporal import VtfrcSession
 
         cadence = input_spec.timeline.cadence
+        assert isinstance(cadence, Fraction)
         geometry = input_spec.frame.geometry
         self._time_base = input_spec.timeline.time_base
+        self._source_cadence = cadence
+        self._publication_origin_pts = context.publication_origin_pts
         # An MLX input uploads each frame into an IOSurface-backed
         # RGBAHalf buffer for the session (the learned-upscale ->
         # --target-fps shape); CV inputs feed straight through.
@@ -166,8 +175,8 @@ class VtInterpolateProcessor:
         try:
             self._session = VtfrcSession(
                 geometry.width, geometry.height,
-                source_fps=float(cadence),
-                target_fps=float(self._config.target_fps),
+                source_fps=cadence,
+                target_fps=self._config.target_fps,
                 mode=self._config.mode)
         except (RuntimeError, SystemExit) as exc:
             raise MediaError(
@@ -176,9 +185,22 @@ class VtInterpolateProcessor:
     def process(self, unit: FrameUnit,
                 context: PipelineContext) -> Iterable[FrameUnit]:
         if self._origin is None:
-            self._origin = unit.pts
-        index = self._source_index
-        self._source_index += 1
+            self._origin = (unit.pts if self._publication_origin_pts is None
+                            else self._publication_origin_pts)
+        assert self._time_base is not None
+        assert self._source_cadence is not None
+        index = round(
+            Fraction(unit.pts - self._origin)
+            * self._time_base * self._source_cadence)
+        source_step = (
+            grid_ticks(index + 1, self._source_cadence, self._time_base)
+            - grid_ticks(index, self._source_cadence, self._time_base))
+        self._input_end_pts = unit.pts + (
+            unit.duration if unit.duration > 0 else source_step)
+        if self._target_index is None:
+            self._target_index = math.ceil(
+                Fraction(index) * self._config.target_fps
+                / self._source_cadence)
         payload = unit.payload
         if self._upload_pool is not None:
             import mlx.core as mx
@@ -191,7 +213,10 @@ class VtInterpolateProcessor:
             self._pb.upload_frame_to_buffer(rgba, buffer)
             payload = buffer
         for produced in self._session.feed(payload, index):
-            yield self._emit(produced)
+            unit = self._emit(produced)
+            if self._pending is not None:
+                yield self._pending
+            self._pending = unit
 
     def reset(self, boundary: Boundary,
               context: PipelineContext) -> None:
@@ -204,10 +229,27 @@ class VtInterpolateProcessor:
         if self._session is None:
             return
         for payload in self._session.drain():
-            yield self._emit(payload)
+            unit = self._emit(payload)
+            if (self._input_end_pts is not None
+                    and unit.pts >= self._input_end_pts):
+                continue
+            if self._pending is not None:
+                yield self._pending
+            self._pending = unit
+        if self._pending is not None:
+            pending, self._pending = self._pending, None
+            if self._input_end_pts is not None:
+                duration = min(
+                    pending.duration, self._input_end_pts - pending.pts)
+                if duration <= 0:
+                    return
+                pending = pending.retimed(pending.pts, duration)
+            yield pending
 
     def close(self, context: PipelineContext) -> None:
         session, self._session = self._session, None
+        self._pending = None
+        self._input_end_pts = None
         if session is not None:
             session.close()
 

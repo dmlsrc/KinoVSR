@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+from fractions import Fraction
 from types import SimpleNamespace
 
 import pytest
@@ -65,9 +66,41 @@ def _writer(*, native: _NativeWriter | None = None) -> AVWriter:
     result.audio_input = None
     result.audio_track = None
     result.frame_count = 0
+    result.cadence = Fraction(25)
     result.fps = 25.0
     result.label = "test"
     return result
+
+
+def test_default_append_uses_the_exact_rational_cadence(monkeypatch):
+    """The native encode helper's implicit-PTS path must not multiply a
+    rounded one-frame NTSC duration across a long sequence."""
+    from kinovsr.media import pixel_buffers
+
+    cadence = Fraction(30000, 1001)
+    frame_index = round(3600 * cadence)
+    captured = []
+
+    class _Adaptor:
+        def appendPixelBuffer_withPresentationTime_(self, _buffer, pts):
+            captured.append(pts)
+            return True
+
+    result = _writer()
+    result.cadence = cadence
+    result.fps = float(cadence)
+    result.frame_count = frame_index
+    result.adaptor = _Adaptor()
+    result._wait_for_ready = lambda _input, _label: None
+    monkeypatch.setattr(
+        writer_module, "autorelease_pool", contextlib.nullcontext)
+
+    result.append(object())
+
+    assert len(captured) == 1
+    expected = pixel_buffers.frame_ticks(frame_index, cadence)
+    assert captured[0].value == expected
+    assert captured[0].timescale == pixel_buffers.VIDEO_TIME_SCALE
 
 
 def _patch_native_context(monkeypatch) -> None:

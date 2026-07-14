@@ -177,6 +177,7 @@ def open_pipeline(
     settings: Settings | None = None,
     reporter: Reporter | None = None,
     windowing: Any = None,
+    publication_origin_pts: int | None = None,
 ) -> PipelineSession:
     """Resolve and validate ``config`` against ``input_spec``; return a
     session ready to process units.
@@ -199,6 +200,8 @@ def open_pipeline(
         kwargs["windowing"] = tuple(
             (int(p0), int(p1), int(e0), int(e1))
             for p0, p1, e0, e1 in windowing)
+    if publication_origin_pts is not None:
+        kwargs["publication_origin_pts"] = int(publication_origin_pts)
     return PipelineSession(plan, PipelineContext(**kwargs))
 
 

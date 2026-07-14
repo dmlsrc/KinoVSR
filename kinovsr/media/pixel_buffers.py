@@ -9,11 +9,14 @@ arbitrary fps.
 
 from __future__ import annotations
 
+from fractions import Fraction
 from typing import Any
 
 import mlx.core as mx
 
 from kinovsr.native.frameworks import CoreMedia, Foundation, Quartz
+
+from .timing import grid_ticks
 
 # FourCC pixel-format constants ----------------------------------------------
 #
@@ -28,10 +31,10 @@ PIX_NV12 = 875704438                              # '420v' kCVPixelFormatType_42
 
 # CMTime base for video PTS --------------------------------------------------
 #
-# 24000 lands bit-exact for 24/25/30/48/50/60 (frame_duration = 1000/960/800/
-# 500/480/400) and for 23.976 NTSC (1001). 29.97 NTSC drifts ~1.25 ppm,
-# below anything perceptible. Picked over 600 (doesn't divide NTSC) and
-# 90000 (doesn't divide 23.976 exactly).
+# 24000 lands bit-exact for 24/25/30/48/50/60 and 24000/1001. Other NTSC
+# rates alternate adjacent integer durations on an exact rational index grid;
+# no per-frame rounding error accumulates. Picked over 600, whose coarse ticks
+# cannot represent those presentation times closely enough.
 VIDEO_TIME_SCALE = 24000
 
 
@@ -76,14 +79,25 @@ def srgb_colorspace() -> Any:
 # CMTime helpers
 # ---------------------------------------------------------------------------
 
-def frame_pts(frame_index: int, fps: float) -> Any:
+def frame_ticks(
+    frame_index: int,
+    cadence: Fraction | int | float | str,
+) -> int:
+    """Exact rational frame position in the product's integer time base."""
+    return grid_ticks(frame_index, cadence, Fraction(1, VIDEO_TIME_SCALE))
+
+
+def frame_pts(
+    frame_index: int,
+    fps: Fraction | int | float | str,
+) -> Any:
     """Build a CMTime for a video frame index at the given fps.
 
-    Uses the fixed VIDEO_TIME_SCALE so PTSes for any fps land at bit-exact
-    integer ticks (or within microseconds for NTSC fractional rates).
+    The complete rational index is rounded once. Unlike multiplying a rounded
+    one-frame duration, the error therefore stays within half one output tick
+    for arbitrarily long NTSC-family sequences.
     """
-    frame_duration = int(round(VIDEO_TIME_SCALE / float(fps)))
-    return CoreMedia.CMTimeMake(frame_index * frame_duration, VIDEO_TIME_SCALE)
+    return CoreMedia.CMTimeMake(frame_ticks(frame_index, fps), VIDEO_TIME_SCALE)
 
 
 def resolve_pixel_format(attrs: dict) -> int:

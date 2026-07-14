@@ -56,12 +56,18 @@ class PipelineContext:
     Stages whose driver speaks ``set_schedule`` apply it at prepare; every
     other stage ignores it - the same one-schedule-drives-all contract the
     inherited harness used.
+
+    ``publication_origin_pts`` is the file endpoint's explicit public origin,
+    in stream time-base ticks, when leading warmup-only units precede it.
+    ``None`` means an ordinary host stream whose first input PTS is its origin,
+    including a stream whose legitimate timeline begins at a negative PTS.
     """
 
     settings: Settings
     reporter: Reporter = NullReporter()
     stage_id: str | None = None
     windowing: tuple[tuple[int, int, int, int], ...] | None = None
+    publication_origin_pts: int | None = None
 
     def for_stage(self, stage_id: str) -> PipelineContext:
         return replace(self, stage_id=stage_id)

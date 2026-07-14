@@ -105,6 +105,16 @@ the complete set transactionally. Source aliases, aliases between outputs,
 hard links, symlinks, and overlapping file/directory targets are rejected
 before output mutation.
 
+The file endpoint currently accepts constant-frame-rate video only. Before
+reserving any output, it scans compressed sample metadata, counts the actual
+display samples, and verifies that their exact presentation timestamps form a
+single cadence (allowing only one-source-tick quantization). Variable-frame-
+rate input raises `MediaError` and leaves no output or partial artifact; convert
+it to CFR explicitly before calling `process_video_file`. Host-managed
+`open_pipeline` sessions can still describe `VariableCadence.VFR`, but file VFR
+timestamp propagation is not yet implemented and is never silently
+approximated.
+
 ## Audio
 
 The session is a **video** contract. A `FrameUnit` carries one video
@@ -124,7 +134,11 @@ shipping a track that drifts against the video. For a duration-
 preserving cadence change (interpolation), the final output frame is
 trimmed to end exactly at the source-window duration, so the muxed
 audio stays in sync instead of drifting by the target grid's tail
-rounding. A public stream-side
+rounding. Audio carry also requires the source audio and video tracks to
+share an origin. A staggered-track file is rejected before any output is
+reserved; timestamp-aware audio padding and trimming are not implemented, so
+rebasing both tracks independently would silently destroy their offset.
+A public stream-side
 file sink that a host could feed with its own `AudioTrack` stays
 deferred until a real out-of-tree adapter proves its shape; today,
 encode-with-audio means `process_video_file`.

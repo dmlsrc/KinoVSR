@@ -9,6 +9,7 @@ video and audio timelines must agree.
 
 import logging
 import math
+from array import array
 from fractions import Fraction
 from pathlib import Path
 
@@ -67,6 +68,59 @@ def _write_clip(path, *, with_audio: bool) -> None:
     out.close()
 
 
+def _write_vfr_clip(path) -> None:
+    """Five samples at 0, 1/30, 3/30, 4/30, and 7/30 seconds."""
+    out = av.open(str(path), "w")
+    stream = out.add_stream("mpeg4", rate=30)
+    stream.width, stream.height = 64, 64
+    stream.pix_fmt = "yuv420p"
+    stream.options = {"g": "30", "bf": "0"}
+    for index, pts in enumerate((0, 1, 3, 4, 7)):
+        frame = av.VideoFrame(64, 64, "gray")
+        frame.planes[0].update(bytes([index * 40]) * (64 * 64))
+        frame = frame.reformat(format="yuv420p")
+        frame.pts = pts
+        frame.time_base = Fraction(1, 30)
+        for packet in stream.encode(frame):
+            out.mux(packet)
+    for packet in stream.encode():
+        out.mux(packet)
+    out.close()
+
+
+def _write_staggered_tracks(path) -> None:
+    """One-second video at t=10 beside one-second audio at t=0."""
+    out = av.open(str(path), "w")
+    video = out.add_stream("mpeg4", rate=25)
+    video.width = video.height = 64
+    video.pix_fmt = "yuv420p"
+    video.options = {"bf": "0"}
+    audio = out.add_stream("aac", rate=SAMPLE_RATE, layout="mono")
+
+    for index in range(25):
+        frame = av.VideoFrame(64, 64, "gray")
+        frame.planes[0].update(bytes([index * 4]) * (64 * 64))
+        frame.pts = 250 + index
+        frame.time_base = Fraction(1, 25)
+        for packet in video.encode(frame.reformat(format="yuv420p")):
+            out.mux(packet)
+    for packet in video.encode():
+        out.mux(packet)
+
+    silence = array("f", [0.0]) * 1024
+    for pts in range(0, 47 * 1024, 1024):
+        frame = av.AudioFrame(format="fltp", layout="mono", samples=1024)
+        frame.sample_rate = SAMPLE_RATE
+        frame.pts = pts
+        frame.time_base = Fraction(1, SAMPLE_RATE)
+        frame.planes[0].update(silence.tobytes())
+        for packet in audio.encode(frame):
+            out.mux(packet)
+    for packet in audio.encode():
+        out.mux(packet)
+    out.close()
+
+
 @pytest.fixture(scope="module")
 def clip(tmp_path_factory):
     path = tmp_path_factory.mktemp("run_file") / "clip.mp4"
@@ -78,6 +132,20 @@ def clip(tmp_path_factory):
 def clip_with_audio(tmp_path_factory):
     path = tmp_path_factory.mktemp("run_file_audio") / "clip.mp4"
     _write_clip(path, with_audio=True)
+    return path
+
+
+@pytest.fixture(scope="module")
+def vfr_clip(tmp_path_factory):
+    path = tmp_path_factory.mktemp("run_file_vfr") / "clip.mp4"
+    _write_vfr_clip(path)
+    return path
+
+
+@pytest.fixture(scope="module")
+def staggered_clip(tmp_path_factory):
+    path = tmp_path_factory.mktemp("run_file_staggered") / "clip.mp4"
+    _write_staggered_tracks(path)
     return path
 
 
@@ -123,6 +191,93 @@ class TestFileSource:
     def test_empty_window_is_rejected(self, clip):
         with pytest.raises(MediaError, match="empty frame window"):
             FileSource(clip, start=N + 5)
+
+    def test_vfr_is_rejected_from_actual_sample_timestamps(self, vfr_clip):
+        from kinovsr.media import ffmpeg_reader, video_reader
+
+        native = video_reader.probe_video_timing(vfr_clip)
+        fallback = ffmpeg_reader.probe_video_timing(vfr_clip)
+        assert native.sample_count == fallback.sample_count == 5
+        assert native.cadence is fallback.cadence is None
+        assert native.source_tick == fallback.source_tick == Fraction(1, 15360)
+        with pytest.raises(MediaError, match="variable frame rate"):
+            FileSource(vfr_clip)
+
+    def test_vfr_rejection_precedes_the_output_transaction(
+            self, vfr_clip, tmp_path, monkeypatch):
+        from kinovsr.pipeline import run as run_module
+
+        def transaction_must_not_start(_self):
+            raise AssertionError("output transaction started for VFR input")
+
+        monkeypatch.setattr(
+            run_module._OutputTransaction, "__enter__",
+            transaction_must_not_start)
+        output = tmp_path / "vfr.mp4"
+        with pytest.raises(MediaError, match="variable frame rate"):
+            run_file(
+                {"pipeline": []}, video=vfr_clip, output=output,
+                settings=SETTINGS)
+        assert not output.exists()
+        assert not list(tmp_path.glob("*.partial"))
+
+    def test_staggered_audio_video_origins_are_rejected_before_transaction(
+            self, staggered_clip, tmp_path, monkeypatch):
+        from kinovsr.media import ffmpeg_reader, video_reader
+        from kinovsr.pipeline import run as run_module
+
+        native_video = video_reader.probe_video_timing(staggered_clip)
+        native_audio = video_reader.probe_audio_timing(staggered_clip)
+        fallback_video = ffmpeg_reader.probe_video_timing(staggered_clip)
+        fallback_audio = ffmpeg_reader.probe_audio_timing(staggered_clip)
+        assert native_video.first_pts == fallback_video.first_pts == 10
+        assert native_audio is not None and fallback_audio is not None
+        assert native_audio.first_pts == fallback_audio.first_pts == 0
+
+        def transaction_must_not_start(_self):
+            raise AssertionError(
+                "output transaction started for staggered track origins")
+
+        monkeypatch.setattr(
+            run_module._OutputTransaction, "__enter__",
+            transaction_must_not_start)
+        output = tmp_path / "staggered.mp4"
+        with pytest.raises(MediaError, match="staggered audio/video"):
+            run_file(
+                {"pipeline": []}, video=staggered_clip, output=output,
+                settings=SETTINGS, audio=True)
+        assert not output.exists()
+        assert not list(tmp_path.glob("*.partial"))
+
+    def test_audio_origin_tolerance_is_only_the_half_tick_error_envelope(self):
+        from kinovsr.media.timing import AudioTiming, VideoTiming
+        from kinovsr.pipeline.run import _validate_audio_origin
+
+        video = VideoTiming(
+            sample_count=25,
+            cadence=Fraction(25),
+            first_pts=Fraction(0),
+            duration=Fraction(1),
+            source_tick=Fraction(1, 25),
+        )
+        envelope = (Fraction(1, 25) + Fraction(1, 48000)) / 2
+
+        class BoundaryReader:
+            @staticmethod
+            def probe_audio_timing(_path):
+                return AudioTiming(
+                    first_pts=envelope, source_tick=Fraction(1, 48000))
+
+        class WholeTickReader:
+            @staticmethod
+            def probe_audio_timing(_path):
+                return AudioTiming(
+                    first_pts=Fraction(1, 25),
+                    source_tick=Fraction(1, 48000))
+
+        _validate_audio_origin(Path("coarse.avi"), BoundaryReader, video)
+        with pytest.raises(MediaError, match="staggered audio/video"):
+            _validate_audio_origin(Path("coarse.avi"), WholeTickReader, video)
 
     def test_audio_carry_trims_to_the_window(self, clip_with_audio):
         source = FileSource(clip_with_audio, start=4, max_frames=8)
@@ -388,6 +543,63 @@ class TestGopAlign:
         with pytest.raises(MediaError, match="context_frames"):
             FileSource(clip, start=2, end=8, context_frames=4)
 
+    def test_corrected_source_clock_reaches_gop_and_trim_readers(
+            self, tmp_path):
+        from kinovsr.media.timing import VideoTiming
+
+        exact_timing = VideoTiming(
+            sample_count=40,
+            cadence=Fraction(30),
+            first_pts=Fraction(1, 2),
+            duration=Fraction(4, 3),
+            source_tick=Fraction(1, 30000),
+        )
+        captured = {}
+
+        class _Reader:
+            @staticmethod
+            def probe_video_timing(_path):
+                return exact_timing
+
+            @staticmethod
+            def probe_video(_path):
+                # Deliberately wrong legacy nominal/count. The exact timing
+                # scan must own every downstream frame-index conversion.
+                return 64, 64, 15.0, 20, None, None
+
+            @staticmethod
+            def probe_color(_path):
+                return {
+                    "primaries": None, "transfer": None, "matrix": None,
+                    "full_range": False, "tagged": False,
+                }
+
+            @staticmethod
+            def keyframe_display_indices(_path, *, timing=None):
+                captured["keyframe_timing"] = timing
+                return [0]
+
+            @staticmethod
+            def iter_video_buffer_chunks(
+                    _path, _format, chunk_size=8, *, start_frame=0,
+                    end_frame=None, timing=None):
+                captured["decode"] = (start_frame, end_frame, timing)
+                stop = exact_timing.sample_count if end_frame is None else end_frame
+                for begin in range(start_frame, stop, chunk_size):
+                    yield [object() for _ in range(
+                        begin, min(stop, begin + chunk_size))]
+
+        video = tmp_path / "synthetic.mov"
+        video.write_bytes(b"reader-owned fixture")
+        result = run_file(
+            {"pipeline": []}, video=video, output=tmp_path / "unused.mp4",
+            settings=SETTINGS, reader=_Reader, layout=Layout.CV_BGRA,
+            start=10, end=20, gop_align=True, skip_post_mp4=True)
+
+        assert result.frames_in == result.frames_out == 10
+        assert captured["keyframe_timing"] is exact_timing
+        assert captured["decode"] == (0, 20, exact_timing)
+
     @pytest.mark.parametrize(("minimum", "maximum"), [
         (0, 0),
         (-1, 16),
@@ -420,6 +632,135 @@ class TestGopAlign:
             first_plain = next(b.decode(video=0)).to_ndarray(format="rgb24")
         diff = abs(first_gop.astype("f4") - first_plain.astype("f4")).mean()
         assert diff < 2.0
+
+    @pytest.mark.parametrize(("target_fps", "expected_frames"), [
+        (40, 13),
+        (50, 16),
+    ])
+    def test_gop_context_cadence_change_rebases_the_public_grid(
+            self, clip, tmp_path, target_fps, expected_frames):
+        config = {
+            "pipeline": ["fps"],
+            "fps": {"processor": "videotoolbox", "profile": "normal",
+                    "target_fps": target_fps},
+        }
+        result = run_file(
+            config, video=clip,
+            output=tmp_path / f"gop_{target_fps}.mp4",
+            settings=SETTINGS, layout=Layout.CV_RGBA_HALF,
+            start=12, end=20, gop_align=True)
+        skipped = run_file(
+            config, video=clip,
+            output=tmp_path / f"skip_{target_fps}.mp4",
+            settings=SETTINGS, layout=Layout.CV_RGBA_HALF,
+            start=12, end=20, gop_align=True, skip_post_mp4=True)
+
+        assert result.frames_out == skipped.frames_out == expected_frames
+        assert result.output_spec.timeline == skipped.output_spec.timeline
+        with av.open(str(result.path)) as container:
+            stream = container.streams.video[0]
+            times = sorted(
+                Fraction(frame.pts) * Fraction(stream.time_base)
+                for frame in container.decode(video=0))
+        assert times == [Fraction(i, target_fps)
+                         for i in range(expected_frames)]
+        # The first retained FRC sample must select the requested in-point,
+        # not a frame from the GOP-only warmup prefix. The synthetic source
+        # changes monotonically, so frame 12 is the closest source image.
+        with av.open(str(clip)) as container:
+            source_frames = [
+                frame.to_ndarray(format="rgb24")
+                for frame in container.decode(video=0)
+            ]
+        with av.open(str(result.path)) as container:
+            first = next(container.decode(video=0)).to_ndarray(format="rgb24")
+        diffs = [
+            abs(first.astype("f4") - source_frames[index].astype("f4")).mean()
+            for index in range(10, 15)
+        ]
+        assert diffs.index(min(diffs)) == 2
+
+    def test_gop_nonintegral_cadence_keeps_audio_on_the_rebased_clip(
+            self, clip_with_audio, tmp_path):
+        config = {
+            "pipeline": ["fps"],
+            "fps": {"processor": "videotoolbox", "profile": "normal",
+                    "target_fps": 40},
+        }
+        result = run_file(
+            config, video=clip_with_audio, output=tmp_path / "gop_audio.mp4",
+            settings=SETTINGS, layout=Layout.CV_RGBA_HALF,
+            start=12, end=20, gop_align=True, audio=True)
+        video_s, audio_s, frames, _ = _stream_seconds(result.path)
+        assert result.frames_out == frames == 13
+        assert abs(video_s - 8 / 25) < 0.008
+        assert audio_s is not None
+        assert abs(audio_s - video_s) < 0.03
+        with av.open(str(result.path)) as container:
+            assert container.streams.video[0].start_time == 0
+            assert container.streams.audio[0].start_time == 0
+
+    def test_one_frame_gop_window_keeps_the_true_target_phase_and_duration(
+            self, clip_with_audio, tmp_path):
+        config = {
+            "pipeline": ["fps"],
+            "fps": {"processor": "videotoolbox", "profile": "normal",
+                    "target_fps": 40},
+        }
+        result = run_file(
+            config, video=clip_with_audio, output=tmp_path / "one_frame.mp4",
+            settings=SETTINGS, layout=Layout.CV_RGBA_HALF,
+            start=4, end=5, gop_align=True, audio=True)
+        plain = run_file(
+            config, video=clip_with_audio, output=tmp_path / "one_plain.mp4",
+            settings=SETTINGS, layout=Layout.CV_RGBA_HALF,
+            start=4, end=5)
+
+        with av.open(str(result.path)) as container:
+            video = container.streams.video[0]
+            audio = container.streams.audio[0]
+            frames = list(container.decode(video=0))
+            times = sorted(
+                Fraction(frame.pts) * Fraction(video.time_base)
+                for frame in frames)
+            video_duration = Fraction(video.duration) * Fraction(video.time_base)
+            audio_duration = Fraction(audio.duration) * Fraction(audio.time_base)
+            first_gop = frames[0].to_ndarray(format="rgb24")
+        with av.open(str(plain.path)) as container:
+            first_plain = next(container.decode(video=0)).to_ndarray(
+                format="rgb24")
+        assert result.frames_out == 2
+        assert times == [Fraction(0), Fraction(1, 40)]
+        assert video_duration == Fraction(1, 25)
+        assert audio_duration == video_duration
+        assert (first_gop == first_plain).all()
+
+    def test_gop_context_survives_two_cadence_changes(self, clip, tmp_path):
+        config = {
+            "pipeline": ["fps_40", "fps_50"],
+            "fps_40": {
+                "processor": "videotoolbox", "profile": "normal",
+                "target_fps": 40,
+            },
+            "fps_50": {
+                "processor": "videotoolbox", "profile": "normal",
+                "target_fps": 50,
+            },
+        }
+        result = run_file(
+            config, video=clip, output=tmp_path / "chained_frc.mp4",
+            settings=SETTINGS, layout=Layout.CV_RGBA_HALF,
+            start=4, end=5, gop_align=True)
+
+        with av.open(str(result.path)) as container:
+            video = container.streams.video[0]
+            times = sorted(
+                Fraction(frame.pts) * Fraction(video.time_base)
+                for frame in container.decode(video=0))
+            duration = Fraction(video.duration) * Fraction(video.time_base)
+        assert result.frames_out == 2
+        assert times == [Fraction(0), Fraction(1, 50)]
+        assert duration == Fraction(1, 25)
 
     def test_snap_start_moves_to_the_nearest_keyframe(self, clip, tmp_path):
         # start=11 snaps to keyframe 8 -> the window becomes [8, 20).

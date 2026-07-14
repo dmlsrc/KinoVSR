@@ -35,6 +35,12 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from kinovsr.media.timing import (
+    AudioTiming,
+    VideoTiming,
+    grid_ticks,
+    rational_cadence,
+)
 from kinovsr.processors.boundaries import BoundaryKind
 from kinovsr.processors.errors import MediaError, PipelineError
 from kinovsr.processors.specs import (
@@ -75,9 +81,75 @@ def _matrix_token(resolved: tuple) -> str:
 def _cadence(fps: float) -> Fraction:
     """Snap a probed float fps to its exact broadcast rational (24000/1001
     family and integer rates land exactly)."""
-    if fps <= 0:
-        raise MediaError(f"source reports non-positive fps {fps!r}")
-    return Fraction(fps).limit_denominator(1001)
+    try:
+        return rational_cadence(fps, max_denominator=1001)
+    except ValueError as exc:
+        raise MediaError(f"source reports invalid fps {fps!r}") from exc
+
+
+def _reader_module(reader: Any) -> Any:
+    if reader is not None:
+        return reader
+    from kinovsr.media import video_reader
+
+    return video_reader
+
+
+def _probe_cfr_timing(path: Path, reader: Any) -> VideoTiming | None:
+    """Return exact CFR metadata or reject VFR before output mutation.
+
+    Custom reader adapters written before this contract may omit the timing
+    probe; their existing explicit ``probe_video`` cadence remains supported.
+    Both built-in readers implement this metadata-only scan.
+    """
+    probe = getattr(_reader_module(reader), "probe_video_timing", None)
+    if probe is None:
+        return None
+    try:
+        timing = probe(path)
+    except MediaError:
+        raise
+    except Exception as exc:
+        raise MediaError(f"failed to inspect source timing for {path}: {exc}") from exc
+    if timing.cadence is None:
+        raise MediaError(
+            f"{path.name}: variable frame rate (VFR) is not supported by the "
+            f"file pipeline ({timing.sample_count} display samples over "
+            f"{float(timing.duration):.6g}s); convert to CFR before processing")
+    return timing
+
+
+def _validate_audio_origin(
+    path: Path,
+    reader: Any,
+    video_timing: VideoTiming | None,
+) -> None:
+    """Reject audio carry whose source clock cannot yet be preserved."""
+    if video_timing is None:
+        return
+    probe = getattr(_reader_module(reader), "probe_audio_timing", None)
+    if probe is None:
+        return
+    try:
+        audio_timing: AudioTiming | None = probe(path)
+    except MediaError:
+        raise
+    except Exception as exc:
+        raise MediaError(
+            f"failed to inspect source audio timing for {path}: {exc}") from exc
+    if audio_timing is None:
+        return
+    # Each reported origin can be rounded by at most half of its own clock
+    # tick. A whole coarse video tick is a real frame-scale skew, not harmless
+    # quantization (notably for AVI streams whose time base is 1/fps).
+    tolerance = (
+        video_timing.source_tick + audio_timing.source_tick) / 2
+    if abs(audio_timing.first_pts - video_timing.first_pts) > tolerance:
+        raise MediaError(
+            f"{path.name}: staggered audio/video track origins are not "
+            f"supported (video starts at {float(video_timing.first_pts):.6g}s, "
+            f"audio at {float(audio_timing.first_pts):.6g}s); align or remux "
+            f"the tracks before requesting audio carry")
 
 
 class FileSource:
@@ -104,6 +176,7 @@ class FileSource:
         source_range: str = "auto",
         context_frames: int = 0,
         reader: Any = None,
+        timing: VideoTiming | None = None,
     ) -> None:
         if layout not in _DECODE_FORMATS:
             supported = ", ".join(k.value for k in _DECODE_FORMATS)
@@ -111,16 +184,23 @@ class FileSource:
                 f"input endpoint cannot produce layout {layout.value!r} "
                 f"(supported: {supported})")
         from kinovsr.media import pixel_buffers as _pb
-        from kinovsr.media import video_reader as _native_vr
-
-        self._vr = reader if reader is not None else _native_vr
+        self._vr = _reader_module(reader)
         self._pb = _pb
         self.path = Path(path)
         self.layout = layout
         self.chunk_size = int(chunk_size)
 
+        if timing is None:
+            timing = _probe_cfr_timing(self.path, self._vr)
+
         width, height, fps, total, transform, pixel_aspect = (
             self._vr.probe_video(self.path))
+        cadence = timing.cadence if timing is not None else _cadence(fps)
+        assert cadence is not None
+        if timing is not None:
+            total = timing.sample_count
+        fps = float(cadence)
+        self._timing = timing
         from kinovsr.media import color as _color
 
         self._src_color = self._vr.probe_color(self.path)
@@ -149,13 +229,14 @@ class FileSource:
         self.transform = transform
         self.pixel_aspect = pixel_aspect
         self.source_fps = fps
+        self.source_cadence = cadence
 
         if start < 0:
             raise MediaError(f"start must be >= 0, got {start}")
         self.start = start
         # gop-align context: frames BEFORE the window, decoded and fed as
         # recurrence warmup with NEGATIVE pts. They are processed, never
-        # output - run_file drops non-positive-time outputs - so the output
+        # output - run_file drops negative-time outputs - so the output
         # timeline stays anchored at `start` and frame_count is unchanged.
         if context_frames < 0 or context_frames > start:
             raise MediaError(
@@ -172,7 +253,6 @@ class FileSource:
                 f"source {self.path.name}")
         self.end = stop
 
-        cadence = _cadence(fps)
         geometry_kwargs = {}
         if pixel_aspect is not None:
             geometry_kwargs["pixel_aspect"] = Fraction(*pixel_aspect)
@@ -199,7 +279,7 @@ class FileSource:
 
     def _grid_ticks(self, index: int) -> int:
         timeline = self.spec.timeline
-        return round(index / timeline.cadence / timeline.time_base)
+        return grid_ticks(index, timeline.cadence, timeline.time_base)
 
     def units(self) -> Iterator[FrameUnit]:
         """Decode the window and yield timestamped units, one per frame.
@@ -210,6 +290,8 @@ class FileSource:
         decode_format = getattr(self._pb, _DECODE_FORMATS[self.layout])
         to_mlx = self.layout is Layout.MLX_RGB_HWC
         read_start = self.start - self.context_frames
+        timing_kwargs = ({"timing": self._timing}
+                         if self._timing is not None else {})
         if self._force_read:
             # Re-decode raw YUV, force the resolved matrix, reinterpret the
             # range: source's actual full_range in, resolved range out.
@@ -217,11 +299,13 @@ class FileSource:
                 self.path, decode_format, self.resolved_color[2],
                 self._src_color["full_range"], chunk_size=self.chunk_size,
                 start_frame=read_start, end_frame=self.end,
-                reinterpret_full_range=self.resolved_color[3])
+                reinterpret_full_range=self.resolved_color[3],
+                **timing_kwargs)
         else:
             chunks = self._vr.iter_video_buffer_chunks(
                 self.path, decode_format, chunk_size=self.chunk_size,
-                start_frame=read_start, end_frame=self.end)
+                start_frame=read_start, end_frame=self.end,
+                **timing_kwargs)
         index = -self.context_frames
         for chunk in chunks:
             for buffer in chunk:
@@ -358,7 +442,7 @@ class FileSink:
             self.writer = AVWriter(
                 self._temp_path,
                 width=geometry.width, height=geometry.height,
-                fps=float(timeline.cadence),
+                fps=timeline.cadence,
                 source_pixel_format=getattr(_pb, _DECODE_FORMATS[layout]),
                 profile=profile, quality=quality, label=label,
                 audio_track=audio_track, audio_codec=audio_codec,
@@ -383,7 +467,7 @@ class FileSink:
 
     def _grid_ticks(self, index: int) -> int:
         timeline = self.spec.timeline
-        return round(index / timeline.cadence / timeline.time_base)
+        return grid_ticks(index, timeline.cadence, timeline.time_base)
 
     def _mlx_to_buffer(self, frame: Any) -> Any:
         import mlx.core as mx
@@ -1187,6 +1271,12 @@ def run_file(
         noise_map_debug=noise_map_debug,
         overwrite=overwrite,
     )
+    # Inspect the complete source sample clock before entering the artifact
+    # transaction. The file pipeline currently publishes CFR only; rejecting
+    # VFR here prevents both silent retiming/frame loss and partial outputs.
+    timing = _probe_cfr_timing(plan.input_path, reader)
+    if audio:
+        _validate_audio_origin(plan.input_path, reader, timing)
     with _OutputTransaction(plan, settings) as transaction:
         return _run_file_reserved(
             config,
@@ -1213,6 +1303,7 @@ def run_file(
             gop_min_window=gop_min_window,
             gop_max_window=gop_max_window,
             reader=reader,
+            timing=timing,
         )
 
 
@@ -1242,6 +1333,7 @@ def _run_file_reserved(
     gop_min_window: int,
     gop_max_window: int,
     reader: Any,
+    timing: VideoTiming | None,
 ) -> FileRunResult:
     """Execute while the complete output graph is reserved by ``transaction``."""
     from .session import open_pipeline
@@ -1258,13 +1350,18 @@ def _run_file_reserved(
         from kinovsr.media import video_reader as _native_vr
 
         vr = reader if reader is not None else _native_vr
-        keyframes = vr.keyframe_display_indices(video_path)
+        keyframe_kwargs = ({"timing": timing} if timing is not None else {})
+        keyframes = vr.keyframe_display_indices(
+            video_path, **keyframe_kwargs)
         if snap_start and keyframes:
             start = min(keyframes, key=lambda k: abs(k - start))
         if gop_align:
             from kinovsr.modeling.upscaler_base import plan_gop_windows
 
-            _, _, _, total, _, _ = vr.probe_video(video_path)
+            if timing is not None:
+                total = timing.sample_count
+            else:
+                _, _, _, total, _, _ = vr.probe_video(video_path)
             end_abs = total if end is None else min(end, total)
             enclosing = [k for k in keyframes if k <= start]
             read_start = max(enclosing) if enclosing else start
@@ -1282,7 +1379,7 @@ def _run_file_reserved(
         video_path, layout=layout, start=start, end=end,
         max_frames=max_frames, chunk_size=chunk_size,
         source_color=source_color, source_range=source_range,
-        context_frames=context_frames, reader=reader)
+        context_frames=context_frames, reader=reader, timing=timing)
     # Probe-time auto geometry: rewrite bars="auto"/edges="auto" stage
     # tables into detected literal counts before the chain resolves
     # (sampling through the same reader the run decodes with).
@@ -1294,7 +1391,8 @@ def _run_file_reserved(
             pixel_aspect=source.spec.frame.geometry.pixel_aspect)
     session = open_pipeline(
         config, source.spec, settings=settings, reporter=reporter,
-        windowing=windowing)
+        windowing=windowing,
+        publication_origin_pts=0 if context_frames else None)
     # The output cap resolves against the OUTPUT cadence (a time-form cap
     # on a cadence-changing chain means output duration, not input).
     out_cadence = session.output_spec.timeline.cadence
@@ -1390,9 +1488,9 @@ def _run_file_reserved(
     # emitted unit's duration so total output duration matches the source.
     preserve_duration = (session.output_spec.timeline.duration_policy
                          is DurationPolicy.PRESERVED)
-    source_end_ticks = round(
-        source.frame_count / source.source_fps
-        / session.output_spec.timeline.time_base)
+    source_end_ticks = grid_ticks(
+        source.frame_count, source.source_cadence,
+        session.output_spec.timeline.time_base)
     frames_out = 0
     pending: FrameUnit | None = None
     # retain_outputs=False: the sink consumes each unit into the encoder

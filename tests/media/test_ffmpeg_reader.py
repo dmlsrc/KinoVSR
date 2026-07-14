@@ -5,6 +5,8 @@ GOP, tagged 601), so no binary fixtures and no dependency on files AVFoundation
 can or cannot read.
 """
 import math
+from fractions import Fraction
+from types import SimpleNamespace
 
 import av
 import mlx.core as mx
@@ -18,6 +20,18 @@ from kinovsr.media.pixel_buffers import (
 )
 
 W, H, N, FPS, GOP = 160, 128, 24, 25, 8
+
+
+def test_explicit_timing_origin_preserves_nonzero_stream_start_indexing():
+    stream = SimpleNamespace(
+        start_time=10000,
+        time_base=Fraction(1, 1000),
+    )
+    assert fr._pts_index(10000, stream, 25.0) == 0
+    assert fr._pts_index(
+        10000, stream, 25.0, origin=Fraction(10)) == 0
+    assert fr._pts_index(
+        10040, stream, 25.0, origin=Fraction(10)) == 1
 
 
 @pytest.fixture(scope="module")

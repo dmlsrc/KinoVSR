@@ -14,12 +14,14 @@ import contextlib
 import logging
 import threading
 import time
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media import yuv as _yuv
 from kinovsr.media.audio import AudioTrack, audio_writer_settings
+from kinovsr.media.timing import rational_cadence
 
 from .frameworks import (
     CoreMedia,
@@ -109,7 +111,7 @@ class AVWriter:
         output_path: Path,
         width: int,
         height: int,
-        fps: float,
+        fps: Fraction | int | float | str,
         *,
         source_pixel_format: int,
         profile: str = HEVC_PROFILE_MAIN10,
@@ -124,6 +126,7 @@ class AVWriter:
         cv_color: tuple | None = None,
         full_range: bool = False,
     ):
+        cadence = rational_cadence(fps)
         self._state_lock = threading.RLock()
         self._state = "constructing"
         self._failure: BaseException | None = None
@@ -139,7 +142,7 @@ class AVWriter:
         try:
             with autorelease_pool():
                 self._construct(
-                    output_path, width, height, fps,
+                    output_path, width, height, cadence,
                     source_pixel_format=source_pixel_format, profile=profile,
                     quality=quality, label=label, audio_track=audio_track,
                     audio_codec=audio_codec, transform=transform,
@@ -160,7 +163,7 @@ class AVWriter:
         output_path: Path,
         width: int,
         height: int,
-        fps: float,
+        fps: Fraction,
         *,
         source_pixel_format: int,
         profile: str,
@@ -266,7 +269,8 @@ class AVWriter:
         self.video_input = video_input
         self.audio_input = audio_input
         self.adaptor = adaptor
-        self.fps = float(fps)
+        self.cadence = fps
+        self.fps = float(self.cadence)
         self.label = label
         self.path = output_path
         self.frame_count = 0
@@ -417,7 +421,7 @@ class AVWriter:
                         rgb, ybuf, self._yuv_matrix, self._yuv_full)
                     pb = ybuf
                 if pts_ticks is None:
-                    pts = _pb.frame_pts(self.frame_count, self.fps)
+                    pts = _pb.frame_pts(self.frame_count, self.cadence)
                 else:
                     pts = CoreMedia.CMTimeMake(
                         int(pts_ticks), _pb.VIDEO_TIME_SCALE)
@@ -486,7 +490,7 @@ class AVWriter:
                     end = CoreMedia.CMTimeMake(
                         self._explicit_end_ticks, _pb.VIDEO_TIME_SCALE)
                 else:
-                    end = _pb.frame_pts(self.frame_count, self.fps)
+                    end = _pb.frame_pts(self.frame_count, self.cadence)
                 self.writer.endSessionAtSourceTime_(end)
                 native_done = threading.Event()
                 with self._state_lock:

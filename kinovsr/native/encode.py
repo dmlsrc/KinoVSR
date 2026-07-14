@@ -38,6 +38,7 @@ import itertools
 import logging
 import time
 from collections.abc import Iterable, Iterator, Sequence
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,7 @@ import mlx.core as mx
 from kinovsr.media import color as _color
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media.audio import AudioTrack
+from kinovsr.media.timing import rational_cadence
 from kinovsr.reporting import NullReporter, Reporter
 
 from .frameworks import autorelease_pool
@@ -146,7 +148,7 @@ def encode_video_videotoolbox(
     frames: Sequence[Any] | Iterable[Any],
     output_path: str | Path,
     *,
-    fps: float,
+    fps: Fraction | int | float,
     audio_waveform: Any = None,
     audio_sample_rate: int | None = None,
     audio_bit_depth: str = "float32",
@@ -154,7 +156,7 @@ def encode_video_videotoolbox(
     audio_onset_trim_mode: str = "auto",
     audio_onset_trim_ms: float | None = None,
     vsr_spatial_mode: str | None = None,
-    target_fps: float | None = None,
+    target_fps: Fraction | int | float | None = None,
     vsr_temporal_mode: str = "normal",
     vsr_save_original: bool = False,
     encode_quality: float = 0.65,
@@ -210,6 +212,12 @@ def encode_video_videotoolbox(
     """
     if reporter is None:
         reporter = NullReporter()
+    source_cadence = rational_cadence(fps)
+    target_cadence = (rational_cadence(target_fps)
+                      if target_fps is not None else source_cadence)
+    do_temporal = target_cadence != source_cadence
+    fps = float(source_cadence)
+    target_fps = float(target_cadence)
     output_path = Path(output_path)
     if output_path.suffix.lower() != ".mp4":
         output_path = output_path.with_suffix(".mp4")
@@ -238,9 +246,8 @@ def encode_video_videotoolbox(
         scale = 1
         out_w, out_h = in_w, in_h
 
-    do_temporal = target_fps is not None and abs(target_fps - fps) > 1e-6
     if not do_temporal:
-        target_fps = fps  # writer fps is the effective output rate
+        target_cadence = source_cadence
 
     profile = _pick_hevc_profile(vsr_spatial_mode, encode_chroma)
 
@@ -258,7 +265,7 @@ def encode_video_videotoolbox(
     if do_temporal:
         vtfrc = VtfrcSession(
             out_w, out_h,
-            source_fps=fps, target_fps=target_fps,
+            source_fps=source_cadence, target_fps=target_cadence,
             mode=vsr_temporal_mode,
         )
 
@@ -314,7 +321,7 @@ def encode_video_videotoolbox(
     # adaptor pool is YUV; keep the producer on its own RGBAHalf pool.
     writer = AVWriter(
         output_path,
-        width=out_w, height=out_h, fps=target_fps,
+        width=out_w, height=out_h, fps=target_cadence,
         source_pixel_format=writer_src_fmt,
         profile=profile,
         quality=encode_quality,
@@ -366,7 +373,7 @@ def encode_video_videotoolbox(
         orig_yuv_feed = orig_src_fmt == _pb.PIX_RGBAHALF
         writer_orig = AVWriter(
             orig_path,
-            width=in_w, height=in_h, fps=fps,
+            width=in_w, height=in_h, fps=source_cadence,
             source_pixel_format=orig_src_fmt,
             profile=orig_profile,
             quality=encode_quality,
