@@ -47,6 +47,7 @@ from .builder import (
     _wrap_stage_error,
     build_processors,
 )
+from .ownership import retain_safe_outputs
 
 
 def _stage_stream(
@@ -313,9 +314,19 @@ def run_plan(
     plan: BuildPlan,
     units: Iterable[FrameUnit],
     context: PipelineContext,
-) -> ChainRun:
-    """Build the plan's stages and run the chain (the common entry)."""
-    return run_chain(build_processors(plan, context), units, context)
+    *,
+    retain_outputs: bool = True,
+) -> Iterator[FrameUnit]:
+    """Build and run a plan with retain-safe host outputs by default.
+
+    ``retain_outputs=False`` exposes borrowed CVPixelBuffers for a synchronous
+    consumer such as a file sink. :func:`run_chain` is always the low-level
+    borrowed surface.
+    """
+    run = run_chain(build_processors(plan, context), units, context)
+    return retain_safe_outputs(
+        run, plan.output_spec, retain_outputs=retain_outputs
+    )
 
 
 __all__ = ["ChainRun", "run_chain", "run_plan"]

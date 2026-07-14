@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Iterable, Mapping
+from contextlib import suppress
 from fractions import Fraction
 from typing import Any
 
@@ -44,6 +45,8 @@ from kinovsr.processors.specs import (
 from kinovsr.processors.units import FrameUnit
 from kinovsr.settings import Settings
 
+from .pools import MlxUploadPool, apply_output_pool
+
 _PROFILES = ("normal", "high")
 
 # Spatial modes = profiles. Each couples scale, output CV layout, dtype,
@@ -53,9 +56,9 @@ _PROFILES = ("normal", "high")
 _UPSCALE_PROFILES = ("fast", "balanced", "image")
 _UPSCALE_MODE = {
     #        scale, dst layout,          dtype,          domain,        max_w, max_h
-    "fast":     (2, Layout.CV_NV12,      DType.UINT8,    Domain.CODED,   960,  960),
-    "balanced": (4, Layout.CV_RGBA_HALF, DType.FLOAT16,  Domain.UNIT,   1920, 1080),
-    "image":    (4, Layout.CV_RGBA_HALF, DType.FLOAT16,  Domain.UNIT,   1920, 1080),
+    "fast": (2, Layout.CV_NV12, DType.UINT8, Domain.CODED, 960, 960),
+    "balanced": (4, Layout.CV_RGBA_HALF, DType.FLOAT16, Domain.UNIT, 1920, 1080),
+    "image": (4, Layout.CV_RGBA_HALF, DType.FLOAT16, Domain.UNIT, 1920, 1080),
 }
 
 # The CVPixelBuffer layout each mode's VSR session consumes as its source.
@@ -89,18 +92,19 @@ def _produces(spec: StreamSpec, config: object) -> StreamSpec:
         spec.timeline,
         cadence=config.target_fps,
         timestamp_policy=TimestampPolicy.REGENERATED,
-        cardinality=(Cardinality.ONE_TO_MANY
-                     if config.target_fps > spec.timeline.cadence
-                     else Cardinality.MANY_TO_ONE),
+        cardinality=(
+            Cardinality.ONE_TO_MANY
+            if config.target_fps > spec.timeline.cadence
+            else Cardinality.MANY_TO_ONE
+        ),
     )
-    frame = spec.frame
-    if frame.layout is Layout.MLX_RGB_HWC:
-        # MLX frames upload into RGBAHalf buffers for the FRC session (a
-        # learned upscale followed by --target-fps, the harness shape
-        # where FRC ran on the writer-bound buffers); the output is the
-        # session's native CV currency.
-        frame = dataclasses.replace(
-            frame, layout=Layout.CV_RGBA_HALF, dtype=DType.FLOAT16)
+    # VTFrameRateConversion always emits its destination currency,
+    # RGBAHalf, regardless of whether the accepted source was BGRA, NV12,
+    # RGBAHalf, or uploaded MLX RGB. The typed edge must describe the actual
+    # payload so downstream writer-pool compatibility is decided correctly.
+    frame = dataclasses.replace(
+        spec.frame, layout=Layout.CV_RGBA_HALF, dtype=DType.FLOAT16, domain=Domain.UNIT
+    )
     return dataclasses.replace(spec, timeline=timeline, frame=frame)
 
 
@@ -129,15 +133,25 @@ class VtInterpolateProcessor:
         self._target_index: int | None = None
         self._input_end_pts: int | None = None
         self._pending: FrameUnit | None = None
+        self._upload_bridge: MlxUploadPool | None = None
         # A normal host stream keeps its first input PTS as the output origin.
         # Negative input PTS are the file endpoint's processing-only GOP
         # context; those indices stay negative on the target grid so frame 0
         # is generated at the requested public in-point, not relabeled later.
         self._origin: int | None = None
+        self._output_pool_binding: tuple[Any, int, int, int] | None = None
+
+    def _bind_output_pool(
+        self,
+        pool: Any,
+        pixel_format: int,
+        width: int,
+        height: int,
+    ) -> None:
+        self._output_pool_binding = (pool, pixel_format, width, height)
 
     def _grid_ticks(self, target_index: int) -> int:
-        return grid_ticks(
-            target_index, self._config.target_fps, self._time_base)
+        return grid_ticks(target_index, self._config.target_fps, self._time_base)
 
     def _emit(self, payload: Any) -> FrameUnit:
         assert self._target_index is not None
@@ -145,11 +159,9 @@ class VtInterpolateProcessor:
         self._target_index += 1
         pts = self._grid_ticks(m)
         origin = self._origin or 0
-        return FrameUnit(payload=payload, pts=origin + pts,
-                         duration=self._grid_ticks(m + 1) - pts)
+        return FrameUnit(payload=payload, pts=origin + pts, duration=self._grid_ticks(m + 1) - pts)
 
-    def prepare(self, input_spec: StreamSpec,
-                context: PipelineContext) -> None:
+    def prepare(self, input_spec: StreamSpec, context: PipelineContext) -> None:
         from kinovsr.native.temporal import VtfrcSession
 
         cadence = input_spec.timeline.cadence
@@ -158,68 +170,61 @@ class VtInterpolateProcessor:
         self._time_base = input_spec.timeline.time_base
         self._source_cadence = cadence
         self._publication_origin_pts = context.publication_origin_pts
+        output_pool_binding, self._output_pool_binding = (
+            self._output_pool_binding,
+            None,
+        )
         # An MLX input uploads each frame into an IOSurface-backed
         # RGBAHalf buffer for the session (the learned-upscale ->
         # --target-fps shape); CV inputs feed straight through.
-        self._upload_pool = None
-        if input_spec.frame.layout is Layout.MLX_RGB_HWC:
-            from kinovsr.media import pixel_buffers as _pb
-
-            self._pb = _pb
-            self._upload_pool = _pb.make_pool_from_attrs({
-                "PixelFormatType": _pb.PIX_RGBAHALF,
-                "Width": geometry.width, "Height": geometry.height,
-                "IOSurfaceProperties": {},
-                "MetalCompatibility": True,
-            })
         try:
+            if input_spec.frame.layout is Layout.MLX_RGB_HWC:
+                self._upload_bridge = MlxUploadPool(geometry.width, geometry.height)
             self._session = VtfrcSession(
-                geometry.width, geometry.height,
+                geometry.width,
+                geometry.height,
                 source_fps=cadence,
                 target_fps=self._config.target_fps,
-                mode=self._config.mode)
+                mode=self._config.mode,
+            )
+            apply_output_pool(self._session, output_pool_binding, geometry.width, geometry.height)
         except (RuntimeError, SystemExit) as exc:
-            raise MediaError(
-                f"VTFrameRateConversion session unavailable: {exc}") from exc
+            session, self._session = self._session, None
+            upload, self._upload_bridge = self._upload_bridge, None
+            with suppress(Exception):
+                if session is not None:
+                    session.close()
+            with suppress(Exception):
+                if upload is not None:
+                    upload.close()
+            raise MediaError(f"VTFrameRateConversion session unavailable: {exc}") from exc
 
-    def process(self, unit: FrameUnit,
-                context: PipelineContext) -> Iterable[FrameUnit]:
+    def process(self, unit: FrameUnit, context: PipelineContext) -> Iterable[FrameUnit]:
         if self._origin is None:
-            self._origin = (unit.pts if self._publication_origin_pts is None
-                            else self._publication_origin_pts)
+            self._origin = (
+                unit.pts if self._publication_origin_pts is None else self._publication_origin_pts
+            )
         assert self._time_base is not None
         assert self._source_cadence is not None
-        index = round(
-            Fraction(unit.pts - self._origin)
-            * self._time_base * self._source_cadence)
-        source_step = (
-            grid_ticks(index + 1, self._source_cadence, self._time_base)
-            - grid_ticks(index, self._source_cadence, self._time_base))
-        self._input_end_pts = unit.pts + (
-            unit.duration if unit.duration > 0 else source_step)
+        index = round(Fraction(unit.pts - self._origin) * self._time_base * self._source_cadence)
+        source_step = grid_ticks(index + 1, self._source_cadence, self._time_base) - grid_ticks(
+            index, self._source_cadence, self._time_base
+        )
+        self._input_end_pts = unit.pts + (unit.duration if unit.duration > 0 else source_step)
         if self._target_index is None:
             self._target_index = math.ceil(
-                Fraction(index) * self._config.target_fps
-                / self._source_cadence)
+                Fraction(index) * self._config.target_fps / self._source_cadence
+            )
         payload = unit.payload
-        if self._upload_pool is not None:
-            import mlx.core as mx
-
-            rgb = payload
-            rgba = mx.concatenate(
-                [rgb[..., :3].astype(mx.float16),
-                 mx.ones((*rgb.shape[:2], 1), mx.float16)], axis=-1)
-            buffer = self._pb.pool_create_buffer(self._upload_pool)
-            self._pb.upload_frame_to_buffer(rgba, buffer)
-            payload = buffer
+        if self._upload_bridge is not None:
+            payload = self._upload_bridge.upload(payload)
         for produced in self._session.feed(payload, index):
             unit = self._emit(produced)
             if self._pending is not None:
                 yield self._pending
             self._pending = unit
 
-    def reset(self, boundary: Boundary,
-              context: PipelineContext) -> None:
+    def reset(self, boundary: Boundary, context: PipelineContext) -> None:
         # The scheduler drained the pre-boundary tail via flush(), which
         # clears the buffered pair inside the session; the target grid
         # deliberately keeps counting so PTS stays monotonic.
@@ -230,8 +235,7 @@ class VtInterpolateProcessor:
             return
         for payload in self._session.drain():
             unit = self._emit(payload)
-            if (self._input_end_pts is not None
-                    and unit.pts >= self._input_end_pts):
+            if self._input_end_pts is not None and unit.pts >= self._input_end_pts:
                 continue
             if self._pending is not None:
                 yield self._pending
@@ -239,8 +243,7 @@ class VtInterpolateProcessor:
         if self._pending is not None:
             pending, self._pending = self._pending, None
             if self._input_end_pts is not None:
-                duration = min(
-                    pending.duration, self._input_end_pts - pending.pts)
+                duration = min(pending.duration, self._input_end_pts - pending.pts)
                 if duration <= 0:
                     return
                 pending = pending.retimed(pending.pts, duration)
@@ -248,40 +251,46 @@ class VtInterpolateProcessor:
 
     def close(self, context: PipelineContext) -> None:
         session, self._session = self._session, None
+        self._output_pool_binding = None
         self._pending = None
         self._input_end_pts = None
-        if session is not None:
-            session.close()
+        try:
+            if session is not None:
+                session.close()
+        finally:
+            upload, self._upload_bridge = self._upload_bridge, None
+            if upload is not None:
+                upload.close()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class VtUpscaleConfig:
-    mode: str    # "fast" | "balanced" | "image"
+    mode: str  # "fast" | "balanced" | "image"
 
 
 def _upscale_produces(spec: StreamSpec, config: object) -> StreamSpec:
     assert isinstance(config, VtUpscaleConfig)
-    scale, dst_layout, dst_dtype, dst_domain, max_w, max_h = (
-        _UPSCALE_MODE[config.mode])
+    scale, dst_layout, dst_dtype, dst_domain, max_w, max_h = _UPSCALE_MODE[config.mode]
     g = spec.frame.geometry
     # The size cap is a VideoToolbox hard limit and mode-dependent, so it is
     # checked here (open time) rather than as a StreamConstraint bound.
     if g.width > max_w or g.height > max_h:
         raise ValueError(
             f"videotoolbox {config.mode} upscale accepts input up to "
-            f"{max_w}x{max_h}; got {g.width}x{g.height}")
+            f"{max_w}x{max_h}; got {g.width}x{g.height}"
+        )
     # A CV source must be the mode's own session format (zero-copy path);
     # the layout<->mode pairing is mode-dependent, so it is checked here
     # like the size cap rather than as a StreamConstraint bound.
     native = _UPSCALE_NATIVE_SRC[config.mode]
-    if spec.frame.layout is not Layout.MLX_RGB_HWC and (
-            spec.frame.layout is not native):
+    if spec.frame.layout is not Layout.MLX_RGB_HWC and (spec.frame.layout is not native):
         raise ValueError(
             f"videotoolbox {config.mode} upscale takes MLX frames or its "
-            f"native {native.value} source; got {spec.frame.layout.value}")
+            f"native {native.value} source; got {spec.frame.layout.value}"
+        )
     frame = dataclasses.replace(
-        spec.frame, layout=dst_layout, dtype=dst_dtype, domain=dst_domain,
-        geometry=g.scaled(scale))
+        spec.frame, layout=dst_layout, dtype=dst_dtype, domain=dst_domain, geometry=g.scaled(scale)
+    )
     return dataclasses.replace(spec, frame=frame)
 
 
@@ -303,14 +312,27 @@ class VtUpscaleProcessor:
         self._mx: Any = None
         self._index = 0
         self._cv_input = False
+        self._output_pool_binding: tuple[Any, int, int, int] | None = None
 
-    def prepare(self, input_spec: StreamSpec,
-                context: PipelineContext) -> None:
+    def _bind_output_pool(
+        self,
+        pool: Any,
+        pixel_format: int,
+        width: int,
+        height: int,
+    ) -> None:
+        self._output_pool_binding = (pool, pixel_format, width, height)
+
+    def prepare(self, input_spec: StreamSpec, context: PipelineContext) -> None:
         import mlx.core as mx
 
         from kinovsr.native.vsr import VsrSession
 
         self._mx = mx
+        output_pool_binding, self._output_pool_binding = (
+            self._output_pool_binding,
+            None,
+        )
         # A CV source is already in the session's source format (validated
         # at resolve): feed it zero-copy via upscale_buffer_to_buffer, the
         # harness's mainstream decode->VSR path. MLX frames upload.
@@ -318,31 +340,34 @@ class VtUpscaleProcessor:
         g = input_spec.frame.geometry
         try:
             self._session = VsrSession(
-                g.width, g.height, mode=self._config.mode,
-                fps=float(input_spec.timeline.cadence))
+                g.width, g.height, mode=self._config.mode, fps=float(input_spec.timeline.cadence)
+            )
+            apply_output_pool(
+                self._session, output_pool_binding, self._session.out_w, self._session.out_h
+            )
         except (RuntimeError, SystemExit, ValueError) as exc:
-            raise MediaError(
-                f"VideoToolbox VSR session unavailable: {exc}") from exc
+            session, self._session = self._session, None
+            with suppress(Exception):
+                if session is not None:
+                    session.close()
+            raise MediaError(f"VideoToolbox VSR session unavailable: {exc}") from exc
 
-    def process(self, unit: FrameUnit,
-                context: PipelineContext) -> Iterable[FrameUnit]:
+    def process(self, unit: FrameUnit, context: PipelineContext) -> Iterable[FrameUnit]:
         if self._cv_input:
-            out = self._session.upscale_buffer_to_buffer(
-                unit.payload, self._index)
+            out = self._session.upscale_buffer_to_buffer(unit.payload, self._index)
             self._index += 1
             yield unit.with_payload(out)
             return
         mx = self._mx
         rgb = unit.payload
         rgba = mx.concatenate(
-            [rgb.astype(mx.float16),
-             mx.ones((*rgb.shape[:2], 1), mx.float16)], axis=-1)
+            [rgb.astype(mx.float16), mx.ones((*rgb.shape[:2], 1), mx.float16)], axis=-1
+        )
         out = self._session.upscale_to_buffer(rgba, self._index)
         self._index += 1
         yield unit.with_payload(out)
 
-    def reset(self, boundary: Boundary,
-              context: PipelineContext) -> None:
+    def reset(self, boundary: Boundary, context: PipelineContext) -> None:
         if self._session is not None:
             self._session.reset_temporal_context()
 
@@ -351,6 +376,7 @@ class VtUpscaleProcessor:
 
     def close(self, context: PipelineContext) -> None:
         session, self._session = self._session, None
+        self._output_pool_binding = None
         if session is not None:
             session.close()
 
@@ -363,9 +389,8 @@ class VideoToolboxFactory:
             capability=Capability.INTERPOLATE,
             profiles=_PROFILES,
             accepts=StreamConstraint(
-                layouts=(Layout.CV_BGRA, Layout.CV_RGBA_HALF,
-                         Layout.CV_NV12, Layout.MLX_RGB_HWC),
-                cadences=(Fraction,),      # CFR sources only
+                layouts=(Layout.CV_BGRA, Layout.CV_RGBA_HALF, Layout.CV_NV12, Layout.MLX_RGB_HWC),
+                cadences=(Fraction,),  # CFR sources only
             ),
             produces=_produces,
             stateful=True,
@@ -378,11 +403,10 @@ class VideoToolboxFactory:
             # mode<->CV-layout pairing is enforced in _upscale_produces at
             # resolve time, like the size cap.
             accepts=StreamConstraint(
-                layouts=(Layout.MLX_RGB_HWC, Layout.CV_RGBA_HALF,
-                         Layout.CV_NV12),
+                layouts=(Layout.MLX_RGB_HWC, Layout.CV_RGBA_HALF, Layout.CV_NV12),
                 dtypes=(DType.FLOAT32, DType.FLOAT16, DType.UINT8),
                 domains=(Domain.UNIT, Domain.UNIT_SANITIZED, Domain.CODED),
-                cadences=(Fraction,),      # CFR sources only
+                cadences=(Fraction,),  # CFR sources only
             ),
             produces=_upscale_produces,
             # balanced threads one prev frame; declared for all three modes
@@ -406,24 +430,26 @@ class VideoToolboxFactory:
             mode = profile or "balanced"
             if mode not in _UPSCALE_PROFILES:
                 raise ValueError(
-                    f"videotoolbox upscale profile must be one of "
-                    f"{list(_UPSCALE_PROFILES)}")
+                    f"videotoolbox upscale profile must be one of {list(_UPSCALE_PROFILES)}"
+                )
             return VtUpscaleConfig(mode=mode)
         reject_unknown_keys(raw, ("target_fps",))
         if "target_fps" not in raw:
             raise ValueError("target_fps is required for interpolation")
         return VtInterpolateConfig(
-            target_fps=_parse_fps(raw["target_fps"]),
-            mode=profile or "normal")
+            target_fps=_parse_fps(raw["target_fps"]), mode=profile or "normal"
+        )
 
-    def build(self, config: VtInterpolateConfig | VtUpscaleConfig, *,
-              context: PipelineContext) -> VtInterpolateProcessor | VtUpscaleProcessor:
+    def build(
+        self, config: VtInterpolateConfig | VtUpscaleConfig, *, context: PipelineContext
+    ) -> VtInterpolateProcessor | VtUpscaleProcessor:
         if isinstance(config, VtUpscaleConfig):
             return VtUpscaleProcessor(config)
         return VtInterpolateProcessor(config)
 
-    def preferred_source_layout(self, *, capability: Capability,
-                                profile: str | None) -> Layout | None:
+    def preferred_source_layout(
+        self, *, capability: Capability, profile: str | None
+    ) -> Layout | None:
         """The source layout a HEAD stage of this capability decodes best
         from (the optional-hook shape of ``profile_defaults``). An upscale
         head wants its mode's own session format so the decode feeds the

@@ -63,3 +63,40 @@ def test_zero_copy_session_aliases_the_borrowed_input():
     assert len(out) == 1
     # Zero-copy: the pass-through payload IS the borrowed input buffer.
     assert out[0].payload is buf
+
+
+def test_run_plan_is_retain_safe_by_default():
+    from kinovsr.pipeline import resolve_pipeline, run_plan
+    from kinovsr.processors import PipelineContext
+
+    settings = Settings()
+    plan = resolve_pipeline(
+        {"pipeline": []}, input_spec=_cv_spec(), settings=settings
+    )
+    unit, buf = _cv_unit()
+
+    out = list(run_plan(plan, [unit], PipelineContext(settings=settings)))
+
+    assert out[0].payload is not buf
+
+
+def test_run_plan_can_expose_borrowed_outputs_explicitly():
+    from kinovsr.pipeline import resolve_pipeline, run_plan
+    from kinovsr.processors import PipelineContext
+
+    settings = Settings()
+    plan = resolve_pipeline(
+        {"pipeline": []}, input_spec=_cv_spec(), settings=settings
+    )
+    unit, buf = _cv_unit()
+
+    out = list(
+        run_plan(
+            plan,
+            [unit],
+            PipelineContext(settings=settings),
+            retain_outputs=False,
+        )
+    )
+
+    assert out[0].payload is buf

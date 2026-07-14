@@ -19,7 +19,7 @@ from typing import Any
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.settings import default_settings
 
-from .frameworks import Quartz, vt
+from .frameworks import Quartz, autorelease_pool, vt
 
 _log = logging.getLogger(__name__)
 _NATIVE_STDERR_LOCK = threading.RLock()
@@ -81,6 +81,13 @@ def scale_for_mode(mode: str) -> int:
 # 4x it bounds output to 7680x4320 (8K). Re-probe if a future OS raises it.
 HQ_MAX_INPUT_W = 1920
 HQ_MAX_INPUT_H = 1080
+
+# The caller/native handoff needs two destination surfaces. balanced also
+# threads one previous source while VideoToolbox retains its older sequential
+# reference, so it needs three source slots; stateless modes reuse one.
+DST_POOL_ALLOCATION_LIMIT = 2
+TEMPORAL_SRC_POOL_ALLOCATION_LIMIT = 3
+STATELESS_SRC_POOL_ALLOCATION_LIMIT = 1
 
 
 def _validate_combination(width: int, height: int, scale: int, mode: str) -> None:
@@ -245,24 +252,62 @@ class VsrSession:
         self._prev_src_frame: Any = None
         self._prev_dst_frame: Any = None
 
-        # Src pool: two buffers in flight at any time (current + prev_src).
-        self._src_pool = _pb.make_pool_from_attrs(self.src_attrs)
-        if self._src_pool is None:
-            _log.warning(
-                "source pool creation failed; falling back to per-frame allocation"
-            )
-        # Dst pool: typically set by the caller to the AVAssetWriter adaptor's
-        # pool for zero-copy from VSR output to encoder.
-        self._dst_pool: Any = None
-        # Lazily-created pixel-transfer session, used by upscale_buffer_to_buffer
-        # to normalize externally-decoded buffers (see there).
+        # Lazily-created pixel-transfer session, used by
+        # upscale_buffer_to_buffer to normalize externally-decoded buffers.
         self._xfer: Any = None
+
+        # Src pool: one surface for stateless modes; balanced needs current,
+        # previous, and VT's older sequential reference during handoff.
+        self._src_pool_allocation_limit = (
+            TEMPORAL_SRC_POOL_ALLOCATION_LIMIT
+            if mode == "balanced"
+            else STATELESS_SRC_POOL_ALLOCATION_LIMIT
+        )
+        self._src_pool = _pb.make_bounded_pool_from_attrs(
+            self.src_attrs, self._src_pool_allocation_limit
+        )
+        if self._src_pool is None:
+            try:
+                self.processor.endSession()
+            except Exception:  # cleanup must not mask the construction error
+                _log.exception("failed to end VSR after source-pool failure")
+            finally:
+                self.processor = None
+            raise RuntimeError(
+                "VSR source CVPixelBufferPool creation failed; "
+                "bounded source allocation is required"
+            )
+        # Dst pool: session-owned by default so typed/host pipelines reuse
+        # IOSurfaces instead of allocating a CVPixelBuffer for every output.
+        # A compatible file writer may replace it through use_dst_pool().
+        self._dst_pool = _pb.make_bounded_pool_from_attrs(
+            self.dst_attrs, DST_POOL_ALLOCATION_LIMIT
+        )
+        self._owns_dst_pool = True
+        if self._dst_pool is None:
+            try:
+                self.processor.endSession()
+            except Exception:  # cleanup must not mask the construction error
+                _log.exception("failed to end VSR after destination-pool failure")
+            finally:
+                self.processor = None
+                _pb.flush_pool(self._src_pool)
+                self._src_pool = None
+            raise RuntimeError(
+                "VSR destination CVPixelBufferPool creation failed; "
+                "bounded output allocation is required"
+            )
 
     def use_dst_pool(self, pool: Any) -> None:
         """Wire the writer's adaptor pixelBufferPool() as VSR's dst source -
         zero-copy from VSR output straight into the encoder's queue.
         """
+        if pool is None:
+            raise ValueError("destination pool must not be None")
+        if self._owns_dst_pool and self._dst_pool is not pool:
+            _pb.flush_pool(self._dst_pool)
         self._dst_pool = pool
+        self._owns_dst_pool = False
 
     def reset_temporal_context(self) -> None:
         """Drop the previous-frame chain. Call at scene cuts on --video input."""
@@ -270,8 +315,7 @@ class VsrSession:
         self._prev_dst_frame = None
 
     def flush_pools(self) -> None:
-        """Release excess cached buffers in the src pool (and dst pool if we
-        own it - we usually don't; the writer's adaptor owns the dst pool).
+        """Release excess cached buffers in every session-owned pool.
 
         Pool caching is what makes hot-path buffer allocation fast, but at
         steady state the cache should be ~3 buffers. Periodic flushing
@@ -279,32 +323,49 @@ class VsrSession:
         needs after an early decode or processing burst.
         """
         _pb.flush_pool(self._src_pool)
+        if self._owns_dst_pool:
+            _pb.flush_pool(self._dst_pool)
 
     def close(self) -> None:
-        if self.processor is not None:
-            self.processor.endSession()
-            self.processor = None
-        if self._xfer is not None:
-            vt.VTPixelTransferSessionInvalidate(self._xfer)
-            self._xfer = None
+        processor, self.processor = self.processor, None
+        try:
+            if processor is not None:
+                processor.endSession()
+        finally:
+            self.reset_temporal_context()
+            self.config = None
+            xfer, self._xfer = self._xfer, None
+            try:
+                if xfer is not None:
+                    vt.VTPixelTransferSessionInvalidate(xfer)
+            finally:
+                self.flush_pools()
+                self._src_pool = None
+                self._dst_pool = None
+                self._owns_dst_pool = False
 
     # ------------------------------------------------------------------------
     # Internal: buffer factories
     # ------------------------------------------------------------------------
 
     def _make_src_buffer(self) -> Any:
-        if self._src_pool is not None:
-            pb = _pb.pool_create_buffer(self._src_pool)
-            if pb is not None:
-                return pb
-        return _pb.make_pixel_buffer_from_attrs(self.in_w, self.in_h, self.src_attrs)
+        if self._src_pool is None:
+            raise RuntimeError("VSR source pool is unavailable")
+        return _pb.pool_create_buffer_bounded(
+            self._src_pool, self._src_pool_allocation_limit
+        )
 
     def _make_dst_buffer(self) -> Any:
-        if self._dst_pool is not None:
-            pb = _pb.pool_create_buffer(self._dst_pool)
-            if pb is not None:
-                return pb
-        return _pb.make_pixel_buffer_from_attrs(self.out_w, self.out_h, self.dst_attrs)
+        if self._dst_pool is None:
+            raise RuntimeError("VSR destination pool is unavailable")
+        if self._owns_dst_pool:
+            return _pb.pool_create_buffer_bounded(
+                self._dst_pool, DST_POOL_ALLOCATION_LIMIT
+            )
+        pb = _pb.pool_create_buffer(self._dst_pool)
+        if pb is None:
+            raise RuntimeError("external VSR destination pool acquisition failed")
+        return pb
 
     # ------------------------------------------------------------------------
     # Public API
@@ -377,35 +438,39 @@ class VsrSession:
         so an externally-supplied src buffer stays valid across the one
         iteration balanced mode references it.
         """
-        dst_pb = self._make_dst_buffer()
-        pts = _pb.frame_pts(frame_index, self.fps)
-        src_frame = vt.VTFrameProcessorFrame.alloc().initWithBuffer_presentationTimeStamp_(
-            src_pb, pts,
-        )
-        dst_frame = vt.VTFrameProcessorFrame.alloc().initWithBuffer_presentationTimeStamp_(
-            dst_pb, pts,
-        )
+        with autorelease_pool():
+            dst_pb = self._make_dst_buffer()
+            pts = _pb.frame_pts(frame_index, self.fps)
+            src_frame = vt.VTFrameProcessorFrame.alloc(
+            ).initWithBuffer_presentationTimeStamp_(src_pb, pts)
+            dst_frame = vt.VTFrameProcessorFrame.alloc(
+            ).initWithBuffer_presentationTimeStamp_(dst_pb, pts)
 
-        if self.mode == "fast":
-            params = vt.VTLowLatencySuperResolutionScalerParameters.alloc(
-            ).initWithSourceFrame_destinationFrame_(src_frame, dst_frame)
-        else:
-            use_temporal = self.mode == "balanced"
-            params = vt.VTSuperResolutionScalerParameters.alloc(
-            ).initWithSourceFrame_previousFrame_previousOutputFrame_opticalFlow_submissionMode_destinationFrame_(
-                src_frame,
-                self._prev_src_frame if use_temporal else None,
-                self._prev_dst_frame if use_temporal else None,
-                None,
-                vt.VTSuperResolutionScalerParametersSubmissionModeSequential,
-                dst_frame,
-            )
+            if self.mode == "fast":
+                params = vt.VTLowLatencySuperResolutionScalerParameters.alloc(
+                ).initWithSourceFrame_destinationFrame_(src_frame, dst_frame)
+            else:
+                use_temporal = self.mode == "balanced"
+                params = vt.VTSuperResolutionScalerParameters.alloc(
+                ).initWithSourceFrame_previousFrame_previousOutputFrame_opticalFlow_submissionMode_destinationFrame_(
+                    src_frame,
+                    self._prev_src_frame if use_temporal else None,
+                    self._prev_dst_frame if use_temporal else None,
+                    None,
+                    vt.VTSuperResolutionScalerParametersSubmissionModeSequential,
+                    dst_frame,
+                )
 
-        ok, err = self.processor.processWithParameters_error_(params, None)
-        if not ok:
-            raise RuntimeError(
-                f"VSR processWithParameters failed at frame {frame_index}: {err}"
-            )
-        self._prev_src_frame = src_frame
-        self._prev_dst_frame = dst_frame
+            ok, err = self.processor.processWithParameters_error_(params, None)
+            if not ok:
+                raise RuntimeError(
+                    f"VSR processWithParameters failed at frame {frame_index}: {err}"
+                )
+            if self.mode == "balanced":
+                self._prev_src_frame = src_frame
+                self._prev_dst_frame = dst_frame
+            else:
+                self.reset_temporal_context()
+                del src_frame, dst_frame
+            del params
         return dst_pb

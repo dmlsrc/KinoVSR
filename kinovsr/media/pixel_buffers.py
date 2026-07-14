@@ -143,11 +143,64 @@ def make_pool_from_attrs(attrs: dict) -> Any | None:
     return pool
 
 
+def make_bounded_pool_from_attrs(attrs: dict, buffer_count: int) -> Any | None:
+    """Create a pool whose reusable working set matches a hard acquire cap.
+
+    The minimum count keeps returned surfaces cached instead of purging them
+    between VideoToolbox calls; acquisitions pair this with
+    :func:`pool_create_buffer_bounded` at the same count so the cache neither
+    churns nor grows past the declared window.
+    """
+    count = int(buffer_count)
+    if count < 1:
+        raise ValueError("buffer_count must be positive")
+    pool_attrs = {Quartz.kCVPixelBufferPoolMinimumBufferCountKey: count}
+    err, pool = Quartz.CVPixelBufferPoolCreate(
+        None, pool_attrs, attrs, None
+    )
+    if err != 0 or pool is None:
+        return None
+    return pool
+
+
 def pool_create_buffer(pool: Any) -> Any | None:
     """Pull a fresh buffer from a CVPixelBufferPool. None on failure."""
     err, pb = Quartz.CVPixelBufferPoolCreatePixelBuffer(None, pool, None)
     if err != 0 or pb is None:
         return None
+    return pb
+
+
+class PixelBufferPoolExhausted(RuntimeError):
+    """A bounded CVPixelBufferPool has reached its allocation ceiling."""
+
+
+def pool_create_buffer_bounded(pool: Any, allocation_threshold: int) -> Any:
+    """Acquire from ``pool`` without allowing its allocation count to grow.
+
+    CoreVideo's ordinary pool acquisition is only a reuse hint: it may keep
+    allocating indefinitely while prior buffers remain live. The auxiliary
+    allocation-threshold attribute turns that hint into a hard bound and
+    reports a distinct exhaustion status when downstream ownership exceeds
+    the promised in-flight window.
+    """
+    threshold = int(allocation_threshold)
+    if threshold < 1:
+        raise ValueError("allocation_threshold must be positive")
+    aux = {Quartz.kCVPixelBufferPoolAllocationThresholdKey: threshold}
+    err, pb = Quartz.CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+        None, pool, aux, None
+    )
+    if err == Quartz.kCVReturnWouldExceedAllocationThreshold:
+        raise PixelBufferPoolExhausted(
+            "CVPixelBufferPool exhausted at allocation threshold "
+            f"{threshold} (status={err})"
+        )
+    if err != 0 or pb is None:
+        raise RuntimeError(
+            "CVPixelBufferPoolCreatePixelBufferWithAuxAttributes failed: "
+            f"status={err}"
+        )
     return pb
 
 

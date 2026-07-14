@@ -24,7 +24,6 @@ from typing import Any
 
 from kinovsr.processors import (
     FrameUnit,
-    Layout,
     PipelineContext,
     PipelineError,
     StreamSpec,
@@ -33,40 +32,8 @@ from kinovsr.reporting import Reporter
 from kinovsr.settings import Settings
 
 from .builder import BuildPlan, build_processors, resolve_pipeline
+from .ownership import retain_safe_outputs
 from .scheduler import ChainRun, run_chain
-
-# CV payload layouts whose buffers must be copied to give a retaining
-# consumer an owned output (MLX arrays are immutable values, never copied).
-_CV_LAYOUTS = frozenset({Layout.CV_NV12, Layout.CV_BGRA, Layout.CV_RGBA_HALF})
-
-
-class _OwnedCvOutputs:
-    """Wrap a :class:`ChainRun` so each yielded CVPixelBuffer output is a
-    fresh, host-owned deep copy - the retain-safe default for CV-layout
-    sessions. Iteration, cancellation, and context management delegate to the
-    underlying run; only the payload is replaced.
-    """
-
-    def __init__(self, run: ChainRun) -> None:
-        self._run = run
-        from kinovsr.media.pixel_buffers import copy_pixel_buffer
-        self._copy = copy_pixel_buffer
-
-    def __iter__(self) -> _OwnedCvOutputs:
-        return self
-
-    def __next__(self) -> FrameUnit:
-        unit = next(self._run)
-        return unit.with_payload(self._copy(unit.payload))
-
-    def close(self) -> None:
-        self._run.close()
-
-    def __enter__(self) -> _OwnedCvOutputs:
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self._run.__exit__(exc_type, exc, tb)
 
 
 class PipelineSession:
@@ -78,6 +45,7 @@ class PipelineSession:
         self._run: ChainRun | None = None
         self._consumed = False
         self._built: tuple = ()
+        self._terminal_pool_binding: tuple[Any, int, int, int] | None = None
 
     @property
     def plan(self) -> BuildPlan:
@@ -91,6 +59,19 @@ class PipelineSession:
     def output_spec(self) -> StreamSpec:
         """The validated spec of the units :meth:`process` yields."""
         return self._plan.output_spec
+
+    def _bind_terminal_output_pool(
+        self,
+        pool: Any,
+        pixel_format: int,
+        width: int,
+        height: int,
+    ) -> None:
+        """Offer a file writer pool to a compatible terminal native stage."""
+        if self._consumed:
+            raise PipelineError("output pool must be bound before processing")
+        self._terminal_pool_binding = (
+            pool, int(pixel_format), int(width), int(height))
 
     def process(self, units: Iterable[FrameUnit], *,
                 retain_outputs: bool = True) -> Iterator[FrameUnit]:
@@ -118,13 +99,23 @@ class PipelineSession:
                 "this session was already consumed; open_pipeline again "
                 "for the next stream (stage state is never reused)")
         self._consumed = True
+        binding, self._terminal_pool_binding = (
+            self._terminal_pool_binding,
+            None,
+        )
         built = build_processors(self._plan, self._context)
         self._built = built
+        if binding is not None and built:
+            hook = getattr(built[-1][1], "_bind_output_pool", None)
+            if callable(hook):
+                hook(*binding)
         run = run_chain(built, units, self._context)
         self._run = run
-        if retain_outputs and self._plan.output_spec.frame.layout in _CV_LAYOUTS:
-            return _OwnedCvOutputs(run)
-        return run
+        return retain_safe_outputs(
+            run,
+            self._plan.output_spec,
+            retain_outputs=retain_outputs,
+        )
 
     def stage_diagnostics(self) -> list[str]:
         """End-of-run diagnostic lines from the stages that ran.
@@ -159,6 +150,7 @@ class PipelineSession:
     def close(self) -> None:
         """Cancel the active run (if any); safe to call repeatedly."""
         run, self._run = self._run, None
+        self._terminal_pool_binding = None
         self._consumed = True
         if run is not None:
             run.close()

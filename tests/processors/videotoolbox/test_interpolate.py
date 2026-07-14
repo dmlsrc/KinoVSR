@@ -1,6 +1,7 @@
 """VideoToolbox interpolation: one-to-many, monotonic PTS, rewritten
 cadence, preserved clip duration - the native-session proving processor."""
 
+import hashlib
 from fractions import Fraction
 
 import pytest
@@ -10,6 +11,7 @@ from kinovsr.processors import (
     BoundaryKind,
     Capability,
     Cardinality,
+    Domain,
     DType,
     FrameUnit,
     Geometry,
@@ -66,7 +68,11 @@ class TestParseAndSpec:
         assert up.timeline.cadence == Fraction(60)
         assert up.timeline.timestamp_policy is TimestampPolicy.REGENERATED
         assert up.timeline.cardinality is Cardinality.ONE_TO_MANY
-        assert up.frame == bgra_stream().frame       # frame contract intact
+        assert up.frame.layout is Layout.CV_RGBA_HALF
+        assert up.frame.dtype is DType.FLOAT16
+        assert up.frame.domain is Domain.UNIT
+        assert up.frame.geometry == bgra_stream().frame.geometry
+        assert up.frame.color_matrix == bgra_stream().frame.color_matrix
         down = spec.produces(bgra_stream(), parse({"target_fps": 12}))
         assert down.timeline.cardinality is Cardinality.MANY_TO_ONE
 
@@ -92,6 +98,26 @@ def source_units(n):
             pts=i * ticks, duration=ticks)
         for i in range(n)
     ]
+
+
+def cv_digest(buffer) -> str:
+    from kinovsr.native.frameworks import Quartz
+
+    width = int(Quartz.CVPixelBufferGetWidth(buffer))
+    height = int(Quartz.CVPixelBufferGetHeight(buffer))
+    row_bytes = int(Quartz.CVPixelBufferGetBytesPerRow(buffer))
+    Quartz.CVPixelBufferLockBaseAddress(buffer, 1)
+    try:
+        view = Quartz.CVPixelBufferGetBaseAddress(buffer).as_buffer(
+            row_bytes * height
+        )
+        active = b"".join(
+            bytes(view[row * row_bytes:row * row_bytes + width * 8])
+            for row in range(height)
+        )
+    finally:
+        Quartz.CVPixelBufferUnlockBaseAddress(buffer, 1)
+    return hashlib.sha256(active).hexdigest()
 
 
 def run_interpolation(units, target_fps, cut_at=None):
@@ -167,6 +193,32 @@ class TestInterpolation:
         assert first.pts == 0
         stream.close()
         assert processor._session is None  # closed exactly once
+
+    def test_default_host_output_survives_pool_reuse_and_session_close(self):
+        from kinovsr.pipeline import open_pipeline
+
+        config = {
+            "pipeline": ["interp"],
+            "interp": {
+                "processor": "videotoolbox",
+                "capability": "interpolate",
+                "target_fps": 60,
+            },
+        }
+        session = open_pipeline(
+            config, bgra_stream(), settings=SETTINGS
+        )
+        try:
+            with session, session.process(source_units(12)) as run:
+                first = next(run)
+                original = cv_digest(first.payload)
+                later = list(run)
+                assert len(later) == 29
+                assert cv_digest(first.payload) == original
+        except MediaError as exc:
+            pytest.skip(str(exc))
+
+        assert cv_digest(first.payload) == original
 
 
 @pytest.mark.integration

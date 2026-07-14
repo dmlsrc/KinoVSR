@@ -301,12 +301,10 @@ def encode_video_videotoolbox(
     # writer source = the last stage's dst.  When neither is active,
     # the writer source = NV12 and we upload through CoreImage (keeps
     # the encoder's RGB->YUV cost in one place).
-    if vtfrc is not None:
-        writer_src_fmt = _pb.resolve_pixel_format(vtfrc.dst_attrs)
-    elif vsr is not None:
-        writer_src_fmt = _pb.resolve_pixel_format(vsr.dst_attrs)
-    else:
-        writer_src_fmt = _pb.PIX_NV12
+    producer = vtfrc if vtfrc is not None else vsr
+    writer_source_attrs = producer.dst_attrs if producer is not None else None
+    writer_src_fmt = (_pb.resolve_pixel_format(writer_source_attrs)
+                      if writer_source_attrs is not None else _pb.PIX_NV12)
 
     resolved_color = _color.resolve({"full_range": False}, "bt709")
     color_props = _color.av_color_properties(resolved_color)
@@ -326,6 +324,7 @@ def encode_video_videotoolbox(
         profile=profile,
         quality=encode_quality,
         label="encode",
+        source_attrs=writer_source_attrs,
         color_props=color_props,
         cv_color=cv_color if writer_yuv_feed else None,
         full_range=False,

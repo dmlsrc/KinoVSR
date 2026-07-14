@@ -1581,6 +1581,22 @@ def _run_file_reserved(
         transaction.register_sink("comparison output", tee.sink)
         source_units = tee.tap(source_units)
 
+    # A terminal native processor may write directly into the primary file
+    # writer's adaptor pool, but only when its actual destination format and
+    # geometry match. HQ/FRC RGBAHalf outputs deliberately reject the writer's
+    # explicit-YUV pool and keep their processor-owned pool instead.
+    pool_sink = sink if sink is not None else (tee.sink if tee is not None else None)
+    if pool_sink is not None:
+        writer = pool_sink.writer
+        pool = writer.adaptor.pixelBufferPool()
+        if pool is not None:
+            session._bind_terminal_output_pool(
+                pool,
+                writer.adaptor_pixel_format,
+                writer.adaptor_width,
+                writer.adaptor_height,
+            )
+
     # A duration-preserving chain must end exactly at the source-window
     # duration. Interpolation's regenerated grid can round the final unit's
     # end past that (its natural grid-interval duration overshoots the last

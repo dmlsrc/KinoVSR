@@ -279,6 +279,9 @@ class AVWriter:
         self.video_input = video_input
         self.audio_input = audio_input
         self.adaptor = adaptor
+        self.adaptor_pixel_format = int(adaptor_format)
+        self.adaptor_width = int(width)
+        self.adaptor_height = int(height)
         self.cadence = fps
         self.fps = float(self.cadence)
         self.label = label
