@@ -34,6 +34,21 @@ def test_explicit_timing_origin_preserves_nonzero_stream_start_indexing():
         10040, stream, 25.0, origin=Fraction(10)) == 1
 
 
+@pytest.mark.parametrize("chunk_size", [0, -1, True, 1.5])
+def test_direct_readers_reject_invalid_chunks_before_open(chunk_size):
+    from pathlib import Path
+
+    from kinovsr.media import video_reader
+
+    missing = Path("must-not-open.mp4")
+    with pytest.raises(ValueError, match="positive integer"):
+        list(fr.iter_video_buffer_chunks(
+            missing, PIX_BGRA, chunk_size=chunk_size))
+    with pytest.raises(ValueError, match="positive integer"):
+        list(video_reader.iter_video_buffer_chunks(
+            missing, PIX_BGRA, chunk_size=chunk_size))
+
+
 @pytest.fixture(scope="module")
 def clip(tmp_path_factory):
     """Mux a tiny mpeg4 clip with a known GOP and a moving gradient."""
@@ -84,8 +99,10 @@ def test_keyframes_match_decoded_positions(clip):
 
 def test_frames_stream_and_trim(clip):
     # full stream arrives complete and in order via the RGBAHalf path
-    frames = [pb for chunk in fr.iter_video_buffer_chunks(clip, PIX_RGBAHALF, chunk_size=5)
-              for pb in chunk]
+    chunks = list(fr.iter_video_buffer_chunks(
+        clip, PIX_RGBAHALF, chunk_size=5))
+    assert max(map(len, chunks)) == 5
+    frames = [pb for chunk in chunks for pb in chunk]
     assert len(frames) == N
     f0 = read_buffer_rgb_f32(frames[0])
     assert f0.shape == (H, W, 3)

@@ -115,9 +115,37 @@ class TestExitCodes:
         assert exc.value.code == 2
         capsys.readouterr()
 
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_invalid_video_chunk_size_exits_two(
+            self, parser, capsys, value):
+        args = parser.parse_args([*BASE, "--video-chunk-size", value])
+        with pytest.raises(SystemExit) as exc:
+            validate_args(parser, args)
+        assert exc.value.code == 2
+        capsys.readouterr()
+
     def test_probe_noise_waives_output_dir(self, parser):
         args = parser.parse_args(["--video", "clip.mp4", "--probe-noise"])
         validate_args(parser, args)
+
+    def test_flat_noise_probe_threads_the_validated_chunk(
+            self, monkeypatch, tmp_path):
+        from kinovsr.cli.commands import probe_noise as probe_module
+        from kinovsr.cli.commands.run import run_video_command
+
+        captured = {}
+
+        def probe(video, *, start_spec, end_spec, reader, chunk_size):
+            captured["chunk_size"] = chunk_size
+            return 0
+
+        monkeypatch.setattr(probe_module, "probe_noise", probe)
+        assert run_video_command([
+            "--video", str(tmp_path / "unused.mp4"),
+            "--probe-noise",
+            "--video-chunk-size", "1",
+        ]) == 0
+        assert captured["chunk_size"] == 1
 
     def test_realbasicvsr_window_bounds(self, parser, capsys):
         args = parser.parse_args(

@@ -44,8 +44,13 @@ def run_video_command(argv: list[str]) -> int:
 
         from .probe_noise import probe_noise
 
-        return probe_noise(Path(options.video), start_spec=options.start,
-                           end_spec=options.end, reader=options.reader)
+        return probe_noise(
+            Path(options.video),
+            start_spec=options.start,
+            end_spec=options.end,
+            reader=options.reader,
+            chunk_size=options.video_chunk_size,
+        )
 
     # A config that declares a pipeline list runs through the typed
     # pipeline as written; a flag-driven invocation assembles into the

@@ -35,6 +35,7 @@ import av
 import mlx.core as mx
 
 from . import pixel_buffers as _pb
+from .chunks import validate_decode_chunk_size
 from .pixel_buffers import PIX_BGRA, PIX_RGBAHALF
 from .timing import AudioTiming, VideoTiming, analyze_sample_timing
 
@@ -380,6 +381,7 @@ def iter_video_buffer_chunks(
 ) -> Iterator[list]:
     """Native-surface mirror: lists of CVPixelBuffers in src_format, honoring
     the stream's own color tags (libswscale reads them off each frame)."""
+    chunk_size = validate_decode_chunk_size(chunk_size)
     return _iter_chunks(
         path, src_format, chunk_size, start_frame, end_frame, {}, timing)
 
@@ -393,6 +395,7 @@ def iter_forced_color_chunks(
     """Forced-matrix read: override the YCbCr matrix / range at YUV->RGB time
     (libswscale src_colorspace/src_color_range), the --source-color fix for
     untagged or mis-tagged material."""
+    chunk_size = validate_decode_chunk_size(chunk_size)
     m = str(matrix_cv)
     cs = av.video.reformatter.Colorspace.ITU709 if "709" in m else \
         av.video.reformatter.Colorspace.ITU601

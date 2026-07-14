@@ -162,6 +162,196 @@ def _stream_seconds(path):
 
 
 class TestFileSource:
+    @pytest.mark.parametrize(("layout", "expected"), [
+        (Layout.MLX_RGB_HWC, 1),
+        (Layout.CV_RGBA_HALF, 1),
+        (Layout.CV_BGRA, 2),
+        (Layout.CV_NV12, 4),
+    ])
+    def test_decode_chunk_is_capped_by_layout_memory(self, layout, expected):
+        from kinovsr.pipeline.run import _effective_decode_chunk_size
+
+        assert _effective_decode_chunk_size(
+            32, 3840, 2160, layout) == expected
+
+    def test_decode_chunk_preserves_a_smaller_user_limit(self):
+        from kinovsr.pipeline.run import _effective_decode_chunk_size
+
+        assert _effective_decode_chunk_size(
+            3, 640, 480, Layout.CV_RGBA_HALF) == 3
+
+    def test_single_surface_larger_than_budget_still_makes_progress(self):
+        from kinovsr.pipeline.run import _effective_decode_chunk_size
+
+        assert _effective_decode_chunk_size(
+            32, 7680, 4320, Layout.CV_RGBA_HALF) == 1
+
+    def test_forced_color_budgets_yuv_and_rgbahalf_surfaces(self):
+        from kinovsr.pipeline.run import _effective_decode_chunk_size
+
+        assert _effective_decode_chunk_size(
+            32, 1280, 720, Layout.MLX_RGB_HWC,
+            forced_color=True) == 4
+
+    @pytest.mark.parametrize("chunk_size", [0, -1, True, 1.5])
+    def test_invalid_decode_chunk_is_rejected(self, chunk_size):
+        from kinovsr.pipeline.run import _effective_decode_chunk_size
+
+        with pytest.raises(MediaError, match="positive integer"):
+            _effective_decode_chunk_size(
+                chunk_size, 1920, 1080, Layout.MLX_RGB_HWC)
+
+    def test_effective_chunk_reaches_the_reader(self, tmp_path):
+        captured = {}
+
+        class Reader:
+            @staticmethod
+            def probe_video(_path):
+                return 3840, 2160, 25.0, 10, None, None
+
+            @staticmethod
+            def probe_color(_path):
+                return {
+                    "primaries": None,
+                    "transfer": None,
+                    "matrix": None,
+                    "full_range": False,
+                    "tagged": False,
+                }
+
+            @staticmethod
+            def iter_video_buffer_chunks(
+                    _path, _format, chunk_size=8, *, start_frame=0,
+                    end_frame=None):
+                captured["chunk_size"] = chunk_size
+                return iter(())
+
+        source = FileSource(
+            tmp_path / "synthetic.mov",
+            layout=Layout.CV_BGRA,
+            chunk_size=32,
+            reader=Reader,
+        )
+        assert source.chunk_size == 2
+        assert list(source.units()) == []
+        assert captured["chunk_size"] == 2
+
+    def test_forced_effective_chunk_reaches_the_reader(self, tmp_path):
+        captured = {}
+
+        class Reader:
+            @staticmethod
+            def probe_video(_path):
+                return 1280, 720, 25.0, 10, None, None
+
+            @staticmethod
+            def probe_color(_path):
+                return {
+                    "primaries": None,
+                    "transfer": None,
+                    "matrix": None,
+                    "full_range": False,
+                    "tagged": False,
+                }
+
+            @staticmethod
+            def iter_forced_color_chunks(
+                    _path, _format, _matrix, _full_range, chunk_size=8,
+                    *, start_frame=0, end_frame=None,
+                    reinterpret_full_range=None):
+                captured["chunk_size"] = chunk_size
+                return iter(())
+
+        source = FileSource(
+            tmp_path / "synthetic.mov",
+            layout=Layout.MLX_RGB_HWC,
+            chunk_size=32,
+            source_color="bt709",
+            reader=Reader,
+        )
+        assert source.chunk_size == 4
+        assert list(source.units()) == []
+        assert captured["chunk_size"] == 4
+
+    def test_auto_geometry_recomputes_its_rgbahalf_chunk(
+            self, tmp_path, monkeypatch):
+        captured = {}
+
+        class Reader:
+            @staticmethod
+            def probe_video(_path):
+                return 3840, 2160, 25.0, 10, None, None
+
+            @staticmethod
+            def probe_color(_path):
+                return {
+                    "primaries": None,
+                    "transfer": None,
+                    "matrix": None,
+                    "full_range": False,
+                    "tagged": False,
+                }
+
+            @staticmethod
+            def iter_video_buffer_chunks(
+                    _path, _format, chunk_size=8, *, start_frame=0,
+                    end_frame=None):
+                return iter(())
+
+        from kinovsr.pipeline import auto_geometry
+
+        def resolve(config, *, video, vr, pixel_aspect, chunk_size):
+            captured["chunk_size"] = chunk_size
+            return {"pipeline": []}
+
+        monkeypatch.setattr(auto_geometry, "resolve_auto_geometry", resolve)
+        result = run_file(
+            {"pipeline": ["crop"],
+             "crop": {"processor": "crop", "bars": "auto"}},
+            video=tmp_path / "synthetic.mov",
+            output=tmp_path / "unused.mp4",
+            settings=SETTINGS,
+            layout=Layout.CV_NV12,
+            chunk_size=32,
+            reader=Reader,
+            skip_post_mp4=True,
+        )
+        assert result.frames_out == 0
+        assert captured["chunk_size"] == 1
+
+    @pytest.mark.parametrize("chunk_size", [
+        0, -1, True, False, 1.0, 1.5, "8", None,
+    ])
+    def test_invalid_chunk_precedes_file_source_media_io(
+            self, tmp_path, chunk_size):
+        class Reader:
+            @staticmethod
+            def probe_video_timing(_path):
+                raise AssertionError("invalid chunk size reached media probe")
+
+        with pytest.raises(MediaError, match="positive integer"):
+            FileSource(
+                tmp_path / "unread.mov",
+                chunk_size=chunk_size,
+                reader=Reader,
+            )
+
+    def test_invalid_chunk_precedes_run_file_media_io(self, tmp_path):
+        class Reader:
+            @staticmethod
+            def probe_video_timing(_path):
+                raise AssertionError("invalid chunk size reached media probe")
+
+        with pytest.raises(MediaError, match="positive integer"):
+            run_file(
+                {"pipeline": []},
+                video=tmp_path / "unread.mov",
+                output=tmp_path / "unused.mp4",
+                settings=SETTINGS,
+                chunk_size=0,
+                reader=Reader,
+            )
+
     def test_probe_reports_resolved_source_color(self, clip, caplog):
         with caplog.at_level(logging.INFO, logger="kinovsr.pipeline.run"):
             FileSource(clip)

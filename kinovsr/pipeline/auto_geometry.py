@@ -48,14 +48,20 @@ def wants_auto_geometry(config: dict) -> bool:
     return False
 
 
-def _gather_samples(video: Path, vr: Any, pb: Any) -> list:
+def _gather_samples(
+    video: Path,
+    vr: Any,
+    pb: Any,
+    *,
+    chunk_size: int,
+) -> list:
     """Decode the harness's sample frames as float32 [0,1] RGB arrays."""
     import mlx.core as mx
 
     samples: list = []
     index = 0
     for chunk in vr.iter_video_buffer_chunks(
-            video, pb.PIX_RGBAHALF, chunk_size=8):
+            video, pb.PIX_RGBAHALF, chunk_size=chunk_size):
         for buffer in chunk:
             if index in _SAMPLE_INDICES:
                 samples.append(mx.clip(
@@ -97,6 +103,7 @@ def resolve_auto_geometry(
     video: Path,
     vr: Any,
     pixel_aspect: Any = 1,
+    chunk_size: int = 8,
 ) -> dict:
     """Return a config copy with every auto crop/sanitize stage resolved.
 
@@ -107,7 +114,8 @@ def resolve_auto_geometry(
     from kinovsr.analysis.edges import detect_bars, detect_junk_edges
     from kinovsr.media import pixel_buffers as pb
 
-    samples = _gather_samples(Path(video), vr, pb)
+    samples = _gather_samples(
+        Path(video), vr, pb, chunk_size=chunk_size)
     resolved = dict(config)
     pipeline: list[str] = []
     scaled_past = None   # first non-geometry stage seen, if any

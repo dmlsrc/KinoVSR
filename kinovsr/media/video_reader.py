@@ -31,6 +31,7 @@ from typing import Any
 from kinovsr.native.frameworks import CoreMedia, Foundation, Quartz, av, vt
 
 from . import pixel_buffers as _pb
+from .chunks import validate_decode_chunk_size
 from .timing import AudioTiming, VideoTiming, analyze_sample_timing
 
 
@@ -446,6 +447,7 @@ def iter_forced_color_chunks(
     to the YUV->RGB conversion under a different range identity via a
     byte-identical retype copy; None or equal-to-container means no override.
     """
+    chunk_size = validate_decode_chunk_size(chunk_size)
     yuv_fmt = _YUV10_FULL if full_range else _YUV10_VIDEO
     retype_fmt = None
     if reinterpret_full_range is not None and reinterpret_full_range != full_range:
@@ -501,6 +503,7 @@ def iter_video_buffer_chunks(
     buffer is released immediately after the image buffer is extracted; the
     image buffer stays valid until the consumer drops its reference.
     """
+    chunk_size = validate_decode_chunk_size(chunk_size)
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)

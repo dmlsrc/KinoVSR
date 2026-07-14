@@ -17,14 +17,20 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from kinovsr.media.chunks import (
+    budgeted_decode_chunk_size,
+    validate_decode_chunk_size,
+)
 from kinovsr.media.timespec import resolve_trim
 
 _log = logging.getLogger(__name__)
 
 
 def probe_noise(video: Path, *, start_spec: str | None = None,
-                end_spec: str | None = None, reader: str = "auto") -> int:
+                end_spec: str | None = None, reader: str = "auto",
+                chunk_size: int = 6) -> int:
     """Run the noise probe over `video`, logging the analysis report."""
+    chunk_size = validate_decode_chunk_size(chunk_size)
     import mlx.core as mx
 
     from kinovsr.analysis.noise import (
@@ -52,6 +58,8 @@ def probe_noise(video: Path, *, start_spec: str | None = None,
                  f"({type(e).__name__}); using the ffmpeg compatibility reader")
 
     in_w, in_h, source_fps, total_frames, _transform, _par = vr.probe_video(video)
+    chunk_size = budgeted_decode_chunk_size(
+        chunk_size, in_w, in_h, bytes_per_pixel=8)
     win_start, win_end = resolve_trim(start_spec, end_spec, source_fps,
                                       total_frames)
     _pw_end = win_end if win_end is not None else total_frames
@@ -70,7 +78,7 @@ def probe_noise(video: Path, *, start_spec: str | None = None,
     for ws in _starts:
         _fr = []
         for _chk in vr.iter_video_buffer_chunks(
-                video, _pb.PIX_RGBAHALF, chunk_size=6,
+                video, _pb.PIX_RGBAHALF, chunk_size=chunk_size,
                 start_frame=ws, end_frame=min(ws + 12, _pw_end)):
             _fr += [mx.clip(_pb.read_buffer_rgb_f32(b), 0, 1) for b in _chk]
         if len(_fr) < 3:
@@ -215,6 +223,17 @@ def run_probe_noise(argv: list[str]) -> int:
     parser.add_argument("--reader", default="auto",
                         choices=("auto", "native", "ffmpeg"),
                         help="Video reader backend (matches the run flag).")
+    parser.add_argument(
+        "--video-chunk-size",
+        type=int,
+        default=6,
+        help=(
+            "Upper bound on frames retained in each reader output chunk; "
+            "also capped to the approximate 64 MiB RGBAHalf surface budget."),
+    )
     args = parser.parse_args(argv)
+    if args.video_chunk_size < 1:
+        parser.error("--video-chunk-size must be >= 1")
     return probe_noise(args.video, start_spec=args.start, end_spec=args.end,
-                       reader=args.reader)
+                       reader=args.reader,
+                       chunk_size=args.video_chunk_size)

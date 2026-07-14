@@ -133,7 +133,10 @@ def process_video_file(
     (the output-side cap for cadence-changing chains; the seconds form
     resolves against the OUTPUT cadence, and carried audio trims to the
     cap); ``audio`` carries the source audio track (trimmed to the
-    window). Existing output artifacts are rejected unless
+    window). ``chunk_size`` is an upper bound on each retained reader-output
+    chunk and is further reduced to an approximate 64 MiB decoded-surface
+    budget; decoder internals and downstream processor state are separate.
+    Existing output artifacts are rejected unless
     ``overwrite=True``; when enabled, the complete artifact set is replaced
     transactionally.
     """

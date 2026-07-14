@@ -35,6 +35,10 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from kinovsr.media.chunks import (
+    budgeted_decode_chunk_size,
+    validate_decode_chunk_size,
+)
 from kinovsr.media.timing import (
     AudioTiming,
     VideoTiming,
@@ -67,6 +71,45 @@ _DECODE_FORMATS = {
     Layout.CV_NV12: "PIX_NV12",
     Layout.CV_BGRA: "PIX_BGRA",
 }
+
+_DECODE_BYTES_PER_PIXEL = {
+    # MLX input decodes through one 64RGBAHalf CVPixelBuffer before upload.
+    Layout.MLX_RGB_HWC: 8,
+    Layout.CV_RGBA_HALF: 8,
+    Layout.CV_BGRA: 4,
+    # NV12 is nominally 1.5 bytes/pixel. Two is deliberately conservative
+    # for row alignment and keeps the budget independent of plane stride.
+    Layout.CV_NV12: 2,
+}
+
+
+def _effective_decode_chunk_size(
+    requested: int,
+    width: int,
+    height: int,
+    layout: Layout,
+    *,
+    forced_color: bool = False,
+) -> int:
+    """Cap retained decode surfaces to the endpoint's 64 MiB budget."""
+    requested = _validate_requested_chunk_size(requested)
+    bytes_per_pixel = _DECODE_BYTES_PER_PIXEL[layout]
+    if forced_color:
+        # Forced reads retain the decoded 10-bit 4:2:2 YUV chunk while
+        # building the RGBAHalf output chunk. A range reinterpretation can
+        # also retain one retyped YUV surface, so use the conservative sum of
+        # two four-byte YUV surfaces plus eight RGBAHalf bytes per pixel.
+        bytes_per_pixel = 16
+    return budgeted_decode_chunk_size(
+        requested, width, height, bytes_per_pixel)
+
+
+def _validate_requested_chunk_size(requested: Any) -> int:
+    """Return a strict positive frame-count request or raise a typed error."""
+    try:
+        return validate_decode_chunk_size(requested)
+    except ValueError as exc:
+        raise MediaError(str(exc)) from exc
 
 
 def _matrix_token(resolved: tuple) -> str:
@@ -160,7 +203,9 @@ class FileSource:
     architecture: the decode seeks near the window and trims frame-exact,
     so upstream frames are never decoded. Unit PTS are grid ticks
     relative to the window start (output files start at t=0, matching
-    the writer's session clock).
+    the writer's session clock). ``chunk_size`` is capped against an
+    approximate 64 MiB retained output-surface budget after source geometry
+    and decode layout are known; it does not describe total process RSS.
     """
 
     def __init__(
@@ -183,13 +228,12 @@ class FileSource:
             raise MediaError(
                 f"input endpoint cannot produce layout {layout.value!r} "
                 f"(supported: {supported})")
+        requested_chunk_size = _validate_requested_chunk_size(chunk_size)
         from kinovsr.media import pixel_buffers as _pb
         self._vr = _reader_module(reader)
         self._pb = _pb
         self.path = Path(path)
         self.layout = layout
-        self.chunk_size = int(chunk_size)
-
         if timing is None:
             timing = _probe_cfr_timing(self.path, self._vr)
 
@@ -226,6 +270,22 @@ class FileSource:
                 raise MediaError(
                     "forced --source-color/--source-range needs the native "
                     "reader; the ffmpeg reader cannot re-decode raw YUV")
+        self.chunk_size = _effective_decode_chunk_size(
+            requested_chunk_size,
+            width,
+            height,
+            layout,
+            forced_color=self._force_read,
+        )
+        if self.chunk_size != requested_chunk_size:
+            _log.info(
+                "Decode chunk capped from %s to %s frames for %sx%s %s",
+                requested_chunk_size,
+                self.chunk_size,
+                width,
+                height,
+                layout.value,
+            )
         self.transform = transform
         self.pixel_aspect = pixel_aspect
         self.source_fps = fps
@@ -1258,6 +1318,7 @@ def run_file(
     ``max_output_frames`` caps what the sink writes (the distinction
     matters for cadence-changing chains).
     """
+    chunk_size = _validate_requested_chunk_size(chunk_size)
     t0 = time.perf_counter()
     plan = _ArtifactPlan.build(
         video=video,
@@ -1386,9 +1447,17 @@ def _run_file_reserved(
     from .auto_geometry import resolve_auto_geometry, wants_auto_geometry
 
     if wants_auto_geometry(config):
+        geometry = source.spec.frame.geometry
+        auto_chunk_size = _effective_decode_chunk_size(
+            chunk_size,
+            geometry.width,
+            geometry.height,
+            Layout.CV_RGBA_HALF,
+        )
         config = resolve_auto_geometry(
             config, video=video_path, vr=source._vr,
-            pixel_aspect=source.spec.frame.geometry.pixel_aspect)
+            pixel_aspect=geometry.pixel_aspect,
+            chunk_size=auto_chunk_size)
     session = open_pipeline(
         config, source.spec, settings=settings, reporter=reporter,
         windowing=windowing,
