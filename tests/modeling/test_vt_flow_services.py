@@ -236,6 +236,46 @@ def test_close_waits_for_active_lease(monkeypatch):
     assert made[0].close_count == 1
 
 
+def test_interrupted_close_wait_can_be_retried(monkeypatch):
+    services, made = _manager(monkeypatch, 1)
+    active = threading.Event()
+    release = threading.Event()
+
+    class InterruptOnceCondition(threading.Condition):
+        interrupt_next_wait = False
+
+        def wait(self, timeout=None):
+            if self.interrupt_next_wait:
+                self.interrupt_next_wait = False
+                raise KeyboardInterrupt("close wait interrupted")
+            return super().wait(timeout)
+
+    condition = InterruptOnceCondition()
+    services._condition = condition
+
+    def use():
+        with services.borrow(16, 12):
+            active.set()
+            assert release.wait(2)
+
+    user = threading.Thread(target=use)
+    user.start()
+    assert active.wait(2)
+
+    condition.interrupt_next_wait = True
+    with pytest.raises(KeyboardInterrupt, match="close wait interrupted"):
+        services.close()
+
+    release.set()
+    user.join(2)
+    assert not user.is_alive()
+
+    services.close()
+    services.close()
+    assert services.size == 0
+    assert made[0].close_count == 1
+
+
 def test_close_racing_construction_closes_unpublished_service(monkeypatch):
     from kinovsr.modeling.vt_flow import VtFlowServices
 

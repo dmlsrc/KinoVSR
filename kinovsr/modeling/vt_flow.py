@@ -40,6 +40,7 @@ class VtFlowServices:
         self._creating: set[tuple[int, int]] = set()
         self._condition = threading.Condition()
         self._closed = False
+        self._close_in_progress = False
         self._close_complete = False
 
     @staticmethod
@@ -139,28 +140,49 @@ class VtFlowServices:
 
     def close(self) -> None:
         """Wait for active leases, then close every service exactly once."""
-        with self._condition:
-            if self._closed:
-                while not self._close_complete:
-                    self._condition.wait()
-                return
-            self._closed = True
-            while self._creating or any(entry.users for entry in self._entries.values()):
-                self._condition.wait()
-            services = [entry.service for entry in self._entries.values()]
-            self._entries.clear()
-
+        claimed = False
+        services: list[Any] = []
         failures: list[BaseException] = []
         try:
-            for service in services:
+            with self._condition:
+                if self._close_complete:
+                    return
+                self._closed = True
+                while True:
+                    if self._close_complete:
+                        return
+                    if self._close_in_progress:
+                        self._condition.wait()
+                        continue
+                    if self._creating or any(
+                        entry.users for entry in self._entries.values()
+                    ):
+                        self._condition.wait()
+                        continue
+                    self._close_in_progress = True
+                    claimed = True
+                    services = [entry.service for entry in self._entries.values()]
+                    self._entries.clear()
+                    break
+
+            pending = list(services)
+            while True:
                 try:
-                    service.close()
+                    if not pending:
+                        break
+                    service = pending[0]
+                    try:
+                        service.close()
+                    finally:
+                        pending.pop(0)
                 except BaseException as exc:  # close the rest before delivery
                     failures.append(exc)
         finally:
-            with self._condition:
-                self._close_complete = True
-                self._condition.notify_all()
+            if claimed:
+                with self._condition:
+                    self._close_in_progress = False
+                    self._close_complete = True
+                    self._condition.notify_all()
         if failures:
             for cleanup in failures[1:]:
                 _append_cleanup_context(failures[0], cleanup)
