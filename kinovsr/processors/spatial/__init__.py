@@ -57,19 +57,21 @@ class SpatialDenoiser:
             [rgb_f32.astype(mx.float16), mx.ones((h, w, 1), dtype=mx.float16)], axis=-1,
         )
         src = memoryview(mx.contiguous(rgba)).cast("B")
-        data = Foundation.NSData.dataWithBytes_length_(src, len(src))
-        ci = Quartz.CIImage.alloc().initWithBitmapData_bytesPerRow_size_format_colorSpace_(
-            data, w * 8, (w, h), Quartz.kCIFormatRGBAh, _pb.srgb_colorspace(),
-        )
-        filt = Quartz.CIFilter.filterWithName_("CINoiseReduction")
-        filt.setValue_forKey_(ci, "inputImage")
-        filt.setValue_forKey_(float(self.noise_level), "inputNoiseLevel")
-        filt.setValue_forKey_(float(self.sharpness), "inputSharpness")
-        out = filt.valueForKey_("outputImage")
         buf = bytearray(w * h * 8)
-        _pb.ci_context().render_toBitmap_rowBytes_bounds_format_colorSpace_(
-            out, buf, w * 8, ((0, 0), (w, h)), Quartz.kCIFormatRGBAh, _pb.srgb_colorspace(),
-        )
+        with _pb.ci_render_scope() as context:
+            data = Foundation.NSData.dataWithBytes_length_(src, len(src))
+            ci = Quartz.CIImage.alloc().initWithBitmapData_bytesPerRow_size_format_colorSpace_(
+                data, w * 8, (w, h), Quartz.kCIFormatRGBAh, _pb.srgb_colorspace(),
+            )
+            filt = Quartz.CIFilter.filterWithName_("CINoiseReduction")
+            filt.setValue_forKey_(ci, "inputImage")
+            filt.setValue_forKey_(float(self.noise_level), "inputNoiseLevel")
+            filt.setValue_forKey_(float(self.sharpness), "inputSharpness")
+            out = filt.valueForKey_("outputImage")
+            context.render_toBitmap_rowBytes_bounds_format_colorSpace_(
+                out, buf, w * 8, ((0, 0), (w, h)),
+                Quartz.kCIFormatRGBAh, _pb.srgb_colorspace(),
+            )
         rgba_out = mx.array(memoryview(buf)).view(mx.float16).reshape(h, w, 4)
         return mx.contiguous(rgba_out[..., :3]).astype(mx.float32)
 

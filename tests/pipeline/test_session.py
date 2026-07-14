@@ -139,6 +139,60 @@ class TestOpen:
 
 
 class TestProcess:
+    def test_core_image_owner_closes_on_exhaustion_and_pre_pull_cancel(
+        self,
+        tracker,
+        monkeypatch,
+    ):
+        from kinovsr.media import pixel_buffers as pb
+
+        leases = []
+
+        class Lease:
+            def __init__(self):
+                self.close_count = 0
+                leases.append(self)
+
+            def close(self):
+                self.close_count += 1
+
+        monkeypatch.setattr(pb, "ci_cache_owner", Lease)
+
+        exhausted = open_pipeline(CONFIG, spec(), settings=SETTINGS)
+        list(exhausted.process(units(1)))
+        cancelled = open_pipeline(CONFIG, spec(), settings=SETTINGS)
+        cancelled.process(units(1))
+        cancelled.close()
+
+        assert [lease.close_count for lease in leases] == [1, 1]
+
+    def test_core_image_owner_closes_when_processor_build_fails(
+        self,
+        tracker,
+        monkeypatch,
+    ):
+        from kinovsr.media import pixel_buffers as pb
+        from kinovsr.pipeline import session as session_module
+
+        closed = []
+
+        class Lease:
+            def close(self):
+                closed.append("owner")
+
+        monkeypatch.setattr(pb, "ci_cache_owner", Lease)
+        session = open_pipeline(CONFIG, spec(), settings=SETTINGS)
+        monkeypatch.setattr(
+            session_module,
+            "build_processors",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("build failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="build failed"):
+            session.process(units(1))
+
+        assert closed == ["owner"]
+
     def test_units_flow_and_lifecycle_orders(self, tracker):
         session = open_pipeline(CONFIG, spec(), settings=SETTINGS)
         with session, session.process(units(3)) as run:

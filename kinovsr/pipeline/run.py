@@ -1367,7 +1367,13 @@ def run_file(
     timing = _probe_cfr_timing(plan.input_path, reader)
     if audio:
         _validate_audio_origin(plan.input_path, reader, timing)
-    with _OutputTransaction(plan, settings) as transaction:
+    from kinovsr.media.pixel_buffers import ci_cache_owner
+
+    # The file owner outlives the inner session owner: auto-geometry may render
+    # before the session exists, and comparison/final-frame work can render
+    # after the chain has exhausted. Only this outer release performs the final
+    # cache cleanup for the complete file operation.
+    with ci_cache_owner(), _OutputTransaction(plan, settings) as transaction:
         return _run_file_reserved(
             config,
             plan=plan,

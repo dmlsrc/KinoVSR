@@ -34,10 +34,11 @@ consumed lazily so a streaming source doesn't have to materialize.
 
 from __future__ import annotations
 
+import functools
 import itertools
 import logging
 import time
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,16 @@ from .vsr import VsrSession, scale_for_mode
 from .writer import HEVC_PROFILE_MAIN10, HEVC_PROFILE_MAIN422_10, AVWriter
 
 _log = logging.getLogger(__name__)
+
+
+def _owns_ci_cache[**P, R](function: Callable[P, R]) -> Callable[P, R]:
+    """Give utility encode calls the same final cleanup as host sessions."""
+    @functools.wraps(function)
+    def owned(*args: P.args, **kwargs: P.kwargs) -> R:
+        with _pb.ci_cache_owner():
+            return function(*args, **kwargs)
+
+    return owned
 
 
 def _human_size(n: float) -> str:
@@ -144,6 +155,7 @@ def _allocate_writer_src_buffer(adaptor: Any, width: int, height: int, fmt: int)
     return _pb.make_pixel_buffer_from_attrs(width, height, attrs)
 
 
+@_owns_ci_cache
 def encode_video_videotoolbox(
     frames: Sequence[Any] | Iterable[Any],
     output_path: str | Path,
@@ -460,11 +472,6 @@ def encode_video_videotoolbox(
                 del src_pb
             n_in += 1
             reporter.phase_advance(_phase)
-            # Periodic janitorial work: CIContext caches + src pool drain.
-            if n_in % 64 == 0:
-                _pb.clear_ci_caches()
-                if vsr is not None:
-                    vsr.flush_pools()
         # VTFRC drain (no-op today; kept for symmetry with the run path).
         if vtfrc is not None:
             for out_pb in vtfrc.drain():

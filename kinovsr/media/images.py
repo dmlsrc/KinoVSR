@@ -27,7 +27,7 @@ import mlx.core as mx
 
 from kinovsr.native.frameworks import Foundation, Quartz, autorelease_pool
 
-from .pixel_buffers import ci_context, srgb_colorspace
+from .pixel_buffers import ci_render_scope, srgb_colorspace
 
 # RGBX: 4 bytes/pixel, alpha byte ignored. Matches Pillow's convert("RGB")
 # (keep raw RGB, drop alpha) rather than premultiplying by alpha.
@@ -124,7 +124,7 @@ def resize_lanczos(img: Any, width: int, height: int) -> mx.array:
     src_h, src_w = int(a.shape[0]), int(a.shape[1])
     if (src_w, src_h) == (int(width), int(height)):
         return a[:, :, :3].astype(mx.uint8)
-    with autorelease_pool():
+    with ci_render_scope() as context:
         ci = Quartz.CIImage.imageWithCGImage_(_mx_to_cgimage(a))
         scale = height / src_h
         aspect = (width / src_w) / scale  # = (width/src_w) * (src_h/height)
@@ -135,7 +135,7 @@ def resize_lanczos(img: Any, width: int, height: int) -> mx.array:
         out = f.valueForKey_("outputImage")
         # Exact integer rect -> the rendered CGImage is exactly width x height,
         # sidestepping any sub-pixel rounding in the filter's reported extent.
-        cg_out = ci_context().createCGImage_fromRect_(
+        cg_out = context.createCGImage_fromRect_(
             out, Quartz.CGRectMake(0, 0, int(width), int(height))
         )
         if cg_out is None:

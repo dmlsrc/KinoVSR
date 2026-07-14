@@ -30,7 +30,7 @@ forces a host/device synchronization.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 from kinovsr.processors import (
     Boundary,
@@ -145,10 +145,12 @@ class ChainRun:
         built: tuple[tuple[ResolvedStage, Processor], ...],
         units: Iterable[FrameUnit],
         context: PipelineContext,
+        finalizers: tuple[Callable[[], None], ...] = (),
     ) -> None:
         self._built = built
         self._units: Iterable[FrameUnit] | None = units
         self._context = context
+        self._finalizers = finalizers
         self._stream: Iterator[FrameUnit] | None = None
         self._closed = False
 
@@ -292,6 +294,14 @@ class ChainRun:
                 # KeyboardInterrupt/SystemExit mid-cleanup: keep closing the
                 # remaining stages, then deliver every one (first wins).
                 interrupts.append(exc)
+        finalizers, self._finalizers = self._finalizers, ()
+        for finalizer in reversed(finalizers):
+            try:
+                finalizer()
+            except Exception as exc:  # noqa: BLE001 - collected, not lost
+                close_errors.append(exc)
+            except BaseException as exc:
+                interrupts.append(exc)
         return close_errors, interrupts
 
 
@@ -299,6 +309,8 @@ def run_chain(
     built: tuple[tuple[ResolvedStage, Processor], ...],
     units: Iterable[FrameUnit],
     context: PipelineContext,
+    *,
+    finalizers: tuple[Callable[[], None], ...] = (),
 ) -> ChainRun:
     """Pull output units through the whole chain.
 
@@ -308,7 +320,22 @@ def run_chain(
     cancellation, or abandonment - in reverse chain ownership order, with
     per-stage contexts.
     """
-    return ChainRun(built, units, context)
+    return ChainRun(built, units, context, finalizers)
+
+
+def _close_after_failure(
+    active: BaseException,
+    close: Callable[[], None],
+) -> BaseException:
+    """Close an owner and return the precedence-correct exception winner."""
+    try:
+        close()
+    except BaseException as cleanup:  # noqa: BLE001 - re-delivered by caller
+        if not isinstance(cleanup, Exception):
+            _append_context(cleanup, [active])
+            return cleanup
+        _append_context(active, [cleanup])
+    return active
 
 
 def run_plan(
@@ -324,10 +351,29 @@ def run_plan(
     consumer such as a file sink. :func:`run_chain` is always the low-level
     borrowed surface.
     """
-    run = run_chain(build_processors(plan, context), units, context)
-    return retain_safe_outputs(
-        run, plan.output_spec, retain_outputs=retain_outputs
+    from kinovsr.media.pixel_buffers import ci_cache_owner
+
+    lease = ci_cache_owner()
+    run: ChainRun | None = None
+    active: BaseException | None = None
+    try:
+        built = build_processors(plan, context)
+        run = run_chain(
+            built,
+            units,
+            context,
+            finalizers=(lease.close,),
+        )
+        return retain_safe_outputs(
+            run, plan.output_spec, retain_outputs=retain_outputs
+        )
+    except BaseException as exc:  # noqa: BLE001 - cleanup precedence below
+        active = exc
+    winner = _close_after_failure(
+        active,
+        run.close if run is not None else lease.close,
     )
+    raise winner
 
 
 __all__ = ["ChainRun", "run_chain", "run_plan"]

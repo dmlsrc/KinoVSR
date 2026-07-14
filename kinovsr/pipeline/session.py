@@ -33,7 +33,7 @@ from kinovsr.settings import Settings
 
 from .builder import BuildPlan, build_processors, resolve_pipeline
 from .ownership import retain_safe_outputs
-from .scheduler import ChainRun, run_chain
+from .scheduler import ChainRun, _close_after_failure, run_chain
 
 
 class PipelineSession:
@@ -103,19 +103,38 @@ class PipelineSession:
             self._terminal_pool_binding,
             None,
         )
-        built = build_processors(self._plan, self._context)
-        self._built = built
-        if binding is not None and built:
-            hook = getattr(built[-1][1], "_bind_output_pool", None)
-            if callable(hook):
-                hook(*binding)
-        run = run_chain(built, units, self._context)
-        self._run = run
-        return retain_safe_outputs(
-            run,
-            self._plan.output_spec,
-            retain_outputs=retain_outputs,
+        from kinovsr.media.pixel_buffers import ci_cache_owner
+
+        lease = ci_cache_owner()
+        run: ChainRun | None = None
+        active: BaseException | None = None
+        try:
+            built = build_processors(self._plan, self._context)
+            self._built = built
+            run = run_chain(
+                built,
+                units,
+                self._context,
+                finalizers=(lease.close,),
+            )
+            self._run = run
+            if binding is not None and built:
+                hook = getattr(built[-1][1], "_bind_output_pool", None)
+                if callable(hook):
+                    hook(*binding)
+            return retain_safe_outputs(
+                run,
+                self._plan.output_spec,
+                retain_outputs=retain_outputs,
+            )
+        except BaseException as exc:  # noqa: BLE001 - cleanup precedence below
+            active = exc
+        self._run = None
+        winner = _close_after_failure(
+            active,
+            run.close if run is not None else lease.close,
         )
+        raise winner
 
     def stage_diagnostics(self) -> list[str]:
         """End-of-run diagnostic lines from the stages that ran.

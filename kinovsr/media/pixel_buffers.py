@@ -9,14 +9,25 @@ arbitrary fps.
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import threading
+from collections.abc import Callable
 from fractions import Fraction
 from typing import Any
 
 import mlx.core as mx
 
-from kinovsr.native.frameworks import CoreMedia, Foundation, Quartz
+from kinovsr.native.frameworks import (
+    CoreMedia,
+    Foundation,
+    Quartz,
+    autorelease_pool,
+)
 
 from .timing import grid_ticks
+
+_log = logging.getLogger(__name__)
 
 # FourCC pixel-format constants ----------------------------------------------
 #
@@ -40,6 +51,376 @@ VIDEO_TIME_SCALE = 24000
 
 _ci_context: Any = None
 _srgb: Any = None
+_ci_singleton_lock = threading.Lock()
+
+
+def _append_exception_context(
+    winner: BaseException,
+    losers: tuple[BaseException | None, ...] | list[BaseException | None],
+) -> None:
+    """Build one identity-deduplicated, acyclic exception context chain."""
+    ordered: list[BaseException] = []
+    seen: set[int] = set()
+
+    def collect(exc: BaseException | None) -> None:
+        node = exc
+        while node is not None and id(node) not in seen:
+            seen.add(id(node))
+            ordered.append(node)
+            node = node.__context__
+
+    collect(winner)
+    for loser in losers:
+        collect(loser)
+    for earlier, later in zip(ordered, ordered[1:], strict=False):
+        earlier.__context__ = later
+    ordered[-1].__context__ = None
+
+
+def _cleanup_winner(
+    active: BaseException | None,
+    cleanup_errors: list[BaseException],
+) -> BaseException | None:
+    """Apply pipeline cleanup precedence without importing pipeline modules."""
+    if not cleanup_errors:
+        return active
+    interrupts = [exc for exc in cleanup_errors if not isinstance(exc, Exception)]
+    ordinary = [exc for exc in cleanup_errors if isinstance(exc, Exception)]
+    if interrupts:
+        winner = interrupts[0]
+        _append_exception_context(
+            winner,
+            [active, *ordinary, *interrupts[1:]],
+        )
+        return winner
+    if active is not None:
+        _append_exception_context(active, ordinary)
+        return active
+    winner = ordinary[0]
+    _append_exception_context(winner, ordinary[1:])
+    return winner
+
+
+class _CiCacheJanitor:
+    """Serialize cache maintenance around process-global Core Image renders.
+
+    Generations count conversion attempts, not scheduler frames. Periodic
+    cleanup is therefore proportional to the Core Image work that can grow the
+    shared cache. Owner leases add a final cleanup boundary for short runs.
+    """
+
+    def __init__(self, interval: int = 64) -> None:
+        if interval < 1:
+            raise ValueError("Core Image cleanup interval must be positive")
+        self._interval = int(interval)
+        self._condition = threading.Condition()
+        # (active render tokens, dirty completed renders, cleared total,
+        # latest periodic-attempt total). Replacing this tuple makes every
+        # render transition one atomic Python attribute store, so an async
+        # exception cannot split token ownership from its accounting.
+        self._render_ledger: tuple[frozenset[object], int, int, int] = (
+            frozenset(), 0, 0, 0,
+        )
+        # (gate claim, clear executor). Replace the pair atomically so an
+        # asynchronous exception cannot expose a gate-open/stale-executor or
+        # gate-closed/unowned combination.
+        self._clear_state: tuple[object | None, object | None] = (None, None)
+        self._owner_tokens: set[object] = set()
+
+    @property
+    def _clear_claim(self) -> object | None:
+        """Read-only compatibility view used by deterministic tests."""
+        return self._clear_state[0]
+
+    def begin_render(self, token: object) -> None:
+        with self._condition:
+            while self._clear_claim is not None:
+                # The timeout is a lost-notification backstop for asynchronous
+                # exceptions that land after a gate transition but before its
+                # notify call. The ordinary path is still notification-driven.
+                self._condition.wait(timeout=0.1)
+            active, dirty, cleared, attempted = self._render_ledger
+            self._render_ledger = (
+                active.union((token,)), dirty, cleared, attempted,
+            )
+
+    def finish_render(self, token: object, clear: Callable[[], None]) -> None:
+        claim: object | None = None
+        established_claim: object | None = None
+        try:
+            with self._condition:
+                active, dirty, cleared, attempted = self._render_ledger
+                if token in active:
+                    active = active.difference((token,))
+                    dirty += 1
+                    self._render_ledger = (
+                        active, dirty, cleared, attempted,
+                    )
+                    work = cleared + dirty
+                    if (self._clear_claim is None
+                            and work - max(cleared, attempted) >= self._interval):
+                        # Gate new entrants immediately at the threshold. Do
+                        # not wait here: a render body may be blocked on an
+                        # application lock held by this finisher. The last
+                        # already-admitted finisher inherits clear execution.
+                        new_claim = object()
+                        # Advancing the attempt watermark before publishing
+                        # the gate is interruption-safe: a signal between the
+                        # stores may delay retry by one interval, but cannot
+                        # strand entrants behind an unowned gate.
+                        self._render_ledger = (
+                            active, dirty, cleared, work,
+                        )
+                        self._clear_state = (new_claim, None)
+                        established_claim = new_claim
+                # A retry after an interrupt may observe the token transition
+                # but not the responsibility handoff or notification below.
+                pending, executor = self._clear_state
+                if not active and pending is not None and executor is None:
+                    claim = pending
+                    self._clear_state = (pending, pending)
+                if not active or token not in active:
+                    self._condition.notify_all()
+            if claim is not None:
+                self._complete_clear(claim, clear)
+        except BaseException:
+            abandoned = claim if claim is not None else established_claim
+            if abandoned is not None:
+                self._abandon_clear_claim(abandoned)
+            raise
+
+    def acquire_owner(self, clear: Callable[[], None]) -> _CiCacheOwner:
+        token = object()
+        owner = _CiCacheOwner(self, clear, token)
+        with self._condition:
+            self._owner_tokens.add(token)
+        return owner
+
+    def release_owner(self, token: object, clear: Callable[[], None]) -> None:
+        claim: object | None = None
+        try:
+            with self._condition:
+                self._owner_tokens.discard(token)
+                if self._owner_tokens:
+                    return
+                while self._clear_claim is not None:
+                    self._condition.wait(timeout=0.1)
+                    if self._owner_tokens:
+                        return
+                # Gate new render scopes before waiting so final cleanup cannot
+                # race work that starts after the final owner begins closing.
+                claim = object()
+                self._clear_state = (claim, claim)
+                while self._render_ledger[0]:
+                    self._condition.wait(timeout=0.1)
+                if self._render_ledger[1] == 0:
+                    self._clear_state = (None, None)
+                    claim = None
+                    self._condition.notify_all()
+            if claim is not None:
+                self._complete_clear(claim, clear)
+        except BaseException:
+            if claim is not None:
+                self._abandon_clear_claim(claim)
+            raise
+
+    def clear_if_dirty(self, clear: Callable[[], None]) -> None:
+        """Clear every render completed before this call returns."""
+        claim: object | None = None
+        try:
+            with self._condition:
+                while self._clear_claim is not None:
+                    self._condition.wait(timeout=0.1)
+                claim = object()
+                self._clear_state = (claim, claim)
+                while self._render_ledger[0]:
+                    self._condition.wait(timeout=0.1)
+                if self._render_ledger[1] == 0:
+                    self._clear_state = (None, None)
+                    claim = None
+                    self._condition.notify_all()
+            if claim is not None:
+                self._complete_clear(claim, clear)
+        except BaseException:
+            if claim is not None:
+                self._abandon_clear_claim(claim)
+            raise
+
+    def _complete_clear(
+        self,
+        claim: object,
+        clear: Callable[[], None],
+    ) -> None:
+        failure: BaseException | None = None
+        try:
+            # Never hold the condition while Core Image performs maintenance.
+            clear()
+        except BaseException as exc:  # noqa: BLE001 - re-raised after unlock
+            failure = exc
+        with self._condition:
+            if self._clear_state == (claim, claim):
+                if failure is None:
+                    active, dirty, cleared, _attempted = self._render_ledger
+                    cleared += dirty
+                    self._render_ledger = (active, 0, cleared, cleared)
+                self._clear_state = (None, None)
+                self._condition.notify_all()
+        if failure is not None:
+            raise failure
+
+    def _abandon_clear_claim(self, claim: object) -> None:
+        """Release only this caller's gate after an async interruption."""
+        with self._condition:
+            if self._clear_claim is claim:
+                self._clear_state = (None, None)
+            # Notify even when the claim transition already committed: the
+            # interruption may have landed immediately before its notify.
+            self._condition.notify_all()
+
+    def _snapshot(self) -> tuple[int, int, int, bool, int]:
+        """Deterministic private state view for lifecycle regression tests."""
+        with self._condition:
+            active, dirty, cleared, _attempted = self._render_ledger
+            return (
+                len(active),
+                cleared + dirty,
+                cleared,
+                self._clear_claim is not None,
+                len(self._owner_tokens),
+            )
+
+
+class _CiCacheOwner:
+    """Idempotent lease that triggers cleanup when the final owner exits."""
+
+    def __init__(
+        self,
+        janitor: _CiCacheJanitor,
+        clear: Callable[[], None],
+        token: object,
+    ) -> None:
+        self._janitor = janitor
+        self._clear = clear
+        self._token = token
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                self._janitor.release_owner(self._token, self._clear)
+            except Exception as exc:  # cache maintenance is best-effort
+                _log.warning(
+                    "Core Image final cache cleanup failed; dirty work remains "
+                    "eligible for retry: %s",
+                    exc,
+                )
+            except BaseException:
+                # The token remains registered if lock acquisition was
+                # interrupted. If it was already consumed, idempotent retry
+                # re-enters final maintenance when no newer owner exists.
+                raise
+            self._closed = True
+
+    def __del__(self) -> None:
+        with contextlib.suppress(BaseException):
+            self.close()
+
+    def __enter__(self) -> _CiCacheOwner:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        cleanup_errors: list[BaseException] = []
+        try:
+            self.close()
+        except BaseException as cleanup:  # noqa: BLE001 - precedence below
+            cleanup_errors.append(cleanup)
+        winner = _cleanup_winner(exc, cleanup_errors)
+        if winner is None or winner is exc:
+            return False
+        raise winner
+
+
+class _CiRenderScope:
+    """One gated Core Image conversion plus its PyObjC autorelease pool."""
+
+    def __init__(
+        self,
+        janitor: _CiCacheJanitor,
+        clear: Callable[[], None],
+    ) -> None:
+        self._janitor = janitor
+        self._clear = clear
+        self._token = object()
+        self._pool: Any = None
+        self._pool_entered = False
+        self._pool_finished = False
+        self._render_finished = False
+
+    def __enter__(self) -> Any:
+        active: BaseException | None = None
+        try:
+            self._janitor.begin_render(self._token)
+            self._pool = autorelease_pool()
+            self._pool.__enter__()
+            self._pool_entered = True
+            return ci_context()
+        except BaseException as exc:  # noqa: BLE001 - cleanup precedence below
+            active = exc
+        cleanup_errors = self._finish(type(active), active, active.__traceback__)
+        winner = _cleanup_winner(active, cleanup_errors)
+        raise winner
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        cleanup_errors = self._finish(exc_type, exc, tb)
+        winner = _cleanup_winner(exc, cleanup_errors)
+        if winner is None or winner is exc:
+            return False
+        raise winner
+
+    def __del__(self) -> None:
+        with contextlib.suppress(BaseException):
+            self._finish(None, None, None)
+
+    def _finish(self, exc_type, exc, tb) -> list[BaseException]:
+        errors: list[BaseException] = []
+        if self._pool_entered and not self._pool_finished:
+            self._pool_finished = True
+            try:
+                self._pool.__exit__(exc_type, exc, tb)
+            except BaseException as cleanup:  # noqa: BLE001 - collected below
+                errors.append(cleanup)
+        maintenance_errors: list[BaseException] = []
+        if not self._render_finished:
+            # Retry once after any async interruption. Finishing by identity is
+            # idempotent: an interruption before token consumption retries the
+            # transition; one after consumption returns immediately without
+            # double-counting the render.
+            for _attempt in range(2):
+                try:
+                    self._janitor.finish_render(self._token, self._clear)
+                except BaseException as cleanup:  # noqa: BLE001 - precedence below
+                    maintenance_errors.append(cleanup)
+                else:
+                    self._render_finished = True
+                    break
+        for cleanup in maintenance_errors:
+            if isinstance(cleanup, Exception):
+                _log.warning(
+                    "Core Image periodic cache cleanup failed; dirty work remains "
+                    "eligible for retry: %s",
+                    cleanup,
+                )
+        if (exc is not None or errors
+                or any(not isinstance(error, Exception)
+                       for error in maintenance_errors)):
+            errors.extend(maintenance_errors)
+        return errors
+
+
+_ci_janitor = _CiCacheJanitor()
 
 
 # ---------------------------------------------------------------------------
@@ -47,32 +428,50 @@ _srgb: Any = None
 # ---------------------------------------------------------------------------
 
 def ci_context() -> Any:
-    """Shared CIContext for all RGB <-> CVPixelBuffer conversions."""
+    """Shared CIContext; render call sites must use :func:`ci_render_scope`."""
     global _ci_context
-    if _ci_context is None:
-        _ci_context = Quartz.CIContext.contextWithOptions_(None)
-    return _ci_context
+    with _ci_singleton_lock:
+        if _ci_context is None:
+            _ci_context = Quartz.CIContext.contextWithOptions_(None)
+        return _ci_context
+
+
+def _clear_ci_context() -> None:
+    """Clear an existing context without creating one just for maintenance."""
+    with _ci_singleton_lock:
+        context = _ci_context
+    if context is not None:
+        context.clearCaches()
 
 
 def clear_ci_caches() -> None:
-    """Tell CIContext to drop its internal Metal/CG caches.
+    """Clear work recorded by :func:`ci_render_scope`, if any.
 
     CIContext caches intermediate compute resources (rendered tiles, GPU
-    pipeline states, etc.) across render calls for performance. In a long
-    loop that does one render per frame these caches grow continuously
-    even though we never reuse a CIImage. Periodic clearCaches() releases
-    them back to the system.
+    pipeline states, etc.) across render calls. The janitor normally clears
+    every 64 conversions and when the final owner lease closes; this explicit
+    hook is retained for diagnostics and retry after a failed clear.
     """
-    if _ci_context is not None:
-        _ci_context.clearCaches()
+    _ci_janitor.clear_if_dirty(_clear_ci_context)
+
+
+def ci_cache_owner() -> _CiCacheOwner:
+    """Own the shared cache for a host/file run and clear on final release."""
+    return _ci_janitor.acquire_owner(_clear_ci_context)
+
+
+def ci_render_scope() -> _CiRenderScope:
+    """Gate one Core Image conversion and drain its autoreleased objects."""
+    return _CiRenderScope(_ci_janitor, _clear_ci_context)
 
 
 def srgb_colorspace() -> Any:
     """Shared sRGB CGColorSpace handle (cheap to create but reused for clarity)."""
     global _srgb
-    if _srgb is None:
-        _srgb = Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB)
-    return _srgb
+    with _ci_singleton_lock:
+        if _srgb is None:
+            _srgb = Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB)
+        return _srgb
 
 
 # ---------------------------------------------------------------------------
@@ -402,22 +801,24 @@ def upload_frame_to_buffer(frame: Any, pb: Any) -> None:
     # source format from the input dtype: RGBAh for fp16, RGBA8 for uint8.
     if _frame_is_fp16(frame):
         src = _frame_buffer(frame)
-        data = Foundation.NSData.dataWithBytes_length_(src, len(src))
-        ci_image = Quartz.CIImage.alloc().initWithBitmapData_bytesPerRow_size_format_colorSpace_(
-            data, w * 8, (w, h), Quartz.kCIFormatRGBAh, srgb_colorspace(),
-        )
-        ci_context().render_toCVPixelBuffer_(ci_image, pb)
+        with ci_render_scope() as context:
+            data = Foundation.NSData.dataWithBytes_length_(src, len(src))
+            ci_image = Quartz.CIImage.alloc().initWithBitmapData_bytesPerRow_size_format_colorSpace_(
+                data, w * 8, (w, h), Quartz.kCIFormatRGBAh, srgb_colorspace(),
+            )
+            context.render_toCVPixelBuffer_(ci_image, pb)
         return
 
     # uint8 RGB -> opaque RGBA8 for CoreImage.
     f = frame if isinstance(frame, mx.array) else mx.array(frame)
     alpha = mx.full((h, w, 1), 255, dtype=mx.uint8)
     src = _frame_buffer(mx.concatenate([f, alpha], axis=-1))
-    data = Foundation.NSData.dataWithBytes_length_(src, len(src))
-    ci_image = Quartz.CIImage.alloc().initWithBitmapData_bytesPerRow_size_format_colorSpace_(
-        data, w * 4, (w, h), Quartz.kCIFormatRGBA8, srgb_colorspace(),
-    )
-    ci_context().render_toCVPixelBuffer_(ci_image, pb)
+    with ci_render_scope() as context:
+        data = Foundation.NSData.dataWithBytes_length_(src, len(src))
+        ci_image = Quartz.CIImage.alloc().initWithBitmapData_bytesPerRow_size_format_colorSpace_(
+            data, w * 4, (w, h), Quartz.kCIFormatRGBA8, srgb_colorspace(),
+        )
+        context.render_toCVPixelBuffer_(ci_image, pb)
 
 
 # ---------------------------------------------------------------------------
@@ -433,12 +834,13 @@ def read_pixel_buffer_rgb(pb: Any) -> Any:
     """
     w = Quartz.CVPixelBufferGetWidth(pb)
     h = Quartz.CVPixelBufferGetHeight(pb)
-    ci_image = Quartz.CIImage.alloc().initWithCVPixelBuffer_(pb)
     buf = bytearray(w * h * 4)
-    ci_context().render_toBitmap_rowBytes_bounds_format_colorSpace_(
-        ci_image, buf, w * 4, ((0, 0), (w, h)),
-        Quartz.kCIFormatRGBA8, srgb_colorspace(),
-    )
+    with ci_render_scope() as context:
+        ci_image = Quartz.CIImage.alloc().initWithCVPixelBuffer_(pb)
+        context.render_toBitmap_rowBytes_bounds_format_colorSpace_(
+            ci_image, buf, w * 4, ((0, 0), (w, h)),
+            Quartz.kCIFormatRGBA8, srgb_colorspace(),
+        )
     rgba = mx.array(memoryview(buf)).reshape(h, w, 4)
     return mx.contiguous(rgba[..., :3])
 

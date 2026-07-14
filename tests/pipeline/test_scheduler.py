@@ -4,8 +4,8 @@ from fractions import Fraction
 
 import pytest
 
-from kinovsr.pipeline import run_chain
-from kinovsr.pipeline.builder import ResolvedStage
+from kinovsr.pipeline import run_chain, run_plan
+from kinovsr.pipeline.builder import BuildPlan, ResolvedStage
 from kinovsr.processors import (
     Boundary,
     BoundaryKind,
@@ -309,6 +309,126 @@ class TestFlushCascade:
 
 
 class TestCleanup:
+    def test_run_plan_owner_closes_on_exhaustion_and_pre_pull_cancel(
+        self,
+        monkeypatch,
+    ):
+        from kinovsr.media import pixel_buffers as pb
+        from kinovsr.pipeline import scheduler as scheduler_module
+
+        leases = []
+
+        class Lease:
+            def __init__(self):
+                self.close_count = 0
+                leases.append(self)
+
+            def close(self):
+                self.close_count += 1
+
+        monkeypatch.setattr(pb, "ci_cache_owner", Lease)
+        monkeypatch.setattr(
+            scheduler_module,
+            "build_processors",
+            lambda *_args: chain(Recorder("a")),
+        )
+        plan = BuildPlan(stages=(), input_spec=spec(), output_spec=spec())
+
+        exhausted = run_plan(
+            plan,
+            units(1),
+            CONTEXT,
+            retain_outputs=False,
+        )
+        assert len(list(exhausted)) == 1
+        cancelled = run_plan(
+            plan,
+            units(1),
+            CONTEXT,
+            retain_outputs=False,
+        )
+        cancelled.close()
+        cancelled.close()
+
+        assert [lease.close_count for lease in leases] == [1, 1]
+
+    def test_run_plan_owner_closes_when_processor_build_fails(
+        self,
+        monkeypatch,
+    ):
+        from kinovsr.media import pixel_buffers as pb
+        from kinovsr.pipeline import scheduler as scheduler_module
+
+        closed = []
+
+        class Lease:
+            def close(self):
+                closed.append("owner")
+
+        monkeypatch.setattr(pb, "ci_cache_owner", Lease)
+        monkeypatch.setattr(
+            scheduler_module,
+            "build_processors",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("build failed")),
+        )
+        plan = BuildPlan(stages=(), input_spec=spec(), output_spec=spec())
+
+        with pytest.raises(RuntimeError, match="build failed"):
+            run_plan(plan, units(1), CONTEXT, retain_outputs=False)
+
+        assert closed == ["owner"]
+
+    def test_finalizer_runs_after_stages_exactly_once(self):
+        log = []
+        stage = Recorder("a", log)
+
+        def finalize():
+            log.append(("owner", "close", ""))
+
+        run = run_chain(
+            chain(stage),
+            units(1),
+            CONTEXT,
+            finalizers=(finalize,),
+        )
+        list(run)
+        run.close()
+        assert [entry[:2] for entry in log if entry[1] == "close"] == [
+            ("a", "close"),
+            ("owner", "close"),
+        ]
+
+    def test_pre_pull_close_runs_finalizer(self):
+        closed = []
+        run = run_chain(
+            chain(Recorder("a")),
+            units(1),
+            CONTEXT,
+            finalizers=(lambda: closed.append("owner"),),
+        )
+
+        run.close()
+        run.close()
+
+        assert closed == ["owner"]
+
+    def test_active_stage_error_outranks_finalizer_error(self):
+        def fail_finalizer():
+            raise RuntimeError("owner cleanup failed")
+
+        with pytest.raises(PipelineRuntimeError, match="kaboom") as caught:
+            list(run_chain(
+                chain(Exploding("boom", at_pts=0)),
+                units(1),
+                CONTEXT,
+                finalizers=(fail_finalizer,),
+            ))
+
+        assert any(
+            "owner cleanup failed" in str(exc)
+            for exc in _context_chain(caught.value)
+        )
+
     def test_close_exactly_once_on_success(self):
         log = []
         a, b = Recorder("a", log), Recorder("b", log)
