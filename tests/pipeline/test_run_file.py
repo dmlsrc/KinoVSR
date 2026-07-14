@@ -635,8 +635,8 @@ class TestForcedColor:
 
 
 class TestEncodeChroma:
-    # An RGB/MLX chain (no upscale) reaches the encoder as RGBAHalf, so auto
-    # is 4:2:2; forcing 420 must reach 4:2:0 even here (the harness parity gap).
+    # An RGB/MLX chain feeds pooled 4:2:2 YUV directly, so auto is 4:2:2;
+    # forcing 420 must reach 4:2:0 even here (the harness parity gap).
     @pytest.mark.parametrize(("chroma", "pix_fmt"), [
         ("auto", "yuv422p10le"),
         ("420", "yuv420p10le"),
@@ -1403,6 +1403,8 @@ def test_ntsc_cadence_writes_the_exact_rational_grid(tmp_path):
             "bt709", full_range=False, geometry=Geometry(W, H)),
         timeline=TimelineSpec(time_base=time_base, cadence=cadence))
     sink = FileSink(tmp_path / "ntsc.mp4", spec)
+    assert sink._direct_mlx_encode
+    assert sink._pool is None
 
     def ticks(i: int) -> int:
         return round(i / cadence / time_base)
@@ -1426,6 +1428,73 @@ def test_ntsc_cadence_writes_the_exact_rational_grid(tmp_path):
         # the sink writes round(i/cadence*24000)/24000; allow that
         # rounding but not the index-grid quantization drift
         assert abs(t - expected) <= half_tick, (i, float(t), float(expected))
+
+
+def test_source_less_full_range_mlx_sink_keeps_range_metadata(tmp_path):
+    from dataclasses import replace
+
+    import mlx.core as mx
+
+    from kinovsr.pipeline import FileSink
+    from kinovsr.processors import (
+        ColorPrimaries,
+        FrameUnit,
+        Geometry,
+        StreamSpec,
+        TimelineSpec,
+        TransferFunction,
+        frame_spec_for_matrix,
+    )
+
+    spec = StreamSpec(
+        frame=replace(
+            frame_spec_for_matrix(
+                "bt709", full_range=True, geometry=Geometry(W, H)),
+            color_primaries=ColorPrimaries.BT2020,
+            transfer_function=TransferFunction.BT2020,
+        ),
+        timeline=TimelineSpec(
+            time_base=Fraction(1, 24000), cadence=Fraction(25)))
+    sink = FileSink(tmp_path / "full.mp4", spec)
+    assert sink._direct_mlx_encode
+    frame = mx.full((H, W, 3), 0.5, dtype=mx.float32)
+    for i in range(3):
+        sink.append(FrameUnit(
+            payload=frame, pts=i * 960, duration=960))
+    path = sink.finish()
+
+    with av.open(str(path)) as container:
+        codec = container.streams.video[0].codec_context
+        assert int(codec.color_range) == 2
+        assert int(codec.color_primaries) == 9
+        assert int(codec.color_trc) == 1
+        assert int(codec.colorspace) == 1
+
+
+def test_source_less_mlx_sink_rejects_non_rgb_payload(tmp_path):
+    import mlx.core as mx
+
+    from kinovsr.pipeline import FileSink
+    from kinovsr.processors import (
+        FrameUnit,
+        Geometry,
+        StreamSpec,
+        TimelineSpec,
+        frame_spec_for_matrix,
+    )
+
+    spec = StreamSpec(
+        frame=frame_spec_for_matrix(
+            "bt709", full_range=False, geometry=Geometry(W, H)),
+        timeline=TimelineSpec(
+            time_base=Fraction(1, 24000), cadence=Fraction(25)))
+    sink = FileSink(tmp_path / "invalid.mp4", spec)
+    try:
+        with pytest.raises(MediaError, match=r"shape .* RGB spec"):
+            sink.append(FrameUnit(
+                payload=mx.zeros((H, W, 4)), pts=0, duration=960))
+    finally:
+        sink.discard()
 
 
 def test_odd_output_dimension_is_rejected(tmp_path):

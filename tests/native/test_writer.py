@@ -104,6 +104,92 @@ def test_default_append_uses_the_exact_rational_cadence(monkeypatch):
     assert captured[0].timescale == pixel_buffers.VIDEO_TIME_SCALE
 
 
+def test_direct_mlx_rgb_preserves_rounding_and_append_order(monkeypatch):
+    import mlx.core as mx
+
+    result = _writer()
+    result._yuv_feed = True
+    result.accepts_mlx_rgb = True
+    result._yuv_matrix = "matrix"
+    result._yuv_full = False
+    events = []
+    pool = object()
+    yuv_buffer = object()
+    converted = []
+
+    class _Adaptor:
+        @staticmethod
+        def pixelBufferPool():
+            return pool
+
+        @staticmethod
+        def appendPixelBuffer_withPresentationTime_(buffer, pts):
+            events.append("append")
+            assert buffer is yuv_buffer
+            assert pts == (7, 24000)
+            return True
+
+    result.adaptor = _Adaptor()
+    result._wait_for_ready = lambda _input, _label: events.append("ready")
+    _patch_native_context(monkeypatch)
+
+    def pull(actual_pool):
+        events.append("pool")
+        return yuv_buffer if actual_pool is pool else None
+
+    def convert(rgb, dst, matrix, full):
+        events.append("convert")
+        converted.append((rgb, dst, matrix, full))
+
+    monkeypatch.setattr(writer_module._pb, "pool_create_buffer", pull)
+    monkeypatch.setattr(
+        writer_module._pb, "read_rgbahalf_rgb",
+        lambda _buffer: pytest.fail("direct MLX input read RGBAHalf"))
+    monkeypatch.setattr(writer_module._yuv, "rgb_to_yuv422_10", convert)
+
+    rgb = mx.array([[[0.12345, 0.5, 0.98765]]], dtype=mx.float32)
+    result.append_mlx_rgb(rgb, pts_ticks=7, duration_ticks=3)
+
+    assert events == ["ready", "pool", "convert", "append"]
+    assert len(converted) == 1
+    converted_rgb, converted_buffer, matrix, full = converted[0]
+    assert converted_rgb.dtype == mx.float32
+    assert mx.array_equal(
+        converted_rgb, rgb.astype(mx.float16).astype(mx.float32)).item()
+    assert (converted_buffer, matrix, full) == (yuv_buffer, "matrix", False)
+    assert result._explicit_end_ticks == 10
+    assert result.frame_count == 1
+
+
+def test_direct_mlx_conversion_failure_poison_writer_and_finish(monkeypatch):
+    import mlx.core as mx
+
+    native = _NativeWriter()
+    result = _writer(native=native)
+    result._yuv_feed = True
+    result.accepts_mlx_rgb = True
+    result._yuv_matrix = "matrix"
+    result._yuv_full = False
+    result._wait_for_ready = lambda _input, _label: None
+    result.adaptor = type("_Adaptor", (), {
+        "pixelBufferPool": staticmethod(object),
+    })()
+    _patch_native_context(monkeypatch)
+    monkeypatch.setattr(
+        writer_module._pb, "pool_create_buffer", lambda _pool: object())
+    monkeypatch.setattr(
+        writer_module._yuv, "rgb_to_yuv422_10",
+        lambda *_args: (_ for _ in ()).throw(ValueError("conversion failed")))
+
+    with pytest.raises(ValueError, match="conversion failed"):
+        result.append_mlx_rgb(mx.zeros((1, 2, 3)))
+
+    assert result._state == "failed"
+    with pytest.raises(ValueError, match="conversion failed"):
+        result.finish()
+    assert native.cancel_count == 1
+
+
 def _patch_native_context(monkeypatch) -> None:
     monkeypatch.setattr(
         writer_module, "autorelease_pool", contextlib.nullcontext)

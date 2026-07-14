@@ -4,7 +4,10 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
+from kinovsr.media import pixel_buffers as pb
+from kinovsr.media import yuv
 from kinovsr.media.yuv import luma_chroma_blend
+from kinovsr.native.frameworks import Quartz
 
 pytestmark = pytest.mark.unit
 
@@ -64,3 +67,63 @@ def test_coefficients_only_matter_when_luma_differs_from_chroma():
     split_601 = luma_chroma_blend(ORIG, NEW, 0.2, 1.0, 0.299, 0.114)
     split_709 = luma_chroma_blend(ORIG, NEW, 0.2, 1.0, 0.2126, 0.0722)
     assert not _close(split_601, split_709)
+
+
+def _active_yuv_bytes(buffer, width):
+    planes = []
+    Quartz.CVPixelBufferLockBaseAddress(buffer, 1)
+    try:
+        for plane in range(Quartz.CVPixelBufferGetPlaneCount(buffer)):
+            rows = Quartz.CVPixelBufferGetHeightOfPlane(buffer, plane)
+            bpr = Quartz.CVPixelBufferGetBytesPerRowOfPlane(buffer, plane)
+            base = Quartz.CVPixelBufferGetBaseAddressOfPlane(buffer, plane)
+            raw = base.as_buffer(rows * bpr)
+            row_bytes = width * 2
+            planes.append(b"".join(
+                bytes(raw[row * bpr:row * bpr + row_bytes])
+                for row in range(rows)))
+    finally:
+        Quartz.CVPixelBufferUnlockBaseAddress(buffer, 1)
+    return tuple(planes)
+
+
+@pytest.mark.parametrize("matrix", [
+    Quartz.kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+    Quartz.kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+    Quartz.kCVImageBufferYCbCrMatrix_ITU_R_2020,
+])
+@pytest.mark.parametrize("full_range", [False, True])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.float32])
+def test_direct_yuv_matches_the_legacy_rgbahalf_boundary(
+        matrix, full_range, dtype):
+    width, height = 8, 6
+    values = mx.array([
+        -0.1, 0.0, 0.001, 0.12345, 0.5, 0.87654, 0.999, 1.1,
+    ], dtype=dtype)
+    rgb = mx.stack([
+        mx.broadcast_to(values[None, :, None], (height, width, 1)),
+        mx.broadcast_to(values[::-1][None, :, None], (height, width, 1)),
+        mx.broadcast_to(mx.roll(values, 2)[None, :, None], (height, width, 1)),
+    ], axis=-1).reshape(height, width, 3)
+    rgba = pb.make_pixel_buffer_from_attrs(width, height, {
+        "PixelFormatType": pb.PIX_RGBAHALF,
+        "Width": width, "Height": height,
+        "IOSurfaceProperties": {}, "MetalCompatibility": True,
+    })
+    alpha = mx.ones((height, width, 1), dtype=mx.float16)
+    pb.write_fp16_rgba(mx.concatenate([
+        rgb[..., :3].astype(mx.float16), alpha], axis=-1), rgba)
+    staged = pb.read_rgbahalf_rgb(rgba)
+
+    attrs = {
+        "PixelFormatType": yuv.pixel_format(full_range),
+        "Width": width, "Height": height,
+        "IOSurfaceProperties": {}, "MetalCompatibility": True,
+    }
+    legacy = pb.make_pixel_buffer_from_attrs(width, height, attrs)
+    direct = pb.make_pixel_buffer_from_attrs(width, height, attrs)
+    yuv.rgb_to_yuv422_10(staged, legacy, matrix, full_range)
+    equivalent = rgb[..., :3].astype(mx.float16).astype(mx.float32)
+    yuv.rgb_to_yuv422_10(equivalent, direct, matrix, full_range)
+
+    assert _active_yuv_bytes(direct, width) == _active_yuv_bytes(legacy, width)

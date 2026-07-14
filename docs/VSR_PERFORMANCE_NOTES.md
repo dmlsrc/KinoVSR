@@ -213,10 +213,46 @@ All measured, all worth not re-litigating:
 ## 6. Pipeline glue (measured attribution)
 
 Per frame at 854x480, 60-frame runs: decode + passthrough pack + HEVC encode =
-**7 ms**; with 4x output the emit path costs ~20 ms (dominated by the ~50 MB
-fp16-RGBA upload -- unavoidable at 4x). MLX<->CVPixelBuffer conversion for
-preprocessing adds ~7 ms. Conclusion: the glue layer is healthy; the nets
-dominate wherever they should.
+**7 ms**. MLX<->CVPixelBuffer conversion for preprocessing adds ~7 ms.
+
+The old MLX output path also uploaded every learned frame to an RGBAHalf
+CVPixelBuffer, immediately copied it back into MLX, and only then converted it
+to the encoder's pooled 10-bit YUV surface. That bridge was avoidable. The file
+sink now keeps the corrected path's fp16 numeric boundary lazily in MLX
+(`float32 -> float16 -> float32`) and converts directly into the pooled YUV
+buffer after encoder backpressure clears. Native CVPixelBuffer producers keep
+their existing append path.
+
+The 2026-07-14 bridge benchmark used four fresh processes per path and geometry,
+with alternating legacy/direct worker order, 30 warmup frames, and 120 measured
+frames. The parent and every worker verified AC power, nominal thermal state,
+and disabled low-power mode at both boundaries; the benchmark also refused any
+checkout revision change between workers. It used Python 3.14.6 and MLX 0.32.0.
+Both paths used the same pre-evaluated float32 frame, BT.709 video-range
+conversion, and the compatibility fp16 boundary.
+
+| geometry | legacy median / p95 | direct median / p95 | median saved | speedup |
+| --- | ---: | ---: | ---: | ---: |
+| 1920x1080 | 3.630 / 5.654 ms | 1.456 / 2.689 ms | 2.174 ms | 2.49x |
+| 3840x2160 | 11.865 / 16.146 ms | 5.019 / 6.042 ms | 6.846 ms | 2.36x |
+
+The direct path removes one pool acquisition per frame and at least 41,472,000
+bytes/frame at 1080p or 165,888,000 bytes/frame at 4K from the bridge. At 30
+fps that is 1.159 or 4.635 GiB/s of avoided traffic. Fresh-process peak RSS fell
+from 160.1 to 109.0 MiB at 1080p and from 323.0 to 180.9 MiB at 4K. Peak MLX
+allocation was effectively flat at 1080p (95.0 MiB on both paths) and fell from
+395.6 to 379.7 MiB at 4K.
+
+The gate hashes every active YUV plane after each run and refuses to report if
+any path or run differs. The 12-case unit matrix independently covers fp16 and
+fp32 input, BT.601/709/2020, video/full range, and legal RGB overshoot; every
+case is byte-identical to the former RGBAHalf route. The durable raw report is
+`$SHARED_TEMP_DIR/trace_analysis/perf04_mlx_encode_bridge_documented.json`;
+`perf04_mlx_encode_bridge.json` is the latest frozen-diff verification run.
+
+Conclusion: the glue layer is healthy and the learned nets dominate wherever
+they should; the former 4x emit-path RGBAHalf round trip is no longer part of
+that cost.
 
 **Gotcha: never derive per-frame cost from short runs.** A 5-frame smoke test
 implied 76 ms/frame of "glue" that was actually one-time warmup (compile traces,

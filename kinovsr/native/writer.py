@@ -1,11 +1,12 @@
 """AVAssetWriter wrapper: HEVC video + optional ALAC/AAC audio, no ffmpeg.
 
-The writer takes a stream of CVPixelBuffers (typically straight from
-VsrSession's adaptor pool - zero-copy from VSR output to encoder) and
-encodes them as HEVC Main10 4:2:0 or Main42210 4:2:2 10-bit BT.709 at the
-target fps. Audio (if attached) is pulled by AVAssetWriter on a dedicated
-dispatch queue via requestMediaDataWhenReadyOnQueue:, so the audio encode
-doesn't stall the video append loop.
+The writer takes CVPixelBuffers (typically straight from VsrSession's adaptor
+pool) or typed MLX RGB frames. MLX input converts directly into the adaptor's
+pooled YUV surface; it does not stage through RGBAHalf. Frames encode as HEVC
+Main10 4:2:0 or Main42210 4:2:2 10-bit with source-derived color tags. Audio
+(if attached) is pulled by AVAssetWriter on a dedicated dispatch queue via
+requestMediaDataWhenReadyOnQueue:, so the audio encode doesn't stall the video
+append loop.
 """
 
 from __future__ import annotations
@@ -218,10 +219,10 @@ class AVWriter:
         # Feed the encoder YUV we converted ourselves (see yuv.py) rather than
         # RGBAHalf: AVAssetWriter's internal RGB->YUV is colorspace-metadata-
         # dependent and color-shifts uploaded buffers. cv_color present => YUV feed,
-        # and `append` converts the RGBAHalf input to 10-bit 4:2:2 with that matrix.
-        # Only the RGBAHalf producers (balanced/image + the learned/upload upscalers)
-        # need this; NV12 (fast) output is already YUV and feeds through untouched.
+        # and append converts RGBAHalf or direct MLX RGB to 10-bit 4:2:2 with
+        # that matrix. NV12 (fast) output is already YUV and feeds through.
         self._yuv_feed = cv_color is not None and source_pixel_format == _pb.PIX_RGBAHALF
+        self.accepts_mlx_rgb = self._yuv_feed
         self._yuv_matrix = cv_color[2] if cv_color is not None else None
         self._yuv_full = full_range
         adaptor_format = _yuv.pixel_format(full_range) if self._yuv_feed else source_pixel_format
@@ -421,9 +422,24 @@ class AVWriter:
     # Public API
     # ------------------------------------------------------------------------
 
-    def append(self, pb: Any, *, pts_ticks: int | None = None,
-               duration_ticks: int | None = None) -> None:
-        """Append one video frame.
+    def _rgb_to_yuv_buffer(self, rgb: Any) -> Any:
+        ybuf = _pb.pool_create_buffer(self.adaptor.pixelBufferPool())
+        if ybuf is None:
+            raise RuntimeError(
+                f"[{self.label}] YUV pool buffer allocation failed")
+        _yuv.rgb_to_yuv422_10(
+            rgb, ybuf, self._yuv_matrix, self._yuv_full)
+        return ybuf
+
+    def _append_payload(
+        self,
+        payload: Any,
+        *,
+        direct_mlx_rgb: bool,
+        pts_ticks: int | None,
+        duration_ticks: int | None,
+    ) -> None:
+        """Append one prepared buffer or one direct MLX RGB frame.
 
         Default: the next index-grid PTS (frame_count/fps). A caller
         that owns an exact timeline (the typed pipeline's endpoints)
@@ -440,15 +456,13 @@ class AVWriter:
         try:
             with autorelease_pool():
                 self._wait_for_ready(self.video_input, "video")
-                if self._yuv_feed:
-                    rgb = _pb.read_rgbahalf_rgb(pb)
-                    ybuf = _pb.pool_create_buffer(self.adaptor.pixelBufferPool())
-                    if ybuf is None:
-                        raise RuntimeError(
-                            f"[{self.label}] YUV pool buffer allocation failed")
-                    _yuv.rgb_to_yuv422_10(
-                        rgb, ybuf, self._yuv_matrix, self._yuv_full)
-                    pb = ybuf
+                if direct_mlx_rgb:
+                    pb = self._rgb_to_yuv_buffer(payload)
+                elif self._yuv_feed:
+                    pb = self._rgb_to_yuv_buffer(
+                        _pb.read_rgbahalf_rgb(payload))
+                else:
+                    pb = payload
                 if pts_ticks is None:
                     pts = _pb.frame_pts(self.frame_count, self.cadence)
                 else:
@@ -467,6 +481,41 @@ class AVWriter:
         except Exception as exc:
             self._record_failure(exc)
             raise
+
+    def append(self, pb: Any, *, pts_ticks: int | None = None,
+               duration_ticks: int | None = None) -> None:
+        """Append a CVPixelBuffer, converting RGBAHalf to YUV when needed."""
+        self._append_payload(
+            pb,
+            direct_mlx_rgb=False,
+            pts_ticks=pts_ticks,
+            duration_ticks=duration_ticks,
+        )
+
+    def append_mlx_rgb(
+        self,
+        rgb: Any,
+        *,
+        pts_ticks: int | None = None,
+        duration_ticks: int | None = None,
+    ) -> None:
+        """Convert typed MLX RGB directly into the pooled encoder YUV feed."""
+        if not self.accepts_mlx_rgb:
+            raise RuntimeError(
+                f"[{self.label}] direct MLX RGB input requires the YUV feed")
+        import mlx.core as mx
+
+        # Preserve the corrected legacy path's numeric boundary: FileSink
+        # wrote fp16 RGBAHalf and read it back as float32 before YUV
+        # quantization. Keep that rounding in the lazy MLX graph while
+        # removing both CoreVideo copies and their synchronization points.
+        equivalent = rgb[..., :3].astype(mx.float16).astype(mx.float32)
+        self._append_payload(
+            equivalent,
+            direct_mlx_rgb=True,
+            pts_ticks=pts_ticks,
+            duration_ticks=duration_ticks,
+        )
 
     def finish(self) -> None:
         """Finalize once, with bounded audio and native completion waits."""

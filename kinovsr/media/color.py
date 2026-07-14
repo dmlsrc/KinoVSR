@@ -26,6 +26,22 @@ _2020 = (Quartz.kCVImageBufferColorPrimaries_ITU_R_2020,
          Quartz.kCVImageBufferTransferFunction_ITU_R_709_2,     # SDR 2020 uses ~709 gamma
          Quartz.kCVImageBufferYCbCrMatrix_ITU_R_2020)
 _OVERRIDES = {"bt709": _709, "bt601": _601, "bt2020": _2020}
+_FRAME_PRIMARIES = {
+    "smpte_c": Quartz.kCVImageBufferColorPrimaries_SMPTE_C,
+    "bt709": Quartz.kCVImageBufferColorPrimaries_ITU_R_709_2,
+    "bt2020": Quartz.kCVImageBufferColorPrimaries_ITU_R_2020,
+}
+_FRAME_TRANSFERS = {
+    "bt709": Quartz.kCVImageBufferTransferFunction_ITU_R_709_2,
+    # Product policy models SDR BT.2020 with the encoder-supported 709-family
+    # transfer curve, matching _2020 and ffmpeg_reader._TRANSFER.
+    "bt2020": Quartz.kCVImageBufferTransferFunction_ITU_R_709_2,
+}
+_FRAME_MATRICES = {
+    "bt601": Quartz.kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+    "bt709": Quartz.kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+    "bt2020": Quartz.kCVImageBufferYCbCrMatrix_ITU_R_2020,
+}
 
 # AV writer constants, matched to a CV value by shared CFString value (with a
 # BT.709 fallback for anything AV doesn't expose, e.g. the SMPTE_C transfer).
@@ -79,6 +95,19 @@ def resolve(src: dict, override: str = "auto", range_override: str = "auto") -> 
     )
 
 
+def resolve_frame_spec(frame: Any) -> tuple:
+    """Translate the complete typed FrameSpec tuple under the SDR color policy."""
+    try:
+        return (
+            _FRAME_PRIMARIES[frame.color_primaries.value],
+            _FRAME_TRANSFERS[frame.transfer_function.value],
+            _FRAME_MATRICES[frame.color_matrix.value],
+            frame.color_range.value == "full",
+        )
+    except (AttributeError, KeyError) as exc:
+        raise ValueError(f"unsupported typed frame color metadata: {frame!r}") from exc
+
+
 def cv_triple(resolved: tuple) -> tuple:
     """Just the (primaries, transfer, matrix) CV constants (for VTPixelTransfer)."""
     return resolved[0], resolved[1], resolved[2]
@@ -89,7 +118,8 @@ def av_color_properties(resolved: tuple) -> dict:
     prim, trans, mat, _ = resolved
     return {
         av.AVVideoColorPrimariesKey: _match(prim, _AV_PRIMS, av.AVVideoColorPrimaries_ITU_R_709_2),
-        av.AVVideoTransferFunctionKey: _match(trans, _AV_TRANS, av.AVVideoTransferFunction_ITU_R_709_2),
+        av.AVVideoTransferFunctionKey: _match(
+            trans, _AV_TRANS, av.AVVideoTransferFunction_ITU_R_709_2),
         av.AVVideoYCbCrMatrixKey: _match(mat, _AV_MATS, av.AVVideoYCbCrMatrix_ITU_R_709_2),
     }
 

@@ -128,11 +128,11 @@ def rgb_to_yuv422_10(rgb: Any, dst_buffer: Any, matrix: Any, full_range: bool = 
 def _write_planes(buf: Any, planes: tuple) -> None:
     """memcpy each (rows, cols) uint16 MLX plane into the buffer's biplanar storage,
     honoring per-plane bytesPerRow (rows may be padded)."""
+    prepared = tuple(mx.contiguous(arr) for arr in planes)
+    mx.eval(*prepared)
     Quartz.CVPixelBufferLockBaseAddress(buf, 0)
     try:
-        for plane, arr in enumerate(planes):
-            arr = mx.contiguous(arr)
-            mx.eval(arr)
+        for plane, arr in enumerate(prepared):
             rows, cols = int(arr.shape[0]), int(arr.shape[1])
             base = Quartz.CVPixelBufferGetBaseAddressOfPlane(buf, plane)
             bpr = Quartz.CVPixelBufferGetBytesPerRowOfPlane(buf, plane)

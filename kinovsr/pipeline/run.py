@@ -459,12 +459,14 @@ class FileSink:
         resolved = source.resolved_color if source is not None else None
         from kinovsr.media import color as _color
 
+        if resolved is None:
+            resolved = _color.resolve_frame_spec(output_spec.frame)
+
         writer_kwargs: dict[str, Any] = {}
-        if resolved is not None:
-            writer_kwargs["color_props"] = _color.av_color_properties(resolved)
-            if layout in (Layout.MLX_RGB_HWC, Layout.CV_RGBA_HALF):
-                writer_kwargs["cv_color"] = _color.cv_triple(resolved)
-                writer_kwargs["full_range"] = bool(resolved[3])
+        writer_kwargs["color_props"] = _color.av_color_properties(resolved)
+        if layout in (Layout.MLX_RGB_HWC, Layout.CV_RGBA_HALF):
+            writer_kwargs["cv_color"] = _color.cv_triple(resolved)
+            writer_kwargs["full_range"] = bool(resolved[3])
         if source is not None:
             writer_kwargs["transform"] = source.transform
             if geometry.pixel_aspect != 1:
@@ -517,8 +519,12 @@ class FileSink:
                 audio_track=audio_track, audio_codec=audio_codec,
                 **writer_kwargs)
 
+            self._direct_mlx_encode = (
+                self._is_mlx
+                and bool(getattr(self.writer, "accepts_mlx_rgb", False))
+            )
             self._pool = None
-            if self._is_mlx:
+            if self._is_mlx and not self._direct_mlx_encode:
                 self._pool = _pb.make_pool_from_attrs({
                     "PixelFormatType": _pb.PIX_RGBAHALF,
                     "Width": geometry.width, "Height": geometry.height,
@@ -538,16 +544,21 @@ class FileSink:
         timeline = self.spec.timeline
         return grid_ticks(index, timeline.cadence, timeline.time_base)
 
+    def _validate_mlx_frame(self, frame: Any) -> None:
+        geometry = self.spec.frame.geometry
+        shape = getattr(frame, "shape", ())
+        if (len(shape) != 3
+                or int(shape[0]) != geometry.height
+                or int(shape[1]) != geometry.width
+                or int(shape[2]) != 3):
+            raise PipelineError(
+                f"output frame shape {tuple(shape)!r} does not match the "
+                f"validated {geometry.width}x{geometry.height} RGB spec")
+
     def _mlx_to_buffer(self, frame: Any) -> Any:
         import mlx.core as mx
 
         geometry = self.spec.frame.geometry
-        if (int(frame.shape[0]), int(frame.shape[1])) != (
-                geometry.height, geometry.width):
-            raise PipelineError(
-                f"output frame is {frame.shape[1]}x{frame.shape[0]} but the "
-                f"validated output spec says {geometry.width}x"
-                f"{geometry.height}")
         pb = self._pb.pool_create_buffer(self._pool)
         if pb is None:
             pb = self._pb.make_pixel_buffer_from_attrs(
@@ -570,13 +581,22 @@ class FileSink:
                 f"unit {self.writer.frame_count} arrived at pts {unit.pts} "
                 f"but the output cadence grid expects {expected}; the chain "
                 f"broke its declared timeline")
-        payload = (self._mlx_to_buffer(unit.payload)
-                   if self._is_mlx else unit.payload)
         # The chain's timeline is the validated one: stamp the unit's own
         # ticks (the writer's index grid quantizes NTSC-family rates).
         try:
-            self.writer.append(payload, pts_ticks=unit.pts,
-                               duration_ticks=unit.duration or None)
+            if self._is_mlx:
+                self._validate_mlx_frame(unit.payload)
+                if self._direct_mlx_encode:
+                    self.writer.append_mlx_rgb(
+                        unit.payload, pts_ticks=unit.pts,
+                        duration_ticks=unit.duration or None)
+                    return
+                payload = self._mlx_to_buffer(unit.payload)
+            else:
+                payload = unit.payload
+            self.writer.append(
+                payload, pts_ticks=unit.pts,
+                duration_ticks=unit.duration or None)
         except Exception as exc:
             raise MediaError(
                 f"writer append failed for {self._final_path}: {exc}") from exc
