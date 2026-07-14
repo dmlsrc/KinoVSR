@@ -322,7 +322,7 @@ class TestCutLogAndSkipPost:
         log.write_text("stale\n", encoding="utf-8")
         run_file({"pipeline": ["cd"], "cd": {"processor": "cut_detect"}},
                  video=cut_clip, output=tmp_path / "o.mp4",
-                 settings=SETTINGS, cut_log=log)
+                 settings=SETTINGS, cut_log=log, overwrite=True)
         assert log.read_text(encoding="utf-8") == "8\n"
 
     def test_skip_post_mp4_processes_without_writing(self, cut_clip, tmp_path):
@@ -609,6 +609,69 @@ def test_zero_output_cap_is_rejected(clip, tmp_path):
     assert not (tmp_path / "zero.mp4").exists()
 
 
+def test_cut_log_alias_is_rejected_before_source_mutation(clip, tmp_path):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(clip.read_bytes())
+    original = source.read_bytes()
+    output = tmp_path / "out.mp4"
+
+    with pytest.raises(MediaError, match="destroy the source"):
+        run_file(
+            {"pipeline": []},
+            video=source,
+            output=output,
+            settings=SETTINGS,
+            cut_log=source,
+        )
+
+    assert source.read_bytes() == original
+    assert not output.exists()
+    assert not list(tmp_path.glob(".*.partial"))
+
+
+def test_comparison_cannot_alias_post_output(clip, tmp_path):
+    output = tmp_path / "out.mp4"
+    with pytest.raises(MediaError, match="artifact paths alias"):
+        run_file(
+            {"pipeline": []},
+            video=clip,
+            output=output,
+            settings=SETTINGS,
+            comparison=output,
+        )
+    assert not output.exists()
+    assert not list(tmp_path.glob(".*.partial"))
+
+
+def test_second_writer_publish_failure_leaves_no_singleton(
+        clip, tmp_path, monkeypatch):
+    from kinovsr.pipeline.run import _OutputTransaction
+
+    output = tmp_path / "out.mp4"
+    comparison = tmp_path / "comparison.mp4"
+    original_replace = _OutputTransaction._replace
+
+    def fail_comparison(source, destination):
+        if destination == comparison:
+            raise OSError("injected comparison publication failure")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(
+        _OutputTransaction, "_replace", staticmethod(fail_comparison))
+    with pytest.raises(MediaError, match="comparison publication failure"):
+        run_file(
+            {"pipeline": []},
+            video=clip,
+            output=output,
+            settings=SETTINGS,
+            comparison=comparison,
+        )
+
+    assert not output.exists()
+    assert not comparison.exists()
+    assert not list(tmp_path.glob(".*.partial"))
+
+
 def test_failed_run_preserves_existing_output(clip, tmp_path):
     """Finding #3 atomicity: a run that fails after the writer opened (the
     weights load at the first pull, past open-time validation) must leave a
@@ -626,7 +689,7 @@ def test_failed_run_preserves_existing_output(clip, tmp_path):
                      "scale": 4}}
     with pytest.raises(Exception):  # noqa: B017 - loader error, wrapped
         run_file(config, video=clip, output=out, settings=SETTINGS,
-                 max_frames=4)
+                 max_frames=4, overwrite=True)
     assert out.read_bytes() == original            # original intact
     assert not list(tmp_path.glob(".keep.mp4.*"))  # no partial temp left
 
@@ -644,20 +707,19 @@ def test_rename_failure_leaves_no_orphan_temp(clip, tmp_path):
     assert not list(tmp_path.glob(".out.mp4.*"))   # no partial temp left
 
 
-def test_discard_unlinks_temp_even_if_finalize_is_interrupted(tmp_path):
-    """discard() must remove its partial temp even if writer finalization
-    raises a BaseException (interrupt), and must not itself raise - so it
-    cannot mask the original failure the caller re-raises (re-review #3)."""
+def test_discard_cancels_and_unlinks_even_if_cancel_is_interrupted(tmp_path):
+    """discard() must cancel rather than finish and remain BaseException-safe."""
     from kinovsr.pipeline.run import FileSink
 
     temp = tmp_path / ".out.mp4.partial"
     temp.write_bytes(b"partial encode")
     sink = FileSink.__new__(FileSink)   # bypass the heavy native __init__
     sink._published = False
+    sink._discarded = False
     sink._temp_path = temp
 
     class _InterruptingWriter:
-        def finish(self):
+        def cancel(self):
             raise KeyboardInterrupt("during-discard")
 
     sink.writer = _InterruptingWriter()

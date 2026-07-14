@@ -20,10 +20,16 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
+import fcntl
+import hashlib
 import logging
 import os
+import shutil
 import tempfile
+import threading
 import time
+import unicodedata
 from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
@@ -264,6 +270,7 @@ class FileSink:
         audio_track: Any = None,
         audio_codec: str = "alac",
         encode_chroma: str = "auto",
+        overwrite: bool = False,
     ) -> None:
         from kinovsr.media import pixel_buffers as _pb
         from kinovsr.native.writer import (
@@ -318,6 +325,11 @@ class FileSink:
         # after the writer already opened) then leaves any pre-existing
         # output file untouched instead of destroying it.
         self._final_path = Path(path)
+        self._overwrite = overwrite
+        if self._final_path.exists() and not overwrite:
+            raise MediaError(
+                f"destination already exists: {self._final_path}; pass "
+                f"overwrite=True to replace it")
         self._final_path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(
             dir=self._final_path.parent,
@@ -325,6 +337,8 @@ class FileSink:
         os.close(fd)
         self._temp_path = Path(tmp)
         self._published = False
+        self._finalized = False
+        self._discarded = False
 
         # Everything below can fail (AVWriter construction, pool creation);
         # drop the just-created temp so a failed construction leaves nothing
@@ -359,6 +373,10 @@ class FileSink:
                     "MetalCompatibility": True,
                 })
         except BaseException:
+            writer = getattr(self, "writer", None)
+            if writer is not None:
+                with contextlib.suppress(BaseException):
+                    writer.cancel()
             with contextlib.suppress(Exception):
                 self._temp_path.unlink()
             raise
@@ -403,8 +421,33 @@ class FileSink:
                    if self._is_mlx else unit.payload)
         # The chain's timeline is the validated one: stamp the unit's own
         # ticks (the writer's index grid quantizes NTSC-family rates).
-        self.writer.append(payload, pts_ticks=unit.pts,
-                           duration_ticks=unit.duration or None)
+        try:
+            self.writer.append(payload, pts_ticks=unit.pts,
+                               duration_ticks=unit.duration or None)
+        except Exception as exc:
+            raise MediaError(
+                f"writer append failed for {self._final_path}: {exc}") from exc
+
+    def finalize(self) -> None:
+        """Finish encoding while the file is still transaction-private."""
+        if self._finalized or self._published:
+            return
+        if self._discarded:
+            raise MediaError(
+                f"cannot finalize discarded output {self._final_path}")
+        try:
+            self.writer.finish()
+        except BaseException as exc:
+            self.discard()
+            if isinstance(exc, Exception):
+                raise MediaError(
+                    f"writer finalization failed for {self._final_path}: "
+                    f"{exc}") from exc
+            raise
+        self._finalized = True
+
+    def _mark_published(self) -> None:
+        self._published = True
 
     def finish(self) -> Path:
         """Finalize the encode and publish it atomically to the requested
@@ -413,14 +456,18 @@ class FileSink:
         (e.g. the output path is an existing directory, or a full disk) -
         the partial temp is removed and the requested output is left
         untouched."""
+        self.finalize()
         try:
-            self.writer.finish()
+            if self._final_path.exists() and not self._overwrite:
+                raise MediaError(
+                    f"destination appeared before publication: "
+                    f"{self._final_path}")
             self._temp_path.replace(self._final_path)
         except BaseException:
             with contextlib.suppress(Exception):
                 self._temp_path.unlink()
             raise
-        self._published = True
+        self._mark_published()
         return self._final_path
 
     def discard(self) -> None:
@@ -429,19 +476,512 @@ class FileSink:
         Safe to call after a failure at any point, and a no-op once finish()
         has already published.
 
-        Cleanup is BaseException-safe and never raises: the temp is unlinked
-        in a ``finally`` even if the writer finalization is interrupted
-        (KeyboardInterrupt/SystemExit), and discard swallows that interrupt so
-        it cannot mask the original processing failure the caller re-raises."""
-        if self._published:
+        Cleanup is BaseException-safe and never raises: native writing is
+        cancelled (never finalized), and the temp is unlinked even if native
+        cancellation is interrupted, so cleanup cannot mask the original
+        processing failure the caller re-raises."""
+        if self._published or self._discarded:
             return
+        self._discarded = True
         try:
-            self.writer.finish()
+            self.writer.cancel()
         except BaseException:  # noqa: BLE001 - best-effort; must not mask the original
             pass
         finally:
             with contextlib.suppress(Exception):
                 self._temp_path.unlink()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Artifact:
+    label: str
+    path: Path
+    directory: bool = False
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ArtifactPlan:
+    """Complete, normalized destructive path graph for one file run."""
+
+    input_path: Path
+    output_path: Path
+    artifacts: tuple[_Artifact, ...]
+    overwrite: bool
+
+    @staticmethod
+    def _resolved(path: Path | str, label: str) -> Path:
+        try:
+            return Path(path).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise MediaError(f"cannot resolve {label} path {path}: {exc}") from exc
+
+    @staticmethod
+    def _namespace_path(path: Path) -> Path:
+        """Conservative APFS/HFS namespace identity for uncreated paths."""
+        return Path(unicodedata.normalize("NFD", str(path)).casefold())
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        video: Path | str,
+        output: Path | str,
+        comparison: Path | str | None,
+        cut_log: Path | str | None,
+        save_audio_sidecar: bool,
+        save_pre_frames: Path | str | None,
+        save_post_frames: Path | str | None,
+        skip_post_mp4: bool,
+        noise_map_debug: bool,
+        overwrite: bool,
+    ) -> _ArtifactPlan:
+        input_path = cls._resolved(video, "input")
+        output_path = cls._resolved(output, "post output")
+        artifacts: list[_Artifact] = []
+
+        def add(label: str, path: Path | str, *, directory: bool = False) -> None:
+            artifacts.append(_Artifact(
+                label, cls._resolved(path, label), directory))
+
+        if not skip_post_mp4:
+            add("post output", output_path)
+        if comparison is not None:
+            add("comparison output", comparison)
+        if save_audio_sidecar:
+            add(
+                "audio sidecar",
+                output_path.with_name(f"{output_path.stem}_audio.wav"),
+            )
+        if cut_log is not None:
+            add("cut log", cut_log)
+        if save_pre_frames is not None:
+            add("pre-frame directory", save_pre_frames, directory=True)
+        if save_post_frames is not None:
+            add("post-frame directory", save_post_frames, directory=True)
+        if noise_map_debug and not skip_post_mp4:
+            for suffix in ("noisemap", "blockmap"):
+                add(
+                    f"{suffix} debug image",
+                    output_path.with_name(
+                        f"{output_path.stem}_{suffix}.png"),
+                )
+
+        plan = cls(input_path, output_path, tuple(artifacts), overwrite)
+        plan.validate()
+        return plan
+
+    def path(self, label: str) -> Path:
+        for artifact in self.artifacts:
+            if artifact.label == label:
+                return artifact.path
+        raise KeyError(label)
+
+    def get(self, label: str) -> Path | None:
+        with contextlib.suppress(KeyError):
+            return self.path(label)
+        return None
+
+    @staticmethod
+    def _same_existing_path(left: Path, right: Path) -> bool:
+        if not left.exists() or not right.exists():
+            return False
+        try:
+            return left.samefile(right)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _validate_parent(path: Path, label: str) -> None:
+        parent = path.parent
+        while not parent.exists() and parent != parent.parent:
+            parent = parent.parent
+        if not parent.is_dir():
+            raise MediaError(
+                f"{label} parent is not a directory: {parent}")
+
+    def validate(self) -> None:
+        """Validate aliases, nesting, types, and overwrite policy read-only."""
+        named = [("input", self.input_path), *(
+            (artifact.label, artifact.path) for artifact in self.artifacts)]
+        for index, (left_label, left) in enumerate(named):
+            for right_label, right in named[index + 1:]:
+                if (left == right
+                        or self._namespace_path(left) == self._namespace_path(right)
+                        or self._same_existing_path(left, right)):
+                    source_warning = (
+                        "; writing there would destroy the source"
+                        if "input" in (left_label, right_label) else "")
+                    raise MediaError(
+                        f"artifact paths alias: {left_label} and "
+                        f"{right_label} both identify {left}"
+                        f"{source_warning}")
+
+        for index, left in enumerate(self.artifacts):
+            for right in self.artifacts[index + 1:]:
+                left_namespace = self._namespace_path(left.path)
+                right_namespace = self._namespace_path(right.path)
+                if (left_namespace in right_namespace.parents
+                        or right_namespace in left_namespace.parents):
+                    raise MediaError(
+                        f"artifact paths overlap: {left.label} ({left.path}) "
+                        f"and {right.label} ({right.path})")
+            if (left.directory
+                    and self._namespace_path(left.path)
+                    in self._namespace_path(self.input_path).parents):
+                raise MediaError(
+                    f"{left.label} contains the input file: {left.path}")
+
+        for artifact in self.artifacts:
+            self._validate_parent(artifact.path, artifact.label)
+            if not artifact.path.exists():
+                continue
+            if artifact.directory != artifact.path.is_dir():
+                expected = "directory" if artifact.directory else "file"
+                raise MediaError(
+                    f"{artifact.label} must be a {expected}: "
+                    f"{artifact.path}")
+            if not self.overwrite:
+                raise MediaError(
+                    f"destination already exists: {artifact.path}; pass "
+                    f"overwrite=True to replace it")
+
+
+_RESERVATION_GUARD = threading.RLock()
+_RESERVED_NAMESPACES: set[Path] = set()
+
+
+class _ArtifactReservation:
+    """Cross-thread/process advisory reservation for a complete artifact set."""
+
+    def __init__(self, plan: _ArtifactPlan, settings: Settings) -> None:
+        self._paths = tuple(sorted(
+            (artifact.path for artifact in plan.artifacts), key=str))
+        self._namespaces = tuple(
+            _ArtifactPlan._namespace_path(path) for path in self._paths)
+        requests: dict[Path, int] = {}
+        for path in self._namespaces:
+            requests[path] = fcntl.LOCK_EX
+            for parent in path.parents:
+                requests.setdefault(parent, fcntl.LOCK_SH)
+        self._lock_requests = tuple(sorted(requests.items(), key=lambda item: str(item[0])))
+        self._lock_root = (
+            settings.shared_temp_dir.expanduser().resolve(strict=False)
+            / "kinovsr-artifact-locks")
+        self._fds: list[int] = []
+        self._held = False
+
+    def acquire(self) -> None:
+        if self._held:
+            return
+        with _RESERVATION_GUARD:
+            conflict = {
+                requested
+                for requested in self._namespaces
+                for reserved in _RESERVED_NAMESPACES
+                if (requested == reserved
+                    or requested in reserved.parents
+                    or reserved in requested.parents)
+            }
+            if conflict:
+                path = min(conflict, key=str)
+                raise MediaError(
+                    f"destination hierarchy is already reserved: {path}")
+            try:
+                self._lock_root.mkdir(parents=True, exist_ok=True)
+                for path, mode in self._lock_requests:
+                    digest = hashlib.sha256(
+                        os.fsencode(str(path))).hexdigest()
+                    lock_path = self._lock_root / f"{digest}.lock"
+                    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+                    try:
+                        fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                    except OSError as exc:
+                        os.close(fd)
+                        if exc.errno in (errno.EACCES, errno.EAGAIN):
+                            raise MediaError(
+                                f"destination hierarchy is already reserved: "
+                                f"{path}") from exc
+                        raise
+                    self._fds.append(fd)
+            except BaseException as exc:
+                self._release_fds()
+                if isinstance(exc, OSError):
+                    raise MediaError(
+                        f"cannot reserve artifact destinations under "
+                        f"{self._lock_root}: {exc}") from exc
+                raise
+            _RESERVED_NAMESPACES.update(self._namespaces)
+            self._held = True
+
+    def _release_fds(self) -> None:
+        for fd in reversed(self._fds):
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self._fds.clear()
+
+    def release(self) -> None:
+        if not self._held:
+            return
+        with _RESERVATION_GUARD:
+            self._release_fds()
+            _RESERVED_NAMESPACES.difference_update(self._namespaces)
+            self._held = False
+
+
+@dataclasses.dataclass(slots=True)
+class _TransactionEntry:
+    artifact: _Artifact
+    temp_path: Path
+    sink: FileSink | None = None
+    backup_path: Path | None = None
+    publishing: bool = False
+    published: bool = False
+
+
+class _OutputTransaction:
+    """Own every temporary and publish the full artifact set all-or-none."""
+
+    def __init__(self, plan: _ArtifactPlan, settings: Settings) -> None:
+        self.plan = plan
+        self._reservation = _ArtifactReservation(plan, settings)
+        self._entries: dict[str, _TransactionEntry] = {}
+        self._created_parents: list[Path] = []
+        self._committed = False
+        self._closed = False
+
+    def __enter__(self) -> _OutputTransaction:
+        self._reservation.acquire()
+        try:
+            # Close the validation/reservation race before any output temp is
+            # created. Cooperative concurrent runs now hold the same locks.
+            self.plan.validate()
+        except BaseException:
+            self._reservation.release()
+            raise
+        return self
+
+    def _artifact(self, label: str) -> _Artifact:
+        for artifact in self.plan.artifacts:
+            if artifact.label == label:
+                return artifact
+        raise KeyError(label)
+
+    def _ensure_parent(self, path: Path) -> None:
+        missing: list[Path] = []
+        parent = path.parent
+        while not parent.exists() and parent != parent.parent:
+            missing.append(parent)
+            parent = parent.parent
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._created_parents.extend(
+            candidate for candidate in reversed(missing)
+            if candidate.is_dir())
+
+    def prepare_sink(self, label: str) -> Path:
+        artifact = self._artifact(label)
+        self._ensure_parent(artifact.path)
+        return artifact.path
+
+    def register_sink(self, label: str, sink: FileSink) -> None:
+        if label in self._entries:
+            raise RuntimeError(f"artifact already materialized: {label}")
+        self._entries[label] = _TransactionEntry(
+            self._artifact(label), sink._temp_path, sink=sink)
+
+    def temp_file(self, label: str) -> Path:
+        existing = self._entries.get(label)
+        if existing is not None:
+            return existing.temp_path
+        artifact = self._artifact(label)
+        if artifact.directory:
+            raise RuntimeError(f"{label} is a directory artifact")
+        self._ensure_parent(artifact.path)
+        fd, raw = tempfile.mkstemp(
+            dir=artifact.path.parent,
+            prefix=f".{artifact.path.name}.", suffix=".partial")
+        os.close(fd)
+        temp_path = Path(raw)
+        self._entries[label] = _TransactionEntry(artifact, temp_path)
+        return temp_path
+
+    def temp_directory(self, label: str) -> Path:
+        existing = self._entries.get(label)
+        if existing is not None:
+            return existing.temp_path
+        artifact = self._artifact(label)
+        if not artifact.directory:
+            raise RuntimeError(f"{label} is a file artifact")
+        self._ensure_parent(artifact.path)
+        temp_path = Path(tempfile.mkdtemp(
+            dir=artifact.path.parent,
+            prefix=f".{artifact.path.name}.", suffix=".partial"))
+        self._entries[label] = _TransactionEntry(artifact, temp_path)
+        return temp_path
+
+    def _ordered_entries(self) -> list[_TransactionEntry]:
+        return [
+            self._entries[artifact.label]
+            for artifact in self.plan.artifacts
+            if artifact.label in self._entries
+        ]
+
+    @staticmethod
+    def _remove(path: Path) -> None:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _backup_slot(artifact: _Artifact) -> Path:
+        if artifact.directory:
+            raw = tempfile.mkdtemp(
+                dir=artifact.path.parent,
+                prefix=f".{artifact.path.name}.", suffix=".rollback")
+            backup = Path(raw)
+            backup.rmdir()
+            return backup
+        fd, raw = tempfile.mkstemp(
+            dir=artifact.path.parent,
+            prefix=f".{artifact.path.name}.", suffix=".rollback")
+        os.close(fd)
+        return Path(raw)
+
+    @staticmethod
+    def _replace(source: Path, destination: Path) -> None:
+        source.replace(destination)
+
+    def _rollback(self, entries: list[_TransactionEntry]) -> list[str]:
+        errors: list[str] = []
+        for entry in reversed(entries):
+            landed = entry.published or (
+                entry.publishing
+                and entry.artifact.path.exists()
+                and not entry.temp_path.exists())
+            if landed:
+                try:
+                    self._remove(entry.artifact.path)
+                except BaseException as exc:  # preserve the original failure
+                    errors.append(
+                        f"remove {entry.artifact.path}: {exc}")
+                entry.published = False
+            entry.publishing = False
+        for entry in reversed(entries):
+            backup = entry.backup_path
+            if backup is not None and backup.exists():
+                try:
+                    self._replace(backup, entry.artifact.path)
+                except BaseException as exc:
+                    errors.append(
+                        f"restore {entry.artifact.path}: {exc}")
+        for entry in reversed(entries):
+            if entry.temp_path.exists():
+                try:
+                    self._remove(entry.temp_path)
+                except BaseException as exc:
+                    errors.append(f"remove {entry.temp_path}: {exc}")
+        return errors
+
+    def commit(self) -> None:
+        if self._committed:
+            return
+        entries = self._ordered_entries()
+        try:
+            # Native finish is bounded and still private. No destination is
+            # visible until every writer has completed successfully.
+            for entry in entries:
+                if entry.sink is not None:
+                    entry.sink.finalize()
+
+            self.plan.validate()
+            for entry in entries:
+                final = entry.artifact.path
+                if final.exists():
+                    if not self.plan.overwrite:
+                        raise MediaError(
+                            f"destination appeared before publication: {final}")
+                    backup = self._backup_slot(entry.artifact)
+                    entry.backup_path = backup
+                    try:
+                        self._replace(final, backup)
+                    except BaseException:
+                        if final.exists():
+                            with contextlib.suppress(BaseException):
+                                self._remove(backup)
+                            entry.backup_path = None
+                        elif backup.exists():
+                            with contextlib.suppress(BaseException):
+                                self._replace(backup, final)
+                            if not backup.exists():
+                                entry.backup_path = None
+                        raise
+
+            for entry in entries:
+                entry.publishing = True
+                self._replace(entry.temp_path, entry.artifact.path)
+                entry.published = True
+                entry.publishing = False
+        except BaseException as exc:
+            rollback_errors = self._rollback(entries)
+            if rollback_errors:
+                detail = "; ".join(rollback_errors)
+                if not isinstance(exc, Exception):
+                    exc.add_note(f"artifact rollback also failed: {detail}")
+                    raise
+                raise MediaError(
+                    f"artifact publication failed ({exc}); rollback also "
+                    f"failed: {detail}") from exc
+            if isinstance(exc, PipelineError):
+                raise
+            if isinstance(exc, Exception):
+                raise MediaError(
+                    f"artifact publication failed: {exc}") from exc
+            raise
+
+        # Every destination has landed. This is the commit point: a later
+        # interruption during backup cleanup must not roll back a complete set.
+        self._committed = True
+        cleanup_interrupt: BaseException | None = None
+        for entry in entries:
+            if entry.sink is not None:
+                entry.sink._mark_published()
+            backup = entry.backup_path
+            if backup is not None and backup.exists():
+                try:
+                    self._remove(backup)
+                except BaseException as exc:
+                    _log.warning(
+                        "could not remove rollback backup %s: %s",
+                        backup, exc)
+                    if not isinstance(exc, Exception):
+                        with contextlib.suppress(BaseException):
+                            self._remove(backup)
+                        cleanup_interrupt = cleanup_interrupt or exc
+        if cleanup_interrupt is not None:
+            raise cleanup_interrupt
+
+    def discard(self) -> None:
+        if self._closed or self._committed:
+            return
+        entries = self._ordered_entries()
+        for entry in reversed(entries):
+            if entry.sink is not None:
+                entry.sink.discard()
+        errors = self._rollback(entries)
+        for error in errors:
+            _log.error("artifact cleanup failed: %s", error)
+        for parent in reversed(self._created_parents):
+            with contextlib.suppress(BaseException):
+                parent.rmdir()
+        self._closed = True
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if not self._committed:
+            self.discard()
+        self._reservation.release()
+        return False
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -479,6 +1019,7 @@ class _ComparisonTee:
         audio_track: Any = None,
         audio_codec: str = "alac",
         encode_chroma: str = "auto",
+        overwrite: bool = False,
     ) -> None:
         from collections import deque
 
@@ -495,24 +1036,28 @@ class _ComparisonTee:
             path, dataclasses.replace(output_spec, frame=comp_frame),
             source=source, quality=quality, label="comparison",
             audio_track=audio_track, audio_codec=audio_codec,
-            encode_chroma=encode_chroma)
-        self._retained: Any = deque()   # (seconds, uint8 (H,W,3) mx.array)
-        self._src_time_base = float(source.spec.timeline.time_base)
-        self._out_time_base = float(output_spec.timeline.time_base)
-        self._src_layout = source.spec.frame.layout
-        self._out_layout = output_spec.frame.layout
-        self._out_w, self._out_h = out_geometry.width, out_geometry.height
-        src_geometry = source.spec.frame.geometry
-        # Nearest-neighbor gather maps, source -> output geometry. For an
-        # integer scale s this is j // s, identical to mx.repeat.
-        import mlx.core as mx
+            encode_chroma=encode_chroma, overwrite=overwrite)
+        try:
+            self._retained: Any = deque()  # (seconds, uint8 (H,W,3) mx.array)
+            self._src_time_base = float(source.spec.timeline.time_base)
+            self._out_time_base = float(output_spec.timeline.time_base)
+            self._src_layout = source.spec.frame.layout
+            self._out_layout = output_spec.frame.layout
+            self._out_w, self._out_h = out_geometry.width, out_geometry.height
+            src_geometry = source.spec.frame.geometry
+            # Nearest-neighbor gather maps, source -> output geometry. For an
+            # integer scale s this is j // s, identical to mx.repeat.
+            import mlx.core as mx
 
-        self._ix = mx.array(
-            [(x * src_geometry.width) // self._out_w
-             for x in range(self._out_w)], dtype=mx.int32)
-        self._iy = mx.array(
-            [(y * src_geometry.height) // self._out_h
-             for y in range(self._out_h)], dtype=mx.int32)
+            self._ix = mx.array(
+                [(x * src_geometry.width) // self._out_w
+                 for x in range(self._out_w)], dtype=mx.int32)
+            self._iy = mx.array(
+                [(y * src_geometry.height) // self._out_h
+                 for y in range(self._out_h)], dtype=mx.int32)
+        except BaseException:
+            self.sink.discard()
+            raise
 
     def _to_uint8_rgb(self, payload: Any, layout: Layout) -> Any:
         import mlx.core as mx
@@ -617,6 +1162,7 @@ def run_file(
     cut_log: Path | str | None = None,
     skip_post_mp4: bool = False,
     noise_map_debug: bool = False,
+    overwrite: bool = False,
     reader: Any = None,
 ) -> FileRunResult:
     """Run a composed pipeline config file-to-file through the endpoints.
@@ -628,17 +1174,79 @@ def run_file(
     ``max_output_frames`` caps what the sink writes (the distinction
     matters for cadence-changing chains).
     """
+    t0 = time.perf_counter()
+    plan = _ArtifactPlan.build(
+        video=video,
+        output=output,
+        comparison=comparison,
+        cut_log=cut_log,
+        save_audio_sidecar=save_audio_sidecar,
+        save_pre_frames=save_pre_frames,
+        save_post_frames=save_post_frames,
+        skip_post_mp4=skip_post_mp4,
+        noise_map_debug=noise_map_debug,
+        overwrite=overwrite,
+    )
+    with _OutputTransaction(plan, settings) as transaction:
+        return _run_file_reserved(
+            config,
+            plan=plan,
+            transaction=transaction,
+            settings=settings,
+            t0=t0,
+            reporter=reporter,
+            layout=layout,
+            start=start,
+            end=end,
+            max_frames=max_frames,
+            max_output_frames=max_output_frames,
+            max_output_seconds=max_output_seconds,
+            audio=audio,
+            audio_codec=audio_codec,
+            quality=quality,
+            chunk_size=chunk_size,
+            source_color=source_color,
+            source_range=source_range,
+            encode_chroma=encode_chroma,
+            snap_start=snap_start,
+            gop_align=gop_align,
+            gop_min_window=gop_min_window,
+            gop_max_window=gop_max_window,
+            reader=reader,
+        )
+
+
+def _run_file_reserved(
+    config: dict,
+    *,
+    plan: _ArtifactPlan,
+    transaction: _OutputTransaction,
+    settings: Settings,
+    t0: float,
+    reporter: Any,
+    layout: Layout,
+    start: int,
+    end: int | None,
+    max_frames: int | None,
+    max_output_frames: int | None,
+    max_output_seconds: float | None,
+    audio: bool,
+    audio_codec: str,
+    quality: float,
+    chunk_size: int,
+    source_color: str,
+    source_range: str,
+    encode_chroma: str,
+    snap_start: bool,
+    gop_align: bool,
+    gop_min_window: int,
+    gop_max_window: int,
+    reader: Any,
+) -> FileRunResult:
+    """Execute while the complete output graph is reserved by ``transaction``."""
     from .session import open_pipeline
 
-    t0 = time.perf_counter()
-    video_path = Path(video).resolve()
-    output_path = Path(output).resolve()
-    if video_path == output_path or (
-            output_path.exists() and video_path.samefile(output_path)):
-        raise MediaError(
-            f"output {output_path} is the input file; the writer truncates "
-            f"its target before the first decoded frame, which would "
-            f"destroy the source")
+    video_path = plan.input_path
     # Keyframe-driven windowing (the harness's --snap-start / --gop-align).
     # snap-start MOVES the window start to the nearest keyframe; gop-align
     # KEEPS it, reads back to the enclosing keyframe as recurrence context
@@ -671,7 +1279,7 @@ def run_file(
                 raise MediaError(f"invalid GOP window bounds: {exc}") from exc
 
     source = FileSource(
-        video, layout=layout, start=start, end=end,
+        video_path, layout=layout, start=start, end=end,
         max_frames=max_frames, chunk_size=chunk_size,
         source_color=source_color, source_range=source_range,
         context_frames=context_frames, reader=reader)
@@ -705,23 +1313,33 @@ def run_file(
         # to the capped output duration (a cap past the natural end is a
         # no-op; trimmed() clamps).
         track = track.trimmed(0.0, max_output_frames / float(out_cadence))
-    if save_audio_sidecar and track is not None:
+    if plan.get("audio sidecar") is not None and track is not None:
         # A WAV sidecar of the (trimmed) carried track, beside the output.
-        track.save_wav(output_path.with_name(f"{output_path.stem}_audio.wav"))
+        track.save_wav(transaction.temp_file("audio sidecar"))
     # --skip-post-mp4 parity: process the chain (frame dumps, comparison,
     # sidecar still apply) without writing the post MP4.
-    sink = None if skip_post_mp4 else FileSink(
-        output, session.output_spec, source=source, quality=quality,
-        audio_track=track, audio_codec=audio_codec,
-        encode_chroma=encode_chroma)
+    sink = None
+    post_path = plan.get("post output")
+    if post_path is not None:
+        sink = FileSink(
+            transaction.prepare_sink("post output"),
+            session.output_spec,
+            source=source,
+            quality=quality,
+            audio_track=track,
+            audio_codec=audio_codec,
+            encode_chroma=encode_chroma,
+            overwrite=plan.overwrite,
+        )
+        transaction.register_sink("post output", sink)
 
     # --cut-log parity: detected cuts' source-frame indices, one per line,
     # truncated at run start like the harness. The cut_detect stage stamps
     # source_index on the HARD_CUT boundary and the scheduler carries it
     # downstream on the first post-cut unit.
-    cut_log_path = Path(cut_log) if cut_log else None
-    if cut_log_path is not None:
-        cut_log_path.parent.mkdir(parents=True, exist_ok=True)
+    cut_log_path = None
+    if plan.get("cut log") is not None:
+        cut_log_path = transaction.temp_file("cut log")
         cut_log_path.write_text("", encoding="utf-8")
 
     # Optional per-frame PNG dumps: pre = the SOURCE frames (before the chain),
@@ -729,11 +1347,12 @@ def run_file(
     # stages - the PRE tap wraps the source iterator so it dumps exactly the
     # frames the session pulls, and the POST tap dumps each emitted unit.
     from kinovsr.media import pixel_buffers as _pbmod
-    pre_dir = Path(save_pre_frames) if save_pre_frames else None
-    post_dir = Path(save_post_frames) if save_post_frames else None
+    pre_dir = (transaction.temp_directory("pre-frame directory")
+               if plan.get("pre-frame directory") is not None else None)
+    post_dir = (transaction.temp_directory("post-frame directory")
+                if plan.get("post-frame directory") is not None else None)
     source_units = source.units()
     if pre_dir is not None:
-        pre_dir.mkdir(parents=True, exist_ok=True)
         src_layout = source.spec.frame.layout
 
         def _pre_tapped(units: Any) -> Any:
@@ -741,8 +1360,6 @@ def run_file(
                 _save_frame_png(unit.payload, src_layout, pre_dir, i, _pbmod)
                 yield unit
         source_units = _pre_tapped(source_units)
-    if post_dir is not None:
-        post_dir.mkdir(parents=True, exist_ok=True)
     post_layout = session.output_spec.frame.layout
     post_index = 0
 
@@ -752,15 +1369,18 @@ def run_file(
     # both files carry the same profile, as the harness's shared `profile`
     # variable did.
     tee = None
-    if comparison is not None:
+    comparison_path = plan.get("comparison output")
+    if comparison_path is not None:
         comp_chroma = encode_chroma
         if (comp_chroma == "auto"
                 and session.output_spec.frame.layout is Layout.CV_NV12):
             comp_chroma = "420"
         tee = _ComparisonTee(
-            comparison, session.output_spec, source, quality=quality,
+            transaction.prepare_sink("comparison output"),
+            session.output_spec, source, quality=quality,
             audio_track=track, audio_codec=audio_codec,
-            encode_chroma=comp_chroma)
+            encode_chroma=comp_chroma, overwrite=plan.overwrite)
+        transaction.register_sink("comparison output", tee.sink)
         source_units = tee.tap(source_units)
 
     # A duration-preserving chain must end exactly at the source-window
@@ -775,75 +1395,52 @@ def run_file(
         / session.output_spec.timeline.time_base)
     frames_out = 0
     pending: FrameUnit | None = None
-    try:
-        # retain_outputs=False: the sink consumes each unit into the encoder
-        # synchronously, so outputs need not be copied for retention. A
-        # one-unit holdback lets the final frame be clamped before it is
-        # written (the clamp needs to know it is the last).
-        with session, session.process(
-                source_units, retain_outputs=False) as run:
-            for unit in run:
-                if cut_log_path is not None and unit.boundaries:
-                    with cut_log_path.open("a", encoding="utf-8") as log:
-                        for boundary in unit.boundaries:
-                            if boundary.kind is BoundaryKind.HARD_CUT:
-                                log.write(f"{boundary.source_index}\n")
-                if unit.pts < 0:
-                    # gop-align context frames: fed to the stages as
-                    # recurrence warmup, dropped here after every stage
-                    # consumed them (the harness's _gop_head_skip).
-                    continue
-                if post_dir is not None:
-                    _save_frame_png(unit.payload, post_layout, post_dir,
-                                    post_index, _pbmod)
-                    post_index += 1
-                if pending is not None:
-                    if sink is not None:
-                        sink.append(pending)
-                    if tee is not None:
-                        tee.emit(pending)
-                    frames_out += 1
-                pending = unit
-                if (max_output_frames is not None
-                        and frames_out + 1 == max_output_frames):
-                    # The staged unit is the capped final frame; stop pulling
-                    # (cadence-changing stages mean output count != input).
-                    break
+    # retain_outputs=False: the sink consumes each unit into the encoder
+    # synchronously, so outputs need not be copied for retention. A one-unit
+    # holdback lets the final frame be clamped before it is written.
+    with session, session.process(
+            source_units, retain_outputs=False) as run:
+        for unit in run:
+            if cut_log_path is not None and unit.boundaries:
+                with cut_log_path.open("a", encoding="utf-8") as log:
+                    for boundary in unit.boundaries:
+                        if boundary.kind is BoundaryKind.HARD_CUT:
+                            log.write(f"{boundary.source_index}\n")
+            if unit.pts < 0:
+                # gop-align context frames: recurrence warmup, never output.
+                continue
+            if post_dir is not None:
+                _save_frame_png(unit.payload, post_layout, post_dir,
+                                post_index, _pbmod)
+                post_index += 1
             if pending is not None:
-                if preserve_duration:
-                    # End exactly at the source-window duration: interpolation's
-                    # regenerated grid can round the final unit past it. Clamp
-                    # to min(source end, natural end) - an interior or capped
-                    # frame that already lands earlier is untouched, and only a
-                    # true tail overshoot is trimmed. This also covers a cap set
-                    # to the natural output count, where the final frame IS the
-                    # overshoot (the earlier hit_cap skip missed that).
-                    clamped_end = min(source_end_ticks,
-                                      pending.pts + pending.duration)
-                    pending = pending.retimed(
-                        pending.pts, max(1, clamped_end - pending.pts))
                 if sink is not None:
                     sink.append(pending)
                 if tee is not None:
                     tee.emit(pending)
                 frames_out += 1
-            # Stage state is still live here (drained, not yet closed):
-            # collect the families' end-of-run reports - the harness's
-            # inline diagnostics, family-owned on the typed path.
-            diagnostics = session.stage_diagnostics()
-            # --noise-map-debug parity: dump the conditioning maps beside
-            # the post output ({stem}_noisemap.png / {stem}_blockmap.png);
-            # like the harness, only when a post file is being written.
-            debug_images = (session.stage_debug_images()
-                            if noise_map_debug and sink is not None else {})
-    except BaseException:
-        # The partial output is not a deliverable; drop the temp files and
-        # leave any pre-existing files untouched.
-        if sink is not None:
-            sink.discard()
-        if tee is not None:
-            tee.sink.discard()
-        raise
+            pending = unit
+            if (max_output_frames is not None
+                    and frames_out + 1 == max_output_frames):
+                break
+        if pending is not None:
+            if preserve_duration:
+                clamped_end = min(
+                    source_end_ticks, pending.pts + pending.duration)
+                pending = pending.retimed(
+                    pending.pts, max(1, clamped_end - pending.pts))
+            if sink is not None:
+                sink.append(pending)
+            if tee is not None:
+                tee.emit(pending)
+            frames_out += 1
+        # Stage state is still live here (drained, not yet closed).
+        diagnostics = session.stage_diagnostics()
+        debug_images = (
+            session.stage_debug_images()
+            if plan.get("noisemap debug image") is not None and sink is not None
+            else {})
+
     for line in diagnostics:
         _log.info("%s", line)
     for suffix, image in debug_images.items():
@@ -851,14 +1448,20 @@ def run_file(
 
         from kinovsr.media.images import save_image
 
-        png = output_path.with_name(f"{output_path.stem}_{suffix}.png")
+        label = f"{suffix} debug image"
+        try:
+            png = transaction.temp_file(label)
+            final_png = plan.path(label)
+        except KeyError as exc:
+            raise MediaError(
+                f"stage returned unplanned debug artifact {suffix!r}") from exc
         u8 = (mx.clip(image, 0, 1) * 255).astype(mx.uint8)
         save_image(mx.stack([u8, u8, u8], axis=-1), png)
-        _log.info("[noise-map-debug] %s written: %s", suffix, png)
-    path = sink.finish() if sink is not None else None
-    comparison_path = tee.sink.finish() if tee is not None else None
+        _log.info("[noise-map-debug] %s written: %s", suffix, final_png)
+
+    transaction.commit()
     return FileRunResult(
-        path=path, frames_in=source.frame_count, frames_out=frames_out,
+        path=post_path, frames_in=source.frame_count, frames_out=frames_out,
         output_spec=session.output_spec,
         elapsed_s=time.perf_counter() - t0,
         comparison_path=comparison_path)

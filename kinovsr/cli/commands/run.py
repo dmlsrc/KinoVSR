@@ -161,6 +161,7 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
     """
     from datetime import datetime
     from pathlib import Path
+    from uuid import uuid4
 
     options = invocation.options
     selected = () if assemble_flags else _pipeline_owned_flags(options)
@@ -222,9 +223,9 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
             return 2
 
     stem = (f"{sanitize_output_prefix(options.output_prefix)}_"
-            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_"
+            f"{uuid4().hex[:8]}")
     out_root = Path(options.output_dir)
-    out_root.mkdir(parents=True, exist_ok=True)
     output = out_root / f"{stem}_post.mp4"
     # Per-frame PNG dumps land in sibling {stem}_pre / {stem}_post dirs,
     # matching the harness naming (the _post dir sits beside _post.mp4).
@@ -277,6 +278,7 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
             cut_log=options.cut_log,
             skip_post_mp4=options.skip_post_mp4,
             noise_map_debug=options.noise_map_debug,
+            overwrite=options.overwrite,
             layout=_source_layout(
                 config,
                 source_color=options.source_color,

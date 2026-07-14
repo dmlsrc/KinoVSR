@@ -119,6 +119,7 @@ def process_video_file(
     cut_log: Path | str | None = None,
     skip_post_mp4: bool = False,
     noise_map_debug: bool = False,
+    overwrite: bool = False,
     layout: Any = None,
     reader: Any = None,
 ) -> VideoProcessResult:
@@ -132,7 +133,9 @@ def process_video_file(
     (the output-side cap for cadence-changing chains; the seconds form
     resolves against the OUTPUT cadence, and carried audio trims to the
     cap); ``audio`` carries the source audio track (trimmed to the
-    window).
+    window). Existing output artifacts are rejected unless
+    ``overwrite=True``; when enabled, the complete artifact set is replaced
+    transactionally.
     """
     if settings is None:
         settings = Settings.from_env()
@@ -171,6 +174,7 @@ def process_video_file(
         cut_log=cut_log,
         skip_post_mp4=skip_post_mp4,
         noise_map_debug=noise_map_debug,
+        overwrite=overwrite,
         reader=reader,
     )
     return VideoProcessResult(

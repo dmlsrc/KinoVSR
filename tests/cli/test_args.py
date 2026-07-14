@@ -55,6 +55,11 @@ class TestCanonicalVocabulary:
         args = parser.parse_args(BASE)
         assert args.upscale == "balanced"
         assert args.fastdvdnet_profile == "clipped"
+        assert args.overwrite is False
+
+    def test_overwrite_is_explicit(self, parser):
+        args = parser.parse_args([*BASE, "--overwrite"])
+        assert args.overwrite is True
 
     def test_help_shows_canonical_names(self, parser):
         text = parser.format_help()

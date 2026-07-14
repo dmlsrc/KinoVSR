@@ -95,6 +95,16 @@ audio only when duration was preserved (the synchronization-correct
 policy). The CLI's `[pipeline]`-config route calls exactly this
 function.
 
+File runs plan and reserve the complete artifact set before opening a
+writer: post and comparison videos, audio sidecar, cut log, debug images,
+and frame-dump directories. Every artifact is written to a temporary
+sibling, every writer finishes while private, and the set is published
+together with rollback if any rename fails. Existing destinations are an
+error by default; pass `overwrite=True` (or CLI `--overwrite`) to replace
+the complete set transactionally. Source aliases, aliases between outputs,
+hard links, symlinks, and overlapping file/directory targets are rejected
+before output mutation.
+
 ## Audio
 
 The session is a **video** contract. A `FrameUnit` carries one video

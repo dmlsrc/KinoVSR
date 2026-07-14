@@ -10,6 +10,7 @@ doesn't stall the video append loop.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -99,6 +100,10 @@ class AVWriter:
         writer.finish()             # waits for audio drain + finishWriting
     """
 
+    READY_TIMEOUT_S = 30.0
+    AUDIO_TIMEOUT_S = 120.0
+    FINISH_TIMEOUT_S = 120.0
+
     def __init__(
         self,
         output_path: Path,
@@ -119,6 +124,11 @@ class AVWriter:
         cv_color: tuple | None = None,
         full_range: bool = False,
     ):
+        self._state_lock = threading.RLock()
+        self._state = "constructing"
+        self._failure: BaseException | None = None
+        self._finish_done = threading.Event()
+        self._native_cancelled = False
         # Every AVFoundation-touching phase of a writer's life (construction,
         # append, finish) leaves autoreleased objects behind that hold the
         # hardware-encoder session. A long-lived host process without a
@@ -126,15 +136,24 @@ class AVWriter:
         # never releases them, and after ~32 writers the encoder falls back
         # to a software capability set without the 4:2:2 profile - writer
         # creation then fails. Each phase drains its own pool.
-        with autorelease_pool():
-            self._construct(
-                output_path, width, height, fps,
-                source_pixel_format=source_pixel_format, profile=profile,
-                quality=quality, label=label, audio_track=audio_track,
-                audio_codec=audio_codec, transform=transform,
-                source_attrs=source_attrs, color_props=color_props,
-                pixel_aspect=pixel_aspect, cv_color=cv_color,
-                full_range=full_range)
+        try:
+            with autorelease_pool():
+                self._construct(
+                    output_path, width, height, fps,
+                    source_pixel_format=source_pixel_format, profile=profile,
+                    quality=quality, label=label, audio_track=audio_track,
+                    audio_codec=audio_codec, transform=transform,
+                    source_attrs=source_attrs, color_props=color_props,
+                    pixel_aspect=pixel_aspect, cv_color=cv_color,
+                    full_range=full_range)
+            with self._state_lock:
+                if self._failure is not None:
+                    raise self._failure
+                self._state = "writing"
+        except BaseException as exc:
+            self._record_failure(exc)
+            self.cancel()
+            raise
 
     def _construct(
         self,
@@ -275,29 +294,9 @@ class AVWriter:
             n_samples = audio_track.n_samples
             chunk_frames = max(4096, audio_track.sample_rate // 4)  # ~250 ms
 
-            def pump():
-                try:
-                    while self.audio_input.isReadyForMoreMediaData():
-                        pos = self._audio_progress[0]
-                        if pos >= n_samples:
-                            self.audio_input.markAsFinished()
-                            self._audio_done.set()
-                            return
-                        end = min(pos + chunk_frames, n_samples)
-                        sb = audio_track.make_sample_buffer(pos, end)
-                        if sb is None or not self.audio_input.appendSampleBuffer_(sb):
-                            self._audio_done.set()
-                            raise RuntimeError(
-                                f"[{label}] audio appendSampleBuffer failed at "
-                                f"{pos}: {self.writer.error()}"
-                            )
-                        self._audio_progress[0] = end
-                except Exception:
-                    self._audio_done.set()
-                    raise
-
             self.audio_input.requestMediaDataWhenReadyOnQueue_usingBlock_(
-                self._audio_queue, pump,
+                self._audio_queue,
+                lambda: self._pump_audio(n_samples, chunk_frames),
             )
         else:
             self._audio_done.set()
@@ -307,26 +306,83 @@ class AVWriter:
     # Internal: wait-with-status-check
     # ------------------------------------------------------------------------
 
+    def _record_failure(self, exc: BaseException) -> None:
+        """Retain the first causal failure for the synchronous caller."""
+        with self._state_lock:
+            if self._failure is None:
+                self._failure = exc
+            if self._state not in ("finished", "cancelled"):
+                self._state = "failed"
+
+    def _raise_if_failed(self) -> None:
+        with self._state_lock:
+            failure = self._failure
+        if failure is not None:
+            raise failure
+
+    def _accepting_callbacks(self) -> bool:
+        with self._state_lock:
+            return self._state in ("constructing", "writing", "finishing")
+
+    def _pump_audio(self, n_samples: int, chunk_frames: int) -> None:
+        """Drain ready audio without letting callback failures disappear.
+
+        GCD cannot propagate a Python exception to ``finish``. Store the first
+        one, signal the waiter, and let the synchronous writer boundary raise
+        it with its original position and native status.
+        """
+        try:
+            while (self._accepting_callbacks()
+                   and self.audio_input.isReadyForMoreMediaData()):
+                pos = self._audio_progress[0]
+                if pos >= n_samples:
+                    self.audio_input.markAsFinished()
+                    return
+                end = min(pos + chunk_frames, n_samples)
+                sb = self.audio_track.make_sample_buffer(pos, end)
+                if sb is None or not self.audio_input.appendSampleBuffer_(sb):
+                    raise RuntimeError(
+                        f"[{self.label}] audio appendSampleBuffer failed at "
+                        f"{pos}: status={self.writer.status()} "
+                        f"error={self.writer.error()}")
+                self._audio_progress[0] = end
+        except BaseException as exc:  # callback failures cross via shared state
+            self._record_failure(exc)
+        finally:
+            # A callback can be invoked again while more data becomes ready.
+            # Signal only on completion, failure, or cancellation.
+            if (self._audio_progress[0] >= n_samples
+                    or not self._accepting_callbacks()
+                    or self._failure is not None):
+                self._audio_done.set()
+
+    def _check_native_status(self, what: str) -> None:
+        self._raise_if_failed()
+        status = self.writer.status()
+        if status in (3, 4):  # AVAssetWriterStatusFailed/Cancelled
+            exc = RuntimeError(
+                f"[{self.label}] writer entered status={status} during "
+                f"{what}: {self.writer.error()}")
+            self._record_failure(exc)
+            raise exc
+
     def _wait_for_ready(self, input_obj: Any, what: str) -> None:
         """Block until input_obj.isReadyForMoreMediaData(). Bail with a clean
         error if the writer enters Failed/Cancelled, or after 30 s of no
         progress (so a stuck writer surfaces as a visible failure, not a hang).
         """
-        waited = 0.0
+        deadline = time.monotonic() + self.READY_TIMEOUT_S
         while not input_obj.isReadyForMoreMediaData():
-            status = self.writer.status()
-            if status in (3, 4):  # Failed, Cancelled
-                raise RuntimeError(
-                    f"[{self.label}] writer entered status={status} while waiting on "
-                    f"{what}: {self.writer.error()}"
-                )
+            self._check_native_status(f"waiting on {what}")
             time.sleep(0.001)
-            waited += 0.001
-            if waited > 30.0:
-                raise RuntimeError(
+            if time.monotonic() >= deadline:
+                exc = RuntimeError(
                     f"[{self.label}] {what} input never became ready "
-                    f"(waited 30s, status={status})"
-                )
+                    f"(waited {self.READY_TIMEOUT_S:g}s, "
+                    f"status={self.writer.status()})")
+                self._record_failure(exc)
+                raise exc
+        self._check_native_status(f"waiting on {what}")
 
     # ------------------------------------------------------------------------
     # Public API
@@ -342,48 +398,145 @@ class AVWriter:
         instead - the index grid quantizes NTSC-family rates to a fixed
         per-frame duration, which drifts ~3.6 s/hour at 59.94 fps
         against the exact rational grid."""
-        with autorelease_pool():
-            self._wait_for_ready(self.video_input, "video")
-            if self._yuv_feed:
-                rgb = _pb.read_rgbahalf_rgb(pb)
-                ybuf = _pb.pool_create_buffer(self.adaptor.pixelBufferPool())
-                if ybuf is None:
-                    raise RuntimeError(f"[{self.label}] YUV pool buffer allocation failed")
-                _yuv.rgb_to_yuv422_10(rgb, ybuf, self._yuv_matrix, self._yuv_full)
-                pb = ybuf
-            if pts_ticks is None:
-                pts = _pb.frame_pts(self.frame_count, self.fps)
-            else:
-                pts = CoreMedia.CMTimeMake(int(pts_ticks), _pb.VIDEO_TIME_SCALE)
-                if duration_ticks is not None:
-                    self._explicit_end_ticks = int(pts_ticks) + int(duration_ticks)
-            if not self.adaptor.appendPixelBuffer_withPresentationTime_(pb, pts):
+        with self._state_lock:
+            if self._state != "writing":
+                self._raise_if_failed()
                 raise RuntimeError(
-                    f"[{self.label}] appendPixelBuffer failed at frame {self.frame_count}: "
-                    f"status={self.writer.status()} error={self.writer.error()}"
-                )
-            self.frame_count += 1
+                    f"[{self.label}] cannot append while writer is "
+                    f"{self._state}")
+        try:
+            with autorelease_pool():
+                self._wait_for_ready(self.video_input, "video")
+                if self._yuv_feed:
+                    rgb = _pb.read_rgbahalf_rgb(pb)
+                    ybuf = _pb.pool_create_buffer(self.adaptor.pixelBufferPool())
+                    if ybuf is None:
+                        raise RuntimeError(
+                            f"[{self.label}] YUV pool buffer allocation failed")
+                    _yuv.rgb_to_yuv422_10(
+                        rgb, ybuf, self._yuv_matrix, self._yuv_full)
+                    pb = ybuf
+                if pts_ticks is None:
+                    pts = _pb.frame_pts(self.frame_count, self.fps)
+                else:
+                    pts = CoreMedia.CMTimeMake(
+                        int(pts_ticks), _pb.VIDEO_TIME_SCALE)
+                    if duration_ticks is not None:
+                        self._explicit_end_ticks = (
+                            int(pts_ticks) + int(duration_ticks))
+                if not self.adaptor.appendPixelBuffer_withPresentationTime_(
+                        pb, pts):
+                    raise RuntimeError(
+                        f"[{self.label}] appendPixelBuffer failed at frame "
+                        f"{self.frame_count}: status={self.writer.status()} "
+                        f"error={self.writer.error()}")
+                self.frame_count += 1
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
 
     def finish(self) -> None:
-        """Mark inputs finished, drain audio, end session, finishWriting."""
-        with autorelease_pool():
-            self.video_input.markAsFinished()
-            if self.audio_input is not None and not self._audio_done.wait(timeout=120.0):
-                raise RuntimeError(
-                    f"[{self.label}] audio pump didn't finish (progress="
-                    f"{self._audio_progress[0]}/{self.audio_track.n_samples})"
-                )
-            if self._explicit_end_ticks is not None:
-                end = CoreMedia.CMTimeMake(self._explicit_end_ticks,
-                                           _pb.VIDEO_TIME_SCALE)
+        """Finalize once, with bounded audio and native completion waits."""
+        failure_to_raise: BaseException | None = None
+        with self._state_lock:
+            if self._state == "finished":
+                return
+            if self._failure is not None:
+                failure_to_raise = self._failure
+                wait_for_other = False
+            elif self._state == "finishing":
+                wait_for_other = True
             else:
-                end = _pb.frame_pts(self.frame_count, self.fps)
-            self.writer.endSessionAtSourceTime_(end)
-            done = threading.Event()
-            self.writer.finishWritingWithCompletionHandler_(lambda: done.set())
-            done.wait()
-            if self.writer.status() != 2:  # AVAssetWriterStatusCompleted = 2
-                raise RuntimeError(
-                    f"[{self.label}] AVAssetWriter finished with status "
-                    f"{self.writer.status()}: {self.writer.error()}"
-                )
+                if self._state == "cancelled":
+                    raise RuntimeError(f"[{self.label}] writer was cancelled")
+                self._state = "finishing"
+                wait_for_other = False
+
+        if failure_to_raise is not None:
+            self.cancel()
+            raise failure_to_raise
+
+        if wait_for_other:
+            if not self._finish_done.wait(timeout=self.FINISH_TIMEOUT_S):
+                exc = RuntimeError(
+                    f"[{self.label}] concurrent finish did not complete within "
+                    f"{self.FINISH_TIMEOUT_S:g}s")
+                self._record_failure(exc)
+                self.cancel()
+                raise exc
+            with self._state_lock:
+                if self._state == "finished":
+                    return
+            self._raise_if_failed()
+            raise RuntimeError(f"[{self.label}] writer was cancelled")
+
+        try:
+            with autorelease_pool():
+                self.video_input.markAsFinished()
+                if (self.audio_input is not None
+                        and not self._audio_done.wait(
+                            timeout=self.AUDIO_TIMEOUT_S)):
+                    raise RuntimeError(
+                        f"[{self.label}] audio pump didn't finish within "
+                        f"{self.AUDIO_TIMEOUT_S:g}s (progress="
+                        f"{self._audio_progress[0]}/"
+                        f"{self.audio_track.n_samples})")
+                self._check_native_status("audio drain")
+                if self._explicit_end_ticks is not None:
+                    end = CoreMedia.CMTimeMake(
+                        self._explicit_end_ticks, _pb.VIDEO_TIME_SCALE)
+                else:
+                    end = _pb.frame_pts(self.frame_count, self.fps)
+                self.writer.endSessionAtSourceTime_(end)
+                native_done = threading.Event()
+                with self._state_lock:
+                    self._native_finish_done = native_done
+                self.writer.finishWritingWithCompletionHandler_(
+                    lambda: native_done.set())
+                if not native_done.wait(timeout=self.FINISH_TIMEOUT_S):
+                    raise RuntimeError(
+                        f"[{self.label}] AVAssetWriter finish callback did not "
+                        f"arrive within {self.FINISH_TIMEOUT_S:g}s "
+                        f"(status={self.writer.status()})")
+                self._check_native_status("finish")
+                if self.writer.status() != 2:
+                    raise RuntimeError(
+                        f"[{self.label}] AVAssetWriter finished with status "
+                        f"{self.writer.status()}: {self.writer.error()}")
+            with self._state_lock:
+                if self._state == "cancelled":
+                    raise RuntimeError(f"[{self.label}] writer was cancelled")
+                self._state = "finished"
+        except BaseException as exc:
+            self._record_failure(exc)
+            self.cancel()
+            raise
+        finally:
+            with self._state_lock:
+                self._native_finish_done = None
+            self._finish_done.set()
+
+    def cancel(self) -> None:
+        """Stop callbacks and cancel native writing; safe to call repeatedly."""
+        with self._state_lock:
+            if self._state in ("finished", "cancelled"):
+                return
+            self._state = "cancelled"
+            do_native_cancel = not self._native_cancelled
+            self._native_cancelled = True
+
+        audio_input = getattr(self, "audio_input", None)
+        if audio_input is not None:
+            with contextlib.suppress(BaseException):
+                audio_input.stopRequestingMediaData()
+        audio_done = getattr(self, "_audio_done", None)
+        if audio_done is not None:
+            audio_done.set()
+        writer = getattr(self, "writer", None)
+        if do_native_cancel and writer is not None:
+            with contextlib.suppress(BaseException):
+                writer.cancelWriting()
+        native_finish_done = getattr(self, "_native_finish_done", None)
+        if native_finish_done is not None:
+            native_finish_done.set()
+        self._finish_done.set()
