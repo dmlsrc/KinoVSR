@@ -91,36 +91,13 @@ def _color_label(color_props: dict | None) -> str:
 
 
 class _AsyncAttempt:
-    """One immutable-result background cleanup generation."""
+    """One background cleanup attempt with an immutable published result."""
 
-    __slots__ = (
-        "claim_lock",
-        "claimed",
-        "done",
-        "failure",
-        "fallback_scheduled",
-        "ambiguous_launch",
-        "launch_failed",
-        "launch_rounds",
-        "runner_lock",
-        "thread",
-        "thread_start_returned",
-        "threads",
-    )
+    __slots__ = ("done", "failure")
 
     def __init__(self) -> None:
-        self.claim_lock = threading.Lock()
-        self.claimed = False
         self.done = threading.Event()
         self.failure: BaseException | None = None
-        self.fallback_scheduled = False
-        self.ambiguous_launch = False
-        self.launch_failed = False
-        self.launch_rounds: dict[tuple[int, int], int] = {}
-        self.runner_lock = threading.Lock()
-        self.thread: threading.Thread | None = None
-        self.thread_start_returned = False
-        self.threads: list[threading.Thread] = []
 
 
 def _merge_attempt_failure(
@@ -134,217 +111,19 @@ def _merge_attempt_failure(
         generation.failure.add_note(f"additional {what}: {failure!r}")
 
 
-def _publish_attempt(
-    generation: _AsyncAttempt,
-    wrapper_failure: BaseException | None,
-) -> None:
-    """Freeze a cleanup result after all native pool teardown has run."""
-    if wrapper_failure is not None:
-        _merge_attempt_failure(
-            generation,
-            wrapper_failure,
-            "worker-wrapper failure",
-        )
-    try:
-        generation.done.set()
-    except BaseException as publication_failure:
-        _merge_attempt_failure(
-            generation,
-            publication_failure,
-            "completion-publication failure",
-        )
-        # The result remains immutable. A second best-effort signal handles
-        # one-shot interruption; a waiter can recover after the owner exits if
-        # publication itself remains unavailable.
-        try:
-            generation.done.set()
-        except BaseException as retry_failure:
-            generation.failure.add_note(
-                f"completion publication retry failed: {retry_failure!r}")
-
-
-def _run_claimed_cleanup(
-    generation: _AsyncAttempt,
-    operation: Any,
-    args: tuple[Any, ...],
-    claim_failure: BaseException | None,
-) -> None:
-    """Run an owned cleanup and publish only after its native pool drains."""
-    wrapper_failure = claim_failure
-    try:
-        try:
-            pool = autorelease_pool()
-            pool.__enter__()
-        except BaseException as entry_failure:
-            # Infrastructure failure happened before the operation. Keep it
-            # observable, but make one fresh-pool attempt so a failed
-            # constructor does not abandon resources with no owner.
-            if wrapper_failure is None:
-                wrapper_failure = entry_failure
-            else:
-                wrapper_failure.add_note(
-                    f"autorelease-pool entry failed: {entry_failure!r}")
-            try:
-                retry_pool = autorelease_pool()
-                retry_pool.__enter__()
-            except BaseException as retry_entry_failure:
-                wrapper_failure.add_note(
-                    f"second autorelease-pool entry failed: "
-                    f"{retry_entry_failure!r}")
-                # No asynchronous mechanism can manufacture a functioning
-                # Objective-C pool. Run cleanup once without one as the
-                # last-resort ownership path, while still publishing the pool
-                # failure to the synchronous observer.
-                try:
-                    operation(*args)
-                except BaseException as unpooled_failure:
-                    wrapper_failure.add_note(
-                        f"unpooled cleanup fallback failed: "
-                        f"{unpooled_failure!r}")
-            else:
-                try:
-                    operation(*args)
-                except BaseException as retry_failure:
-                    wrapper_failure.add_note(
-                        f"cleanup after pool-entry failure failed: "
-                        f"{retry_failure!r}")
-                finally:
-                    try:
-                        retry_pool.__exit__(None, None, None)
-                    except BaseException as retry_exit_failure:
-                        wrapper_failure.add_note(
-                            f"retry autorelease-pool exit failed: "
-                            f"{retry_exit_failure!r}")
-        else:
-            try:
-                operation(*args)
-            except BaseException as operation_failure:
-                if wrapper_failure is None:
-                    wrapper_failure = operation_failure
-                else:
-                    wrapper_failure.add_note(
-                        f"cleanup operation failed: {operation_failure!r}")
-            finally:
-                try:
-                    pool.__exit__(None, None, None)
-                except BaseException as exit_failure:
-                    if wrapper_failure is None:
-                        wrapper_failure = exit_failure
-                    else:
-                        wrapper_failure.add_note(
-                            f"autorelease-pool exit failed: {exit_failure!r}")
-    except BaseException as boundary_failure:
-        if wrapper_failure is None:
-            wrapper_failure = boundary_failure
-        elif wrapper_failure is not boundary_failure:
-            wrapper_failure.add_note(
-                f"additional worker-boundary failure: {boundary_failure!r}")
-    finally:
-        _publish_attempt(generation, wrapper_failure)
-
-
-def _run_with_autorelease_pool(
+def _run_cleanup_attempt(
     generation: _AsyncAttempt,
     operation: Any,
     *args: Any,
 ) -> None:
-    """Claim one generation and run cleanup from the claim guard itself."""
-    # If Thread.start is interrupted in its launch-before-metadata window, a
-    # libdispatch fallback races the possible Python thread through this lock.
-    # Exactly one candidate claims the generation and touches native state.
-    with generation.runner_lock:
-        owns_generation = False
-        claim_failure: BaseException | None = None
-        try:
-            try:
-                with generation.claim_lock:
-                    if generation.done.is_set() or generation.claimed:
-                        return
-                    owns_generation = True
-                    generation.claimed = True
-            except BaseException as failure:
-                if generation.done.is_set():
-                    return
-                if owns_generation:
-                    generation.claimed = True
-                elif not generation.claimed:
-                    owns_generation = True
-                    generation.claimed = True
-                if not owns_generation:
-                    raise
-                claim_failure = failure
-        finally:
-            # Keep owned execution in the claim-stage publication guard so
-            # exceptions raised by lock, pool, operation, and publication
-            # calls cannot bypass cleanup. CPython cannot make arbitrary
-            # externally injected exceptions between bytecodes transactional;
-            # daemon workers are therefore not an async-exception boundary.
-            if owns_generation:
-                _run_claimed_cleanup(
-                    generation,
-                    operation,
-                    args,
-                    claim_failure,
-                )
-
-
-def _recover_dead_attempt(generation: _AsyncAttempt, what: str) -> bool:
-    """Freeze an ownerless generation so waiters can retry instead of hang."""
-    if generation.done.is_set():
-        return True
-    if not generation.runner_lock.acquire(blocking=False):
-        return False
+    """Run one owned cleanup inside its own autorelease pool, then publish."""
     try:
-        with generation.claim_lock:
-            if generation.done.is_set():
-                return True
-            if not generation.claimed:
-                owner_alive = False
-                for owner in generation.threads:
-                    try:
-                        if owner.is_alive():
-                            owner_alive = True
-                            break
-                    except RuntimeError:
-                        continue
-                if owner_alive:
-                    return False
-                # A successful Thread.start with a now-dead owner cannot have
-                # a future candidate. After an ambiguous start exception, a
-                # confirmed libdispatch candidate may merely be queued; never
-                # steal its claim based on elapsed wall time.
-                if generation.ambiguous_launch or generation.launch_failed:
-                    return False
-                if (not generation.thread_start_returned
-                        and generation.fallback_scheduled):
-                    return False
-                generation.claimed = True
-            if generation.failure is None:
-                generation.failure = RuntimeError(
-                    f"{what} exited without publishing completion")
-            generation.done.set()
-            return True
+        with autorelease_pool():
+            operation(*args)
+    except BaseException as failure:  # noqa: BLE001 - workers cannot raise
+        _merge_attempt_failure(generation, failure, "cleanup worker failure")
     finally:
-        generation.runner_lock.release()
-
-
-def _wait_for_attempt(
-    generation: _AsyncAttempt,
-    timeout: float | None,
-    what: str,
-) -> bool:
-    deadline = None if timeout is None else time.monotonic() + timeout
-    while True:
-        if generation.done.is_set() or _recover_dead_attempt(generation, what):
-            return True
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            wait = min(AVWriter.STATUS_POLL_S, remaining)
-        else:
-            wait = AVWriter.STATUS_POLL_S
-        generation.done.wait(timeout=wait)
+        generation.done.set()
 
 
 def _start_cleanup_attempt(
@@ -354,150 +133,66 @@ def _start_cleanup_attempt(
     operation: Any,
     args: tuple[Any, ...],
 ) -> None:
-    """Start via Python, racing an ambiguous launch failure through GCD."""
-    generation.launch_failed = False
-    executor_signature = (
-        id(threading.Thread),
-        id(libdispatch.dispatch_async),
-    )
-    generation.launch_rounds[executor_signature] = (
-        generation.launch_rounds.get(executor_signature, 0) + 1
-    )
-    # A failed or metadata-hidden Thread object does not own the actual hidden
-    # target and need not be retained forever. Keep only records whose Python
-    # owner is observably live; generation ambiguity protects invisible owners.
-    live_owners = []
-    for existing_owner in generation.threads:
-        try:
-            if existing_owner.is_alive():
-                live_owners.append(existing_owner)
-        except RuntimeError:
-            continue
-    generation.threads = live_owners
+    """Start the attempt's daemon owner, with one libdispatch fallback.
 
-    target_args = (generation, operation, *args)
+    ``Thread.start`` raises from its pre-launch allocation path, so on
+    failure there is no live owner and the GCD fallback can safely take
+    over.  If both executors refuse, the failure is published on the
+    attempt so waiters cannot hang, and raised to the caller; the next
+    ``cancel()`` creates a fresh attempt and retries.
+    """
+    worker_args = (generation, operation, *args)
     owner = threading.Thread(
-        target=_run_with_autorelease_pool,
-        args=target_args,
+        target=_run_cleanup_attempt,
+        args=worker_args,
         name=name,
         daemon=True,
     )
-    generation.thread = owner
-    generation.threads.append(owner)
     try:
         owner.start()
-        generation.thread_start_returned = True
-        generation.ambiguous_launch = False
-    except BaseException as start_failure:
-        round_ambiguous = not isinstance(start_failure, Exception)
-        # Thread.start can be interrupted after the OS launch but before
-        # ident/is_alive metadata is visible. Always enqueue a second candidate;
-        # runner_lock + claimed guarantee that at most one performs cleanup.
+    except Exception as start_failure:
         try:
             queue = libdispatch.dispatch_get_global_queue(0, 0)
             libdispatch.dispatch_async(
                 queue,
-                lambda: _run_with_autorelease_pool(*target_args),
+                lambda: _run_cleanup_attempt(*worker_args),
             )
-            generation.fallback_scheduled = True
-            generation.ambiguous_launch = round_ambiguous
         except BaseException as dispatch_failure:
-            round_ambiguous = (
-                round_ambiguous
-                or not isinstance(dispatch_failure, Exception)
-            )
             start_failure.add_note(
                 f"libdispatch fallback failed: {dispatch_failure!r}")
-            # One more Python candidate handles a genuine pre-launch failure.
-            # If the first start was actually hidden in its metadata window,
-            # the generation claim still guarantees exactly one native owner.
-            retry_owner = threading.Thread(
-                target=_run_with_autorelease_pool,
-                args=target_args,
-                name=f"{name}-recovery",
-                daemon=True,
-            )
-            generation.threads.append(retry_owner)
-            try:
-                retry_owner.start()
-            except BaseException as retry_start_failure:
-                round_ambiguous = (
-                    round_ambiguous
-                    or not isinstance(retry_start_failure, Exception)
-                )
-                start_failure.add_note(
-                    f"recovery Thread.start failed: "
-                    f"{retry_start_failure!r}")
-                generation.launch_failed = True
-                generation.ambiguous_launch = round_ambiguous
-            else:
-                generation.thread = retry_owner
-                generation.thread_start_returned = True
-                generation.ambiguous_launch = round_ambiguous
-        raise
+            _merge_attempt_failure(
+                generation, start_failure, "cleanup launch failure")
+            generation.done.set()
+            # The dispatch failure is already a note on start_failure; a
+            # cause edge would just duplicate it.
+            raise start_failure from None
 
 
-def _can_retry_cleanup_launch(generation: _AsyncAttempt) -> bool:
-    """Return whether a later caller should retry an unowned launch."""
-    if (generation.done.is_set()
-            or generation.claimed
-            or not generation.launch_failed
-            or generation.fallback_scheduled):
-        return False
-    executor_signature = (
-        id(threading.Thread),
-        id(libdispatch.dispatch_async),
-    )
-    if (generation.ambiguous_launch
-            and generation.launch_rounds.get(executor_signature, 0)
-            >= _MAX_CLEANUP_LAUNCH_ROUNDS):
-        return False
-    for owner in generation.threads:
-        try:
-            if owner.is_alive():
-                return False
-        except RuntimeError:
-            continue
-    return True
-
-
-def _exception_chain_contains(
-    root: BaseException,
-    target: BaseException,
+def _wait_for_attempt(
+    generation: _AsyncAttempt,
+    timeout: float | None,
 ) -> bool:
-    pending = [root]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if current is target:
-            return True
-        identity = id(current)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        if current.__cause__ is not None:
-            pending.append(current.__cause__)
-        if current.__context__ is not None:
-            pending.append(current.__context__)
-    return False
+    """Wait for the attempt's published result.
+
+    Workers publish from a ``finally`` and a failed launch publishes
+    immediately, so the event always arrives; there is no dead-owner
+    forensics to run.
+    """
+    return generation.done.wait(timeout)
 
 
 def _raise_primary(primary: BaseException, later: BaseException) -> None:
-    """Deliver the first failure without replacing or cycling its root cause."""
-    if primary is later:
+    """Deliver the first failure without replacing its root cause.
+
+    ``raise primary from later`` only when primary has no explicit cause
+    yet - never clobber one.  CPython's traceback rendering tracks seen
+    exceptions, so a context edge back into the chain cannot hang or
+    crash error display.
+    """
+    if primary is later or primary.__cause__ is not None:
+        if primary is not later:
+            primary.add_note(f"later writer boundary failure: {later!r}")
         raise primary
-    existing_cause = primary.__cause__
-    if (existing_cause is not None
-            or _exception_chain_contains(later, primary)):
-        primary.add_note(f"later writer boundary failure: {later!r}")
-        existing_context = primary.__context__
-        try:
-            raise primary from existing_cause
-        except BaseException:
-            # Raising while ``later`` is actively handled would otherwise set
-            # primary.__context__ = later and form a mixed context/cause cycle.
-            primary.__context__ = existing_context
-            raise
     raise primary from later
 
 
@@ -544,12 +239,12 @@ class AVWriter:
         self._state_lock = threading.RLock()
         self._audio_pump_lock = threading.Lock()
         self._video_append_lock = threading.Lock()
-        self._native_mutations: set[Any] = set()
+        self._native_mutations = 0
+        self._mutations_retired = threading.Condition(self._state_lock)
         self._state = "constructing"
         self._failure: BaseException | None = None
         self._finish_done = threading.Event()
         self._native_cancelled = False
-        self._native_cancel_in_progress = False
         self._native_finished = False
         self._native_finish_done: threading.Event | None = None
         self._cancel_attempt: _AsyncAttempt | None = None
@@ -558,8 +253,6 @@ class AVWriter:
         self._audio_callbacks_done.set()
         self._audio_track_close_pending = False
         self._audio_track_closed = False
-        self._audio_track_closing = False
-        self._audio_close_attempt: _AsyncAttempt | None = None
         self._audio_done = threading.Event()
         self._audio_progress = [0]
         self._audio_complete = False
@@ -790,42 +483,35 @@ class AVWriter:
         The cancellation coordinator waits for every token to retire before it
         calls AVAssetWriter.cancelWriting(), as required by AVFoundation.
         """
-        token = threading.Lock()
-        # The C-backed lock is the durable ownership record. Even if an async
-        # exception interrupts the Python set-removal code, unwinding this
-        # context releases the token and a later coordinator can reclaim it.
-        with token:
-            try:
-                with self._state_lock:
-                    if self._state not in states:
-                        return False, None
-                    self._native_mutations.add(token)
-                return True, operation()
-            finally:
-                with self._state_lock:
-                    self._native_mutations.discard(token)
+        with self._state_lock:
+            if self._state not in states:
+                return False, None
+            self._native_mutations += 1
+        try:
+            return True, operation()
+        finally:
+            with self._mutations_retired:
+                self._native_mutations -= 1
+                if self._native_mutations == 0:
+                    self._mutations_retired.notify_all()
 
     def _wait_for_native_mutations(self) -> None:
-        """Wait for and reclaim every mutation admitted before cancellation."""
-        while True:
-            with self._state_lock:
-                tokens = tuple(self._native_mutations)
-            if not tokens:
-                return
-            for token in tokens:
-                # Context-manager unwinding makes the coordinator's acquire
-                # itself BaseException-safe. Stale unlocked tokens left by an
-                # interrupted mutator are reclaimed here without blocking.
-                with token:
-                    pass
-            with self._state_lock:
-                self._native_mutations.difference_update(tokens)
+        """Wait for every mutation admitted before cancellation to retire.
+
+        The same inflight-counter idiom the audio callbacks use: admission
+        is atomic with the state check, retirement always runs in the
+        mutator's ``finally``.
+        """
+        with self._mutations_retired:
+            while self._native_mutations:
+                self._mutations_retired.wait()
 
     def _status_context(self) -> tuple[Any, Any]:
         writer = self.writer
         if writer is None:
-            with self._state_lock:
-                return self._state, None
+            # No native writer yet: no status to inspect (None is never a
+            # failed/cancelled status and formats clearly in messages).
+            return None, None
         return writer.status(), writer.error()
 
     def _begin_audio_callback(self) -> bool:
@@ -846,61 +532,19 @@ class AVWriter:
             else:
                 self._failure.add_note(f"{what}: {exc!r}")
 
-    def _audio_close_worker_main(
-        self,
-        track: AudioTrack,
-        generation: _AsyncAttempt,
-    ) -> None:
-        closed = False
-        failure: BaseException | None = None
-        try:
-            for attempt in range(2):
-                try:
-                    track.close()
-                except Exception as exc:
-                    if failure is None:
-                        failure = exc
-                    else:
-                        failure.add_note(
-                            f"audio close retry failed: {exc!r}")
-                    if attempt == 0:
-                        continue
-                    break
-                except BaseException as exc:
-                    if failure is None:
-                        failure = exc
-                    else:
-                        failure.add_note(
-                            f"audio close retry interrupted: {exc!r}")
-                    break
-                else:
-                    closed = True
-                    failure = None
-                    break
-        except BaseException as exc:
-            failure = exc
-        finally:
-            if failure is not None:
-                try:
-                    self._record_cleanup_failure(
-                        failure, "audio source close failed")
-                except BaseException as record_failure:
-                    failure.add_note(
-                        f"recording audio close failure failed: "
-                        f"{record_failure!r}")
-            with self._state_lock:
-                self._audio_track_closing = False
-                self._audio_track_closed = closed
-                self._audio_track_close_pending = not closed
-                if failure is not None:
-                    _merge_attempt_failure(
-                        generation, failure, "audio close failure")
+    def _close_audio_track_if_pending(self) -> BaseException | None:
+        """Close the forked audio source once, off the callback path.
 
-    def _ensure_audio_close_worker(
-        self,
-        *,
-        retry_failed: bool = False,
-    ) -> _AsyncAttempt | None:
+        Close reaches container teardown that can raise or block
+        (ffmpeg-backed sources), so it runs only on the cancel
+        coordinator or the finish caller - never inside ``cancel()``'s
+        prompt path and never on the AVFoundation callback queue.  Single
+        attempt: the streaming track detaches its source before closing,
+        so a retry could never reach a failed source again anyway.  A
+        failure is recorded on the writer (surfacing through the next
+        synchronous boundary), returned to the caller, and the track
+        still counts as closed.
+        """
         with self._state_lock:
             track = self.audio_track
             if track is None or self._audio_track_closed:
@@ -908,78 +552,18 @@ class AVWriter:
                 self._audio_track_close_pending = False
                 return None
             if self._audio_callbacks_inflight:
+                # A callback still owns the decoder cursor; the caller waits
+                # on _audio_callbacks_done before retrying.
                 self._audio_track_close_pending = True
                 return None
-
-            generation = self._audio_close_attempt
-            if generation is not None and not generation.done.is_set():
-                if not _recover_dead_attempt(
-                    generation, "audio close worker"):
-                    if _can_retry_cleanup_launch(generation):
-                        _start_cleanup_attempt(
-                            generation,
-                            name=(
-                                f"kinovsr-close-"
-                                f"{getattr(self, 'label', 'writer')}"
-                            ),
-                            operation=self._audio_close_worker_main,
-                            args=(track, generation),
-                        )
-                    return generation
-                self._audio_track_closing = False
-                self._audio_track_close_pending = True
-            if (generation is not None
-                    and generation.done.is_set()
-                    and generation.failure is not None
-                    and not retry_failed):
-                return generation
-
-            generation = _AsyncAttempt()
-            self._audio_track_closing = True
+            self._audio_track_closed = True
             self._audio_track_close_pending = False
-            self._audio_close_attempt = generation
-            _start_cleanup_attempt(
-                generation,
-                name=f"kinovsr-close-{getattr(self, 'label', 'writer')}",
-                operation=self._audio_close_worker_main,
-                args=(track, generation),
-            )
-            return generation
-
-    def _wait_for_audio_close(
-        self,
-        timeout: float | None,
-        *,
-        retry_failed: bool = False,
-    ) -> bool:
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            with self._state_lock:
-                closed = self._audio_track_closed
-                generation = self._audio_close_attempt if closed else None
-            if generation is None:
-                if closed:
-                    return True
-                generation = self._ensure_audio_close_worker(
-                    retry_failed=retry_failed)
-            retry_failed = False
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-            else:
-                remaining = None
-            if generation is None:
-                if not self._audio_callbacks_done.wait(timeout=remaining):
-                    return False
-                continue
-            if not _wait_for_attempt(
-                generation, remaining, "audio close worker"):
-                return False
-            if generation.failure is not None:
-                raise generation.failure
-            if closed:
-                return True
+        try:
+            track.close()
+        except BaseException as exc:  # noqa: BLE001 - recorded, not raised
+            self._record_cleanup_failure(exc, "audio source close failed")
+            return exc
+        return None
 
     def _cancel_for_failure(
         self,
@@ -989,23 +573,9 @@ class AVWriter:
         try:
             self.cancel()
         except BaseException as cleanup:
+            # A failed cleanup request rides the primary as a note; the next
+            # cancel() creates a fresh attempt and retries.
             primary.add_note(f"writer cleanup request failed: {cleanup!r}")
-            # Construction failures leave no caller-owned writer through which
-            # a pre-launch Thread.start interruption could be retried. Re-run
-            # only worker admission; an owner that did launch is detected and
-            # shared, so this cannot create competing cleanup calls.
-            for what, ensure in (
-                (
-                    "audio close worker recovery",
-                    lambda: self._ensure_audio_close_worker(
-                        retry_failed=True),
-                ),
-                ("cancel worker recovery", self._ensure_cancel_worker),
-            ):
-                try:
-                    ensure()
-                except BaseException as recovery:
-                    primary.add_note(f"{what} failed: {recovery!r}")
 
     def _raise_after_cancel(self, exc: BaseException) -> None:
         """Poison the writer, clean up, and deliver the first causal error."""
@@ -1020,24 +590,16 @@ class AVWriter:
         with self._state_lock:
             if self._audio_callbacks_inflight > 0:
                 self._audio_callbacks_inflight -= 1
-            callbacks_done = self._audio_callbacks_inflight == 0
-            if callbacks_done:
+            if self._audio_callbacks_inflight == 0:
                 self._audio_callbacks_done.set()
-            should_close = (
-                callbacks_done and self._audio_track_close_pending
-            )
             should_signal = (
                 self._audio_complete
                 or self._audio_progress[0] >= n_samples
                 or self._state not in ("constructing", "writing", "finishing")
                 or self._failure is not None
             )
-        if should_close:
-            try:
-                self._ensure_audio_close_worker()
-            except BaseException as exc:  # callback cannot raise to its caller
-                self._record_cleanup_failure(
-                    exc, "audio close worker start failed")
+        # A pending close is consumed by the cancel coordinator or finish
+        # once callbacks have retired; nothing closes on the callback queue.
         if should_signal:
             self._audio_done.set()
 
@@ -1080,8 +642,8 @@ class AVWriter:
                             f"[{self.label}] audio callback has no source track")
 
                     # The callback owns the track until its finally block.
-                    # Cancel can return while a decoder read is blocked and
-                    # defers track close to the last admitted callback.
+                    # Cancel can return while a decoder read is blocked; the
+                    # coordinator closes the track after callbacks retire.
                     sb = (
                         None if pos >= n_samples
                         else track.make_sample_buffer(pos, end)
@@ -1160,12 +722,6 @@ class AVWriter:
             raise RuntimeError(
                 f"[{self.label}] writer was cancelled during {what}")
         status, error = self._status_context()
-        self._raise_if_failed()
-        with self._state_lock:
-            state = self._state
-        if state == "cancelled":
-            raise RuntimeError(
-                f"[{self.label}] writer was cancelled during {what}")
         if status in (3, 4):  # AVAssetWriterStatusFailed/Cancelled
             exc = RuntimeError(
                 f"[{self.label}] writer entered status={status} during "
@@ -1501,10 +1057,13 @@ class AVWriter:
                     raise RuntimeError(f"[{self.label}] writer was cancelled")
                 self._native_finished = True
                 self._state = "closing"
-            if not self._wait_for_audio_close(self.FINISH_TIMEOUT_S):
+            if not self._audio_callbacks_done.wait(
+                    timeout=self.FINISH_TIMEOUT_S):
                 raise RuntimeError(
-                    f"[{self.label}] audio source close did not complete "
-                    f"within {self.FINISH_TIMEOUT_S:g}s")
+                    f"[{self.label}] audio callbacks did not retire within "
+                    f"{self.FINISH_TIMEOUT_S:g}s")
+            self._close_audio_track_if_pending()
+            self._raise_if_failed()
             with self._state_lock:
                 if self._state != "closing":
                     raise RuntimeError(f"[{self.label}] writer was cancelled")
@@ -1517,106 +1076,63 @@ class AVWriter:
             self._finish_done.set()
 
     def _cancel_worker_main(self, generation: _AsyncAttempt) -> None:
-        """Retire admitted mutations, then perform blocking cleanup off-thread."""
+        """Retire admitted work, then perform blocking cleanup off-thread."""
         failure: BaseException | None = None
-        native_failure: BaseException | None = None
         try:
-            # AVFoundation explicitly forbids cancelWriting concurrently with
-            # either append API. Cancellation admission closed the mutation
-            # set, so waiting here cannot race a new append.
+            # Release the decoder first: once the in-flight callbacks retire
+            # nothing else touches the source track, and closing it before
+            # the native cancel means a wedged cancelWriting cannot retain
+            # an otherwise idle decoder.
+            self._audio_callbacks_done.wait()
+            failure = self._close_audio_track_if_pending()
+
+            # AVFoundation explicitly forbids cancelWriting concurrently
+            # with either append API. Cancellation admission closed the
+            # mutation set, so waiting here cannot race a new append.
             self._wait_for_native_mutations()
             with self._state_lock:
                 writer = self.writer
                 native_finished = self._native_finished
                 native_cancelled = self._native_cancelled
-            if writer is not None and not native_finished and not native_cancelled:
-                with self._state_lock:
-                    self._native_cancel_in_progress = True
-                cancel_failure: BaseException | None = None
-                cancelled = False
+            if (writer is not None
+                    and not native_finished
+                    and not native_cancelled):
+                # Single attempt: an ObjC call that just threw fails the
+                # same way microseconds later. The useful retry is a fresh
+                # attempt on the next explicit cancel(), which
+                # _ensure_cancel_worker provides.
                 try:
-                    for attempt in range(2):
-                        try:
-                            writer.cancelWriting()
-                        except Exception as exc:
-                            if cancel_failure is None:
-                                cancel_failure = exc
-                            else:
-                                cancel_failure.add_note(
-                                    f"native cancel retry failed: {exc!r}")
-                            if attempt == 0:
-                                continue
-                            break
-                        except BaseException as exc:
-                            if cancel_failure is None:
-                                cancel_failure = exc
-                            else:
-                                cancel_failure.add_note(
-                                    f"native cancel retry interrupted: {exc!r}")
-                            break
-                        else:
-                            cancelled = True
-                            cancel_failure = None
-                            break
-                finally:
-                    with self._state_lock:
-                        self._native_cancel_in_progress = False
-                        if cancelled:
-                            self._native_cancelled = True
-                if cancel_failure is not None:
-                    failure = cancel_failure
-                    native_failure = cancel_failure
-
-            # Track close cannot race a callback-owned decoder cursor. The
-            # independent close worker may already have completed while native
-            # cancellation was blocked; the coordinator only joins its result.
-            self._audio_callbacks_done.wait()
-            try:
-                self._wait_for_audio_close(None)
-            except BaseException as exc:
-                if failure is None:
-                    failure = exc
+                    writer.cancelWriting()
+                except BaseException as exc:  # noqa: BLE001 - recorded below
+                    self._record_cleanup_failure(
+                        exc, "native writer cancellation failed")
+                    if failure is None:
+                        failure = exc
+                    else:
+                        failure.add_note(
+                            f"native writer cancellation also failed: "
+                            f"{exc!r}")
                 else:
-                    failure.add_note(
-                        f"additional audio close failure: {exc!r}")
-        except BaseException as exc:
+                    with self._state_lock:
+                        self._native_cancelled = True
+        except BaseException as exc:  # noqa: BLE001 - published below
             if failure is None:
                 failure = exc
+                self._record_cleanup_failure(
+                    exc, "cancellation coordinator failed")
             elif failure is not exc:
                 failure.add_note(
                     f"additional cancellation coordinator failure: {exc!r}")
-            native_failure = failure
         finally:
-            if native_failure is not None:
-                try:
-                    self._record_cleanup_failure(
-                        native_failure, "native writer cancellation failed")
-                except BaseException as record_failure:
-                    native_failure.add_note(
-                        f"recording cancellation failure failed: "
-                        f"{record_failure!r}")
-            with self._state_lock:
-                if failure is not None:
+            if failure is not None:
+                with self._state_lock:
                     _merge_attempt_failure(
                         generation, failure, "cancel coordinator failure")
 
     def _ensure_cancel_worker(self) -> _AsyncAttempt | None:
         with self._state_lock:
             generation = self._cancel_attempt
-            if (generation is not None
-                    and not generation.done.is_set()
-                    and not _recover_dead_attempt(
-                        generation, "cancel worker")):
-                if _can_retry_cleanup_launch(generation):
-                    _start_cleanup_attempt(
-                        generation,
-                        name=(
-                            f"kinovsr-cancel-"
-                            f"{getattr(self, 'label', 'writer')}"
-                        ),
-                        operation=self._cancel_worker_main,
-                        args=(generation,),
-                    )
+            if generation is not None and not generation.done.is_set():
                 return generation
             cleanup_complete = (
                 (self.writer is None
@@ -1638,11 +1154,16 @@ class AVWriter:
             return generation
 
     def _wait_for_cancel_cleanup(self, timeout: float | None) -> bool:
+        """Join the cancel coordinator's published result.
+
+        Cancellation itself is prompt; this is the deliberate join for
+        callers (and tests) that need the blocking cleanup's outcome.
+        """
         with self._state_lock:
             generation = self._cancel_attempt
         if generation is None:
             return True
-        if not _wait_for_attempt(generation, timeout, "cancel worker"):
+        if not _wait_for_attempt(generation, timeout):
             return False
         if generation.failure is not None:
             raise generation.failure
@@ -1675,21 +1196,7 @@ class AVWriter:
             native_finish_done.set()
         self._finish_done.set()
 
-        # Native cancellation and decoder closure own independent resources.
-        # Start both before waiting in either worker so a stuck framework
-        # cancel cannot retain an otherwise idle audio decoder.
-        start_failure: BaseException | None = None
-        try:
-            self._ensure_audio_close_worker(retry_failed=True)
-        except BaseException as exc:
-            start_failure = exc
-        try:
-            self._ensure_cancel_worker()
-        except BaseException as exc:
-            if start_failure is None:
-                start_failure = exc
-            else:
-                start_failure.add_note(
-                    f"additional cancel worker start failure: {exc!r}")
-        if start_failure is not None:
-            raise start_failure
+        # The coordinator owns all blocking cleanup: it releases the audio
+        # decoder once callbacks retire, then retires admitted mutations and
+        # performs the native cancel.
+        self._ensure_cancel_worker()
