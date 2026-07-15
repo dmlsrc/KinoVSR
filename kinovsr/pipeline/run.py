@@ -20,14 +20,12 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import enum
 import errno
 import fcntl
 import hashlib
 import logging
 import os
 import shutil
-import stat as stat_module
 import tempfile
 import threading
 import time
@@ -1100,41 +1098,24 @@ class _ArtifactReservation:
             self._held = False
 
 
-_PathIdentity = tuple[int, int, int]
-
-
-class _PublicationState(enum.Enum):
-    TEMP_OWNED = enum.auto()
-    MOVING_TO_FINAL = enum.auto()
-    FINAL_OWNED = enum.auto()
-    ABSENT = enum.auto()
-    AMBIGUOUS = enum.auto()
-    CLEANUP_AMBIGUOUS = enum.auto()
-
-
-class _BackupState(enum.Enum):
-    NONE = enum.auto()
-    SLOT_OWNED = enum.auto()
-    MOVING_ORIGINAL = enum.auto()
-    ORIGINAL_HELD = enum.auto()
-    RESTORING = enum.auto()
-    RESTORED = enum.auto()
-    REMOVING = enum.auto()
-    REMOVED = enum.auto()
-    AMBIGUOUS = enum.auto()
-
-
 @dataclasses.dataclass(slots=True)
 class _TransactionEntry:
+    """One artifact's publication state.
+
+    Rename atomicity is the oracle: ``publishing`` is set before the
+    publish rename and ``published`` after it returns, so rollback can
+    decide "landed" from the flags plus plain existence.  The cooperative
+    threat model (doc 15) assumes no other actor mutates our temp, backup,
+    or destination paths mid-transaction; inode-identity verification and
+    quarantine machinery were removed with it.
+    """
+
     artifact: _Artifact
     temp_path: Path
     sink: FileSink | None = None
-    temp_identity: _PathIdentity | None = None
-    publication_state: _PublicationState = _PublicationState.TEMP_OWNED
+    publishing: bool = False
+    published: bool = False
     backup_path: Path | None = None
-    original_identity: _PathIdentity | None = None
-    backup_slot_identity: _PathIdentity | None = None
-    backup_state: _BackupState = _BackupState.NONE
 
 
 class _OutputTransaction:
@@ -1165,45 +1146,6 @@ class _OutputTransaction:
                 return artifact
         raise KeyError(label)
 
-    @staticmethod
-    def _identity_from_stat(result: os.stat_result) -> _PathIdentity:
-        return (
-            result.st_dev,
-            result.st_ino,
-            stat_module.S_IFMT(result.st_mode),
-        )
-
-    @classmethod
-    def _path_identity(cls, path: Path | str) -> _PathIdentity:
-        return cls._identity_from_stat(os.lstat(path))
-
-    @classmethod
-    def _inspect_identity(
-        cls, path: Path | str,
-    ) -> tuple[_PathIdentity | None, BaseException | None]:
-        try:
-            return cls._path_identity(path), None
-        except FileNotFoundError:
-            return None, None
-        except BaseException as exc:
-            return None, exc
-
-    @classmethod
-    def _require_owned_identity(
-        cls, path: Path, *, label: str,
-    ) -> _PathIdentity:
-        try:
-            return cls._path_identity(path)
-        except OSError as exc:
-            raise MediaError(f"cannot inspect {label} {path}: {exc}") from exc
-
-    @staticmethod
-    def _clear_backup(entry: _TransactionEntry, state: _BackupState) -> None:
-        entry.backup_path = None
-        entry.original_identity = None
-        entry.backup_slot_identity = None
-        entry.backup_state = state
-
     def _ensure_parent(self, path: Path) -> None:
         missing: list[Path] = []
         parent = path.parent
@@ -1231,8 +1173,6 @@ class _OutputTransaction:
             self._artifact(label), sink._temp_path, sink=sink)
         self._entries[label] = entry
         sink._transaction_managed = True
-        entry.temp_identity = self._require_owned_identity(
-            entry.temp_path, label=f"{label} temporary")
 
     def temp_file(self, label: str) -> Path:
         existing = self._entries.get(label)
@@ -1244,7 +1184,6 @@ class _OutputTransaction:
         self._ensure_parent(artifact.path)
         raw: str | None = None
         fd: int | None = None
-        temp_identity: _PathIdentity | None = None
         try:
             fd, raw = tempfile.mkstemp(
                 dir=artifact.path.parent,
@@ -1253,8 +1192,6 @@ class _OutputTransaction:
             _close_created_fd(owned_fd)
             temp_path = Path(raw)
             _widen_temp_mode(temp_path)
-            temp_identity = self._require_owned_identity(
-                temp_path, label=f"{label} temporary")
         except BaseException as exc:
             if fd is not None:
                 try:
@@ -1270,11 +1207,7 @@ class _OutputTransaction:
                     f"cannot create {artifact.label} temporary for "
                     f"{artifact.path}: {exc}") from exc
             raise
-        self._entries[label] = _TransactionEntry(
-            artifact,
-            temp_path,
-            temp_identity=temp_identity,
-        )
+        self._entries[label] = _TransactionEntry(artifact, temp_path)
         return temp_path
 
     def temp_directory(self, label: str) -> Path:
@@ -1286,15 +1219,12 @@ class _OutputTransaction:
             raise RuntimeError(f"{label} is a file artifact")
         self._ensure_parent(artifact.path)
         raw: str | None = None
-        temp_identity: _PathIdentity | None = None
         try:
             raw = tempfile.mkdtemp(
                 dir=artifact.path.parent,
                 prefix=f".{artifact.path.name}.", suffix=".partial")
             temp_path = Path(raw)
             _widen_temp_mode(temp_path, directory=True)
-            temp_identity = self._require_owned_identity(
-                temp_path, label=f"{label} temporary")
         except BaseException as exc:
             if raw is not None:
                 with contextlib.suppress(BaseException):
@@ -1304,11 +1234,7 @@ class _OutputTransaction:
                     f"cannot create {artifact.label} temporary for "
                     f"{artifact.path}: {exc}") from exc
             raise
-        self._entries[label] = _TransactionEntry(
-            artifact,
-            temp_path,
-            temp_identity=temp_identity,
-        )
+        self._entries[label] = _TransactionEntry(artifact, temp_path)
         return temp_path
 
     def _ordered_entries(self) -> list[_TransactionEntry]:
@@ -1325,413 +1251,102 @@ class _OutputTransaction:
         else:
             path.unlink(missing_ok=True)
 
-    @classmethod
-    def _backup_slot(
-        cls, artifact: _Artifact,
-    ) -> tuple[Path, _PathIdentity | None]:
+    @staticmethod
+    def _backup_slot(artifact: _Artifact) -> Path:
         """Reserve, then vacate, a unique rollback pathname.
 
-        The raw name is made absent before ``Path`` conversion, so a conversion
-        failure cannot orphan a slot. Destructive operations are never retried:
-        an exception may arrive after the name was removed and reused.
+        The raw name is made absent before ``Path`` conversion so a
+        conversion failure cannot orphan a slot, and because the exclusive
+        rename that follows needs an absent destination.
         """
         if artifact.directory:
             raw = tempfile.mkdtemp(
                 dir=artifact.path.parent,
                 prefix=f".{artifact.path.name}.", suffix=".rollback")
-            # The name must be absent before Path conversion so conversion
-            # failure cannot orphan the directory slot.
             os.rmdir(raw)  # noqa: PTH106
-            return Path(raw), None
-
+            return Path(raw)
         fd, raw = tempfile.mkstemp(
             dir=artifact.path.parent,
             prefix=f".{artifact.path.name}.", suffix=".rollback")
-        unlink_failure: BaseException | None = None
         try:
             os.unlink(raw)  # noqa: PTH108 - Path conversion follows removal
-        except BaseException as exc:
-            unlink_failure = exc
-        close_failure: BaseException | None = None
-        try:
+        finally:
             _close_created_fd(fd)
-        except BaseException as close_exc:
-            close_failure = close_exc
-        if unlink_failure is not None:
-            if close_failure is not None:
-                unlink_failure.add_note(
-                    f"rollback-slot descriptor cleanup also failed: "
-                    f"{close_failure!r}")
-            raise unlink_failure
-        if close_failure is not None:
-            raise close_failure
-        return Path(raw), None
+        return Path(raw)
 
     @staticmethod
     def _replace(source: Path, destination: Path) -> None:
         rename_exclusive(source, destination)
 
-    def _remove_owned_path(
-        self,
-        path: Path,
-        expected: _PathIdentity,
-        *,
-        operation: str,
-    ) -> tuple[bool, list[str]]:
-        """Remove a captured path once and reconcile without retrying.
-
-        Even a matching inode cannot prove pathname-generation ownership: an
-        actor can relink the same inode, or add external children to the same
-        directory, after a removal completes. A second destructive call is
-        therefore never safe.
-        """
-        try:
-            self._remove(path)
-        except BaseException as exc:
-            errors = [f"{operation} {path}: {exc}"]
-            identity, probe_exc = self._inspect_identity(path)
-            if probe_exc is not None:
-                errors.append(
-                    f"inspect {path} after failed removal: {probe_exc}")
-            elif identity is not None:
-                ownership = "same identity" if identity == expected else "changed"
-                errors.append(
-                    f"did not retry {operation} {path}: pathname ownership "
-                    f"is ambiguous ({ownership})")
-            else:
-                return True, errors
-            return False, errors
-        return True, []
-
-    def _quarantine_and_remove(
-        self,
-        path: Path,
-        expected: _PathIdentity,
-        artifact: _Artifact,
-        *,
-        operation: str,
-    ) -> tuple[bool, list[str]]:
-        """Move a public entry aside, verify it, then remove it once."""
-        errors: list[str] = []
-        try:
-            quarantine, _ = self._backup_slot(artifact)
-        except BaseException as exc:
-            return False, [f"acquire quarantine for {path}: {exc}"]
-        try:
-            self._replace(path, quarantine)
-        except BaseException as exc:
-            errors.append(f"quarantine {path}: {exc}")
-            path_identity, path_exc = self._inspect_identity(path)
-            quarantine_identity, quarantine_exc = self._inspect_identity(
-                quarantine)
-            if path_exc is not None:
-                errors.append(f"inspect {path}: {path_exc}")
-            if quarantine_exc is not None:
-                errors.append(f"inspect {quarantine}: {quarantine_exc}")
-            if path_exc is not None or quarantine_exc is not None:
-                return False, errors
-            if quarantine_identity == expected and path_identity != expected:
-                removed, remove_errors = self._remove_owned_path(
-                    quarantine,
-                    expected,
-                    operation=operation,
-                )
-                errors.extend(remove_errors)
-                return removed, errors
-            if quarantine_identity is not None and (
-                    quarantine_identity != expected):
-                try:
-                    self._replace(quarantine, path)
-                except BaseException as restore_exc:
-                    errors.append(
-                        f"restore foreign entry to {path}: {restore_exc}")
-            return False, errors
-
-        identity, probe_exc = self._inspect_identity(quarantine)
-        if probe_exc is not None:
-            errors.append(f"inspect quarantined {path}: {probe_exc}")
-            return False, errors
-        if identity != expected:
-            errors.append(
-                f"refused to {operation} {path}: identity changed before "
-                f"quarantine")
-            try:
-                self._replace(quarantine, path)
-            except BaseException as restore_exc:
-                errors.append(
-                    f"restore foreign entry to {path}: {restore_exc}")
-            return False, errors
-
-        removed, remove_errors = self._remove_owned_path(
-            quarantine,
-            expected,
-            operation=operation,
-        )
-        errors.extend(remove_errors)
-        return removed, errors
-
-    def _reconcile_publication(
-        self, entry: _TransactionEntry,
-    ) -> list[str]:
-        errors: list[str] = []
-        expected = entry.temp_identity
-        if expected is None:
-            entry.publication_state = _PublicationState.AMBIGUOUS
-            return [f"missing temporary identity for {entry.temp_path}"]
-
-        temp_identity, temp_exc = self._inspect_identity(entry.temp_path)
-        final_identity, final_exc = self._inspect_identity(entry.artifact.path)
-        if temp_exc is not None:
-            errors.append(f"inspect {entry.temp_path}: {temp_exc}")
-        if final_exc is not None:
-            errors.append(f"inspect {entry.artifact.path}: {final_exc}")
-        if errors:
-            entry.publication_state = _PublicationState.AMBIGUOUS
-            return errors
-
-        if temp_identity is None and final_identity == expected:
-            entry.publication_state = _PublicationState.FINAL_OWNED
-        elif temp_identity == expected and final_identity != expected:
-            entry.publication_state = _PublicationState.TEMP_OWNED
-        else:
-            entry.publication_state = _PublicationState.AMBIGUOUS
-            errors.append(
-                f"publication ownership is ambiguous for "
-                f"{entry.artifact.path}; no destination was removed")
-        return errors
-
-    def _verify_published(self, entry: _TransactionEntry) -> None:
-        expected = entry.temp_identity
-        if expected is None:
-            entry.publication_state = _PublicationState.AMBIGUOUS
-            raise MediaError(
-                f"missing published identity for {entry.artifact.path}")
-
-        temp_identity, temp_exc = self._inspect_identity(entry.temp_path)
-        final_identity, final_exc = self._inspect_identity(entry.artifact.path)
-        probe_failures = [
-            ("temporary", temp_exc),
-            ("destination", final_exc),
-        ]
-        probe_failures = [
-            (label, failure)
-            for label, failure in probe_failures
-            if failure is not None
-        ]
-        if probe_failures:
-            entry.publication_state = _PublicationState.AMBIGUOUS
-            primary_label, primary = probe_failures[0]
-            assert primary is not None
-            for label, failure in probe_failures[1:]:
-                primary.add_note(
-                    f"{label} publication probe also failed: {failure!r}")
-            primary.add_note(
-                f"{primary_label} publication probe failed after rename")
-            raise primary
-
-        if temp_identity is None and final_identity == expected:
-            entry.publication_state = _PublicationState.FINAL_OWNED
-            return
-        entry.publication_state = _PublicationState.AMBIGUOUS
-        raise MediaError(
-            f"published identity does not match completed temporary: "
-            f"{entry.artifact.path}")
-
-    def _reconcile_backup_move(
-        self, entry: _TransactionEntry,
-    ) -> list[str]:
-        backup = entry.backup_path
-        original = entry.original_identity
-        if backup is None or original is None:
-            self._clear_backup(entry, _BackupState.NONE)
-            return []
-
-        errors: list[str] = []
-        final_identity, final_exc = self._inspect_identity(entry.artifact.path)
-        backup_identity, backup_exc = self._inspect_identity(backup)
-        if final_exc is not None:
-            errors.append(f"inspect {entry.artifact.path}: {final_exc}")
-        if backup_exc is not None:
-            errors.append(f"inspect {backup}: {backup_exc}")
-        if errors:
-            entry.backup_state = _BackupState.AMBIGUOUS
-            return errors
-
-        if backup_identity == original and final_identity != original:
-            entry.backup_state = _BackupState.ORIGINAL_HELD
-            return []
-
-        slot = entry.backup_slot_identity
-        if final_identity == original and (
-                backup_identity is None or backup_identity == slot):
-            if backup_identity is None:
-                self._clear_backup(entry, _BackupState.REMOVED)
-                return []
-            removed, remove_errors = self._remove_owned_path(
-                backup,
-                slot,
-                operation="remove unused rollback slot",
-            )
-            errors.extend(remove_errors)
-            if removed:
-                self._clear_backup(entry, _BackupState.REMOVED)
-            else:
-                entry.backup_state = _BackupState.AMBIGUOUS
-            return errors
-
-        entry.backup_state = _BackupState.AMBIGUOUS
-        errors.append(
-            f"backup ownership is ambiguous for {entry.artifact.path}; "
-            f"retained {backup}")
-        return errors
+    @staticmethod
+    def _restore_replace(backup: Path, destination: Path) -> None:
+        # Plain replace, not exclusive: restore may legitimately overwrite
+        # our own failed artifact left behind when its removal failed.
+        backup.replace(destination)
 
     def _remove_published(self, entry: _TransactionEntry) -> list[str]:
-        if entry.publication_state in {
-            _PublicationState.MOVING_TO_FINAL,
-            _PublicationState.AMBIGUOUS,
-        }:
-            errors = self._reconcile_publication(entry)
-        else:
-            errors = []
-        if entry.publication_state is not _PublicationState.FINAL_OWNED:
-            return errors
-        if entry.temp_identity is None:
-            entry.publication_state = _PublicationState.AMBIGUOUS
-            errors.append(
-                f"missing published identity for {entry.artifact.path}")
-            return errors
+        """Remove a landed destination during rollback.
 
-        identity, probe_exc = self._inspect_identity(entry.artifact.path)
-        if probe_exc is not None:
-            entry.publication_state = _PublicationState.AMBIGUOUS
-            errors.append(f"inspect {entry.artifact.path}: {probe_exc}")
-            return errors
-        if identity is None:
-            entry.publication_state = _PublicationState.ABSENT
-            return errors
-        if identity != entry.temp_identity:
-            entry.publication_state = _PublicationState.AMBIGUOUS
-            errors.append(
-                f"refused to remove {entry.artifact.path}: destination "
-                f"identity changed")
-            return errors
-
-        removed, remove_errors = self._quarantine_and_remove(
-            entry.artifact.path,
-            entry.temp_identity,
-            entry.artifact,
-            operation="remove published artifact",
-        )
-        errors.extend(remove_errors)
-        entry.publication_state = (
-            _PublicationState.ABSENT
-            if removed else _PublicationState.CLEANUP_AMBIGUOUS
-        )
-        return errors
+        The publish rename is atomic: it landed iff it returned
+        (``published``) or - for an interrupt racing the syscall's return -
+        the destination exists while our temp is gone.  A publish rename
+        that failed (for example EEXIST against a foreign file) never
+        removes the destination, because the temp still exists.
+        """
+        if not entry.publishing:
+            return []
+        final = entry.artifact.path
+        landed = entry.published or (
+            os.path.lexists(final) and not os.path.lexists(entry.temp_path))
+        if landed:
+            try:
+                self._remove(final)
+            except BaseException as exc:
+                # Flags stay set: a later rollback pass (exit discard after a
+                # commit failure) makes one more attempt.
+                return [f"remove published artifact {final}: {exc}"]
+        # Neutralize the entry either way.  Rollback runs again from the exit
+        # discard, and by then the world has legitimately changed (temp
+        # removed, original restored) in a way the landed heuristic would
+        # misread as "landed" and delete a preserved or restored file.
+        entry.published = False
+        entry.publishing = False
+        return []
 
     def _restore_backup(self, entry: _TransactionEntry) -> list[str]:
-        errors: list[str] = []
-        if entry.backup_state in {
-            _BackupState.SLOT_OWNED,
-            _BackupState.MOVING_ORIGINAL,
-            _BackupState.AMBIGUOUS,
-        }:
-            errors.extend(self._reconcile_backup_move(entry))
-        if entry.backup_state is not _BackupState.ORIGINAL_HELD:
-            return errors
+        """Put a displaced original back during rollback.
 
+        Plain replace, not exclusive rename: in the only cooperative state
+        where the destination is occupied at restore time (removal of our
+        own landed artifact failed mid-rollback), replacing it with the
+        user's original is the desired recovery.  Restore only ever runs
+        for destinations the user explicitly opted to overwrite.
+        """
         backup = entry.backup_path
-        original = entry.original_identity
-        if backup is None or original is None:
-            entry.backup_state = _BackupState.AMBIGUOUS
-            errors.append(
-                f"lost rollback metadata for {entry.artifact.path}")
-            return errors
-
-        final_identity, final_exc = self._inspect_identity(entry.artifact.path)
-        backup_identity, backup_exc = self._inspect_identity(backup)
-        if final_exc is not None:
-            errors.append(f"inspect {entry.artifact.path}: {final_exc}")
-        if backup_exc is not None:
-            errors.append(f"inspect {backup}: {backup_exc}")
-        if errors:
-            entry.backup_state = _BackupState.AMBIGUOUS
-            return errors
-
-        if final_identity == original and backup_identity is None:
-            self._clear_backup(entry, _BackupState.RESTORED)
-            return errors
-        if final_identity is not None:
-            entry.backup_state = _BackupState.AMBIGUOUS
-            errors.append(
-                f"refused to restore {entry.artifact.path}: destination is "
-                f"occupied; retained {backup}")
-            return errors
-        if backup_identity != original:
-            entry.backup_state = _BackupState.AMBIGUOUS
-            errors.append(
-                f"refused to restore {entry.artifact.path}: rollback backup "
-                f"identity changed; retained {backup}")
-            return errors
-
-        entry.backup_state = _BackupState.RESTORING
+        if backup is None:
+            return []
+        if not os.path.lexists(backup):
+            # The backup move never landed; the original never left.
+            entry.backup_path = None
+            return []
         try:
-            self._replace(backup, entry.artifact.path)
+            self._restore_replace(backup, entry.artifact.path)
         except BaseException as exc:
-            errors.append(f"restore {entry.artifact.path}: {exc}")
-            final_identity, final_exc = self._inspect_identity(
-                entry.artifact.path)
-            backup_identity, backup_exc = self._inspect_identity(backup)
-            if final_exc is not None:
-                errors.append(
-                    f"inspect {entry.artifact.path} after restore: "
-                    f"{final_exc}")
-            if backup_exc is not None:
-                errors.append(f"inspect {backup} after restore: {backup_exc}")
-            if final_exc is not None or backup_exc is not None:
-                entry.backup_state = _BackupState.AMBIGUOUS
-            elif final_identity == original and backup_identity is None:
-                self._clear_backup(entry, _BackupState.RESTORED)
-            elif final_identity is None and backup_identity == original:
-                entry.backup_state = _BackupState.ORIGINAL_HELD
-            else:
-                entry.backup_state = _BackupState.AMBIGUOUS
-            return errors
-
-        self._clear_backup(entry, _BackupState.RESTORED)
-        return errors
+            return [
+                f"restore {entry.artifact.path}: {exc}; original retained "
+                f"at {backup}",
+            ]
+        entry.backup_path = None
+        return []
 
     def _remove_temporary(self, entry: _TransactionEntry) -> list[str]:
-        if entry.publication_state is not _PublicationState.TEMP_OWNED:
+        if entry.published:
             return []
-        if entry.temp_identity is None:
-            entry.publication_state = _PublicationState.AMBIGUOUS
-            return [f"missing temporary identity for {entry.temp_path}"]
-
-        identity, probe_exc = self._inspect_identity(entry.temp_path)
-        if probe_exc is not None:
-            entry.publication_state = _PublicationState.AMBIGUOUS
-            return [f"inspect {entry.temp_path}: {probe_exc}"]
-        if identity is None:
-            entry.publication_state = _PublicationState.ABSENT
-            return []
-        if identity != entry.temp_identity:
-            entry.publication_state = _PublicationState.AMBIGUOUS
-            return [
-                f"refused to remove {entry.temp_path}: temporary identity "
-                f"changed",
-            ]
-
-        removed, errors = self._remove_owned_path(
-            entry.temp_path,
-            entry.temp_identity,
-            operation="remove temporary artifact",
-        )
-        entry.publication_state = (
-            _PublicationState.ABSENT
-            if removed else _PublicationState.CLEANUP_AMBIGUOUS
-        )
-        return errors
+        try:
+            self._remove(entry.temp_path)
+        except BaseException as exc:
+            return [f"remove temporary artifact {entry.temp_path}: {exc}"]
+        return []
 
     def _rollback(self, entries: list[_TransactionEntry]) -> list[str]:
         errors: list[str] = []
@@ -1746,46 +1361,14 @@ class _OutputTransaction:
     def _cleanup_committed_backup(
         self, entry: _TransactionEntry,
     ) -> BaseException | None:
-        """Quarantine, verify, then remove one displaced destination.
-
-        Moving to another private, exclusive name before deletion prevents a
-        same-name replacement at the rollback path from being deleted. The
-        final removal operates only on the random transaction-private name.
-        """
         backup = entry.backup_path
-        original = entry.original_identity
-        if backup is None or original is None:
+        if backup is None:
             return None
         try:
-            quarantine, _ = self._backup_slot(entry.artifact)
-            self._replace(backup, quarantine)
+            self._remove(backup)
         except BaseException as exc:
-            entry.backup_state = _BackupState.AMBIGUOUS
             return exc
-
-        identity, probe_exc = self._inspect_identity(quarantine)
-        if probe_exc is not None:
-            entry.backup_state = _BackupState.AMBIGUOUS
-            return probe_exc
-        if identity != original:
-            failure = MediaError(
-                f"rollback backup identity changed during cleanup: {backup}")
-            try:
-                self._replace(quarantine, backup)
-            except BaseException as restore_exc:
-                failure.add_note(
-                    f"foreign rollback-path entry was retained at "
-                    f"{quarantine}: {restore_exc!r}")
-            entry.backup_state = _BackupState.AMBIGUOUS
-            return failure
-
-        entry.backup_state = _BackupState.REMOVING
-        try:
-            self._remove(quarantine)
-        except BaseException as exc:
-            entry.backup_state = _BackupState.AMBIGUOUS
-            return exc
-        self._clear_backup(entry, _BackupState.REMOVED)
+        entry.backup_path = None
         return None
 
     def commit(self) -> None:
@@ -1799,70 +1382,27 @@ class _OutputTransaction:
                 if entry.sink is not None:
                     entry.sink.finalize()
 
-            # Some owned materializers atomically replace the initially
-            # reserved placeholder (for example ImageIO when writing PNG).
-            # Seal the identity of each completed private artifact only after
-            # all writers finish, before any requested destination is moved.
-            for entry in entries:
-                entry.temp_identity = self._require_owned_identity(
-                    entry.temp_path,
-                    label=f"completed {entry.artifact.label} temporary",
-                )
-                entry.publication_state = _PublicationState.TEMP_OWNED
-
             self.plan.validate()
+            # Backup pass: displace every pre-existing destination into a
+            # private slot (overwrite is an explicit opt-in; a destination
+            # appearing without it fails the whole set before anything moves).
             for entry in entries:
                 final = entry.artifact.path
-                try:
-                    original_identity = self._path_identity(final)
-                except FileNotFoundError:
+                if not os.path.lexists(final):
                     continue
                 if not self.plan.overwrite:
                     raise MediaError(
                         f"destination appeared before publication: {final}")
-                backup, slot_identity = self._backup_slot(entry.artifact)
+                backup = self._backup_slot(entry.artifact)
                 entry.backup_path = backup
-                entry.original_identity = original_identity
-                entry.backup_slot_identity = slot_identity
-                entry.backup_state = _BackupState.MOVING_ORIGINAL
-                try:
-                    self._replace(final, backup)
-                except BaseException as exc:
-                    reconciliation_errors = self._reconcile_backup_move(entry)
-                    if reconciliation_errors:
-                        exc.add_note(
-                            "backup move reconciliation: "
-                            + "; ".join(reconciliation_errors))
-                    raise
-                moved_identity = self._path_identity(backup)
-                if moved_identity != original_identity:
-                    failure = MediaError(
-                        f"destination identity changed while creating "
-                        f"rollback backup: {final}")
-                    entry.backup_state = _BackupState.AMBIGUOUS
-                    try:
-                        self._replace(backup, final)
-                    except BaseException as restore_exc:
-                        failure.add_note(
-                            f"foreign destination entry was retained at "
-                            f"{backup}: {restore_exc!r}")
-                    else:
-                        self._clear_backup(entry, _BackupState.RESTORED)
-                    raise failure
-                entry.backup_state = _BackupState.ORIGINAL_HELD
+                self._replace(final, backup)
 
+            # Publish pass: exclusive rename into the (now absent) final
+            # names.  Rename atomicity is the oracle for rollback.
             for entry in entries:
-                entry.publication_state = _PublicationState.MOVING_TO_FINAL
-                try:
-                    self._replace(entry.temp_path, entry.artifact.path)
-                except BaseException as exc:
-                    reconciliation_errors = self._reconcile_publication(entry)
-                    if reconciliation_errors:
-                        exc.add_note(
-                            "publication reconciliation: "
-                            + "; ".join(reconciliation_errors))
-                    raise
-                self._verify_published(entry)
+                entry.publishing = True
+                self._replace(entry.temp_path, entry.artifact.path)
+                entry.published = True
         except BaseException as exc:
             rollback_errors = self._rollback(entries)
             if rollback_errors:
