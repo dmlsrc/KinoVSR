@@ -513,6 +513,42 @@ class TestBuildRollbackUnderInterrupts:
             build_processors(plan, PipelineContext(settings=SETTINGS))
         assert closed == ["second", "first"]
 
+    @pytest.mark.parametrize("failure_type", [TypeError, AssertionError])
+    def test_programmer_close_failure_is_preserved_during_rollback(
+            self, families, failure_type):
+        closed = []
+        close_failure = failure_type("injected close defect")
+        build_failure = RuntimeError("weights exploded")
+
+        def make_session(name, error=None):
+            class Session(Passthrough):
+                def close(self, context):
+                    closed.append(name)
+                    if error is not None:
+                        raise error
+
+            return Session()
+
+        config, module = self._plan_and_module(families)
+        module.fakedenoise.build = (
+            lambda cfg, *, context: make_session("first", close_failure))
+        module.fakeupscale.build = (
+            lambda cfg, *, context: make_session("second"))
+
+        def failing_build(cfg, *, context):
+            raise build_failure
+
+        module.fakeinterp.build = failing_build
+        plan = resolve_pipeline(config, input_spec=stream(),
+                                settings=SETTINGS)
+
+        with pytest.raises(RuntimeError) as caught:
+            build_processors(plan, PipelineContext(settings=SETTINGS))
+
+        assert caught.value is build_failure
+        assert closed == ["second", "first"]
+        assert any(node is close_failure for node in _ctx_chain(caught.value))
+
     def test_interrupt_during_rollback_finishes_then_chains(self, families):
         closed = []
 

@@ -156,10 +156,10 @@ def save_image(img: Any, path: str | Path) -> Path:
     with autorelease_pool():
         dest = Quartz.CGImageDestinationCreateWithURL(_url(path), uti, 1, None)
         if dest is None:
-            raise ValueError(f"Cannot create image destination for {path}")
+            raise OSError(f"cannot create image destination for {path}")
         Quartz.CGImageDestinationAddImage(dest, _mx_to_cgimage(img), None)
         if not Quartz.CGImageDestinationFinalize(dest):
-            raise ValueError(f"Failed to write image {path}")
+            raise OSError(f"failed to write image {path}")
     return path
 
 

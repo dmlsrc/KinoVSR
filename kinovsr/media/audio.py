@@ -11,6 +11,7 @@ from typing import Any
 
 import mlx.core as mx
 
+from kinovsr.media.errors import is_native_operation_error
 from kinovsr.native.frameworks import CoreAudio, CoreMedia
 
 # CoreAudio FormatID constants (avoid importing the whole module just for these)
@@ -431,8 +432,13 @@ def read_audio_track_from_video(
                 max_duration_sec=max_duration_sec,
             )
         except Exception as e:
-            _log.warning("audio decode failed (%s); continuing without audio", type(e).__name__)
-            return None
+            if is_native_operation_error(e):
+                _log.warning(
+                    "audio decode failed (%s); continuing without audio",
+                    type(e).__name__,
+                )
+                return None
+            raise
     if hasattr(reader, "read_audio_track"):
         # Never fall back to the original whole-track protocol: applying a
         # view after read_audio_track(path) still leaves the complete decoded
@@ -452,9 +458,14 @@ def read_audio_track_from_video(
             max_duration_sec=max_duration_sec,
         )
     except Exception as e:
-        # No audio track (or an unsupported audio format) - carry on silent.
-        _log.warning("no usable audio track (%s: %s); output will be silent", type(e).__name__, e)
-        return None
+        if is_native_operation_error(e):
+            # No audio track (or an unsupported audio format) - carry on silent.
+            _log.warning(
+                "no usable audio track (%s: %s); output will be silent",
+                type(e).__name__, e,
+            )
+            return None
+        raise
     if track is not None:
         _log.info(
             "audio window: %sch, %s Hz, %s samples",

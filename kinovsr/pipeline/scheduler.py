@@ -75,6 +75,8 @@ def _stage_stream(
 
     try:
         processor.prepare(stage.input_spec, context)
+    except (AssertionError, TypeError):
+        raise
     except Exception as exc:
         raise _wrap_stage_error(stage, exc) from exc
 
@@ -88,6 +90,8 @@ def _stage_stream(
                         yield attach(tail)
                 for boundary in unit.boundaries:
                     processor.reset(boundary, context)
+            except (AssertionError, TypeError):
+                raise
             except Exception as exc:
                 raise _wrap_stage_error(stage, exc) from exc
             pending.extend(unit.boundaries)
@@ -99,12 +103,16 @@ def _stage_stream(
             outputs = processor.process(unit, context)
             for produced in outputs:
                 yield attach(produced)
+        except (AssertionError, TypeError):
+            raise
         except Exception as exc:
             raise _wrap_stage_error(stage, exc) from exc
 
     try:
         for tail in processor.flush(context):
             yield attach(tail)
+    except (AssertionError, TypeError):
+        raise
     except Exception as exc:
         raise _wrap_stage_error(stage, exc) from exc
 

@@ -115,6 +115,7 @@ def _source_layout(config, *, source_color: str = "auto",
     """
     from kinovsr.pipeline.builder import _resolve_capability
     from kinovsr.processors import Layout, get_factory
+    from kinovsr.processors.errors import PipelineError
 
     # Forced color/range reinterpretation is implemented by the RGBAHalf MLX
     # decode route. Native VideoToolbox heads accept that upload bridge, so an
@@ -144,7 +145,7 @@ def _source_layout(config, *, source_color: str = "auto",
             if layout is not None:
                 return layout
         layouts = factory.capabilities[capability].accepts.layouts
-    except Exception:
+    except PipelineError:
         return Layout.MLX_RGB_HWC
     accepted = set(layouts or (Layout.MLX_RGB_HWC,))
     if Layout.MLX_RGB_HWC in accepted:
@@ -200,7 +201,7 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
         reader = ffmpeg_reader
     try:
         _w, _h, fps, total, _tf, _par = (reader or _vr).probe_video(video)
-    except Exception as exc:
+    except (OSError, RuntimeError, PipelineError) as exc:
         if options.reader != "auto":
             _log.error("cannot open %s: %s", video, exc)
             return 2
@@ -209,7 +210,7 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
         reader = ffmpeg_reader
         try:
             _w, _h, fps, total, _tf, _par = reader.probe_video(video)
-        except Exception as fallback_exc:
+        except (OSError, RuntimeError, PipelineError) as fallback_exc:
             _log.error("cannot open %s: %s", video, fallback_exc)
             return 2
     start, end = resolve_trim(options.start, options.end, fps, total)

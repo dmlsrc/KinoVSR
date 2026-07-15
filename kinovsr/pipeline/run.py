@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import enum
 import errno
 import fcntl
 import hashlib
 import logging
 import os
 import shutil
+import stat as stat_module
 import tempfile
 import threading
 import time
@@ -39,6 +41,8 @@ from kinovsr.media.chunks import (
     budgeted_decode_chunk_size,
     validate_decode_chunk_size,
 )
+from kinovsr.media.errors import is_native_operation_error
+from kinovsr.media.filesystem import rename_exclusive
 from kinovsr.media.timing import (
     AudioTiming,
     VideoTiming,
@@ -81,6 +85,58 @@ _DECODE_BYTES_PER_PIXEL = {
     # for row alignment and keeps the budget independent of plane stride.
     Layout.CV_NV12: 2,
 }
+
+
+@contextlib.contextmanager
+def _media_operation(operation: str, path: Path | str) -> Iterator[None]:
+    """Normalize an explicit native or filesystem operation.
+
+    The scope at each call site must stay narrow: ``RuntimeError`` is the
+    established failure type used by the native media adapters, but can also
+    describe an internal invariant elsewhere. Programmer errors and process
+    control exceptions deliberately pass through unchanged.
+    """
+    try:
+        yield
+    except PipelineError:
+        raise
+    except Exception as exc:
+        if is_native_operation_error(exc):
+            raise MediaError(f"{operation} {path}: {exc}") from exc
+        raise
+
+
+def _close_created_fd(fd: int) -> None:
+    """Close a newly-created fd exactly once.
+
+    A failed ``close`` has ambiguous ownership: the kernel may already have
+    released the descriptor and another thread may reuse its number. Retrying
+    could therefore close an unrelated resource, even when ``fstat`` reports
+    the same inode through a newly-opened descriptor.
+    """
+    os.close(fd)
+
+
+def _unlink_temporary(path: Path) -> None:
+    """Make one best-effort removal without replacing an active failure."""
+    try:
+        path.unlink(missing_ok=True)
+    except BaseException as exc:
+        # An unlink may complete before reporting an interruption. A retry can
+        # delete a same-name replacement, so an ambiguous private residue is
+        # safer than a second destructive operation.
+        _log.warning("could not remove temporary %s: %s", path, exc)
+
+
+def _unlink_created_raw(raw: str, primary: BaseException) -> None:
+    """Remove a raw mkstemp pathname without invoking Path conversion."""
+    try:
+        os.unlink(raw)  # noqa: PTH108 - Path conversion may be the failure
+    except FileNotFoundError:
+        pass
+    except BaseException as cleanup_exc:
+        primary.add_note(
+            f"temporary acquisition cleanup also failed: {cleanup_exc!r}")
 
 
 def _effective_decode_chunk_size(
@@ -153,7 +209,10 @@ def _probe_cfr_timing(path: Path, reader: Any) -> VideoTiming | None:
     except MediaError:
         raise
     except Exception as exc:
-        raise MediaError(f"failed to inspect source timing for {path}: {exc}") from exc
+        if is_native_operation_error(exc):
+            raise MediaError(
+                f"failed to inspect source timing for {path}: {exc}") from exc
+        raise
     if timing.cadence is None:
         raise MediaError(
             f"{path.name}: variable frame rate (VFR) is not supported by the "
@@ -178,8 +237,11 @@ def _validate_audio_origin(
     except MediaError:
         raise
     except Exception as exc:
-        raise MediaError(
-            f"failed to inspect source audio timing for {path}: {exc}") from exc
+        if is_native_operation_error(exc):
+            raise MediaError(
+                f"failed to inspect source audio timing for {path}: {exc}"
+            ) from exc
+        raise
     if audio_timing is None:
         return
     # Each reported origin can be rounded by at most half of its own clock
@@ -237,8 +299,9 @@ class FileSource:
         if timing is None:
             timing = _probe_cfr_timing(self.path, self._vr)
 
-        width, height, fps, total, transform, pixel_aspect = (
-            self._vr.probe_video(self.path))
+        with _media_operation("failed to probe video source", self.path):
+            width, height, fps, total, transform, pixel_aspect = (
+                self._vr.probe_video(self.path))
         cadence = timing.cadence if timing is not None else _cadence(fps)
         assert cadence is not None
         if timing is not None:
@@ -247,7 +310,8 @@ class FileSource:
         self._timing = timing
         from kinovsr.media import color as _color
 
-        self._src_color = self._vr.probe_color(self.path)
+        with _media_operation("failed to probe source color", self.path):
+            self._src_color = self._vr.probe_color(self.path)
         self.resolved_color = _color.resolve(
             self._src_color, source_color, source_range)
         origin = ("tagged" if self._src_color["tagged"]
@@ -355,22 +419,35 @@ class FileSource:
         if self._force_read:
             # Re-decode raw YUV, force the resolved matrix, reinterpret the
             # range: source's actual full_range in, resolved range out.
-            chunks = self._vr.iter_forced_color_chunks(
-                self.path, decode_format, self.resolved_color[2],
-                self._src_color["full_range"], chunk_size=self.chunk_size,
-                start_frame=read_start, end_frame=self.end,
-                reinterpret_full_range=self.resolved_color[3],
-                **timing_kwargs)
+            with _media_operation("failed to open video decode", self.path):
+                chunks = self._vr.iter_forced_color_chunks(
+                    self.path, decode_format, self.resolved_color[2],
+                    self._src_color["full_range"], chunk_size=self.chunk_size,
+                    start_frame=read_start, end_frame=self.end,
+                    reinterpret_full_range=self.resolved_color[3],
+                    **timing_kwargs)
         else:
-            chunks = self._vr.iter_video_buffer_chunks(
-                self.path, decode_format, chunk_size=self.chunk_size,
-                start_frame=read_start, end_frame=self.end,
-                **timing_kwargs)
+            with _media_operation("failed to open video decode", self.path):
+                chunks = self._vr.iter_video_buffer_chunks(
+                    self.path, decode_format, chunk_size=self.chunk_size,
+                    start_frame=read_start, end_frame=self.end,
+                    **timing_kwargs)
+        with _media_operation("failed to open video decode", self.path):
+            chunk_iterator = iter(chunks)
         index = -self.context_frames
-        for chunk in chunks:
+        while True:
+            try:
+                with _media_operation("failed to decode video source", self.path):
+                    chunk = next(chunk_iterator)
+            except StopIteration:
+                break
             for buffer in chunk:
-                payload = (self._pb.read_buffer_rgb_f32(buffer)
-                           if to_mlx else buffer)
+                if to_mlx:
+                    with _media_operation(
+                            "failed to read decoded pixel buffer", self.path):
+                        payload = self._pb.read_buffer_rgb_f32(buffer)
+                else:
+                    payload = buffer
                 pts = self._grid_ticks(index)
                 yield FrameUnit(
                     payload=payload, pts=pts,
@@ -397,9 +474,12 @@ class FileSource:
             )
         except MediaError:
             raise
-        except RuntimeError as exc:
-            raise MediaError(
-                f"failed to open bounded audio from {self.path}: {exc}") from exc
+        except Exception as exc:
+            if is_native_operation_error(exc):
+                raise MediaError(
+                    f"failed to open bounded audio from {self.path}: {exc}"
+                ) from exc
+            raise
 
 
 class FileSink:
@@ -485,15 +565,36 @@ class FileSink:
             raise MediaError(
                 f"destination already exists: {self._final_path}; pass "
                 f"overwrite=True to replace it")
-        self._final_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            dir=self._final_path.parent,
-            prefix=f".{self._final_path.name}.", suffix=".partial")
-        os.close(fd)
-        self._temp_path = Path(tmp)
+        raw: str | None = None
+        fd: int | None = None
+        try:
+            self._final_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, raw = tempfile.mkstemp(
+                dir=self._final_path.parent,
+                prefix=f".{self._final_path.name}.", suffix=".partial")
+            owned_fd, fd = fd, None
+            _close_created_fd(owned_fd)
+            temp_path = Path(raw)
+        except BaseException as exc:
+            if fd is not None:
+                try:
+                    _close_created_fd(fd)
+                except BaseException as cleanup_exc:
+                    exc.add_note(
+                        f"writer temporary descriptor cleanup also failed: "
+                        f"{cleanup_exc!r}")
+            if raw is not None:
+                _unlink_created_raw(raw, exc)
+            if isinstance(exc, OSError):
+                raise MediaError(
+                    f"failed to create writer temporary for "
+                    f"{self._final_path}: {exc}") from exc
+            raise
+        self._temp_path = temp_path
         self._published = False
         self._finalized = False
         self._discarded = False
+        self._transaction_managed = False
 
         # Everything below can fail (AVWriter construction, pool creation);
         # drop the just-created temp so a failed construction leaves nothing
@@ -531,13 +632,18 @@ class FileSink:
                     "IOSurfaceProperties": {},
                     "MetalCompatibility": True,
                 })
-        except BaseException:
+        except BaseException as exc:
             writer = getattr(self, "writer", None)
             if writer is not None:
                 with contextlib.suppress(BaseException):
                     writer.cancel()
-            with contextlib.suppress(Exception):
-                self._temp_path.unlink()
+            _unlink_temporary(self._temp_path)
+            if isinstance(exc, PipelineError):
+                raise
+            if is_native_operation_error(exc, allow_value_error=True):
+                raise MediaError(
+                    f"writer setup failed for {self._final_path}: {exc}"
+                ) from exc
             raise
 
     def _grid_ticks(self, index: int) -> int:
@@ -559,19 +665,25 @@ class FileSink:
         import mlx.core as mx
 
         geometry = self.spec.frame.geometry
-        pb = self._pb.pool_create_buffer(self._pool)
+        with _media_operation(
+                "writer buffer allocation failed for", self._final_path):
+            pb = self._pb.pool_create_buffer(self._pool)
         if pb is None:
-            pb = self._pb.make_pixel_buffer_from_attrs(
-                geometry.width, geometry.height, {
-                    "PixelFormatType": self._pb.PIX_RGBAHALF,
-                    "IOSurfaceProperties": {},
-                    "MetalCompatibility": True,
-                })
+            with _media_operation(
+                    "writer buffer allocation failed for", self._final_path):
+                pb = self._pb.make_pixel_buffer_from_attrs(
+                    geometry.width, geometry.height, {
+                        "PixelFormatType": self._pb.PIX_RGBAHALF,
+                        "IOSurfaceProperties": {},
+                        "MetalCompatibility": True,
+                    })
         rgb = frame[..., :3].astype(mx.float16)
         alpha = mx.ones((geometry.height, geometry.width, 1),
                         dtype=mx.float16)
-        self._pb.write_fp16_rgba(
-            mx.contiguous(mx.concatenate([rgb, alpha], axis=-1)), pb)
+        rgba = mx.contiguous(mx.concatenate([rgb, alpha], axis=-1))
+        with _media_operation(
+                "writer buffer upload failed for", self._final_path):
+            self._pb.write_fp16_rgba(rgba, pb)
         return pb
 
     def append(self, unit: FrameUnit) -> None:
@@ -583,23 +695,42 @@ class FileSink:
                 f"broke its declared timeline")
         # The chain's timeline is the validated one: stamp the unit's own
         # ticks (the writer's index grid quantizes NTSC-family rates).
-        try:
-            if self._is_mlx:
-                self._validate_mlx_frame(unit.payload)
-                if self._direct_mlx_encode:
-                    self.writer.append_mlx_rgb(
-                        unit.payload, pts_ticks=unit.pts,
+        if self._is_mlx:
+            self._validate_mlx_frame(unit.payload)
+            if self._direct_mlx_encode:
+                try:
+                    prepared = self.writer.prepare_mlx_rgb(unit.payload)
+                except Exception as exc:
+                    if is_native_operation_error(exc):
+                        raise MediaError(
+                            f"writer MLX preparation failed for "
+                            f"{self._final_path}: {exc}") from exc
+                    raise
+                try:
+                    self.writer.append_prepared_mlx_rgb(
+                        prepared, pts_ticks=unit.pts,
                         duration_ticks=unit.duration or None)
-                    return
-                payload = self._mlx_to_buffer(unit.payload)
-            else:
-                payload = unit.payload
+                except Exception as exc:
+                    if is_native_operation_error(
+                            exc, allow_value_error=True):
+                        raise MediaError(
+                            f"writer append failed for {self._final_path}: "
+                            f"{exc}") from exc
+                    raise
+                return
+            payload = self._mlx_to_buffer(unit.payload)
+        else:
+            payload = unit.payload
+        try:
             self.writer.append(
                 payload, pts_ticks=unit.pts,
                 duration_ticks=unit.duration or None)
         except Exception as exc:
-            raise MediaError(
-                f"writer append failed for {self._final_path}: {exc}") from exc
+            if is_native_operation_error(exc, allow_value_error=True):
+                raise MediaError(
+                    f"writer append failed for {self._final_path}: {exc}"
+                ) from exc
+            raise
 
     def finalize(self) -> None:
         """Finish encoding while the file is still transaction-private."""
@@ -612,7 +743,9 @@ class FileSink:
             self.writer.finish()
         except BaseException as exc:
             self.discard()
-            if isinstance(exc, Exception):
+            if isinstance(exc, PipelineError):
+                raise
+            if is_native_operation_error(exc, allow_value_error=True):
                 raise MediaError(
                     f"writer finalization failed for {self._final_path}: "
                     f"{exc}") from exc
@@ -624,21 +757,25 @@ class FileSink:
 
     def finish(self) -> Path:
         """Finalize the encode and publish it atomically to the requested
-        output path (Path.replace is atomic on the same filesystem). On ANY
+        output path (Darwin exclusive rename closes the no-overwrite race). On ANY
         failure - a writer-finalization error, or a rename that cannot land
         (e.g. the output path is an existing directory, or a full disk) -
         the partial temp is removed and the requested output is left
         untouched."""
         self.finalize()
         try:
-            if self._final_path.exists() and not self._overwrite:
+            if self._overwrite:
+                self._temp_path.replace(self._final_path)
+            else:
+                rename_exclusive(self._temp_path, self._final_path)
+        except BaseException as exc:
+            _unlink_temporary(self._temp_path)
+            if isinstance(exc, PipelineError):
+                raise
+            if isinstance(exc, (OSError, RuntimeError)):
                 raise MediaError(
-                    f"destination appeared before publication: "
-                    f"{self._final_path}")
-            self._temp_path.replace(self._final_path)
-        except BaseException:
-            with contextlib.suppress(Exception):
-                self._temp_path.unlink()
+                    f"writer publication failed for {self._final_path}: {exc}"
+                ) from exc
             raise
         self._mark_published()
         return self._final_path
@@ -661,8 +798,8 @@ class FileSink:
         except BaseException:  # noqa: BLE001 - best-effort; must not mask the original
             pass
         finally:
-            with contextlib.suppress(Exception):
-                self._temp_path.unlink()
+            if not getattr(self, "_transaction_managed", False):
+                _unlink_temporary(self._temp_path)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -837,9 +974,14 @@ class _ArtifactReservation:
             for parent in path.parents:
                 requests.setdefault(parent, fcntl.LOCK_SH)
         self._lock_requests = tuple(sorted(requests.items(), key=lambda item: str(item[0])))
-        self._lock_root = (
-            settings.shared_temp_dir.expanduser().resolve(strict=False)
-            / "kinovsr-artifact-locks")
+        try:
+            self._lock_root = (
+                settings.shared_temp_dir.expanduser().resolve(strict=False)
+                / "kinovsr-artifact-locks")
+        except (OSError, RuntimeError) as exc:
+            raise MediaError(
+                f"cannot resolve artifact lock directory "
+                f"{settings.shared_temp_dir}: {exc}") from exc
         self._fds: list[int] = []
         self._held = False
 
@@ -903,14 +1045,41 @@ class _ArtifactReservation:
             self._held = False
 
 
+_PathIdentity = tuple[int, int, int]
+
+
+class _PublicationState(enum.Enum):
+    TEMP_OWNED = enum.auto()
+    MOVING_TO_FINAL = enum.auto()
+    FINAL_OWNED = enum.auto()
+    ABSENT = enum.auto()
+    AMBIGUOUS = enum.auto()
+    CLEANUP_AMBIGUOUS = enum.auto()
+
+
+class _BackupState(enum.Enum):
+    NONE = enum.auto()
+    SLOT_OWNED = enum.auto()
+    MOVING_ORIGINAL = enum.auto()
+    ORIGINAL_HELD = enum.auto()
+    RESTORING = enum.auto()
+    RESTORED = enum.auto()
+    REMOVING = enum.auto()
+    REMOVED = enum.auto()
+    AMBIGUOUS = enum.auto()
+
+
 @dataclasses.dataclass(slots=True)
 class _TransactionEntry:
     artifact: _Artifact
     temp_path: Path
     sink: FileSink | None = None
+    temp_identity: _PathIdentity | None = None
+    publication_state: _PublicationState = _PublicationState.TEMP_OWNED
     backup_path: Path | None = None
-    publishing: bool = False
-    published: bool = False
+    original_identity: _PathIdentity | None = None
+    backup_slot_identity: _PathIdentity | None = None
+    backup_state: _BackupState = _BackupState.NONE
 
 
 class _OutputTransaction:
@@ -941,13 +1110,56 @@ class _OutputTransaction:
                 return artifact
         raise KeyError(label)
 
+    @staticmethod
+    def _identity_from_stat(result: os.stat_result) -> _PathIdentity:
+        return (
+            result.st_dev,
+            result.st_ino,
+            stat_module.S_IFMT(result.st_mode),
+        )
+
+    @classmethod
+    def _path_identity(cls, path: Path | str) -> _PathIdentity:
+        return cls._identity_from_stat(os.lstat(path))
+
+    @classmethod
+    def _inspect_identity(
+        cls, path: Path | str,
+    ) -> tuple[_PathIdentity | None, BaseException | None]:
+        try:
+            return cls._path_identity(path), None
+        except FileNotFoundError:
+            return None, None
+        except BaseException as exc:
+            return None, exc
+
+    @classmethod
+    def _require_owned_identity(
+        cls, path: Path, *, label: str,
+    ) -> _PathIdentity:
+        try:
+            return cls._path_identity(path)
+        except OSError as exc:
+            raise MediaError(f"cannot inspect {label} {path}: {exc}") from exc
+
+    @staticmethod
+    def _clear_backup(entry: _TransactionEntry, state: _BackupState) -> None:
+        entry.backup_path = None
+        entry.original_identity = None
+        entry.backup_slot_identity = None
+        entry.backup_state = state
+
     def _ensure_parent(self, path: Path) -> None:
         missing: list[Path] = []
         parent = path.parent
         while not parent.exists() and parent != parent.parent:
             missing.append(parent)
             parent = parent.parent
-        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise MediaError(
+                f"cannot create artifact parent {path.parent}: {exc}") from exc
         self._created_parents.extend(
             candidate for candidate in reversed(missing)
             if candidate.is_dir())
@@ -960,8 +1172,12 @@ class _OutputTransaction:
     def register_sink(self, label: str, sink: FileSink) -> None:
         if label in self._entries:
             raise RuntimeError(f"artifact already materialized: {label}")
-        self._entries[label] = _TransactionEntry(
+        entry = _TransactionEntry(
             self._artifact(label), sink._temp_path, sink=sink)
+        self._entries[label] = entry
+        sink._transaction_managed = True
+        entry.temp_identity = self._require_owned_identity(
+            entry.temp_path, label=f"{label} temporary")
 
     def temp_file(self, label: str) -> Path:
         existing = self._entries.get(label)
@@ -971,12 +1187,38 @@ class _OutputTransaction:
         if artifact.directory:
             raise RuntimeError(f"{label} is a directory artifact")
         self._ensure_parent(artifact.path)
-        fd, raw = tempfile.mkstemp(
-            dir=artifact.path.parent,
-            prefix=f".{artifact.path.name}.", suffix=".partial")
-        os.close(fd)
-        temp_path = Path(raw)
-        self._entries[label] = _TransactionEntry(artifact, temp_path)
+        raw: str | None = None
+        fd: int | None = None
+        temp_identity: _PathIdentity | None = None
+        try:
+            fd, raw = tempfile.mkstemp(
+                dir=artifact.path.parent,
+                prefix=f".{artifact.path.name}.", suffix=".partial")
+            owned_fd, fd = fd, None
+            _close_created_fd(owned_fd)
+            temp_path = Path(raw)
+            temp_identity = self._require_owned_identity(
+                temp_path, label=f"{label} temporary")
+        except BaseException as exc:
+            if fd is not None:
+                try:
+                    _close_created_fd(fd)
+                except BaseException as cleanup_exc:
+                    exc.add_note(
+                        f"artifact temporary descriptor cleanup also failed: "
+                        f"{cleanup_exc!r}")
+            if raw is not None:
+                _unlink_created_raw(raw, exc)
+            if isinstance(exc, OSError):
+                raise MediaError(
+                    f"cannot create {artifact.label} temporary for "
+                    f"{artifact.path}: {exc}") from exc
+            raise
+        self._entries[label] = _TransactionEntry(
+            artifact,
+            temp_path,
+            temp_identity=temp_identity,
+        )
         return temp_path
 
     def temp_directory(self, label: str) -> Path:
@@ -987,10 +1229,29 @@ class _OutputTransaction:
         if not artifact.directory:
             raise RuntimeError(f"{label} is a file artifact")
         self._ensure_parent(artifact.path)
-        temp_path = Path(tempfile.mkdtemp(
-            dir=artifact.path.parent,
-            prefix=f".{artifact.path.name}.", suffix=".partial"))
-        self._entries[label] = _TransactionEntry(artifact, temp_path)
+        raw: str | None = None
+        temp_identity: _PathIdentity | None = None
+        try:
+            raw = tempfile.mkdtemp(
+                dir=artifact.path.parent,
+                prefix=f".{artifact.path.name}.", suffix=".partial")
+            temp_path = Path(raw)
+            temp_identity = self._require_owned_identity(
+                temp_path, label=f"{label} temporary")
+        except BaseException as exc:
+            if raw is not None:
+                with contextlib.suppress(BaseException):
+                    shutil.rmtree(raw)
+            if isinstance(exc, OSError):
+                raise MediaError(
+                    f"cannot create {artifact.label} temporary for "
+                    f"{artifact.path}: {exc}") from exc
+            raise
+        self._entries[label] = _TransactionEntry(
+            artifact,
+            temp_path,
+            temp_identity=temp_identity,
+        )
         return temp_path
 
     def _ordered_entries(self) -> list[_TransactionEntry]:
@@ -1007,55 +1268,468 @@ class _OutputTransaction:
         else:
             path.unlink(missing_ok=True)
 
-    @staticmethod
-    def _backup_slot(artifact: _Artifact) -> Path:
+    @classmethod
+    def _backup_slot(
+        cls, artifact: _Artifact,
+    ) -> tuple[Path, _PathIdentity | None]:
+        """Reserve, then vacate, a unique rollback pathname.
+
+        The raw name is made absent before ``Path`` conversion, so a conversion
+        failure cannot orphan a slot. Destructive operations are never retried:
+        an exception may arrive after the name was removed and reused.
+        """
         if artifact.directory:
             raw = tempfile.mkdtemp(
                 dir=artifact.path.parent,
                 prefix=f".{artifact.path.name}.", suffix=".rollback")
-            backup = Path(raw)
-            backup.rmdir()
-            return backup
+            # The name must be absent before Path conversion so conversion
+            # failure cannot orphan the directory slot.
+            os.rmdir(raw)  # noqa: PTH106
+            return Path(raw), None
+
         fd, raw = tempfile.mkstemp(
             dir=artifact.path.parent,
             prefix=f".{artifact.path.name}.", suffix=".rollback")
-        os.close(fd)
-        return Path(raw)
+        unlink_failure: BaseException | None = None
+        try:
+            os.unlink(raw)  # noqa: PTH108 - Path conversion follows removal
+        except BaseException as exc:
+            unlink_failure = exc
+        close_failure: BaseException | None = None
+        try:
+            _close_created_fd(fd)
+        except BaseException as close_exc:
+            close_failure = close_exc
+        if unlink_failure is not None:
+            if close_failure is not None:
+                unlink_failure.add_note(
+                    f"rollback-slot descriptor cleanup also failed: "
+                    f"{close_failure!r}")
+            raise unlink_failure
+        if close_failure is not None:
+            raise close_failure
+        return Path(raw), None
 
     @staticmethod
     def _replace(source: Path, destination: Path) -> None:
-        source.replace(destination)
+        rename_exclusive(source, destination)
+
+    def _remove_owned_path(
+        self,
+        path: Path,
+        expected: _PathIdentity,
+        *,
+        operation: str,
+    ) -> tuple[bool, list[str]]:
+        """Remove a captured path once and reconcile without retrying.
+
+        Even a matching inode cannot prove pathname-generation ownership: an
+        actor can relink the same inode, or add external children to the same
+        directory, after a removal completes. A second destructive call is
+        therefore never safe.
+        """
+        try:
+            self._remove(path)
+        except BaseException as exc:
+            errors = [f"{operation} {path}: {exc}"]
+            identity, probe_exc = self._inspect_identity(path)
+            if probe_exc is not None:
+                errors.append(
+                    f"inspect {path} after failed removal: {probe_exc}")
+            elif identity is not None:
+                ownership = "same identity" if identity == expected else "changed"
+                errors.append(
+                    f"did not retry {operation} {path}: pathname ownership "
+                    f"is ambiguous ({ownership})")
+            else:
+                return True, errors
+            return False, errors
+        return True, []
+
+    def _quarantine_and_remove(
+        self,
+        path: Path,
+        expected: _PathIdentity,
+        artifact: _Artifact,
+        *,
+        operation: str,
+    ) -> tuple[bool, list[str]]:
+        """Move a public entry aside, verify it, then remove it once."""
+        errors: list[str] = []
+        try:
+            quarantine, _ = self._backup_slot(artifact)
+        except BaseException as exc:
+            return False, [f"acquire quarantine for {path}: {exc}"]
+        try:
+            self._replace(path, quarantine)
+        except BaseException as exc:
+            errors.append(f"quarantine {path}: {exc}")
+            path_identity, path_exc = self._inspect_identity(path)
+            quarantine_identity, quarantine_exc = self._inspect_identity(
+                quarantine)
+            if path_exc is not None:
+                errors.append(f"inspect {path}: {path_exc}")
+            if quarantine_exc is not None:
+                errors.append(f"inspect {quarantine}: {quarantine_exc}")
+            if path_exc is not None or quarantine_exc is not None:
+                return False, errors
+            if quarantine_identity == expected and path_identity != expected:
+                removed, remove_errors = self._remove_owned_path(
+                    quarantine,
+                    expected,
+                    operation=operation,
+                )
+                errors.extend(remove_errors)
+                return removed, errors
+            if quarantine_identity is not None and (
+                    quarantine_identity != expected):
+                try:
+                    self._replace(quarantine, path)
+                except BaseException as restore_exc:
+                    errors.append(
+                        f"restore foreign entry to {path}: {restore_exc}")
+            return False, errors
+
+        identity, probe_exc = self._inspect_identity(quarantine)
+        if probe_exc is not None:
+            errors.append(f"inspect quarantined {path}: {probe_exc}")
+            return False, errors
+        if identity != expected:
+            errors.append(
+                f"refused to {operation} {path}: identity changed before "
+                f"quarantine")
+            try:
+                self._replace(quarantine, path)
+            except BaseException as restore_exc:
+                errors.append(
+                    f"restore foreign entry to {path}: {restore_exc}")
+            return False, errors
+
+        removed, remove_errors = self._remove_owned_path(
+            quarantine,
+            expected,
+            operation=operation,
+        )
+        errors.extend(remove_errors)
+        return removed, errors
+
+    def _reconcile_publication(
+        self, entry: _TransactionEntry,
+    ) -> list[str]:
+        errors: list[str] = []
+        expected = entry.temp_identity
+        if expected is None:
+            entry.publication_state = _PublicationState.AMBIGUOUS
+            return [f"missing temporary identity for {entry.temp_path}"]
+
+        temp_identity, temp_exc = self._inspect_identity(entry.temp_path)
+        final_identity, final_exc = self._inspect_identity(entry.artifact.path)
+        if temp_exc is not None:
+            errors.append(f"inspect {entry.temp_path}: {temp_exc}")
+        if final_exc is not None:
+            errors.append(f"inspect {entry.artifact.path}: {final_exc}")
+        if errors:
+            entry.publication_state = _PublicationState.AMBIGUOUS
+            return errors
+
+        if temp_identity is None and final_identity == expected:
+            entry.publication_state = _PublicationState.FINAL_OWNED
+        elif temp_identity == expected and final_identity != expected:
+            entry.publication_state = _PublicationState.TEMP_OWNED
+        else:
+            entry.publication_state = _PublicationState.AMBIGUOUS
+            errors.append(
+                f"publication ownership is ambiguous for "
+                f"{entry.artifact.path}; no destination was removed")
+        return errors
+
+    def _verify_published(self, entry: _TransactionEntry) -> None:
+        expected = entry.temp_identity
+        if expected is None:
+            entry.publication_state = _PublicationState.AMBIGUOUS
+            raise MediaError(
+                f"missing published identity for {entry.artifact.path}")
+
+        temp_identity, temp_exc = self._inspect_identity(entry.temp_path)
+        final_identity, final_exc = self._inspect_identity(entry.artifact.path)
+        probe_failures = [
+            ("temporary", temp_exc),
+            ("destination", final_exc),
+        ]
+        probe_failures = [
+            (label, failure)
+            for label, failure in probe_failures
+            if failure is not None
+        ]
+        if probe_failures:
+            entry.publication_state = _PublicationState.AMBIGUOUS
+            primary_label, primary = probe_failures[0]
+            assert primary is not None
+            for label, failure in probe_failures[1:]:
+                primary.add_note(
+                    f"{label} publication probe also failed: {failure!r}")
+            primary.add_note(
+                f"{primary_label} publication probe failed after rename")
+            raise primary
+
+        if temp_identity is None and final_identity == expected:
+            entry.publication_state = _PublicationState.FINAL_OWNED
+            return
+        entry.publication_state = _PublicationState.AMBIGUOUS
+        raise MediaError(
+            f"published identity does not match completed temporary: "
+            f"{entry.artifact.path}")
+
+    def _reconcile_backup_move(
+        self, entry: _TransactionEntry,
+    ) -> list[str]:
+        backup = entry.backup_path
+        original = entry.original_identity
+        if backup is None or original is None:
+            self._clear_backup(entry, _BackupState.NONE)
+            return []
+
+        errors: list[str] = []
+        final_identity, final_exc = self._inspect_identity(entry.artifact.path)
+        backup_identity, backup_exc = self._inspect_identity(backup)
+        if final_exc is not None:
+            errors.append(f"inspect {entry.artifact.path}: {final_exc}")
+        if backup_exc is not None:
+            errors.append(f"inspect {backup}: {backup_exc}")
+        if errors:
+            entry.backup_state = _BackupState.AMBIGUOUS
+            return errors
+
+        if backup_identity == original and final_identity != original:
+            entry.backup_state = _BackupState.ORIGINAL_HELD
+            return []
+
+        slot = entry.backup_slot_identity
+        if final_identity == original and (
+                backup_identity is None or backup_identity == slot):
+            if backup_identity is None:
+                self._clear_backup(entry, _BackupState.REMOVED)
+                return []
+            removed, remove_errors = self._remove_owned_path(
+                backup,
+                slot,
+                operation="remove unused rollback slot",
+            )
+            errors.extend(remove_errors)
+            if removed:
+                self._clear_backup(entry, _BackupState.REMOVED)
+            else:
+                entry.backup_state = _BackupState.AMBIGUOUS
+            return errors
+
+        entry.backup_state = _BackupState.AMBIGUOUS
+        errors.append(
+            f"backup ownership is ambiguous for {entry.artifact.path}; "
+            f"retained {backup}")
+        return errors
+
+    def _remove_published(self, entry: _TransactionEntry) -> list[str]:
+        if entry.publication_state in {
+            _PublicationState.MOVING_TO_FINAL,
+            _PublicationState.AMBIGUOUS,
+        }:
+            errors = self._reconcile_publication(entry)
+        else:
+            errors = []
+        if entry.publication_state is not _PublicationState.FINAL_OWNED:
+            return errors
+        if entry.temp_identity is None:
+            entry.publication_state = _PublicationState.AMBIGUOUS
+            errors.append(
+                f"missing published identity for {entry.artifact.path}")
+            return errors
+
+        identity, probe_exc = self._inspect_identity(entry.artifact.path)
+        if probe_exc is not None:
+            entry.publication_state = _PublicationState.AMBIGUOUS
+            errors.append(f"inspect {entry.artifact.path}: {probe_exc}")
+            return errors
+        if identity is None:
+            entry.publication_state = _PublicationState.ABSENT
+            return errors
+        if identity != entry.temp_identity:
+            entry.publication_state = _PublicationState.AMBIGUOUS
+            errors.append(
+                f"refused to remove {entry.artifact.path}: destination "
+                f"identity changed")
+            return errors
+
+        removed, remove_errors = self._quarantine_and_remove(
+            entry.artifact.path,
+            entry.temp_identity,
+            entry.artifact,
+            operation="remove published artifact",
+        )
+        errors.extend(remove_errors)
+        entry.publication_state = (
+            _PublicationState.ABSENT
+            if removed else _PublicationState.CLEANUP_AMBIGUOUS
+        )
+        return errors
+
+    def _restore_backup(self, entry: _TransactionEntry) -> list[str]:
+        errors: list[str] = []
+        if entry.backup_state in {
+            _BackupState.SLOT_OWNED,
+            _BackupState.MOVING_ORIGINAL,
+            _BackupState.AMBIGUOUS,
+        }:
+            errors.extend(self._reconcile_backup_move(entry))
+        if entry.backup_state is not _BackupState.ORIGINAL_HELD:
+            return errors
+
+        backup = entry.backup_path
+        original = entry.original_identity
+        if backup is None or original is None:
+            entry.backup_state = _BackupState.AMBIGUOUS
+            errors.append(
+                f"lost rollback metadata for {entry.artifact.path}")
+            return errors
+
+        final_identity, final_exc = self._inspect_identity(entry.artifact.path)
+        backup_identity, backup_exc = self._inspect_identity(backup)
+        if final_exc is not None:
+            errors.append(f"inspect {entry.artifact.path}: {final_exc}")
+        if backup_exc is not None:
+            errors.append(f"inspect {backup}: {backup_exc}")
+        if errors:
+            entry.backup_state = _BackupState.AMBIGUOUS
+            return errors
+
+        if final_identity == original and backup_identity is None:
+            self._clear_backup(entry, _BackupState.RESTORED)
+            return errors
+        if final_identity is not None:
+            entry.backup_state = _BackupState.AMBIGUOUS
+            errors.append(
+                f"refused to restore {entry.artifact.path}: destination is "
+                f"occupied; retained {backup}")
+            return errors
+        if backup_identity != original:
+            entry.backup_state = _BackupState.AMBIGUOUS
+            errors.append(
+                f"refused to restore {entry.artifact.path}: rollback backup "
+                f"identity changed; retained {backup}")
+            return errors
+
+        entry.backup_state = _BackupState.RESTORING
+        try:
+            self._replace(backup, entry.artifact.path)
+        except BaseException as exc:
+            errors.append(f"restore {entry.artifact.path}: {exc}")
+            final_identity, final_exc = self._inspect_identity(
+                entry.artifact.path)
+            backup_identity, backup_exc = self._inspect_identity(backup)
+            if final_exc is not None:
+                errors.append(
+                    f"inspect {entry.artifact.path} after restore: "
+                    f"{final_exc}")
+            if backup_exc is not None:
+                errors.append(f"inspect {backup} after restore: {backup_exc}")
+            if final_exc is not None or backup_exc is not None:
+                entry.backup_state = _BackupState.AMBIGUOUS
+            elif final_identity == original and backup_identity is None:
+                self._clear_backup(entry, _BackupState.RESTORED)
+            elif final_identity is None and backup_identity == original:
+                entry.backup_state = _BackupState.ORIGINAL_HELD
+            else:
+                entry.backup_state = _BackupState.AMBIGUOUS
+            return errors
+
+        self._clear_backup(entry, _BackupState.RESTORED)
+        return errors
+
+    def _remove_temporary(self, entry: _TransactionEntry) -> list[str]:
+        if entry.publication_state is not _PublicationState.TEMP_OWNED:
+            return []
+        if entry.temp_identity is None:
+            entry.publication_state = _PublicationState.AMBIGUOUS
+            return [f"missing temporary identity for {entry.temp_path}"]
+
+        identity, probe_exc = self._inspect_identity(entry.temp_path)
+        if probe_exc is not None:
+            entry.publication_state = _PublicationState.AMBIGUOUS
+            return [f"inspect {entry.temp_path}: {probe_exc}"]
+        if identity is None:
+            entry.publication_state = _PublicationState.ABSENT
+            return []
+        if identity != entry.temp_identity:
+            entry.publication_state = _PublicationState.AMBIGUOUS
+            return [
+                f"refused to remove {entry.temp_path}: temporary identity "
+                f"changed",
+            ]
+
+        removed, errors = self._remove_owned_path(
+            entry.temp_path,
+            entry.temp_identity,
+            operation="remove temporary artifact",
+        )
+        entry.publication_state = (
+            _PublicationState.ABSENT
+            if removed else _PublicationState.CLEANUP_AMBIGUOUS
+        )
+        return errors
 
     def _rollback(self, entries: list[_TransactionEntry]) -> list[str]:
         errors: list[str] = []
         for entry in reversed(entries):
-            landed = entry.published or (
-                entry.publishing
-                and entry.artifact.path.exists()
-                and not entry.temp_path.exists())
-            if landed:
-                try:
-                    self._remove(entry.artifact.path)
-                except BaseException as exc:  # preserve the original failure
-                    errors.append(
-                        f"remove {entry.artifact.path}: {exc}")
-                entry.published = False
-            entry.publishing = False
+            errors.extend(self._remove_published(entry))
         for entry in reversed(entries):
-            backup = entry.backup_path
-            if backup is not None and backup.exists():
-                try:
-                    self._replace(backup, entry.artifact.path)
-                except BaseException as exc:
-                    errors.append(
-                        f"restore {entry.artifact.path}: {exc}")
+            errors.extend(self._restore_backup(entry))
         for entry in reversed(entries):
-            if entry.temp_path.exists():
-                try:
-                    self._remove(entry.temp_path)
-                except BaseException as exc:
-                    errors.append(f"remove {entry.temp_path}: {exc}")
+            errors.extend(self._remove_temporary(entry))
         return errors
+
+    def _cleanup_committed_backup(
+        self, entry: _TransactionEntry,
+    ) -> BaseException | None:
+        """Quarantine, verify, then remove one displaced destination.
+
+        Moving to another private, exclusive name before deletion prevents a
+        same-name replacement at the rollback path from being deleted. The
+        final removal operates only on the random transaction-private name.
+        """
+        backup = entry.backup_path
+        original = entry.original_identity
+        if backup is None or original is None:
+            return None
+        try:
+            quarantine, _ = self._backup_slot(entry.artifact)
+            self._replace(backup, quarantine)
+        except BaseException as exc:
+            entry.backup_state = _BackupState.AMBIGUOUS
+            return exc
+
+        identity, probe_exc = self._inspect_identity(quarantine)
+        if probe_exc is not None:
+            entry.backup_state = _BackupState.AMBIGUOUS
+            return probe_exc
+        if identity != original:
+            failure = MediaError(
+                f"rollback backup identity changed during cleanup: {backup}")
+            try:
+                self._replace(quarantine, backup)
+            except BaseException as restore_exc:
+                failure.add_note(
+                    f"foreign rollback-path entry was retained at "
+                    f"{quarantine}: {restore_exc!r}")
+            entry.backup_state = _BackupState.AMBIGUOUS
+            return failure
+
+        entry.backup_state = _BackupState.REMOVING
+        try:
+            self._remove(quarantine)
+        except BaseException as exc:
+            entry.backup_state = _BackupState.AMBIGUOUS
+            return exc
+        self._clear_backup(entry, _BackupState.REMOVED)
+        return None
 
     def commit(self) -> None:
         if self._committed:
@@ -1068,47 +1742,85 @@ class _OutputTransaction:
                 if entry.sink is not None:
                     entry.sink.finalize()
 
+            # Some owned materializers atomically replace the initially
+            # reserved placeholder (for example ImageIO when writing PNG).
+            # Seal the identity of each completed private artifact only after
+            # all writers finish, before any requested destination is moved.
+            for entry in entries:
+                entry.temp_identity = self._require_owned_identity(
+                    entry.temp_path,
+                    label=f"completed {entry.artifact.label} temporary",
+                )
+                entry.publication_state = _PublicationState.TEMP_OWNED
+
             self.plan.validate()
             for entry in entries:
                 final = entry.artifact.path
-                if final.exists():
-                    if not self.plan.overwrite:
-                        raise MediaError(
-                            f"destination appeared before publication: {final}")
-                    backup = self._backup_slot(entry.artifact)
-                    entry.backup_path = backup
+                try:
+                    original_identity = self._path_identity(final)
+                except FileNotFoundError:
+                    continue
+                if not self.plan.overwrite:
+                    raise MediaError(
+                        f"destination appeared before publication: {final}")
+                backup, slot_identity = self._backup_slot(entry.artifact)
+                entry.backup_path = backup
+                entry.original_identity = original_identity
+                entry.backup_slot_identity = slot_identity
+                entry.backup_state = _BackupState.MOVING_ORIGINAL
+                try:
+                    self._replace(final, backup)
+                except BaseException as exc:
+                    reconciliation_errors = self._reconcile_backup_move(entry)
+                    if reconciliation_errors:
+                        exc.add_note(
+                            "backup move reconciliation: "
+                            + "; ".join(reconciliation_errors))
+                    raise
+                moved_identity = self._path_identity(backup)
+                if moved_identity != original_identity:
+                    failure = MediaError(
+                        f"destination identity changed while creating "
+                        f"rollback backup: {final}")
+                    entry.backup_state = _BackupState.AMBIGUOUS
                     try:
-                        self._replace(final, backup)
-                    except BaseException:
-                        if final.exists():
-                            with contextlib.suppress(BaseException):
-                                self._remove(backup)
-                            entry.backup_path = None
-                        elif backup.exists():
-                            with contextlib.suppress(BaseException):
-                                self._replace(backup, final)
-                            if not backup.exists():
-                                entry.backup_path = None
-                        raise
+                        self._replace(backup, final)
+                    except BaseException as restore_exc:
+                        failure.add_note(
+                            f"foreign destination entry was retained at "
+                            f"{backup}: {restore_exc!r}")
+                    else:
+                        self._clear_backup(entry, _BackupState.RESTORED)
+                    raise failure
+                entry.backup_state = _BackupState.ORIGINAL_HELD
 
             for entry in entries:
-                entry.publishing = True
-                self._replace(entry.temp_path, entry.artifact.path)
-                entry.published = True
-                entry.publishing = False
+                entry.publication_state = _PublicationState.MOVING_TO_FINAL
+                try:
+                    self._replace(entry.temp_path, entry.artifact.path)
+                except BaseException as exc:
+                    reconciliation_errors = self._reconcile_publication(entry)
+                    if reconciliation_errors:
+                        exc.add_note(
+                            "publication reconciliation: "
+                            + "; ".join(reconciliation_errors))
+                    raise
+                self._verify_published(entry)
         except BaseException as exc:
             rollback_errors = self._rollback(entries)
             if rollback_errors:
                 detail = "; ".join(rollback_errors)
-                if not isinstance(exc, Exception):
-                    exc.add_note(f"artifact rollback also failed: {detail}")
+                exc.add_note(f"artifact rollback also failed: {detail}")
+                if isinstance(exc, PipelineError):
                     raise
-                raise MediaError(
-                    f"artifact publication failed ({exc}); rollback also "
-                    f"failed: {detail}") from exc
+                if isinstance(exc, OSError):
+                    raise MediaError(
+                        f"artifact publication failed ({exc}); rollback also "
+                        f"failed: {detail}") from exc
+                raise
             if isinstance(exc, PipelineError):
                 raise
-            if isinstance(exc, Exception):
+            if isinstance(exc, OSError):
                 raise MediaError(
                     f"artifact publication failed: {exc}") from exc
             raise
@@ -1116,24 +1828,28 @@ class _OutputTransaction:
         # Every destination has landed. This is the commit point: a later
         # interruption during backup cleanup must not roll back a complete set.
         self._committed = True
-        cleanup_interrupt: BaseException | None = None
+        cleanup_failures: list[BaseException] = []
         for entry in entries:
             if entry.sink is not None:
                 entry.sink._mark_published()
-            backup = entry.backup_path
-            if backup is not None and backup.exists():
-                try:
-                    self._remove(backup)
-                except BaseException as exc:
-                    _log.warning(
-                        "could not remove rollback backup %s: %s",
-                        backup, exc)
-                    if not isinstance(exc, Exception):
-                        with contextlib.suppress(BaseException):
-                            self._remove(backup)
-                        cleanup_interrupt = cleanup_interrupt or exc
-        if cleanup_interrupt is not None:
-            raise cleanup_interrupt
+            cleanup_failure = self._cleanup_committed_backup(entry)
+            if cleanup_failure is not None:
+                cleanup_failures.append(cleanup_failure)
+                _log.warning(
+                    "could not remove rollback backup %s: %s",
+                    entry.backup_path, cleanup_failure)
+        cleanup_failure = next(
+            (failure for failure in cleanup_failures
+             if not isinstance(failure, OSError)),
+            None,
+        )
+        if cleanup_failure is not None:
+            for failure in cleanup_failures:
+                if failure is not cleanup_failure:
+                    cleanup_failure.add_note(
+                        f"another rollback backup cleanup failed: "
+                        f"{failure!r}")
+            raise cleanup_failure
 
     def discard(self) -> None:
         if self._closed or self._committed:
@@ -1198,6 +1914,7 @@ class _ComparisonTee:
 
         from kinovsr.processors.specs import DType
 
+        self._path = Path(path)
         out_geometry = output_spec.frame.geometry
         comp_frame = dataclasses.replace(
             output_spec.frame,
@@ -1222,12 +1939,14 @@ class _ComparisonTee:
             # integer scale s this is j // s, identical to mx.repeat.
             import mlx.core as mx
 
-            self._ix = mx.array(
-                [(x * src_geometry.width) // self._out_w
-                 for x in range(self._out_w)], dtype=mx.int32)
-            self._iy = mx.array(
-                [(y * src_geometry.height) // self._out_h
-                 for y in range(self._out_h)], dtype=mx.int32)
+            with _media_operation(
+                    "comparison map allocation failed for", self._path):
+                self._ix = mx.array(
+                    [(x * src_geometry.width) // self._out_w
+                     for x in range(self._out_w)], dtype=mx.int32)
+                self._iy = mx.array(
+                    [(y * src_geometry.height) // self._out_h
+                     for y in range(self._out_h)], dtype=mx.int32)
         except BaseException:
             self.sink.discard()
             raise
@@ -1242,9 +1961,13 @@ class _ComparisonTee:
                    else mx.clip(payload[..., :3] * 255.0, 0,
                                 255).astype(mx.uint8))
         else:
-            rgb = _pb.read_pixel_buffer_rgb(payload)
+            with _media_operation(
+                    "comparison source read failed for", self._path):
+                rgb = _pb.read_pixel_buffer_rgb(payload)
         rgb = mx.contiguous(rgb)
-        mx.eval(rgb)   # materialize: free the decode graph, keep only uint8
+        with _media_operation(
+                "comparison materialization failed for", self._path):
+            mx.eval(rgb)  # materialize: free decode graph, retain only uint8
         return rgb
 
     def tap(self, units: Any) -> Any:
@@ -1278,10 +2001,12 @@ class _ComparisonTee:
         else:
             from kinovsr.media import pixel_buffers as _pb
 
-            post_f = _pb.read_pixel_buffer_rgb(
-                unit.payload).astype(mx.float32) / 255.0
-        self.sink.append(
-            unit.with_payload(mx.concatenate([pre_f, post_f], axis=1)))
+            with _media_operation(
+                    "comparison output read failed for", self._path):
+                post_f = _pb.read_pixel_buffer_rgb(
+                    unit.payload).astype(mx.float32) / 255.0
+        payload = mx.concatenate([pre_f, post_f], axis=1)
+        self.sink.append(unit.with_payload(payload))
 
 
 def _save_frame_png(payload: Any, layout: Layout, out_dir: Path,
@@ -1296,12 +2021,16 @@ def _save_frame_png(payload: Any, layout: Layout, out_dir: Path,
 
     from kinovsr.media.images import save_image
 
+    frame_path = out_dir / f"frame_{index:05d}.png"
     if layout is Layout.MLX_RGB_HWC:
         rgb = (payload[..., :3] if payload.dtype == mx.uint8
-               else mx.clip(payload[..., :3] * 255.0, 0, 255).astype(mx.uint8))
+               else mx.clip(payload[..., :3] * 255.0, 0,
+                            255).astype(mx.uint8))
     else:
-        rgb = _pb.read_pixel_buffer_rgb(payload)
-    save_image(rgb, out_dir / f"frame_{index:05d}.png")
+        with _media_operation("frame pixel-buffer read failed for", frame_path):
+            rgb = _pb.read_pixel_buffer_rgb(payload)
+    with _media_operation("frame image write failed for", frame_path):
+        save_image(rgb, frame_path)
 
 
 def run_file(
@@ -1447,8 +2176,9 @@ def _run_file_reserved(
 
         vr = reader if reader is not None else _native_vr
         keyframe_kwargs = ({"timing": timing} if timing is not None else {})
-        keyframes = vr.keyframe_display_indices(
-            video_path, **keyframe_kwargs)
+        with _media_operation("keyframe inspection failed for", video_path):
+            keyframes = vr.keyframe_display_indices(
+                video_path, **keyframe_kwargs)
         if snap_start and keyframes:
             start = min(keyframes, key=lambda k: abs(k - start))
         if gop_align:
@@ -1457,7 +2187,9 @@ def _run_file_reserved(
             if timing is not None:
                 total = timing.sample_count
             else:
-                _, _, _, total, _, _ = vr.probe_video(video_path)
+                with _media_operation(
+                        "GOP video probe failed for", video_path):
+                    _, _, _, total, _, _ = vr.probe_video(video_path)
             end_abs = total if end is None else min(end, total)
             enclosing = [k for k in keyframes if k <= start]
             read_start = max(enclosing) if enclosing else start
@@ -1519,7 +2251,10 @@ def _run_file_reserved(
     )
     if plan.get("audio sidecar") is not None and track is not None:
         # A WAV sidecar of the (trimmed) carried track, beside the output.
-        track.save_wav(transaction.temp_file("audio sidecar"))
+        sidecar_temp = transaction.temp_file("audio sidecar")
+        with _media_operation(
+                "audio sidecar write failed for", plan.path("audio sidecar")):
+            track.save_wav(sidecar_temp)
     # --skip-post-mp4 parity: process the chain (frame dumps, comparison,
     # sidecar still apply) without writing the post MP4.
     sink = None
@@ -1544,7 +2279,9 @@ def _run_file_reserved(
     cut_log_path = None
     if plan.get("cut log") is not None:
         cut_log_path = transaction.temp_file("cut log")
-        cut_log_path.write_text("", encoding="utf-8")
+        with _media_operation(
+                "cut log initialization failed for", plan.path("cut log")):
+            cut_log_path.write_text("", encoding="utf-8")
 
     # Optional per-frame PNG dumps: pre = the SOURCE frames (before the chain),
     # post = the encoded output frames (after it). Debug taps, not chain
@@ -1594,7 +2331,9 @@ def _run_file_reserved(
     pool_sink = sink if sink is not None else (tee.sink if tee is not None else None)
     if pool_sink is not None:
         writer = pool_sink.writer
-        pool = writer.adaptor.pixelBufferPool()
+        with _media_operation(
+                "writer output-pool lookup failed for", pool_sink._final_path):
+            pool = writer.adaptor.pixelBufferPool()
         if pool is not None:
             session._bind_terminal_output_pool(
                 pool,
@@ -1622,7 +2361,11 @@ def _run_file_reserved(
             source_units, retain_outputs=False) as run:
         for unit in run:
             if cut_log_path is not None and unit.boundaries:
-                with cut_log_path.open("a", encoding="utf-8") as log:
+                with (
+                    _media_operation(
+                        "cut log append failed for", plan.path("cut log")),
+                    cut_log_path.open("a", encoding="utf-8") as log,
+                ):
                     for boundary in unit.boundaries:
                         if boundary.kind is BoundaryKind.HARD_CUT:
                             log.write(f"{boundary.source_index}\n")
@@ -1676,7 +2419,9 @@ def _run_file_reserved(
             raise MediaError(
                 f"stage returned unplanned debug artifact {suffix!r}") from exc
         u8 = (mx.clip(image, 0, 1) * 255).astype(mx.uint8)
-        save_image(mx.stack([u8, u8, u8], axis=-1), png)
+        debug_rgb = mx.stack([u8, u8, u8], axis=-1)
+        with _media_operation("debug image write failed for", final_png):
+            save_image(debug_rgb, png)
         _log.info("[noise-map-debug] %s written: %s", suffix, final_png)
 
     transaction.commit()

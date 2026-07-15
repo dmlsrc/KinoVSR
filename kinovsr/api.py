@@ -34,6 +34,7 @@ from typing import Any
 
 from kinovsr.pipeline import PipelineSession
 from kinovsr.processors import StreamSpec
+from kinovsr.processors.errors import MediaError, PipelineError
 from kinovsr.reporting import Reporter
 from kinovsr.settings import Settings
 
@@ -142,44 +143,54 @@ def process_video_file(
     """
     if settings is None:
         settings = Settings.from_env()
-    _runtime_setup(settings)
+    try:
+        _runtime_setup(settings)
+    except (OSError, RuntimeError) as exc:
+        raise MediaError(f"MLX runtime setup failed: {exc}") from exc
 
     from kinovsr.pipeline import run_file
     from kinovsr.processors import Layout
 
-    result = run_file(
-        dict(config),
-        video=video,
-        output=output,
-        settings=settings,
-        reporter=reporter,
-        layout=layout or Layout.MLX_RGB_HWC,
-        start=start,
-        end=end,
-        max_frames=max_frames,
-        max_output_frames=max_output_frames,
-        max_output_seconds=max_output_seconds,
-        audio=audio,
-        audio_codec=audio_codec,
-        save_audio_sidecar=save_audio_sidecar,
-        quality=quality,
-        chunk_size=chunk_size,
-        source_color=source_color,
-        source_range=source_range,
-        encode_chroma=encode_chroma,
-        save_pre_frames=save_pre_frames,
-        save_post_frames=save_post_frames,
-        comparison=comparison,
-        snap_start=snap_start,
-        gop_align=gop_align,
-        gop_min_window=gop_min_window,
-        gop_max_window=gop_max_window,
-        cut_log=cut_log,
-        skip_post_mp4=skip_post_mp4,
-        noise_map_debug=noise_map_debug,
-        overwrite=overwrite,
-        reader=reader,
-    )
+    try:
+        result = run_file(
+            dict(config),
+            video=video,
+            output=output,
+            settings=settings,
+            reporter=reporter,
+            layout=layout or Layout.MLX_RGB_HWC,
+            start=start,
+            end=end,
+            max_frames=max_frames,
+            max_output_frames=max_output_frames,
+            max_output_seconds=max_output_seconds,
+            audio=audio,
+            audio_codec=audio_codec,
+            save_audio_sidecar=save_audio_sidecar,
+            quality=quality,
+            chunk_size=chunk_size,
+            source_color=source_color,
+            source_range=source_range,
+            encode_chroma=encode_chroma,
+            save_pre_frames=save_pre_frames,
+            save_post_frames=save_post_frames,
+            comparison=comparison,
+            snap_start=snap_start,
+            gop_align=gop_align,
+            gop_min_window=gop_min_window,
+            gop_max_window=gop_max_window,
+            cut_log=cut_log,
+            skip_post_mp4=skip_post_mp4,
+            noise_map_debug=noise_map_debug,
+            overwrite=overwrite,
+            reader=reader,
+        )
+    except PipelineError:
+        raise
+    except OSError as exc:
+        raise MediaError(
+            f"video processing failed for {video} -> {output}: {exc}"
+        ) from exc
     return VideoProcessResult(
         post_path=result.path,
         comparison_path=result.comparison_path,

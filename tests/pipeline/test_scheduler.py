@@ -113,6 +113,38 @@ class Exploding(Recorder):
         yield unit
 
 
+class ProgrammerFailure(Recorder):
+    def __init__(self, hook, failure, log=None):
+        super().__init__("programmer", log)
+        self.hook = hook
+        self.failure = failure
+
+    def prepare(self, input_spec, context):
+        if self.hook == "prepare":
+            raise self.failure
+        super().prepare(input_spec, context)
+
+    def process(self, unit, context):
+        if self.hook == "process":
+            raise self.failure
+        yield unit
+
+    def reset(self, boundary, context):
+        if self.hook == "reset":
+            raise self.failure
+        super().reset(boundary, context)
+
+    def flush(self, context):
+        if self.hook == "flush":
+            raise self.failure
+        return super().flush(context)
+
+    def close(self, context):
+        if self.hook == "close":
+            raise self.failure
+        super().close(context)
+
+
 def stage_for(processor, name=None) -> ResolvedStage:
     s = spec()
     return ResolvedStage(
@@ -202,6 +234,18 @@ class TestLifecycle:
         next(stream)
         assert len(pulled) <= 2  # no eager drain of the source
         stream.close()
+
+    @pytest.mark.parametrize(
+        "hook", ["prepare", "reset", "process", "flush", "close"],
+    )
+    @pytest.mark.parametrize("failure_type", [TypeError, AssertionError])
+    def test_programmer_failure_is_not_wrapped(self, hook, failure_type):
+        failure = failure_type(f"injected {hook} defect")
+        processor = ProgrammerFailure(hook, failure)
+
+        with pytest.raises(failure_type) as caught:
+            list(run_chain(chain(processor), units(1), CONTEXT))
+        assert caught.value is failure
 
 
 class TestBoundaries:
@@ -512,6 +556,35 @@ class TestCleanup:
         assert [x for x in b.log if x[1] == "close"] == [("b", "close", "")]
         assert any("a-close failed" in str(c)
                    for c in _context_chain(exc.value))
+
+    @pytest.mark.parametrize("failure_type", [TypeError, AssertionError])
+    def test_programmer_close_failure_runs_all_cleanup(
+            self, failure_type):
+        log = []
+        finalizers = []
+        failure = failure_type("injected close defect")
+
+        class BadClose(Recorder):
+            def close(self, context):
+                super().close(context)
+                raise failure
+
+        first = Recorder("first", log)
+        second = BadClose("second", log)
+
+        with pytest.raises(failure_type) as caught:
+            list(run_chain(
+                chain(first, second),
+                units(1),
+                CONTEXT,
+                finalizers=(lambda: finalizers.append("finalized"),),
+            ))
+
+        assert caught.value is failure
+        assert [name for name, event, _ in log if event == "close"] == [
+            "second", "first",
+        ]
+        assert finalizers == ["finalized"]
 
 
 @pytest.mark.slow

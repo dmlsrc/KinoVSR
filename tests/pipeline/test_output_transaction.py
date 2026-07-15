@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from kinovsr.pipeline.run import (
+    FileSink,
     _Artifact,
     _ArtifactPlan,
     _ComparisonTee,
@@ -271,10 +272,42 @@ def test_comparison_setup_failure_discards_unregistered_sink(monkeypatch, tmp_pa
         mx, "array", lambda *args, **kwargs: (_ for _ in ()).throw(
             RuntimeError("injected comparison setup failure")))
 
-    with pytest.raises(RuntimeError, match="injected comparison"):
+    with pytest.raises(MediaError, match="injected comparison") as caught:
         _ComparisonTee(tmp_path / "comparison.mp4", spec, source, quality=0.5)
+    assert isinstance(caught.value.__cause__, RuntimeError)
     assert len(instances) == 1
     assert instances[0].discarded
+
+
+@pytest.mark.parametrize("failure_type", [TypeError, AssertionError])
+def test_comparison_setup_preserves_programmer_failure(
+        monkeypatch, tmp_path, failure_type):
+    import mlx.core as mx
+
+    from kinovsr.pipeline import run as run_module
+
+    class _Sink:
+        def __init__(self, *args, **kwargs):
+            self.discarded = False
+
+        def discard(self):
+            self.discarded = True
+
+    spec = StreamSpec(
+        frame=frame_spec_for_matrix(
+            "bt709", full_range=False, geometry=Geometry(16, 16)),
+        timeline=TimelineSpec(
+            time_base=Fraction(1, 24000), cadence=Fraction(25)),
+    )
+    source = SimpleNamespace(spec=spec)
+    failure = failure_type("injected programmer failure")
+    monkeypatch.setattr(run_module, "FileSink", _Sink)
+    monkeypatch.setattr(
+        mx, "array", lambda *args, **kwargs: (_ for _ in ()).throw(failure))
+
+    with pytest.raises(failure_type) as caught:
+        _ComparisonTee(tmp_path / "comparison.mp4", spec, source, quality=0.5)
+    assert caught.value is failure
 
 
 def test_commit_publishes_files_and_directories_together(tmp_path):
@@ -303,6 +336,22 @@ def test_commit_publishes_files_and_directories_together(tmp_path):
     assert not list(tmp_path.glob(".*.partial"))
 
 
+def test_commit_seals_materializer_replaced_temporary_identity(tmp_path):
+    plan = _build_plan(tmp_path)
+
+    with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+        temp = transaction.temp_file("post output")
+        original_inode = temp.stat().st_ino
+        replacement = tmp_path / "materializer-output"
+        replacement.write_bytes(b"complete")
+        replacement.replace(temp)
+        assert temp.stat().st_ino != original_inode
+        transaction.commit()
+
+    assert plan.path("post output").read_bytes() == b"complete"
+    assert not list(tmp_path.glob(".*.partial"))
+
+
 @pytest.mark.parametrize(
     ("failure", "expected"),
     [(OSError, MediaError), (KeyboardInterrupt, KeyboardInterrupt)],
@@ -324,6 +373,44 @@ def test_second_publish_failure_rolls_back_new_singleton(
     assert not plan.path("post output").exists()
     assert not comparison.exists()
     assert not list(tmp_path.glob(".*.partial"))
+
+
+def test_rollback_quarantine_preserves_replaced_publication(tmp_path):
+    post = tmp_path / "post.mp4"
+    comparison = tmp_path / "comparison.mp4"
+    plan = _build_plan(tmp_path, comparison=comparison)
+    failure = TypeError("injected second publication defect")
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            post_temp = transaction.temp_file("post output")
+            comparison_temp = transaction.temp_file("comparison output")
+            post_temp.write_bytes(b"post")
+            comparison_temp.write_bytes(b"comparison")
+            original_replace = transaction._replace
+            original_quarantine = transaction._quarantine_and_remove
+
+            def fail_second(source, destination):
+                if source == comparison_temp:
+                    raise failure
+                original_replace(source, destination)
+
+            def replace_before_quarantine(path, *args, **kwargs):
+                if path == post:
+                    path.unlink()
+                    path.write_bytes(b"external")
+                return original_quarantine(path, *args, **kwargs)
+
+            transaction._replace = fail_second
+            transaction._quarantine_and_remove = replace_before_quarantine
+            transaction.commit()
+
+    with pytest.raises(TypeError) as caught:
+        commit()
+
+    assert caught.value is failure
+    assert post.read_bytes() == b"external"
+    assert not comparison.exists()
 
 
 def test_overwrite_rollback_restores_every_existing_destination(tmp_path):
@@ -428,10 +515,432 @@ def test_interrupt_after_backup_rename_restores_original(tmp_path):
     assert not list(tmp_path.glob(".*.rollback"))
 
 
-def test_interrupt_during_backup_cleanup_keeps_committed_output(tmp_path):
+def test_failed_publication_does_not_remove_external_destination(tmp_path):
+    post = tmp_path / "post.mp4"
+    marker = post / "external.txt"
+    plan = _build_plan(tmp_path)
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            temp = transaction.temp_file("post output")
+            temp.write_bytes(b"new")
+
+            def external_destination_then_fail(source, destination):
+                destination.mkdir()
+                marker.write_bytes(b"external")
+                source.replace(destination)
+
+            transaction._replace = external_destination_then_fail
+            transaction.commit()
+
+    with pytest.raises(MediaError):
+        commit()
+
+    assert marker.read_bytes() == b"external"
+    assert not list(tmp_path.glob(".*.partial"))
+
+
+def test_exclusive_publication_preserves_external_regular_file(tmp_path):
+    post = tmp_path / "post.mp4"
+    plan = _build_plan(tmp_path)
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            temp = transaction.temp_file("post output")
+            temp.write_bytes(b"new")
+            original_replace = transaction._replace
+
+            def external_file_then_publish(source, destination):
+                if source == temp:
+                    destination.write_bytes(b"external")
+                original_replace(source, destination)
+
+            transaction._replace = external_file_then_publish
+            transaction.commit()
+
+    with pytest.raises(MediaError):
+        commit()
+
+    assert post.read_bytes() == b"external"
+    assert not list(tmp_path.glob(".*.partial"))
+
+
+def test_successful_rename_rejects_replaced_temporary_identity(tmp_path):
+    post = tmp_path / "post.mp4"
+    stash = tmp_path / "owned-stash"
+    plan = _build_plan(tmp_path)
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            temp = transaction.temp_file("post output")
+            temp.write_bytes(b"owned")
+            original_replace = transaction._replace
+
+            def replace_temporary_before_publish(source, destination):
+                if source == temp:
+                    source.replace(stash)
+                    source.write_bytes(b"external")
+                original_replace(source, destination)
+
+            transaction._replace = replace_temporary_before_publish
+            transaction.commit()
+
+    with pytest.raises(MediaError, match="published identity"):
+        commit()
+
+    assert post.read_bytes() == b"external"
+    assert stash.read_bytes() == b"owned"
+
+
+def test_transaction_discard_preserves_replaced_sink_temporary(tmp_path):
+    post = tmp_path / "post.mp4"
+    temp = tmp_path / ".post.mp4.sink.partial"
+    stash = tmp_path / "owned-stash"
+    temp.write_bytes(b"owned")
+    plan = _build_plan(tmp_path)
+    cancelled = []
+
+    sink = FileSink.__new__(FileSink)
+    sink._temp_path = temp
+    sink._published = False
+    sink._discarded = False
+    sink._transaction_managed = False
+    sink.writer = SimpleNamespace(cancel=lambda: cancelled.append(True))
+
+    with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+        transaction.register_sink("post output", sink)
+        temp.replace(stash)
+        temp.write_bytes(b"external")
+
+    assert cancelled == [True]
+    assert temp.read_bytes() == b"external"
+    assert stash.read_bytes() == b"owned"
+    assert not post.exists()
+
+
+def test_backup_move_detects_source_identity_replacement(tmp_path):
+    post = tmp_path / "post.mp4"
+    stash = tmp_path / "actor-stash"
+    post.write_bytes(b"old")
+    plan = _build_plan(tmp_path, overwrite=True)
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            transaction.temp_file("post output").write_bytes(b"new")
+            original_replace = transaction._replace
+
+            def replace_source_before_backup(source, destination):
+                if source == post:
+                    source.replace(stash)
+                    source.write_bytes(b"external")
+                original_replace(source, destination)
+
+            transaction._replace = replace_source_before_backup
+            transaction.commit()
+
+    with pytest.raises(MediaError, match="identity changed"):
+        commit()
+
+    assert post.read_bytes() == b"external"
+    assert stash.read_bytes() == b"old"
+    assert not list(tmp_path.glob(".*.rollback"))
+
+
+def test_exclusive_restore_preserves_external_regular_file(tmp_path):
     post = tmp_path / "post.mp4"
     post.write_bytes(b"old")
     plan = _build_plan(tmp_path, overwrite=True)
+    failure = TypeError("injected publication defect")
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            temp = transaction.temp_file("post output")
+            temp.write_bytes(b"new")
+            original_replace = transaction._replace
+
+            def external_file_before_restore(source, destination):
+                if source == temp:
+                    raise failure
+                if source.suffix == ".rollback" and destination == post:
+                    destination.write_bytes(b"external")
+                original_replace(source, destination)
+
+            transaction._replace = external_file_before_restore
+            transaction.commit()
+
+    with pytest.raises(TypeError) as caught:
+        commit()
+
+    assert caught.value is failure
+    assert post.read_bytes() == b"external"
+    backups = list(tmp_path.glob(".*.rollback"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"old"
+
+
+def test_backup_cleanup_preserves_replacement_identity(tmp_path):
+    post = tmp_path / "post.mp4"
+    post.write_bytes(b"old")
+    plan = _build_plan(tmp_path, overwrite=True)
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            transaction.temp_file("post output").write_bytes(b"new")
+            original_cleanup = transaction._cleanup_committed_backup
+
+            def replace_backup_then_cleanup(entry):
+                assert entry.backup_path is not None
+                entry.backup_path.unlink()
+                entry.backup_path.write_bytes(b"external")
+                return original_cleanup(entry)
+
+            transaction._cleanup_committed_backup = replace_backup_then_cleanup
+            transaction.commit()
+
+    with pytest.raises(MediaError, match="identity changed"):
+        commit()
+
+    assert post.read_bytes() == b"new"
+    backups = list(tmp_path.glob(".*.rollback"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"external"
+
+
+def test_publication_replacement_after_rename_survives_rollback(tmp_path):
+    post = tmp_path / "post.mp4"
+    plan = _build_plan(tmp_path)
+    failure = KeyboardInterrupt("publication returned after rename")
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            temp = transaction.temp_file("post output")
+            temp.write_bytes(b"new")
+
+            def replace_then_swap(source, destination):
+                source.replace(destination)
+                destination.unlink()
+                destination.write_bytes(b"external")
+                raise failure
+
+            transaction._replace = replace_then_swap
+            transaction.commit()
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        commit()
+
+    assert caught.value is failure
+    assert post.read_bytes() == b"external"
+    assert any(
+        "publication ownership is ambiguous" in note
+        for note in getattr(failure, "__notes__", ())
+    )
+
+
+def test_backup_probe_failure_does_not_replace_primary(tmp_path):
+    post = tmp_path / "post.mp4"
+    post.write_bytes(b"old")
+    plan = _build_plan(tmp_path, overwrite=True)
+    failure = KeyboardInterrupt("backup returned after rename")
+    probe_failure = OSError("injected backup probe failure")
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            transaction.temp_file("post output").write_bytes(b"new")
+            original_inspect = transaction._inspect_identity
+            probe_failed = False
+
+            def fail_probe_once(path):
+                nonlocal probe_failed
+                if path == post and not probe_failed:
+                    probe_failed = True
+                    return None, probe_failure
+                return original_inspect(path)
+
+            def replace_then_interrupt(source, destination):
+                source.replace(destination)
+                if source == post:
+                    raise failure
+
+            transaction._inspect_identity = fail_probe_once
+            transaction._replace = replace_then_interrupt
+            transaction.commit()
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        commit()
+
+    assert caught.value is failure
+    assert post.read_bytes() == b"old"
+    assert any(
+        "injected backup probe failure" in note
+        for note in getattr(failure, "__notes__", ())
+    )
+    assert not list(tmp_path.glob(".*.rollback"))
+
+
+def test_failed_backup_restore_retains_original_and_diagnostic(tmp_path):
+    post = tmp_path / "post.mp4"
+    post.write_bytes(b"old")
+    plan = _build_plan(tmp_path, overwrite=True)
+    failure = KeyboardInterrupt("backup returned after rename")
+    restore_failure = OSError("injected backup restore failure")
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            transaction.temp_file("post output").write_bytes(b"new")
+
+            def replace(source, destination):
+                if source == post:
+                    source.replace(destination)
+                    raise failure
+                if source.suffix == ".rollback":
+                    raise restore_failure
+                source.replace(destination)
+
+            transaction._replace = replace
+            transaction.commit()
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        commit()
+
+    assert caught.value is failure
+    assert not post.exists()
+    backups = list(tmp_path.glob(".*.rollback"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"old"
+    assert any(
+        "injected backup restore failure" in note
+        for note in getattr(failure, "__notes__", ())
+    )
+
+
+def test_restore_that_completes_then_raises_is_not_retried(tmp_path):
+    post = tmp_path / "post.mp4"
+    post.write_bytes(b"old")
+    plan = _build_plan(tmp_path, overwrite=True)
+    failure = TypeError("injected publication defect")
+    restore_failure = OSError("restore returned after rename")
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            temp = transaction.temp_file("post output")
+            temp.write_bytes(b"new")
+
+            def replace(source, destination):
+                if source == temp:
+                    raise failure
+                if source.suffix == ".rollback":
+                    source.replace(destination)
+                    raise restore_failure
+                source.replace(destination)
+
+            transaction._replace = replace
+            transaction.commit()
+
+    with pytest.raises(TypeError) as caught:
+        commit()
+
+    assert caught.value is failure
+    assert post.read_bytes() == b"old"
+    assert not list(tmp_path.glob(".*.rollback"))
+    assert any(
+        "restore returned after rename" in note
+        for note in getattr(failure, "__notes__", ())
+    )
+
+
+@pytest.mark.parametrize("directory", [False, True])
+def test_backup_slot_path_conversion_failure_cleans_slot(
+        monkeypatch, tmp_path, directory):
+    from kinovsr.pipeline import run as run_module
+
+    artifact = _Artifact("output", tmp_path / "output", directory=directory)
+    failure = SystemExit("injected rollback Path conversion failure")
+
+    def fail_path(raw):
+        raise failure
+
+    monkeypatch.setattr(run_module, "Path", fail_path)
+    with pytest.raises(SystemExit) as caught:
+        _OutputTransaction._backup_slot(artifact)
+
+    assert caught.value is failure
+    assert not list(tmp_path.glob(".*.rollback"))
+
+
+def test_backup_slot_close_failure_cleans_path_without_retry(
+        monkeypatch, tmp_path):
+    from kinovsr.pipeline import run as run_module
+
+    artifact = _Artifact("output", tmp_path / "output")
+    failure = KeyboardInterrupt("injected rollback close interruption")
+    acquired = []
+
+    def fail_close(fd):
+        acquired.append(fd)
+        raise failure
+
+    monkeypatch.setattr(run_module, "_close_created_fd", fail_close)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _OutputTransaction._backup_slot(artifact)
+
+    assert caught.value is failure
+    assert len(acquired) == 1
+    assert not list(tmp_path.glob(".*.rollback"))
+    os.close(acquired[0])
+
+
+def test_backup_file_slot_failure_preserves_replacement(monkeypatch, tmp_path):
+    from kinovsr.pipeline import run as run_module
+
+    artifact = _Artifact("output", tmp_path / "output")
+    failure = TypeError("injected rollback unlink defect")
+    original_unlink = run_module.os.unlink
+
+    def unlink_then_replace(raw):
+        original_unlink(raw)
+        Path(raw).write_bytes(b"external")
+        raise failure
+
+    monkeypatch.setattr(run_module.os, "unlink", unlink_then_replace)
+    with pytest.raises(TypeError) as caught:
+        _OutputTransaction._backup_slot(artifact)
+
+    assert caught.value is failure
+    backups = list(tmp_path.glob(".*.rollback"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"external"
+
+
+def test_backup_directory_slot_failure_preserves_replacement(
+        monkeypatch, tmp_path):
+    from kinovsr.pipeline import run as run_module
+
+    artifact = _Artifact("output", tmp_path / "output", directory=True)
+    failure = TypeError("injected rollback rmdir defect")
+    original_rmdir = run_module.os.rmdir
+
+    def rmdir_then_replace(raw):
+        original_rmdir(raw)
+        Path(raw).mkdir()
+        (Path(raw) / "external").write_bytes(b"external")
+        raise failure
+
+    monkeypatch.setattr(run_module.os, "rmdir", rmdir_then_replace)
+    with pytest.raises(TypeError) as caught:
+        _OutputTransaction._backup_slot(artifact)
+
+    assert caught.value is failure
+    backups = list(tmp_path.glob(".*.rollback"))
+    assert len(backups) == 1
+    assert (backups[0] / "external").read_bytes() == b"external"
+
+
+def test_interrupt_after_backup_removal_does_not_delete_replacement(tmp_path):
+    post = tmp_path / "post.mp4"
+    post.write_bytes(b"old")
+    plan = _build_plan(tmp_path, overwrite=True)
+    failure = KeyboardInterrupt("during backup cleanup")
+    replacement = b"external replacement"
 
     def commit():
         with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
@@ -443,14 +952,162 @@ def test_interrupt_during_backup_cleanup_keeps_committed_output(tmp_path):
                 nonlocal interrupted
                 if path.suffix == ".rollback" and not interrupted:
                     interrupted = True
-                    raise KeyboardInterrupt("during backup cleanup")
+                    original_remove(path)
+                    path.write_bytes(replacement)
+                    raise failure
                 original_remove(path)
 
             transaction._remove = interrupt_once
             transaction.commit()
 
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(KeyboardInterrupt) as caught:
         commit()
 
+    assert caught.value is failure
     assert post.read_bytes() == b"new"
-    assert not list(tmp_path.glob(".*.rollback"))
+    backups = list(tmp_path.glob(".*.rollback"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == replacement
+
+
+def test_operational_backup_cleanup_failure_is_not_retried(tmp_path):
+    post = tmp_path / "post.mp4"
+    post.write_bytes(b"old")
+    plan = _build_plan(tmp_path, overwrite=True)
+    calls = []
+
+    with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+        transaction.temp_file("post output").write_bytes(b"new")
+        original_remove = transaction._remove
+
+        def fail_backup_remove(path):
+            if path.suffix == ".rollback":
+                calls.append(path)
+                raise OSError("injected backup cleanup failure")
+            original_remove(path)
+
+        transaction._remove = fail_backup_remove
+        transaction.commit()
+
+    assert post.read_bytes() == b"new"
+    assert len(calls) == 1
+    backups = list(tmp_path.glob(".*.rollback"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"old"
+
+
+@pytest.mark.parametrize("failure_type", [TypeError, AssertionError])
+def test_programmer_failure_during_backup_cleanup_retains_backup(
+        tmp_path, failure_type):
+    post = tmp_path / "post.mp4"
+    post.write_bytes(b"old")
+    plan = _build_plan(tmp_path, overwrite=True)
+    failure = failure_type("injected backup cleanup defect")
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            transaction.temp_file("post output").write_bytes(b"new")
+            original_remove = transaction._remove
+            failed = False
+
+            def fail_once(path):
+                nonlocal failed
+                if path.suffix == ".rollback" and not failed:
+                    failed = True
+                    raise failure
+                original_remove(path)
+
+            transaction._remove = fail_once
+            transaction.commit()
+
+    with pytest.raises(failure_type) as caught:
+        commit()
+    assert caught.value is failure
+    assert post.read_bytes() == b"new"
+    backups = list(tmp_path.glob(".*.rollback"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"old"
+
+
+@pytest.mark.parametrize(
+    "failure_type", [TypeError, AssertionError, KeyboardInterrupt, SystemExit],
+)
+def test_rollback_cleanup_failure_does_not_replace_primary(
+        tmp_path, failure_type):
+    plan = _build_plan(tmp_path)
+    settings = _settings(tmp_path)
+    failure = failure_type("injected publication defect")
+    cleanup_failure = OSError("injected rollback cleanup failure")
+    replacement = b"external replacement"
+    cleanup_calls = 0
+
+    def commit():
+        with _OutputTransaction(plan, settings) as transaction:
+            temp = transaction.temp_file("post output")
+            temp.write_bytes(b"new")
+            original_remove = transaction._remove
+
+            def fail_publication(source, destination):
+                raise failure
+
+            def fail_cleanup_once(path):
+                nonlocal cleanup_calls
+                if path == temp:
+                    cleanup_calls += 1
+                    original_remove(path)
+                    path.write_bytes(replacement)
+                    raise cleanup_failure
+                original_remove(path)
+
+            transaction._replace = fail_publication
+            transaction._remove = fail_cleanup_once
+            transaction.commit()
+
+    with pytest.raises(failure_type) as caught:
+        commit()
+    assert caught.value is failure
+    assert any(
+        "artifact rollback also failed" in note
+        for note in getattr(failure, "__notes__", ())
+    )
+    assert cleanup_calls == 1
+    partials = list(tmp_path.glob(".*.partial"))
+    assert len(partials) == 1
+    assert partials[0].read_bytes() == replacement
+
+
+def test_ambiguous_directory_cleanup_is_not_retried_on_exit(tmp_path):
+    frames = tmp_path / "frames"
+    plan = _build_plan(tmp_path, save_pre_frames=frames)
+    failure = TypeError("injected publication defect")
+    cleanup_failure = OSError("injected directory cleanup failure")
+    cleanup_calls = 0
+
+    def commit():
+        with _OutputTransaction(plan, _settings(tmp_path)) as transaction:
+            temp = transaction.temp_directory("pre-frame directory")
+            (temp / "owned").write_bytes(b"owned")
+
+            def fail_publication(source, destination):
+                raise failure
+
+            def replace_contents_then_fail(path):
+                nonlocal cleanup_calls
+                assert path == temp
+                cleanup_calls += 1
+                (path / "owned").unlink()
+                (path / "external").write_bytes(b"external")
+                raise cleanup_failure
+
+            transaction._replace = fail_publication
+            transaction._remove = replace_contents_then_fail
+            transaction.commit()
+
+    with pytest.raises(TypeError) as caught:
+        commit()
+
+    assert caught.value is failure
+    assert cleanup_calls == 1
+    partials = list(tmp_path.glob(".*.partial"))
+    assert len(partials) == 1
+    assert (partials[0] / "external").read_bytes() == b"external"

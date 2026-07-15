@@ -310,7 +310,7 @@ def _boundary_violation(kind: BoundaryKind) -> FieldViolation:
 def _wrap_stage_error(stage: ResolvedStage, exc: Exception) -> Exception:
     """Name the offending stage on a raw processor error, leaving an
     already-typed PipelineError untouched."""
-    if isinstance(exc, PipelineError):
+    if isinstance(exc, (AssertionError, PipelineError, TypeError)):
         return exc
     return PipelineRuntimeError(stage.name, f"{type(exc).__name__}: {exc}")
 
@@ -399,7 +399,8 @@ def build_processors(
                 # Ordinary close failures lose to the build error but ride its
                 # context chain so a leaked-resource failure is still visible.
                 close_errors.append(
-                    exc if isinstance(exc, PipelineError)
+                    exc if isinstance(
+                        exc, (AssertionError, PipelineError, TypeError))
                     else PipelineRuntimeError(
                         stage_name, f"{type(exc).__name__}: {exc}"))
             except BaseException as exc:  # noqa: BLE001 - collected like _close_all
