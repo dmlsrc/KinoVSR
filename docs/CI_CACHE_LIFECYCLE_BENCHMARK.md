@@ -33,19 +33,17 @@ covers:
   or diagnostic work; and
 - the legacy `encode_video_videotoolbox` utility on success and failure.
 
-The janitor uses identity render tokens, identity clear claims, and one atomic
-render ledger. A clear runs outside the synchronization condition, while new
-renders remain gated. At the interval boundary it gates new entrants
-immediately; the last already-admitted finisher clears all work from that
-cohort. The threshold-crossing finisher never waits for its peers, because its
-caller may still hold an application lock needed by another render body.
-Staggered concurrent loops therefore cannot starve cleanup by keeping at least
-one render active, and cleanup does not create a lock inversion. This prevents
-a callback from deadlocking the accounting lock and prevents interrupts from
-stranding a numeric counter or a global boolean gate. Ordinary framework
-cache-clear failures are logged and remain dirty for retry; an explicit
-`clear_ci_caches()` call reports the failure. `KeyboardInterrupt` and
-`SystemExit` still propagate.
+The janitor keeps plain counters (active renders, dirty completed renders,
+owner leases) under one lock with an untimed condition. A clear runs outside
+the lock with a clearing flag set; render entry waits while a clear executes,
+and a clear only ever starts at zero active renders - the first finisher past
+the interval threshold at an idle moment runs it, so a finisher never waits on
+peers and no lock inversion is possible. The product renders from a single
+thread (verified at runtime on CI chains); the waits exist for host embedders.
+A failed periodic clear defers the next periodic attempt by one further
+interval, and the dirty count stays eligible for the final owner clear or an
+explicit `clear_ci_caches()` retry. Ordinary framework cache-clear failures
+are logged; `KeyboardInterrupt` and `SystemExit` still propagate.
 
 VideoToolbox pools are not flushed every 64 inputs. Those pools have their own
 hard capacities and retain their reuse set until processor close. Cache
@@ -172,14 +170,10 @@ Focused tests cover:
 - exact cleanup at 63, 64, 65, and 128 renders;
 - nested owners, owner-free work, final partial cleanup, and idempotent close;
 - concurrent renders and admission gating during a clear;
-- continuously overlapping renders that never quiesce at an interval boundary;
-- application-lock inversion at a periodic threshold;
+- overlap deferring the periodic clear to the first idle moment;
 - failed periodic clears followed by periodic, explicit, or final retry;
 - render failure versus cleanup failure exception precedence;
 - autorelease-pool exit failure combined with cleanup failure;
-- interrupts while waiting, after claiming a clear, and while committing a
-  render completion;
-- owner construction and interrupted-release failure windows;
 - session, `run_plan`, file-run, and native-encoder ownership on success,
   cancellation, construction failure, and mid-stream failure;
 - all actual Core Image render sites advancing exactly once and direct

@@ -9,7 +9,6 @@ arbitrary fps.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import threading
 from collections.abc import Callable
@@ -104,9 +103,15 @@ def _cleanup_winner(
 class _CiCacheJanitor:
     """Serialize cache maintenance around process-global Core Image renders.
 
-    Generations count conversion attempts, not scheduler frames. Periodic
-    cleanup is therefore proportional to the Core Image work that can grow the
-    shared cache. Owner leases add a final cleanup boundary for short runs.
+    Plain counters under one lock: renders in flight, completed renders not
+    yet covered by a clear (dirty), and live owner leases.  A clear executes
+    outside the lock with ``_clearing`` set; render entry waits while it is.
+    The product renders from a single thread (verified at runtime on CI
+    chains), so the waits exist for host embedders, not for scheduling.
+
+    Failed clears leave the dirty count in place: the work stays eligible
+    for the next threshold, the final owner release, or an explicit
+    :func:`clear_ci_caches`.
     """
 
     def __init__(self, interval: int = 64) -> None:
@@ -114,179 +119,88 @@ class _CiCacheJanitor:
             raise ValueError("Core Image cleanup interval must be positive")
         self._interval = int(interval)
         self._condition = threading.Condition()
-        # (active render tokens, dirty completed renders, cleared total,
-        # latest periodic-attempt total). Replacing this tuple makes every
-        # render transition one atomic Python attribute store, so an async
-        # exception cannot split token ownership from its accounting.
-        self._render_ledger: tuple[frozenset[object], int, int, int] = (
-            frozenset(), 0, 0, 0,
-        )
-        # (gate claim, clear executor). Replace the pair atomically so an
-        # asynchronous exception cannot expose a gate-open/stale-executor or
-        # gate-closed/unowned combination.
-        self._clear_state: tuple[object | None, object | None] = (None, None)
-        self._owner_tokens: set[object] = set()
+        self._active = 0
+        self._dirty = 0
+        self._cleared = 0
+        self._backoff = 0
+        self._owners = 0
+        self._clearing = False
 
-    @property
-    def _clear_claim(self) -> object | None:
-        """Read-only compatibility view used by deterministic tests."""
-        return self._clear_state[0]
-
-    def begin_render(self, token: object) -> None:
+    def begin_render(self) -> None:
         with self._condition:
-            while self._clear_claim is not None:
-                # The timeout is a lost-notification backstop for asynchronous
-                # exceptions that land after a gate transition but before its
-                # notify call. The ordinary path is still notification-driven.
-                self._condition.wait(timeout=0.1)
-            active, dirty, cleared, attempted = self._render_ledger
-            self._render_ledger = (
-                active.union((token,)), dirty, cleared, attempted,
-            )
+            while self._clearing:
+                self._condition.wait()
+            self._active += 1
 
-    def finish_render(self, token: object, clear: Callable[[], None]) -> None:
-        claim: object | None = None
-        established_claim: object | None = None
-        try:
-            with self._condition:
-                active, dirty, cleared, attempted = self._render_ledger
-                if token in active:
-                    active = active.difference((token,))
-                    dirty += 1
-                    self._render_ledger = (
-                        active, dirty, cleared, attempted,
-                    )
-                    work = cleared + dirty
-                    if (self._clear_claim is None
-                            and work - max(cleared, attempted) >= self._interval):
-                        # Gate new entrants immediately at the threshold. Do
-                        # not wait here: a render body may be blocked on an
-                        # application lock held by this finisher. The last
-                        # already-admitted finisher inherits clear execution.
-                        new_claim = object()
-                        # Advancing the attempt watermark before publishing
-                        # the gate is interruption-safe: a signal between the
-                        # stores may delay retry by one interval, but cannot
-                        # strand entrants behind an unowned gate.
-                        self._render_ledger = (
-                            active, dirty, cleared, work,
-                        )
-                        self._clear_state = (new_claim, None)
-                        established_claim = new_claim
-                # A retry after an interrupt may observe the token transition
-                # but not the responsibility handoff or notification below.
-                pending, executor = self._clear_state
-                if not active and pending is not None and executor is None:
-                    claim = pending
-                    self._clear_state = (pending, pending)
-                if not active or token not in active:
-                    self._condition.notify_all()
-            if claim is not None:
-                self._complete_clear(claim, clear)
-        except BaseException:
-            abandoned = claim if claim is not None else established_claim
-            if abandoned is not None:
-                self._abandon_clear_claim(abandoned)
-            raise
+    def finish_render(self, clear: Callable[[], None]) -> None:
+        with self._condition:
+            self._active -= 1
+            self._dirty += 1
+            # A failed attempt sets _backoff so the next periodic attempt
+            # waits one further interval instead of retrying every render.
+            due = (self._active == 0
+                   and not self._clearing
+                   and self._dirty - self._backoff >= self._interval)
+            if due:
+                self._clearing = True
+            if self._active == 0:
+                self._condition.notify_all()
+        if due:
+            self._run_clear(clear)
 
     def acquire_owner(self, clear: Callable[[], None]) -> _CiCacheOwner:
-        token = object()
-        owner = _CiCacheOwner(self, clear, token)
         with self._condition:
-            self._owner_tokens.add(token)
-        return owner
+            self._owners += 1
+        return _CiCacheOwner(self, clear)
 
-    def release_owner(self, token: object, clear: Callable[[], None]) -> None:
-        claim: object | None = None
-        try:
-            with self._condition:
-                self._owner_tokens.discard(token)
-                if self._owner_tokens:
-                    return
-                while self._clear_claim is not None:
-                    self._condition.wait(timeout=0.1)
-                    if self._owner_tokens:
-                        return
-                # Gate new render scopes before waiting so final cleanup cannot
-                # race work that starts after the final owner begins closing.
-                claim = object()
-                self._clear_state = (claim, claim)
-                while self._render_ledger[0]:
-                    self._condition.wait(timeout=0.1)
-                if self._render_ledger[1] == 0:
-                    self._clear_state = (None, None)
-                    claim = None
-                    self._condition.notify_all()
-            if claim is not None:
-                self._complete_clear(claim, clear)
-        except BaseException:
-            if claim is not None:
-                self._abandon_clear_claim(claim)
-            raise
+    def release_owner(self, clear: Callable[[], None]) -> None:
+        with self._condition:
+            self._owners -= 1
+            if self._owners:
+                return
+            while self._clearing or self._active:
+                self._condition.wait()
+            if not self._dirty:
+                return
+            self._clearing = True
+        self._run_clear(clear)
 
     def clear_if_dirty(self, clear: Callable[[], None]) -> None:
         """Clear every render completed before this call returns."""
-        claim: object | None = None
-        try:
-            with self._condition:
-                while self._clear_claim is not None:
-                    self._condition.wait(timeout=0.1)
-                claim = object()
-                self._clear_state = (claim, claim)
-                while self._render_ledger[0]:
-                    self._condition.wait(timeout=0.1)
-                if self._render_ledger[1] == 0:
-                    self._clear_state = (None, None)
-                    claim = None
-                    self._condition.notify_all()
-            if claim is not None:
-                self._complete_clear(claim, clear)
-        except BaseException:
-            if claim is not None:
-                self._abandon_clear_claim(claim)
-            raise
+        with self._condition:
+            while self._clearing or self._active:
+                self._condition.wait()
+            if not self._dirty:
+                return
+            self._clearing = True
+        self._run_clear(clear)
 
-    def _complete_clear(
-        self,
-        claim: object,
-        clear: Callable[[], None],
-    ) -> None:
-        failure: BaseException | None = None
+    def _run_clear(self, clear: Callable[[], None]) -> None:
+        # Never hold the condition while Core Image performs maintenance.
         try:
-            # Never hold the condition while Core Image performs maintenance.
             clear()
-        except BaseException as exc:  # noqa: BLE001 - re-raised after unlock
-            failure = exc
-        with self._condition:
-            if self._clear_state == (claim, claim):
-                if failure is None:
-                    active, dirty, cleared, _attempted = self._render_ledger
-                    cleared += dirty
-                    self._render_ledger = (active, 0, cleared, cleared)
-                self._clear_state = (None, None)
+        except BaseException:
+            with self._condition:
+                self._backoff = self._dirty
+                self._clearing = False
                 self._condition.notify_all()
-        if failure is not None:
-            raise failure
-
-    def _abandon_clear_claim(self, claim: object) -> None:
-        """Release only this caller's gate after an async interruption."""
+            raise
         with self._condition:
-            if self._clear_claim is claim:
-                self._clear_state = (None, None)
-            # Notify even when the claim transition already committed: the
-            # interruption may have landed immediately before its notify.
+            self._cleared += self._dirty
+            self._dirty = 0
+            self._backoff = 0
+            self._clearing = False
             self._condition.notify_all()
 
     def _snapshot(self) -> tuple[int, int, int, bool, int]:
-        """Deterministic private state view for lifecycle regression tests."""
+        """Deterministic counter view for lifecycle regression tests."""
         with self._condition:
-            active, dirty, cleared, _attempted = self._render_ledger
             return (
-                len(active),
-                cleared + dirty,
-                cleared,
-                self._clear_claim is not None,
-                len(self._owner_tokens),
+                self._active,
+                self._cleared + self._dirty,
+                self._cleared,
+                self._clearing,
+                self._owners,
             )
 
 
@@ -297,11 +211,9 @@ class _CiCacheOwner:
         self,
         janitor: _CiCacheJanitor,
         clear: Callable[[], None],
-        token: object,
     ) -> None:
         self._janitor = janitor
         self._clear = clear
-        self._token = token
         self._lock = threading.Lock()
         self._closed = False
 
@@ -309,24 +221,15 @@ class _CiCacheOwner:
         with self._lock:
             if self._closed:
                 return
+            self._closed = True
             try:
-                self._janitor.release_owner(self._token, self._clear)
+                self._janitor.release_owner(self._clear)
             except Exception as exc:  # cache maintenance is best-effort
                 _log.warning(
-                    "Core Image final cache cleanup failed; dirty work remains "
-                    "eligible for retry: %s",
+                    "Core Image final cache cleanup failed; dirty work "
+                    "remains eligible for retry: %s",
                     exc,
                 )
-            except BaseException:
-                # The token remains registered if lock acquisition was
-                # interrupted. If it was already consumed, idempotent retry
-                # re-enters final maintenance when no newer owner exists.
-                raise
-            self._closed = True
-
-    def __del__(self) -> None:
-        with contextlib.suppress(BaseException):
-            self.close()
 
     def __enter__(self) -> _CiCacheOwner:
         return self
@@ -353,19 +256,16 @@ class _CiRenderScope:
     ) -> None:
         self._janitor = janitor
         self._clear = clear
-        self._token = object()
         self._pool: Any = None
-        self._pool_entered = False
-        self._pool_finished = False
-        self._render_finished = False
+        self._begun = False
 
     def __enter__(self) -> Any:
         active: BaseException | None = None
         try:
-            self._janitor.begin_render(self._token)
+            self._janitor.begin_render()
+            self._begun = True
             self._pool = autorelease_pool()
             self._pool.__enter__()
-            self._pool_entered = True
             return ci_context()
         except BaseException as exc:  # noqa: BLE001 - cleanup precedence below
             active = exc
@@ -380,43 +280,30 @@ class _CiRenderScope:
             return False
         raise winner
 
-    def __del__(self) -> None:
-        with contextlib.suppress(BaseException):
-            self._finish(None, None, None)
-
     def _finish(self, exc_type, exc, tb) -> list[BaseException]:
         errors: list[BaseException] = []
-        if self._pool_entered and not self._pool_finished:
-            self._pool_finished = True
+        pool, self._pool = self._pool, None
+        if pool is not None:
             try:
-                self._pool.__exit__(exc_type, exc, tb)
+                pool.__exit__(exc_type, exc, tb)
             except BaseException as cleanup:  # noqa: BLE001 - collected below
                 errors.append(cleanup)
-        maintenance_errors: list[BaseException] = []
-        if not self._render_finished:
-            # Retry once after any async interruption. Finishing by identity is
-            # idempotent: an interruption before token consumption retries the
-            # transition; one after consumption returns immediately without
-            # double-counting the render.
-            for _attempt in range(2):
-                try:
-                    self._janitor.finish_render(self._token, self._clear)
-                except BaseException as cleanup:  # noqa: BLE001 - precedence below
-                    maintenance_errors.append(cleanup)
-                else:
-                    self._render_finished = True
-                    break
-        for cleanup in maintenance_errors:
-            if isinstance(cleanup, Exception):
+        begun, self._begun = self._begun, False
+        if begun:
+            try:
+                self._janitor.finish_render(self._clear)
+            except Exception as cleanup:
+                # Ordinary periodic-maintenance failures never fail a clean
+                # render; the dirty count stays eligible for a later clear.
                 _log.warning(
-                    "Core Image periodic cache cleanup failed; dirty work remains "
-                    "eligible for retry: %s",
+                    "Core Image periodic cache cleanup failed; dirty work "
+                    "remains eligible for retry: %s",
                     cleanup,
                 )
-        if (exc is not None or errors
-                or any(not isinstance(error, Exception)
-                       for error in maintenance_errors)):
-            errors.extend(maintenance_errors)
+                if exc is not None or errors:
+                    errors.append(cleanup)
+            except BaseException as cleanup:
+                errors.append(cleanup)
         return errors
 
 

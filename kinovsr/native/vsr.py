@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import os
-import signal
 import sys
 import threading
 from contextlib import contextmanager, suppress
@@ -24,23 +23,6 @@ from .frameworks import Quartz, autorelease_pool, vt
 
 _log = logging.getLogger(__name__)
 _NATIVE_STDERR_LOCK = threading.RLock()
-_SYNCHRONOUS_SIGNAL_NAMES = (
-    "SIGBUS",
-    "SIGEMT",
-    "SIGFPE",
-    "SIGILL",
-    "SIGSEGV",
-    "SIGSYS",
-    "SIGTRAP",
-)
-_FD_ACQUISITION_SIGNALS = signal.valid_signals()
-_FD_ACQUISITION_SIGNALS.discard(signal.SIGKILL)
-_FD_ACQUISITION_SIGNALS.discard(signal.SIGSTOP)
-for _signal_name in _SYNCHRONOUS_SIGNAL_NAMES:
-    _signal_number = getattr(signal, _signal_name, None)
-    if _signal_number is not None:
-        _FD_ACQUISITION_SIGNALS.discard(_signal_number)
-_FD_ACQUISITION_SIGNALS = frozenset(_FD_ACQUISITION_SIGNALS)
 
 
 def _duplicate_stderr() -> int:
@@ -57,17 +39,6 @@ def _redirect_stderr(source: int) -> None:
 
 def _close_fd(fd: int) -> None:
     os.close(fd)
-
-
-@contextmanager
-def _defer_fd_acquisition_signals():
-    """Defer asynchronous signal handlers until an fd owner is recorded."""
-    previous = signal.pthread_sigmask(
-        signal.SIG_BLOCK, _FD_ACQUISITION_SIGNALS)
-    try:
-        yield
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 @contextmanager
@@ -91,62 +62,45 @@ def _suppress_native_stderr():
     # one thread safe as well.
     with _NATIVE_STDERR_LOCK:
         sys.stderr.flush()
-        saved_fd: int | None = None
-        devnull_fd: int | None = None
-        failures: list[tuple[str, BaseException]] = []
+        saved_fd = _duplicate_stderr()
         try:
-            try:
-                # A Python signal handler can run after dup/open returns but
-                # before the assignment records ownership. Keep asynchronous
-                # signals masked through that publication; the surrounding
-                # finally is already armed before either acquisition starts.
-                with _defer_fd_acquisition_signals():
-                    saved_fd = _duplicate_stderr()
-            except BaseException as exc:
-                failures.append(("duplicate stderr", exc))
-            if saved_fd is not None and not failures:
-                try:
-                    with _defer_fd_acquisition_signals():
-                        devnull_fd = _open_devnull()
-                except BaseException as exc:
-                    failures.append(("open /dev/null", exc))
-            if devnull_fd is not None and not failures:
-                try:
-                    _redirect_stderr(devnull_fd)
-                except BaseException as exc:
-                    failures.append(("redirect stderr", exc))
-                else:
-                    try:
-                        yield
-                    except BaseException as exc:
-                        failures.append(("suppressed body", exc))
+            devnull_fd = _open_devnull()
+        except BaseException:
+            # EMFILE near the descriptor limit is the one realistic failure
+            # here; the descriptor just duplicated must not leak with it.
+            with suppress(OSError):
+                _close_fd(saved_fd)
+            raise
 
-                # Once /dev/null was acquired, redirect may have completed
-                # before reporting an exception. Always restore fd 2 before
-                # either owned descriptor is closed.
-                try:
-                    _redirect_stderr(saved_fd)
-                except BaseException as exc:
-                    failures.append(("restore stderr", exc))
-        finally:
+        primary: BaseException | None = None
+        cleanup_failures: list[tuple[str, BaseException]] = []
+
+        def _cleanup(label: str, fn: Any, fd: int) -> None:
             try:
-                if devnull_fd is not None:
-                    owned_devnull, devnull_fd = devnull_fd, None
-                    try:
-                        _close_fd(owned_devnull)
-                    except BaseException as exc:
-                        failures.append(("close /dev/null", exc))
+                fn(fd)
+            except BaseException as exc:  # noqa: BLE001 - collected below
+                cleanup_failures.append((label, exc))
+
+        try:
+            _redirect_stderr(devnull_fd)
+            try:
+                yield
             finally:
-                if saved_fd is not None:
-                    owned_saved, saved_fd = saved_fd, None
-                    try:
-                        _close_fd(owned_saved)
-                    except BaseException as exc:
-                        failures.append(("close saved stderr", exc))
+                # Restore fd 2 before closing either owned descriptor.
+                _cleanup("restore stderr", _redirect_stderr, saved_fd)
+        except BaseException as exc:
+            primary = exc
+        finally:
+            _cleanup("close /dev/null", _close_fd, devnull_fd)
+            _cleanup("close saved stderr", _close_fd, saved_fd)
 
-        if failures:
-            _, primary = failures[0]
-            for label, failure in failures[1:]:
+        # First failure wins: a body error (the native failure being
+        # silenced around) outranks cleanup errors, which ride as notes.
+        if primary is None and cleanup_failures:
+            _, primary = cleanup_failures[0]
+            cleanup_failures = cleanup_failures[1:]
+        if primary is not None:
+            for label, failure in cleanup_failures:
                 if failure is primary:
                     continue
                 with suppress(BaseException):

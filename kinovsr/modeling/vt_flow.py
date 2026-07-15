@@ -5,29 +5,32 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
 @dataclass(slots=True)
 class _Entry:
     service: Any
-    users: int = 0
-    use_lock: Any = field(default_factory=threading.Lock)
+    borrowed: bool = False
 
 
 class VtFlowServices:
     """Own a small LRU of geometry-specific VTOpticalFlow services.
 
-    A service owns mutable CVPixelBuffers and VTFrameProcessors, so leases for
-    one geometry are serialized. Reservations count while callers wait for the
-    per-service lock, preventing eviction or close underneath an active user.
-    Construction, eviction cleanup, and native computation happen outside the
-    cache lock. The owner closes the complete cache with its pipeline driver.
+    A service owns mutable CVPixelBuffers and VTFrameProcessors, so a lease
+    is exclusive per geometry.  Every product instance is owned by one
+    pipeline driver and borrowed from a single thread (verified at runtime
+    on flow-aligned runs), so there is no waiting: borrowing a geometry that
+    is already borrowed, or needing an eviction victim while every entry is
+    borrowed, is a caller bug and raises immediately.  The lock keeps the
+    bookkeeping coherent for host embedders; it is not a scheduling
+    primitive.
 
-    Service configuration is fixed here (quality tier, window, and self-test),
-    so geometry is the complete compatibility key. A future configurable tier
-    must become part of the key or use a separate manager instance.
+    Service configuration is fixed here (quality tier, window, and
+    self-test), so geometry is the complete compatibility key.  A future
+    configurable tier must become part of the key or use a separate manager
+    instance.
     """
 
     def __init__(self, max_geometries: int = 2) -> None:
@@ -37,11 +40,8 @@ class VtFlowServices:
             raise ValueError("max_geometries must be positive")
         self.max_geometries = max_geometries
         self._entries: OrderedDict[tuple[int, int], _Entry] = OrderedDict()
-        self._creating: set[tuple[int, int]] = set()
-        self._condition = threading.Condition()
+        self._lock = threading.Lock()
         self._closed = False
-        self._close_in_progress = False
-        self._close_complete = False
 
     @staticmethod
     def _make_service(width: int, height: int) -> Any:
@@ -57,64 +57,8 @@ class VtFlowServices:
 
     @property
     def size(self) -> int:
-        with self._condition:
+        with self._lock:
             return len(self._entries)
-
-    def _reserve(self, key: tuple[int, int]) -> _Entry:
-        evicted: Any = None
-        while True:
-            with self._condition:
-                if self._closed:
-                    raise RuntimeError("VT optical-flow services are closed")
-                entry = self._entries.get(key)
-                if entry is not None:
-                    entry.users += 1
-                    self._entries.move_to_end(key)
-                    return entry
-                if key in self._creating:
-                    self._condition.wait()
-                    continue
-                if len(self._entries) + len(self._creating) >= self.max_geometries:
-                    idle_key = next(
-                        (candidate for candidate, item in self._entries.items() if item.users == 0),
-                        None,
-                    )
-                    if idle_key is None:
-                        self._condition.wait()
-                        continue
-                    evicted = self._entries.pop(idle_key).service
-                self._creating.add(key)
-                break
-
-        try:
-            if evicted is not None:
-                evicted.close()
-            service = self._make_service(*key)
-        except BaseException:
-            with self._condition:
-                self._creating.remove(key)
-                self._condition.notify_all()
-            raise
-
-        with self._condition:
-            close_after_creation = self._closed
-            if not close_after_creation:
-                entry = _Entry(service=service, users=1)
-                self._entries[key] = entry
-                self._creating.remove(key)
-                self._condition.notify_all()
-                return entry
-
-        active = RuntimeError("VT optical-flow services closed during construction")
-        try:
-            service.close()
-        except BaseException as cleanup:
-            _append_cleanup_context(active, cleanup)
-        finally:
-            with self._condition:
-                self._creating.remove(key)
-                self._condition.notify_all()
-        raise active
 
     @contextmanager
     def borrow(self, width: int, height: int):
@@ -122,67 +66,96 @@ class VtFlowServices:
         key = (int(width), int(height))
         if key[0] < 1 or key[1] < 1:
             raise ValueError("VT optical-flow geometry must be positive")
-        entry = self._reserve(key)
-        try:
-            entry.use_lock.acquire()
-        except BaseException:
-            with self._condition:
-                entry.users -= 1
-                self._condition.notify_all()
-            raise
+        evicted: Any = None
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("VT optical-flow services are closed")
+            entry = self._entries.get(key)
+            if entry is not None:
+                if entry.borrowed:
+                    raise RuntimeError(
+                        f"VT optical-flow service {key} is already borrowed")
+                entry.borrowed = True
+                self._entries.move_to_end(key)
+            elif len(self._entries) >= self.max_geometries:
+                idle = next(
+                    (candidate for candidate, item in self._entries.items()
+                     if not item.borrowed),
+                    None,
+                )
+                if idle is None:
+                    raise RuntimeError(
+                        "every VT optical-flow service is borrowed; raise "
+                        "max_geometries or release a lease first")
+                evicted = self._entries.pop(idle).service
+
+        if entry is None:
+            # Construction and eviction cleanup run outside the lock; the
+            # entry is published only after the service exists.
+            if evicted is not None:
+                evicted.close()
+            service = self._make_service(*key)
+            redundant: Any = None
+            failure: BaseException | None = None
+            with self._lock:
+                existing = self._entries.get(key)
+                if self._closed:
+                    redundant = service
+                    failure = RuntimeError(
+                        "VT optical-flow services closed during construction")
+                elif existing is not None:
+                    # A host raced the same geometry in; ours is redundant.
+                    redundant = service
+                    if existing.borrowed:
+                        failure = RuntimeError(
+                            f"VT optical-flow service {key} is already "
+                            f"borrowed")
+                    else:
+                        existing.borrowed = True
+                        self._entries.move_to_end(key)
+                        entry = existing
+                else:
+                    entry = _Entry(service=service, borrowed=True)
+                    self._entries[key] = entry
+            if redundant is not None:
+                try:
+                    redundant.close()
+                except BaseException as cleanup:  # noqa: BLE001 - chained
+                    if failure is None:
+                        raise
+                    _append_cleanup_context(failure, cleanup)
+            if failure is not None:
+                raise failure
+
         try:
             yield entry.service
         finally:
-            entry.use_lock.release()
-            with self._condition:
-                entry.users -= 1
-                self._condition.notify_all()
+            with self._lock:
+                entry.borrowed = False
 
     def close(self) -> None:
-        """Wait for active leases, then close every service exactly once."""
-        claimed = False
-        services: list[Any] = []
-        failures: list[BaseException] = []
-        try:
-            with self._condition:
-                if self._close_complete:
-                    return
-                self._closed = True
-                while True:
-                    if self._close_complete:
-                        return
-                    if self._close_in_progress:
-                        self._condition.wait()
-                        continue
-                    if self._creating or any(
-                        entry.users for entry in self._entries.values()
-                    ):
-                        self._condition.wait()
-                        continue
-                    self._close_in_progress = True
-                    claimed = True
-                    services = [entry.service for entry in self._entries.values()]
-                    self._entries.clear()
-                    break
+        """Close every service exactly once; later calls are no-ops.
 
-            pending = list(services)
-            while True:
-                try:
-                    if not pending:
-                        break
-                    service = pending[0]
-                    try:
-                        service.close()
-                    finally:
-                        pending.pop(0)
-                except BaseException as exc:  # close the rest before delivery
-                    failures.append(exc)
-        finally:
-            if claimed:
-                with self._condition:
-                    self._close_in_progress = False
-                    self._close_complete = True
-                    self._condition.notify_all()
+        Closing while a lease is live is a caller bug (the product driver
+        closes on the borrowing thread after its last lease exits) and
+        raises before anything is torn down.
+        """
+        with self._lock:
+            if self._closed and not self._entries:
+                return
+            if any(entry.borrowed for entry in self._entries.values()):
+                raise RuntimeError(
+                    "cannot close VT optical-flow services while a service "
+                    "is borrowed")
+            self._closed = True
+            services = [entry.service for entry in self._entries.values()]
+            self._entries.clear()
+        failures: list[BaseException] = []
+        for service in services:
+            try:
+                service.close()
+            except BaseException as exc:  # close the rest before delivery
+                failures.append(exc)
         if failures:
             for cleanup in failures[1:]:
                 _append_cleanup_context(failures[0], cleanup)

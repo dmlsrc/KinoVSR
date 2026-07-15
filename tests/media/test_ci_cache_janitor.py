@@ -206,333 +206,65 @@ def test_final_owner_cleanup_failure_is_best_effort_and_retryable(fake_ci, caplo
 
 
 @pytest.mark.unit
-def test_final_clear_waits_for_active_render_and_gates_new_work():
+def test_final_clear_waits_for_active_render_and_blocks_renders_while_clearing():
     janitor = pb._CiCacheJanitor(interval=100)
     clear_started = threading.Event()
     allow_clear = threading.Event()
-    second_entered = threading.Event()
+    second_done = threading.Event()
 
     def clear() -> None:
-        assert janitor._snapshot()[0] == 0
         clear_started.set()
         assert allow_clear.wait(timeout=2)
 
     owner = janitor.acquire_owner(clear)
-    first_token = object()
-    janitor.begin_render(first_token)
+    janitor.begin_render()
     closer = threading.Thread(target=owner.close)
     closer.start()
-    with janitor._condition:
-        assert janitor._condition.wait_for(
-            lambda: janitor._clear_claim is not None,
-            timeout=2,
-        )
+    # The final clear must wait for the active render.
+    assert not clear_started.wait(timeout=0.05)
+    janitor.finish_render(clear)
+    assert clear_started.wait(timeout=2)
 
     def second_render() -> None:
-        token = object()
-        janitor.begin_render(token)
-        second_entered.set()
-        janitor.finish_render(token, clear)
+        janitor.begin_render()
+        janitor.finish_render(clear)
+        second_done.set()
 
     entrant = threading.Thread(target=second_render)
     entrant.start()
-    assert not second_entered.wait(timeout=0.05)
-    janitor.finish_render(first_token, clear)
-    assert clear_started.wait(timeout=2)
-    assert not second_entered.is_set()
-
+    # New renders are blocked while the clear executes.
+    assert not second_done.wait(timeout=0.05)
     allow_clear.set()
     closer.join(timeout=2)
     entrant.join(timeout=2)
     assert not closer.is_alive()
     assert not entrant.is_alive()
-    assert second_entered.is_set()
-    # The second render began after the owner's final clear, so it remains a
-    # new dirty generation for periodic maintenance rather than being lost.
+    assert second_done.is_set()
+    # The second render began after the final clear, so it remains a new
+    # dirty generation for periodic maintenance rather than being lost.
     assert janitor._snapshot() == (0, 2, 1, False, 0)
 
 
 @pytest.mark.unit
-def test_periodic_clear_gates_and_drains_continuously_overlapping_renders():
+def test_periodic_clear_defers_until_the_first_idle_moment_under_overlap():
     janitor = pb._CiCacheJanitor(interval=2)
-    clears = []
-    clear_started = threading.Event()
-    fourth_entered = threading.Event()
+    active_at_clear = []
 
     def clear() -> None:
-        clears.append(janitor._snapshot())
-        clear_started.set()
+        active_at_clear.append(janitor._snapshot()[0])
 
-    first, second, third, fourth = (object() for _ in range(4))
-    janitor.begin_render(first)
-    janitor.begin_render(second)
-    janitor.finish_render(first, clear)
-    # The third render enters before the second completes, so the active set
-    # has never reached zero when the interval threshold is crossed.
-    janitor.begin_render(third)
-
-    threshold_finisher = threading.Thread(
-        target=janitor.finish_render,
-        args=(second, clear),
-    )
-    threshold_finisher.start()
-    with janitor._condition:
-        assert janitor._condition.wait_for(
-            lambda: janitor._clear_claim is not None,
-            timeout=2,
-        )
-
-    def enter_fourth() -> None:
-        janitor.begin_render(fourth)
-        fourth_entered.set()
-        janitor.finish_render(fourth, clear)
-
-    later_entrant = threading.Thread(target=enter_fourth)
-    later_entrant.start()
-    assert not fourth_entered.wait(timeout=0.05)
-
-    janitor.finish_render(third, clear)
-    assert clear_started.wait(timeout=2)
-    threshold_finisher.join(timeout=2)
-    later_entrant.join(timeout=2)
-
-    assert not threshold_finisher.is_alive()
-    assert not later_entrant.is_alive()
-    assert fourth_entered.is_set()
-    assert len(clears) == 1
-    # The clear owns the complete three-render admitted cohort. The fourth
-    # render starts only afterward and remains the next dirty generation.
-    assert clears[0][:3] == (0, 3, 0)
-    assert janitor._snapshot() == (0, 4, 3, False, 0)
-
-
-@pytest.mark.unit
-def test_periodic_threshold_finisher_does_not_wait_on_application_lock():
-    janitor = pb._CiCacheJanitor(interval=2)
-    application_lock = threading.Lock()
-    threshold_holds_lock = threading.Event()
-    peer_waiting_for_lock = threading.Event()
-    threshold_done = threading.Event()
-    clears = []
-
-    seed, peer, threshold = (object() for _ in range(3))
-    janitor.begin_render(seed)
-    janitor.begin_render(peer)
-    janitor.finish_render(seed, lambda: clears.append("clear"))
-
-    def finish_threshold() -> None:
-        janitor.begin_render(threshold)
-        with application_lock:
-            threshold_holds_lock.set()
-            assert peer_waiting_for_lock.wait(timeout=2)
-            janitor.finish_render(threshold, lambda: clears.append("clear"))
-            threshold_done.set()
-
-    def finish_peer() -> None:
-        assert threshold_holds_lock.wait(timeout=2)
-        peer_waiting_for_lock.set()
-        with application_lock:
-            janitor.finish_render(peer, lambda: clears.append("clear"))
-
-    threshold_thread = threading.Thread(target=finish_threshold)
-    peer_thread = threading.Thread(target=finish_peer)
-    threshold_thread.start()
-    peer_thread.start()
-
-    assert threshold_done.wait(timeout=2)
-    threshold_thread.join(timeout=2)
-    peer_thread.join(timeout=2)
-
-    assert not threshold_thread.is_alive()
-    assert not peer_thread.is_alive()
-    assert clears == ["clear"]
+    janitor.begin_render()
+    janitor.begin_render()
+    janitor.finish_render(clear)
+    # A third render enters before the second completes: the threshold is
+    # crossed while a peer is active, so the clear defers.
+    janitor.begin_render()
+    janitor.finish_render(clear)
+    assert active_at_clear == []
+    # The last finisher out runs the deferred clear at zero active renders.
+    janitor.finish_render(clear)
+    assert active_at_clear == [0]
     assert janitor._snapshot() == (0, 3, 3, False, 0)
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize("operation", ["owner", "explicit"])
-def test_interrupted_wait_rolls_back_render_gate(monkeypatch, operation):
-    janitor = pb._CiCacheJanitor(interval=100)
-    clears = []
-    token = object()
-    janitor.begin_render(token)
-    owner = janitor.acquire_owner(lambda: clears.append("clear"))
-    original_wait = janitor._condition.wait
-
-    def interrupt_wait(*_args, **_kwargs):
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(janitor._condition, "wait", interrupt_wait)
-    if operation == "owner":
-        with pytest.raises(KeyboardInterrupt):
-            owner.close()
-        expected_owners = 0
-    else:
-        with pytest.raises(KeyboardInterrupt):
-            janitor.clear_if_dirty(lambda: clears.append("clear"))
-        expected_owners = 1
-
-    assert janitor._snapshot() == (1, 0, 0, False, expected_owners)
-    monkeypatch.setattr(janitor._condition, "wait", original_wait)
-    janitor.finish_render(token, lambda: clears.append("clear"))
-    owner.close()
-    assert clears == ["clear"]
-    assert janitor._snapshot() == (0, 1, 1, False, 0)
-
-
-@pytest.mark.unit
-def test_render_finish_entry_interrupt_is_retried_without_stranding(fake_ci):
-    janitor, _context, _enters, _exits = fake_ci
-    scope = pb.ci_render_scope()
-    scope.__enter__()
-    base = janitor._condition
-
-    class InterruptingCondition:
-        def __init__(self):
-            self.interrupt = True
-
-        def __enter__(self):
-            if self.interrupt:
-                self.interrupt = False
-                raise KeyboardInterrupt
-            return base.__enter__()
-
-        def __exit__(self, exc_type, exc, tb):
-            return base.__exit__(exc_type, exc, tb)
-
-        def wait(self, timeout=None):
-            return base.wait(timeout)
-
-        def notify_all(self):
-            return base.notify_all()
-
-    janitor._condition = InterruptingCondition()
-
-    with pytest.raises(KeyboardInterrupt):
-        scope.__exit__(None, None, None)
-
-    assert janitor._snapshot() == (0, 1, 0, False, 0)
-    janitor.clear_if_dirty(lambda: None)
-    assert janitor._snapshot() == (0, 1, 1, False, 0)
-
-
-@pytest.mark.unit
-def test_interrupt_between_clear_claim_and_callback_releases_gate(monkeypatch):
-    janitor = pb._CiCacheJanitor(interval=1)
-    token = object()
-    janitor.begin_render(token)
-    original_complete = janitor._complete_clear
-
-    def interrupt_before_callback(*_args):
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(janitor, "_complete_clear", interrupt_before_callback)
-    with pytest.raises(KeyboardInterrupt):
-        janitor.finish_render(token, lambda: None)
-
-    assert janitor._snapshot() == (0, 1, 0, False, 0)
-    monkeypatch.setattr(janitor, "_complete_clear", original_complete)
-    janitor.clear_if_dirty(lambda: None)
-    assert janitor._snapshot() == (0, 1, 1, False, 0)
-
-
-@pytest.mark.unit
-def test_owner_release_entry_interrupt_is_retryable():
-    janitor = pb._CiCacheJanitor(interval=100)
-    owner = janitor.acquire_owner(lambda: None)
-    base = janitor._condition
-
-    class InterruptingCondition:
-        def __init__(self):
-            self.interrupt = True
-
-        def __enter__(self):
-            if self.interrupt:
-                self.interrupt = False
-                raise KeyboardInterrupt
-            return base.__enter__()
-
-        def __exit__(self, exc_type, exc, tb):
-            return base.__exit__(exc_type, exc, tb)
-
-        def wait(self, timeout=None):
-            return base.wait(timeout)
-
-        def notify_all(self):
-            return base.notify_all()
-
-    janitor._condition = InterruptingCondition()
-
-    with pytest.raises(KeyboardInterrupt):
-        owner.close()
-    assert janitor._snapshot() == (0, 0, 0, False, 1)
-
-    owner.close()
-    assert janitor._snapshot() == (0, 0, 0, False, 0)
-
-
-@pytest.mark.unit
-def test_owner_construction_failure_does_not_register_token(monkeypatch):
-    janitor = pb._CiCacheJanitor(interval=100)
-
-    def fail_owner(*_args):
-        raise MemoryError("owner construction failed")
-
-    monkeypatch.setattr(pb, "_CiCacheOwner", fail_owner)
-    with pytest.raises(MemoryError, match="owner construction failed"):
-        janitor.acquire_owner(lambda: None)
-
-    assert janitor._snapshot() == (0, 0, 0, False, 0)
-
-
-@pytest.mark.unit
-def test_interrupt_after_render_transition_retries_missed_notification(fake_ci):
-    janitor, _context, _enters, _exits = fake_ci
-    scope = pb.ci_render_scope()
-    scope.__enter__()
-    original_notify = janitor._condition.notify_all
-    calls = 0
-
-    def interrupt_first_notify():
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise KeyboardInterrupt
-        original_notify()
-
-    janitor._condition.notify_all = interrupt_first_notify
-
-    with pytest.raises(KeyboardInterrupt):
-        scope.__exit__(None, None, None)
-
-    assert calls >= 2
-    assert janitor._snapshot() == (0, 1, 0, False, 0)
-
-
-@pytest.mark.unit
-def test_interrupt_after_clear_transition_retries_missed_notification(fake_ci):
-    janitor, context, _enters, _exits = fake_ci
-    janitor._interval = 1
-    original_notify = janitor._condition.notify_all
-    calls = 0
-
-    def interrupt_second_notify():
-        nonlocal calls
-        calls += 1
-        # First notify removes the render token. The second releases the clear
-        # gate after the cache callback and ledger transition have completed.
-        if calls == 2:
-            raise KeyboardInterrupt
-        original_notify()
-
-    janitor._condition.notify_all = interrupt_second_notify
-
-    with pytest.raises(KeyboardInterrupt), pb.ci_render_scope():
-        pass
-
-    assert context.clear_calls == 1
-    assert calls >= 3
-    assert janitor._snapshot() == (0, 1, 1, False, 0)
 
 
 @pytest.mark.unit

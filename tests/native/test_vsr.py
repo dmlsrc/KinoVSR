@@ -131,10 +131,8 @@ def test_native_stderr_preserves_process_control_body(monkeypatch, failure_type)
 
 def test_native_stderr_real_fd_failure_matrix_in_subprocess():
     script = r'''
-import dis
 import json
 import os
-import signal
 import sys
 import threading
 import time
@@ -158,50 +156,6 @@ def fd_set():
             continue
         result.append(fd)
     return result
-
-def interrupt_acquisition_at_return(helper):
-    sentinel = KeyboardInterrupt(f"interrupted {helper.__name__}")
-    fired = False
-    body_entered = False
-
-    def handle_signal(_signum, _frame):
-        raise sentinel
-
-    def trace(frame, event, _arg):
-        nonlocal fired
-        if frame.f_code is helper.__code__:
-            frame.f_trace_opcodes = True
-            if (event == "opcode"
-                    and dis.opname[
-                        frame.f_code.co_code[frame.f_lasti]] == "RETURN_VALUE"
-                    and not fired):
-                fired = True
-                os.kill(os.getpid(), signal.SIGUSR1)
-        return trace
-
-    previous_handler = signal.signal(signal.SIGUSR1, handle_signal)
-    before = fd_set()
-    sys.settrace(trace)
-    try:
-        with vsr._suppress_native_stderr():
-            body_entered = True
-    except BaseException as caught:
-        identity = caught is sentinel
-    else:
-        identity = False
-    finally:
-        sys.settrace(None)
-        signal.signal(signal.SIGUSR1, previous_handler)
-    after = fd_set()
-    return {
-        "fired": fired,
-        "identity": identity,
-        "body_entered": body_entered,
-        "fd_match": before == after,
-    }
-
-duplicate_signal = interrupt_acquisition_at_return(vsr._duplicate_stderr)
-open_signal = interrupt_acquisition_at_return(vsr._open_devnull)
 
 open_failure = RuntimeError("open failed")
 before_open = fd_set()
@@ -346,8 +300,6 @@ after_contended = fd_set()
 os.write(2, b"stderr-restored-marker\n")
 
 print(json.dumps({
-    "duplicate_signal": duplicate_signal,
-    "open_signal": open_signal,
     "open_identity": open_identity,
     "open_fd_match": before_open == after_open,
     "body_identity": body_identity,
@@ -384,18 +336,6 @@ print(json.dumps({
     assert result.returncode == 0, captured_stderr
     report = json.loads(result.stdout)
     assert report == {
-        "duplicate_signal": {
-            "fired": True,
-            "identity": True,
-            "body_entered": False,
-            "fd_match": True,
-        },
-        "open_signal": {
-            "fired": True,
-            "identity": True,
-            "body_entered": False,
-            "fd_match": True,
-        },
         "open_identity": True,
         "open_fd_match": True,
         "body_identity": True,

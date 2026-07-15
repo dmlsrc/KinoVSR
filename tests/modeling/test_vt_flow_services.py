@@ -55,39 +55,6 @@ def test_geometry_lru_is_bounded_reuses_and_closes_exactly_once(monkeypatch):
     assert first.close_count == second.close_count == third.close_count == 1
 
 
-def test_active_entry_blocks_eviction_until_lease_releases(monkeypatch):
-    services, made = _manager(monkeypatch, 1)
-    active = threading.Event()
-    release = threading.Event()
-    replacement_acquired = threading.Event()
-
-    def hold_first():
-        with services.borrow(16, 12):
-            active.set()
-            assert release.wait(2)
-
-    def borrow_replacement():
-        with services.borrow(32, 24):
-            replacement_acquired.set()
-
-    first_thread = threading.Thread(target=hold_first)
-    first_thread.start()
-    assert active.wait(2)
-    second_thread = threading.Thread(target=borrow_replacement)
-    second_thread.start()
-
-    assert not replacement_acquired.wait(0.05)
-    assert made[0].close_count == 0
-    release.set()
-    first_thread.join(2)
-    second_thread.join(2)
-
-    assert not first_thread.is_alive()
-    assert not second_thread.is_alive()
-    assert replacement_acquired.is_set()
-    assert made[0].close_count == 1
-    services.close()
-
 
 def test_active_oldest_entry_skips_to_idle_victim(monkeypatch):
     services, made = _manager(monkeypatch, 2)
@@ -105,77 +72,6 @@ def test_active_oldest_entry_skips_to_idle_victim(monkeypatch):
     assert all(service.close_count == 1 for service in made)
 
 
-def test_same_geometry_waiter_is_reserved_and_serialized(monkeypatch):
-    services, _ = _manager(monkeypatch, 1)
-    first_acquired = threading.Event()
-    release = threading.Event()
-    second_acquired = threading.Event()
-
-    def first():
-        with services.borrow(16, 12):
-            first_acquired.set()
-            assert release.wait(2)
-
-    def second():
-        with services.borrow(16, 12):
-            second_acquired.set()
-
-    first_thread = threading.Thread(target=first)
-    first_thread.start()
-    assert first_acquired.wait(2)
-    second_thread = threading.Thread(target=second)
-    second_thread.start()
-    with services._condition:
-        assert services._condition.wait_for(
-            lambda: services._entries[(16, 12)].users == 2,
-            timeout=2,
-        )
-    assert not second_acquired.is_set()
-
-    release.set()
-    first_thread.join(2)
-    second_thread.join(2)
-    assert second_acquired.is_set()
-    services.close()
-
-
-def test_same_geometry_construction_is_single_flight(monkeypatch):
-    from kinovsr.modeling.vt_flow import VtFlowServices
-
-    factory_entered = threading.Event()
-    release_factory = threading.Event()
-    factory_calls = []
-    service = _Service((16, 12))
-
-    def make(width, height):
-        factory_calls.append((width, height))
-        factory_entered.set()
-        assert release_factory.wait(2)
-        return service
-
-    monkeypatch.setattr(VtFlowServices, "_make_service", staticmethod(make))
-    services = VtFlowServices(1)
-    completed = []
-
-    def use():
-        with services.borrow(16, 12) as borrowed:
-            completed.append(borrowed)
-
-    first = threading.Thread(target=use)
-    second = threading.Thread(target=use)
-    first.start()
-    assert factory_entered.wait(2)
-    second.start()
-    second.join(0.05)
-    assert second.is_alive()
-    assert factory_calls == [(16, 12)]
-
-    release_factory.set()
-    first.join(2)
-    second.join(2)
-    assert completed == [service, service]
-    assert factory_calls == [(16, 12)]
-    services.close()
 
 
 def test_different_geometry_construction_can_overlap(monkeypatch):
@@ -206,162 +102,8 @@ def test_different_geometry_construction_can_overlap(monkeypatch):
     services.close()
 
 
-def test_close_waits_for_active_lease(monkeypatch):
-    services, made = _manager(monkeypatch, 1)
-    active = threading.Event()
-    release = threading.Event()
-    closed = threading.Event()
-
-    def use():
-        with services.borrow(16, 12):
-            active.set()
-            assert release.wait(2)
-
-    def close():
-        services.close()
-        closed.set()
-
-    user = threading.Thread(target=use)
-    user.start()
-    assert active.wait(2)
-    closer = threading.Thread(target=close)
-    closer.start()
-    assert not closed.wait(0.05)
-    assert made[0].close_count == 0
-
-    release.set()
-    user.join(2)
-    closer.join(2)
-    assert closed.is_set()
-    assert made[0].close_count == 1
 
 
-def test_interrupted_close_wait_can_be_retried(monkeypatch):
-    services, made = _manager(monkeypatch, 1)
-    active = threading.Event()
-    release = threading.Event()
-
-    class InterruptOnceCondition(threading.Condition):
-        interrupt_next_wait = False
-
-        def wait(self, timeout=None):
-            if self.interrupt_next_wait:
-                self.interrupt_next_wait = False
-                raise KeyboardInterrupt("close wait interrupted")
-            return super().wait(timeout)
-
-    condition = InterruptOnceCondition()
-    services._condition = condition
-
-    def use():
-        with services.borrow(16, 12):
-            active.set()
-            assert release.wait(2)
-
-    user = threading.Thread(target=use)
-    user.start()
-    assert active.wait(2)
-
-    condition.interrupt_next_wait = True
-    with pytest.raises(KeyboardInterrupt, match="close wait interrupted"):
-        services.close()
-
-    release.set()
-    user.join(2)
-    assert not user.is_alive()
-
-    services.close()
-    services.close()
-    assert services.size == 0
-    assert made[0].close_count == 1
-
-
-def test_close_racing_construction_closes_unpublished_service(monkeypatch):
-    from kinovsr.modeling.vt_flow import VtFlowServices
-
-    factory_entered = threading.Event()
-    release_factory = threading.Event()
-    service = _Service((16, 12))
-
-    def make(_width, _height):
-        factory_entered.set()
-        assert release_factory.wait(2)
-        return service
-
-    monkeypatch.setattr(VtFlowServices, "_make_service", staticmethod(make))
-    services = VtFlowServices(1)
-    errors = []
-
-    def borrow():
-        try:
-            with services.borrow(16, 12):
-                pytest.fail("a service created during close must not publish")
-        except RuntimeError as exc:
-            errors.append(str(exc))
-
-    borrower = threading.Thread(target=borrow)
-    borrower.start()
-    assert factory_entered.wait(2)
-    closer = threading.Thread(target=services.close)
-    closer.start()
-    with services._condition:
-        assert services._condition.wait_for(lambda: services._closed, timeout=2)
-    release_factory.set()
-    borrower.join(2)
-    closer.join(2)
-
-    assert errors == ["VT optical-flow services closed during construction"]
-    assert service.close_count == 1
-    assert services.size == 0
-
-
-def test_close_racing_construction_preserves_cleanup_failure_as_context(monkeypatch):
-    from kinovsr.modeling.vt_flow import VtFlowServices
-
-    factory_entered = threading.Event()
-    release_factory = threading.Event()
-
-    class FailingCloseService(_Service):
-        def close(self) -> None:
-            self.close_count += 1
-            raise OSError("unpublished cleanup failed")
-
-    service = FailingCloseService((16, 12))
-
-    def make(_width, _height):
-        factory_entered.set()
-        assert release_factory.wait(2)
-        return service
-
-    monkeypatch.setattr(VtFlowServices, "_make_service", staticmethod(make))
-    services = VtFlowServices(1)
-    errors = []
-
-    def borrow():
-        try:
-            with services.borrow(16, 12):
-                pytest.fail("a service created during close must not publish")
-        except RuntimeError as exc:
-            errors.append(exc)
-
-    borrower = threading.Thread(target=borrow)
-    borrower.start()
-    assert factory_entered.wait(2)
-    closer = threading.Thread(target=services.close)
-    closer.start()
-    with services._condition:
-        assert services._condition.wait_for(lambda: services._closed, timeout=2)
-    release_factory.set()
-    borrower.join(2)
-    closer.join(2)
-
-    assert len(errors) == 1
-    assert str(errors[0]) == "VT optical-flow services closed during construction"
-    assert isinstance(errors[0].__context__, OSError)
-    assert str(errors[0].__context__) == "unpublished cleanup failed"
-    assert errors[0].__context__.__context__ is None
-    assert service.close_count == 1
-    assert services.size == 0
 
 
 def test_close_continues_after_service_failure(monkeypatch):
@@ -390,27 +132,6 @@ def test_close_continues_after_service_failure(monkeypatch):
 
     assert first.close_count == second.close_count == 1
 
-
-def test_interrupted_use_lock_acquire_releases_reservation(monkeypatch):
-    services, made = _manager(monkeypatch, 1)
-    with services.borrow(16, 12):
-        pass
-    entry = services._entries[(16, 12)]
-
-    class InterruptedLock:
-        def acquire(self):
-            raise KeyboardInterrupt
-
-        def release(self):
-            pytest.fail("an unacquired lock must not be released")
-
-    entry.use_lock = InterruptedLock()
-    with pytest.raises(KeyboardInterrupt), services.borrow(16, 12):
-        pass
-
-    assert entry.users == 0
-    services.close()
-    assert made[0].close_count == 1
 
 
 def test_windowed_driver_close_releases_owned_manager(monkeypatch):
@@ -487,3 +208,83 @@ def test_single_frame_vt_flow_constructs_no_service(monkeypatch):
     frame = mx.zeros((1, 12, 16, 3))
 
     assert vsr_blocks._vt_flows([frame]) == ([], [])
+
+
+def test_closed_during_construction_never_publishes(monkeypatch):
+    from kinovsr.modeling.vt_flow import VtFlowServices
+
+    services = VtFlowServices(1)
+    service = _Service((16, 12))
+
+    def make(_width, _height):
+        # A host closes the manager while a service is mid-construction.
+        services.close()
+        return service
+
+    monkeypatch.setattr(VtFlowServices, "_make_service", staticmethod(make))
+    with (
+        pytest.raises(RuntimeError, match="closed during construction"),
+        services.borrow(16, 12),
+    ):
+        pytest.fail("a service created during close must not publish")
+    assert service.close_count == 1
+    assert services.size == 0
+
+
+def test_closed_during_construction_chains_cleanup_failure(monkeypatch):
+    from kinovsr.modeling.vt_flow import VtFlowServices
+
+    services = VtFlowServices(1)
+    cleanup_failure = OSError("unpublished cleanup failed")
+
+    class _FailingClose:
+        def close(self):
+            raise cleanup_failure
+
+    def make(_width, _height):
+        services.close()
+        return _FailingClose()
+
+    monkeypatch.setattr(VtFlowServices, "_make_service", staticmethod(make))
+    with (
+        pytest.raises(RuntimeError, match="closed during construction") as caught,
+        services.borrow(16, 12),
+    ):
+        pytest.fail("must not publish")
+    context_chain = []
+    node = caught.value.__context__
+    while node is not None:
+        context_chain.append(node)
+        node = node.__context__
+    assert cleanup_failure in context_chain
+
+
+def test_double_borrow_of_one_geometry_raises(monkeypatch):
+    services, _made = _manager(monkeypatch, 1)
+    with (
+        services.borrow(16, 12),
+        pytest.raises(RuntimeError, match="already borrowed"),
+        services.borrow(16, 12),
+    ):
+        pytest.fail("exclusive lease must not be shared")
+    services.close()
+
+
+def test_eviction_with_every_service_borrowed_raises(monkeypatch):
+    services, _made = _manager(monkeypatch, 1)
+    with (
+        services.borrow(16, 12),
+        pytest.raises(RuntimeError, match="raise max_geometries"),
+        services.borrow(32, 24),
+    ):
+        pytest.fail("no idle victim exists")
+    services.close()
+
+
+def test_close_with_live_borrow_raises_then_close_succeeds(monkeypatch):
+    services, _made = _manager(monkeypatch, 1)
+    with services.borrow(16, 12), \
+            pytest.raises(RuntimeError, match="while a service is borrowed"):
+        services.close()
+    services.close()
+    assert services.size == 0
