@@ -38,3 +38,17 @@ def test_exclusive_rename_moves_file_and_directory(tmp_path):
     (source_directory / "marker").write_bytes(b"directory")
     rename_exclusive(source_directory, destination_directory)
     assert (destination_directory / "marker").read_bytes() == b"directory"
+
+
+def test_exclusive_rename_failure_names_both_paths(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"new")
+    destination.write_bytes(b"external")
+
+    with pytest.raises(OSError) as caught:
+        rename_exclusive(source, destination)
+
+    message = str(caught.value)
+    assert str(source) in message
+    assert str(destination) in message

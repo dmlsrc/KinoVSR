@@ -59,6 +59,22 @@ from .writer import HEVC_PROFILE_MAIN10, HEVC_PROFILE_MAIN422_10, AVWriter
 _log = logging.getLogger(__name__)
 
 
+def _discard_failed_output(writer: Any, path: Path) -> None:
+    """Cancel a writer after an encode failure and remove its partial file.
+
+    Runs only on the error path, so failures here are logged rather than
+    raised - the loop's original error must stay primary.
+    """
+    try:
+        writer.cancel()
+    except Exception as exc:  # noqa: BLE001 - error path, primary must win
+        _log.warning(f"writer cancel failed during discard: {exc}")
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        _log.warning(f"could not remove partial output {path}: {exc}")
+
+
 def _owns_ci_cache[**P, R](function: Callable[P, R]) -> Callable[P, R]:
     """Give utility encode calls the same final cleanup as host sessions."""
     @functools.wraps(function)
@@ -430,6 +446,7 @@ def encode_video_videotoolbox(
     started = time.perf_counter()
     n_in = 0
     n_out = 0
+    completed = False
     n_orig = 0
     try:
         for src_frame in frame_iter:
@@ -478,15 +495,26 @@ def encode_video_videotoolbox(
                 writer.append(out_pb)
                 n_out += 1
                 del out_pb
+        completed = True
     finally:
         reporter.phase_end(_phase)
-        writer.finish()
-        if writer_orig is not None:
-            writer_orig.finish()
-        if vtfrc is not None:
-            vtfrc.close()
-        if vsr is not None:
-            vsr.close()
+        try:
+            if completed:
+                writer.finish()
+                if writer_orig is not None:
+                    writer_orig.finish()
+            else:
+                # The encode loop failed: finalizing would leave a truncated
+                # but playable file at the requested destination and could
+                # mask the loop's error with a writer error.  Discard instead.
+                _discard_failed_output(writer, output_path)
+                if writer_orig is not None and orig_path is not None:
+                    _discard_failed_output(writer_orig, orig_path)
+        finally:
+            if vtfrc is not None:
+                vtfrc.close()
+            if vsr is not None:
+                vsr.close()
 
     elapsed = time.perf_counter() - started
     size = output_path.stat().st_size

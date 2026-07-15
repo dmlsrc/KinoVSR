@@ -36,9 +36,12 @@ def rename_exclusive(source: Path, destination: Path) -> None:
     )
     if result != 0:
         error = ctypes.get_errno()
+        # Positional slot 4 is winerror (ignored on POSIX); the destination
+        # belongs in filename2 so str(exc) reports both paths.
         raise OSError(
             error,
             os.strerror(error),
             os.fspath(source),
+            None,
             os.fspath(destination),
         )

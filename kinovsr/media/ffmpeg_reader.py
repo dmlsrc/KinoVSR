@@ -26,10 +26,11 @@ the native probe at 90/180/270). >8-bit sources are read through rgb48le
 """
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import av
 import mlx.core as mx
@@ -40,8 +41,32 @@ from .pixel_buffers import PIX_BGRA, PIX_RGBAHALF
 from .timing import AudioTiming, VideoTiming, analyze_sample_timing
 
 
+def _raise_ffmpeg_operation(
+    operation: str, path: Path | str, exc: Exception,
+) -> NoReturn:
+    """Normalize a PyAV failure to RuntimeError at the module boundary.
+
+    PyAV maps FFmpeg demux/decode failures onto ValueError subclasses
+    (av.error.InvalidDataError is a builtins.ValueError), which upstream
+    boundaries classify as programmer errors.  Corrupt or truncated media
+    is operational: convert here so av's taxonomy stays private to this
+    module.  OSError-flavored av errors (missing file, permission) already
+    carry operational typing and pass through unchanged.
+    """
+    if isinstance(exc, OSError):
+        raise exc
+    raise RuntimeError(f"{operation} {path}: {exc}") from exc
+
+
+def _open_container(path: Path | str, operation: str) -> Any:
+    try:
+        return av.open(str(path))
+    except av.FFmpegError as exc:
+        _raise_ffmpeg_operation(operation, path, exc)
+
+
 def _open_video(path: Path):
-    container = av.open(str(path))
+    container = _open_container(path, "cannot open video in")
     streams = [s for s in container.streams if s.type == "video"]
     if not streams:
         container.close()
@@ -124,6 +149,8 @@ def probe_video(path: Path) -> tuple[int, int, float, int, Any, tuple[int, int] 
             pixel_aspect = (int(sar.numerator), int(sar.denominator))
         transform = _display_transform(container, vs)
         return w, h, fps, n, transform, pixel_aspect
+    except av.FFmpegError as exc:
+        _raise_ffmpeg_operation("probing video in", path, exc)
     finally:
         container.close()
 
@@ -146,6 +173,8 @@ def probe_video_timing(path: Path) -> VideoTiming:
                 samples, nominal_cadence=_fps(vs), source_tick=time_base)
         except ValueError as exc:
             raise RuntimeError(f"{path.name}: {exc}") from exc
+    except av.FFmpegError as exc:
+        _raise_ffmpeg_operation("probing video timing in", path, exc)
     finally:
         container.close()
 
@@ -224,6 +253,8 @@ def keyframe_display_indices(
                 continue
             kf.add(_pts_index(pkt.pts, vs, fps, origin=origin))
         return sorted(kf) if kf else [0]
+    except av.FFmpegError as exc:
+        _raise_ffmpeg_operation("scanning keyframes in", path, exc)
     finally:
         container.close()
 
@@ -252,6 +283,8 @@ def coded_frame_sizes(path: Path) -> list[int]:
             return []
         hi = max(sized)
         return [sized.get(i, 0) for i in range(hi + 1)]
+    except av.FFmpegError as exc:
+        _raise_ffmpeg_operation("scanning coded frames in", path, exc)
     finally:
         container.close()
 
@@ -370,6 +403,8 @@ def _iter_chunks(path: Path, out_format: int, chunk_size: int,
                 chunk = []
         if chunk:
             yield chunk
+    except av.FFmpegError as exc:
+        _raise_ffmpeg_operation("decoding video from", path, exc)
     finally:
         container.close()
 
@@ -422,7 +457,7 @@ def _audio_origin(container: Any, stream: Any) -> Fraction | None:
 
 def probe_audio_timing(path: Path) -> AudioTiming | None:
     """Return the first audio-stream PTS without decoding any packets."""
-    container = av.open(str(path))
+    container = _open_container(path, "cannot open audio in")
     try:
         streams = [stream for stream in container.streams
                    if stream.type == "audio"]
@@ -437,6 +472,8 @@ def probe_audio_timing(path: Path) -> AudioTiming | None:
             first_pts=origin,
             source_tick=time_base,
         )
+    except av.FFmpegError as exc:
+        _raise_ffmpeg_operation("probing audio timing in", path, exc)
     finally:
         container.close()
 
@@ -499,13 +536,17 @@ class _FFmpegAudioSource:
         self._decoded_frame_count = 0
 
     def _close_cursor(self) -> None:
-        if self._container is not None:
-            self._container.close()
-        self._container = None
+        container, self._container = self._container, None
         self._stream = None
         self._segments = None
         self._pending = None
         self._cursor = None
+        if container is not None:
+            try:
+                container.close()
+            except av.FFmpegError as exc:
+                _raise_ffmpeg_operation(
+                    "closing audio in", self._path, exc)
 
     def _segment_iter(self, resampler: Any) -> Iterator[tuple[int, int, bytes]]:
         assert self._container is not None
@@ -559,7 +600,7 @@ class _FFmpegAudioSource:
 
     def _reset(self, target: int) -> None:
         self._close_cursor()
-        container = av.open(str(self._path))
+        container = _open_container(self._path, "cannot open audio in")
         streams = [stream for stream in container.streams
                    if stream.type == "audio"]
         if not streams:
@@ -584,8 +625,13 @@ class _FFmpegAudioSource:
             + Fraction(seek_sample, self._sample_rate)
         )
         timestamp = int(target_time / Fraction(stream.time_base))
-        container.seek(
-            timestamp, stream=stream, backward=True, any_frame=False)
+        try:
+            container.seek(
+                timestamp, stream=stream, backward=True, any_frame=False)
+        except av.FFmpegError as exc:
+            with contextlib.suppress(Exception):
+                container.close()
+            _raise_ffmpeg_operation("seeking audio in", self._path, exc)
         resampler = av.AudioResampler(
             format="fltp", layout=stream.layout, rate=self._sample_rate)
         self._container = container
@@ -605,6 +651,9 @@ class _FFmpegAudioSource:
             if self._pending is None or self._pending[1] <= position:
                 try:
                     self._pending = next(self._segments)
+                except av.FFmpegError as exc:
+                    _raise_ffmpeg_operation(
+                        "decoding audio from", self._path, exc)
                 except StopIteration:
                     # Some containers omit stream.duration; the container's
                     # duration is only an upper bound when audio ends before
@@ -646,7 +695,7 @@ def read_audio_track_window(
     """Open a bounded lazy PCM window from the first audio stream."""
     from .audio import StreamingAudioTrack, _sample_window
 
-    container = av.open(str(path))
+    container = _open_container(path, "cannot open audio in")
     try:
         astreams = [s for s in container.streams if s.type == "audio"]
         if not astreams:
@@ -692,6 +741,8 @@ def read_audio_track_window(
             source_factory=source_factory,
             offset=start,
         )
+    except av.FFmpegError as exc:
+        _raise_ffmpeg_operation("opening audio window in", path, exc)
     finally:
         container.close()
 

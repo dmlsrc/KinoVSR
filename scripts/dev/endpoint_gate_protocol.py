@@ -30,9 +30,14 @@ SINK_HOLDBACK_FRAMES = 1
 QUALITY_MAX_ABS_RGB10 = 2
 QUALITY_MIN_PSNR_DB = 60.0
 
+# (label, fraction): the allowed regression is max(fraction * baseline
+# median, 3 sigma of the baseline's own recorded run medians).  The old
+# fixed ms/frame floors (2.0 / 5.0) predate the steady-state protocol and
+# exceeded the entire passthrough steady baseline, so the gate could bless
+# a ~2x plumbing regression; the noise term is measured, not asserted.
 GATES = {
-    "pass": ("file passthrough", 2.0, 0.10),
-    "learned": ("bsvd + realplksr 2x", 5.0, 0.03),
+    "pass": ("file passthrough", 0.10),
+    "learned": ("bsvd + realplksr 2x", 0.03),
 }
 
 _MISSING = object()

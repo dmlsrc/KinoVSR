@@ -1516,3 +1516,14 @@ def test_odd_output_dimension_is_rejected(tmp_path):
             time_base=Fraction(1, 24000), cadence=Fraction(25)))
     with pytest.raises(MediaError, match="odd dimension"):
         FileSink(tmp_path / "out.mp4", odd)
+
+
+def test_sidecar_without_audio_is_rejected_before_any_io(tmp_path):
+    with pytest.raises(MediaError, match="save_audio_sidecar requires audio"):
+        run_file(
+            {"pipeline": []},
+            video=tmp_path / "missing.mov",
+            output=tmp_path / "out.mp4",
+            settings=SETTINGS,
+            save_audio_sidecar=True,
+        )

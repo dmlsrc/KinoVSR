@@ -307,12 +307,21 @@ def _boundary_violation(kind: BoundaryKind) -> FieldViolation:
         "not provided by the input endpoint or any earlier stage")
 
 
-def _wrap_stage_error(stage: ResolvedStage, exc: Exception) -> Exception:
-    """Name the offending stage on a raw processor error, leaving an
-    already-typed PipelineError untouched."""
-    if isinstance(exc, (AssertionError, PipelineError, TypeError)):
+# Programmer errors propagate unwrapped so their tracebacks stay raw; this
+# tuple is the single definition every boundary shares.
+_PROGRAMMER_ERRORS = (AssertionError, TypeError)
+
+
+def _wrap_named_error(stage_name: str, exc: Exception) -> Exception:
+    """Name the offending stage on a raw processor error, leaving programmer
+    errors and already-typed PipelineErrors untouched."""
+    if isinstance(exc, (*_PROGRAMMER_ERRORS, PipelineError)):
         return exc
-    return PipelineRuntimeError(stage.name, f"{type(exc).__name__}: {exc}")
+    return PipelineRuntimeError(stage_name, f"{type(exc).__name__}: {exc}")
+
+
+def _wrap_stage_error(stage: ResolvedStage, exc: Exception) -> Exception:
+    return _wrap_named_error(stage.name, exc)
 
 
 def _append_context(winner: BaseException,
@@ -398,11 +407,7 @@ def build_processors(
             except Exception as exc:  # noqa: BLE001 - collected, chained below
                 # Ordinary close failures lose to the build error but ride its
                 # context chain so a leaked-resource failure is still visible.
-                close_errors.append(
-                    exc if isinstance(
-                        exc, (AssertionError, PipelineError, TypeError))
-                    else PipelineRuntimeError(
-                        stage_name, f"{type(exc).__name__}: {exc}"))
+                close_errors.append(_wrap_named_error(stage_name, exc))
             except BaseException as exc:  # noqa: BLE001 - collected like _close_all
                 # KeyboardInterrupt/SystemExit during rollback: keep closing
                 # the remaining stages, then deliver EVERY one (first wins).

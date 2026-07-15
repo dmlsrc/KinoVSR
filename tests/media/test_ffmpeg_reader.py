@@ -392,3 +392,16 @@ def test_coded_frame_sizes(clip):
         pytest.skip("native reader unavailable for this container")
     assert sum(native) == sum(sizes)
     assert len(native) == len(sizes)
+
+
+def test_corrupt_media_raises_operational_error(tmp_path):
+    junk = tmp_path / "garbage.mp4"
+    junk.write_bytes(b"\x00" * 4096)
+
+    with pytest.raises(RuntimeError):
+        fr.probe_video(junk)
+
+
+def test_missing_file_keeps_oserror_typing(tmp_path):
+    with pytest.raises(OSError):
+        fr.probe_video(tmp_path / "absent.mp4")

@@ -120,6 +120,8 @@ def validate_args(parser: argparse.ArgumentParser,
         parser.error(
             "--save-pre-frames/--save-post-frames/--save-audio-sidecar "
             "require --output-dir")
+    if args.save_audio_sidecar and not args.audio:
+        parser.error("--save-audio-sidecar requires --audio")
     if args.video_chunk_size < 1:
         parser.error("--video-chunk-size must be >= 1")
     if args.gop_min_window < 1:

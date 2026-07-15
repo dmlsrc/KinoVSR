@@ -24,8 +24,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import statistics
 import sys
 import tempfile
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -110,12 +112,29 @@ def _compare_behavior_runs(
     return all_mismatches, run_results
 
 
+def _baseline_noise_ms(baseline_measurement: Mapping[str, Any]) -> float:
+    """Measured run-to-run spread of the recorded baseline, as a margin floor.
+
+    3 sigma of the baseline's own steady per-run medians.  Falls back to 0
+    when the baseline predates per-run retention or has fewer than three
+    usable runs (the fractional term still applies).
+    """
+    runs = baseline_measurement.get("runs") or []
+    values = [
+        float(run["steady_ms_per_frame"])
+        for run in runs
+        if run.get("steady_ms_per_frame") is not None
+    ]
+    if len(values) < 3:
+        return 0.0
+    return 3.0 * statistics.stdev(values)
+
+
 def _evaluate_gate(
     measurement: dict[str, Any],
     output_behaviors: list[dict[str, Any]],
     baseline: Mapping[str, Any],
     *,
-    floor_ms: float,
     fraction: float,
 ) -> dict[str, Any]:
     if len(output_behaviors) != len(measurement["runs"]):
@@ -124,7 +143,7 @@ def _evaluate_gate(
         )
     baseline_ms = float(baseline["measurement"]["median"]["steady_ms_per_frame"])
     current_ms = float(measurement["median"]["steady_ms_per_frame"])
-    margin = max(floor_ms, fraction * baseline_ms)
+    margin = max(_baseline_noise_ms(baseline["measurement"]), fraction * baseline_ms)
     delta = current_ms - baseline_ms
     timing_pass = delta <= margin
     behavior_mismatches, behavior_runs = _compare_behavior_runs(
@@ -328,38 +347,46 @@ def main() -> int:
     failures: list[str] = []
     expected_conditions = fingerprint["power_thermal"]
 
-    for chain, (label, floor_ms, fraction) in GATES.items():
+    for chain, (label, fraction) in GATES.items():
         if chain not in selected:
             continue
-        with tempfile.TemporaryDirectory(prefix=f"gate_{chain}_") as keep_raw:
-            measurement, outputs = _measure(
-                str(clip),
-                chain,
-                args.warmup_frames,
-                args.measured_frames,
-                args.tail_frames,
-                args.runs,
-                keep_dir=Path(keep_raw),
-                expected_conditions=expected_conditions,
-            )
-            measurement_errors = _measurement_errors(
-                measurement,
-                protocol=fingerprint["protocol"],
-                expected_conditions=fingerprint["power_thermal"],
-                prefix=f"gates.{chain}.measurement",
-            )
-            if measurement_errors:
-                _log.error("invalid current measurement: %s", "; ".join(measurement_errors))
-                return 2
-            output_behaviors = [
-                _output_probe(
-                    output,
-                    warmup_frames=args.warmup_frames,
-                    measured_frames=args.measured_frames,
-                    total_frames=total_frames,
+        try:
+            with tempfile.TemporaryDirectory(prefix=f"gate_{chain}_") as keep_raw:
+                measurement, outputs = _measure(
+                    str(clip),
+                    chain,
+                    args.warmup_frames,
+                    args.measured_frames,
+                    args.tail_frames,
+                    args.runs,
+                    keep_dir=Path(keep_raw),
+                    expected_conditions=expected_conditions,
                 )
-                for output in outputs
-            ]
+                measurement_errors = _measurement_errors(
+                    measurement,
+                    protocol=fingerprint["protocol"],
+                    expected_conditions=fingerprint["power_thermal"],
+                    prefix=f"gates.{chain}.measurement",
+                )
+                if measurement_errors:
+                    _log.error(
+                        "invalid current measurement: %s",
+                        "; ".join(measurement_errors))
+                    return 2
+                output_behaviors = [
+                    _output_probe(
+                        output,
+                        warmup_frames=args.warmup_frames,
+                        measured_frames=args.measured_frames,
+                        total_frames=total_frames,
+                    )
+                    for output in outputs
+                ]
+        except RuntimeError as exc:
+            # Worker crashes, run-count mismatches, and thermal/power drift
+            # are "cannot run" (exit 2), not a gate FAIL (exit 1).
+            _log.error("cannot run %s gate: %s", chain, exc)
+            return 2
 
         current_ms = float(measurement["median"]["steady_ms_per_frame"])
         if args.record_baseline:
@@ -391,7 +418,6 @@ def main() -> int:
             measurement,
             output_behaviors,
             baseline["gates"][chain],
-            floor_ms=floor_ms,
             fraction=fraction,
         )
         entry["label"] = label
@@ -412,6 +438,35 @@ def main() -> int:
         )
 
     if args.record_baseline:
+        if baseline_path.exists():
+            # Re-recording must not silently absorb a regression into the new
+            # baseline: keep the old file and log the per-gate deltas so the
+            # maintainer sees what the ratchet is about to accept.
+            stamp = time.strftime("%Y%m%dT%H%M%S")
+            backup_path = baseline_path.with_name(
+                f"{baseline_path.stem}.pre-{stamp}{baseline_path.suffix}")
+            try:
+                previous = json.loads(baseline_path.read_text())
+            except (OSError, ValueError):
+                previous = None
+            baseline_path.rename(backup_path)
+            _log.info("previous baseline kept at %s", backup_path)
+            if isinstance(previous, dict):
+                for chain, entry in recorded["gates"].items():
+                    old_entry = (previous.get("gates") or {}).get(chain)
+                    if not isinstance(old_entry, dict):
+                        continue
+                    try:
+                        old_ms = float(old_entry["measurement"]["median"]
+                                       ["steady_ms_per_frame"])
+                        new_ms = float(entry["measurement"]["median"]
+                                       ["steady_ms_per_frame"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    _log.info(
+                        "re-record %s: %.3f -> %.3f ms/frame (%+.1f%%)",
+                        chain, old_ms, new_ms,
+                        100.0 * (new_ms - old_ms) / old_ms if old_ms else 0.0)
         _write_json(baseline_path, recorded)
         report["status"] = "recorded_not_evaluated"
         _log.info("baseline recorded but not evaluated: %s", baseline_path)

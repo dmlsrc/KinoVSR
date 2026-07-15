@@ -1111,3 +1111,45 @@ def test_ambiguous_directory_cleanup_is_not_retried_on_exit(tmp_path):
     partials = list(tmp_path.glob(".*.partial"))
     assert len(partials) == 1
     assert (partials[0] / "external").read_bytes() == b"external"
+
+
+def test_reservation_lock_files_are_account_shared(tmp_path):
+    plan = _build_plan(tmp_path)
+    settings = _settings(tmp_path)
+
+    with _OutputTransaction(plan, settings):
+        lock_root = (settings.shared_temp_dir.expanduser().resolve()
+                     / "kinovsr-artifact-locks")
+        locks = list(lock_root.glob("*.lock"))
+        assert locks
+        for lock in locks:
+            assert (lock.stat().st_mode & 0o666) == 0o666
+
+
+def test_legacy_private_lock_file_is_reset(tmp_path):
+    from kinovsr.pipeline.run import _ArtifactReservation
+
+    lock = tmp_path / "legacy.lock"
+    lock.touch()
+    lock.chmod(0)
+
+    fd = _ArtifactReservation._open_shared_lock(lock)
+    try:
+        assert (os.fstat(fd).st_mode & 0o666) == 0o666
+    finally:
+        os.close(fd)
+
+
+def test_transaction_temps_honor_process_umask(tmp_path):
+    from kinovsr.pipeline.run import _UMASK
+
+    plan = _build_plan(
+        tmp_path, save_pre_frames=tmp_path / "frames")
+    settings = _settings(tmp_path)
+
+    with _OutputTransaction(plan, settings) as transaction:
+        temp_file = transaction.temp_file("post output")
+        temp_dir = transaction.temp_directory("pre-frame directory")
+        assert (temp_file.stat().st_mode & 0o777) == (0o666 & ~_UMASK)
+        assert (temp_dir.stat().st_mode & 0o777) == (0o777 & ~_UMASK)
+        transaction.discard()

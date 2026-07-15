@@ -213,7 +213,11 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
         except (OSError, RuntimeError, PipelineError) as fallback_exc:
             _log.error("cannot open %s: %s", video, fallback_exc)
             return 2
-    start, end = resolve_trim(options.start, options.end, fps, total)
+    try:
+        start, end = resolve_trim(options.start, options.end, fps, total)
+    except ValueError as exc:
+        _log.error("bad --start/--end value: %s", exc)
+        return 2
     # --max-frames caps OUTPUT frames; a time spec is OUTPUT duration,
     # which only the resolved chain's cadence can convert - pass the
     # seconds form through. The input window is start/end.

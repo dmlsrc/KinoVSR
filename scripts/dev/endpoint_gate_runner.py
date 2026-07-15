@@ -33,6 +33,13 @@ _result_log = logging.getLogger("kinovsr.dev.bench_endpoint_gates.result")
 def _worker(args: argparse.Namespace) -> None:
     import mlx.core as mx
 
+    if not hasattr(mx, "get_peak_memory"):
+        # Fail fast with one clear message instead of eight per-field
+        # validation errors after a full measurement run.
+        raise RuntimeError(
+            "this MLX runtime lacks mx.get_peak_memory; the endpoint gate "
+            "requires it to record peak_mlx_mib")
+
     from kinovsr.api import process_video_file
     from kinovsr.pipeline.run import FileSink, FileSource
     from kinovsr.processors.specs import Layout
@@ -105,11 +112,7 @@ def _worker(args: argparse.Namespace) -> None:
         {
             "frames_in": result.frames_in,
             "peak_rss_mib": _environment._peak_rss_mib(),
-            "peak_mlx_mib": (
-                float(mx.get_peak_memory()) / (1024.0 * 1024.0)
-                if hasattr(mx, "get_peak_memory")
-                else None
-            ),
+            "peak_mlx_mib": float(mx.get_peak_memory()) / (1024.0 * 1024.0),
             "measured_before_source_exhaustion_ms": (
                 source_timer.measured_headroom_ms(
                     timer,

@@ -60,8 +60,12 @@ def probe_noise(video: Path, *, start_spec: str | None = None,
     in_w, in_h, source_fps, total_frames, _transform, _par = vr.probe_video(video)
     chunk_size = budgeted_decode_chunk_size(
         chunk_size, in_w, in_h, bytes_per_pixel=8)
-    win_start, win_end = resolve_trim(start_spec, end_spec, source_fps,
-                                      total_frames)
+    try:
+        win_start, win_end = resolve_trim(start_spec, end_spec, source_fps,
+                                          total_frames)
+    except ValueError as exc:
+        _log.error("bad --start/--end value: %s", exc)
+        return 2
     _pw_end = win_end if win_end is not None else total_frames
     _span = max(1, _pw_end - win_start)
     _starts = sorted({win_start + int(f * max(0, _span - 12)) for f in (0.1, 0.5, 0.9)})

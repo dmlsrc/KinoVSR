@@ -247,6 +247,21 @@ class TestLifecycle:
             list(run_chain(chain(processor), units(1), CONTEXT))
         assert caught.value is failure
 
+    @pytest.mark.parametrize("hook", ["prepare", "process", "flush"])
+    def test_typed_stage_error_keeps_original_cause(self, hook):
+        # Pass-through must not `raise exc from exc`: that overwrites the
+        # exception's real __cause__ with a self-reference and loses the
+        # native root cause API users and bug reports rely on.
+        root = OSError("device wedged")
+        failure = PipelineRuntimeError("stage", "vt session failed")
+        failure.__cause__ = root
+        processor = ProgrammerFailure(hook, failure)
+
+        with pytest.raises(PipelineRuntimeError) as caught:
+            list(run_chain(chain(processor), units(1), CONTEXT))
+        assert caught.value is failure
+        assert caught.value.__cause__ is root
+
 
 class TestBoundaries:
     @staticmethod

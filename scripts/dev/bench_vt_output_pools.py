@@ -141,17 +141,24 @@ def _vsr_worker(path: str, warmup: int, measured: int) -> dict[str, Any]:
             output = session.upscale_to_buffer(inputs[index % 2], index)
             del output
         fresh_before = fresh_count()
+        last_output = None
         started = time.perf_counter()
         for offset in range(measured):
             index = warmup + offset
             frame_started = time.perf_counter()
             output = session.upscale_to_buffer(inputs[index % 2], index)
             frame_ms.append((time.perf_counter() - frame_started) * 1000.0)
+            # _surface_id stays in the window: it is per-frame bookkeeping both
+            # A/B paths pay equally.  The full-buffer SHA-256 digest does not -
+            # retain the flagged output and hash it after the clock stops.
             surface_ids.add(_surface_id(output))
             if offset == measured - 1:
-                digest = _active_digest(output)
+                last_output = output
             del output
         steady_ms = (time.perf_counter() - started) * 1000.0
+        if last_output is not None:
+            digest = _active_digest(last_output)
+            del last_output
         fresh_measured = fresh_count() - fresh_before
     finally:
         session.close()
@@ -217,6 +224,7 @@ def _frc_worker(path: str, warmup: int, measured: int) -> dict[str, Any]:
                 del output
             source_index += 1
         fresh_before = fresh_count()
+        last_output = None
         started = time.perf_counter()
         measured_count = 0
         for _ in range(measured // outputs_per_input):
@@ -227,13 +235,16 @@ def _frc_worker(path: str, warmup: int, measured: int) -> dict[str, Any]:
                 group_ids.append(_surface_id(output))
                 measured_count += 1
                 if measured_count == measured:
-                    digest = _active_digest(output)
+                    last_output = output
                 del output
             group_ms = (time.perf_counter() - group_started) * 1000.0 / len(group_ids)
             frame_ms.extend([group_ms] * len(group_ids))
             surface_ids.update(group_ids)
             source_index += 1
         steady_ms = (time.perf_counter() - started) * 1000.0
+        if last_output is not None:
+            digest = _active_digest(last_output)
+            del last_output
         fresh_measured = fresh_count() - fresh_before
         fresh_before_drain = fresh_count()
         drain_ids = []

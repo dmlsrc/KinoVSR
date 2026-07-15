@@ -90,19 +90,20 @@ def resolve_trim(
     """Resolve --start/--end specs to a half-open frame window [start, end).
 
     `end` is None for an open-ended window. Clamps end to the input length and
-    rejects an empty or out-of-range window with a clean SystemExit.
+    rejects an empty or out-of-range window with ValueError (callers own the
+    exit; a library function must never SystemExit a host process).
     """
     try:
         start_frame = parse_time_or_frames(start_spec, fps) if start_spec else 0
         end_frame = parse_time_or_frames(end_spec, fps) if end_spec else None
     except ValueError as e:
-        raise SystemExit(f"bad --start/--end value: {e}") from None
+        raise ValueError(str(e)) from None
     if end_frame is not None and end_frame <= start_frame:
-        raise SystemExit(
+        raise ValueError(
             f"--end ({end_frame}f) must be greater than --start ({start_frame}f)"
         )
     if total_frames and start_frame >= total_frames:
-        raise SystemExit(
+        raise ValueError(
             f"--start ({start_frame}f) is at or past the input length "
             f"({total_frames} frames)"
         )

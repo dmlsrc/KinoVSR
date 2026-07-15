@@ -75,10 +75,14 @@ def _stage_stream(
 
     try:
         processor.prepare(stage.input_spec, context)
-    except (AssertionError, TypeError):
-        raise
     except Exception as exc:
-        raise _wrap_stage_error(stage, exc) from exc
+        wrapped = _wrap_stage_error(stage, exc)
+        if wrapped is exc:
+            # Pass-through (programmer errors, typed PipelineError): a bare
+            # raise keeps the original __cause__ intact; `raise exc from exc`
+            # would overwrite it with a self-reference.
+            raise
+        raise wrapped from exc
 
     started = False
     for unit in upstream:
@@ -90,10 +94,11 @@ def _stage_stream(
                         yield attach(tail)
                 for boundary in unit.boundaries:
                     processor.reset(boundary, context)
-            except (AssertionError, TypeError):
-                raise
             except Exception as exc:
-                raise _wrap_stage_error(stage, exc) from exc
+                wrapped = _wrap_stage_error(stage, exc)
+                if wrapped is exc:
+                    raise
+                raise wrapped from exc
             pending.extend(unit.boundaries)
             # The family learns about boundaries through reset() only.
             unit = FrameUnit(payload=unit.payload, pts=unit.pts,
@@ -103,18 +108,23 @@ def _stage_stream(
             outputs = processor.process(unit, context)
             for produced in outputs:
                 yield attach(produced)
-        except (AssertionError, TypeError):
-            raise
         except Exception as exc:
-            raise _wrap_stage_error(stage, exc) from exc
+            wrapped = _wrap_stage_error(stage, exc)
+            if wrapped is exc:
+                raise
+            raise wrapped from exc
 
     try:
         for tail in processor.flush(context):
             yield attach(tail)
-    except (AssertionError, TypeError):
-        raise
     except Exception as exc:
-        raise _wrap_stage_error(stage, exc) from exc
+        wrapped = _wrap_stage_error(stage, exc)
+        if wrapped is exc:
+            # Pass-through (programmer errors, typed PipelineError): a bare
+            # raise keeps the original __cause__ intact; `raise exc from exc`
+            # would overwrite it with a self-reference.
+            raise
+        raise wrapped from exc
 
 
 def _ensure_stream_start(units: Iterable[FrameUnit]) -> Iterator[FrameUnit]:

@@ -2,6 +2,7 @@
 
 import copy
 import importlib.util
+import statistics
 import sys
 from pathlib import Path
 
@@ -721,7 +722,6 @@ def test_duplicate_baseline_timing_source_is_rejected_and_never_evaluated():
         _measurement(steady_ms=1_000_000_000.0),
         _output_runs(),
         baseline["gates"]["pass"],
-        floor_ms=2.0,
         fraction=0.05,
     )
     assert evaluated["baseline_steady_ms_per_frame"] == 100.0
@@ -746,7 +746,6 @@ def test_gate_uses_only_steady_median_and_requires_exact_output_behavior():
         _measurement(steady_ms=104.0, setup_ms=500000.0),
         _output_runs(),
         baseline,
-        floor_ms=2.0,
         fraction=0.05,
     )
     assert passing["allowed_margin_ms"] == 5.0
@@ -758,7 +757,6 @@ def test_gate_uses_only_steady_median_and_requires_exact_output_behavior():
         _measurement(steady_ms=99.0),
         _output_runs(value=1, one_pixel=True, diagnostic_hash="different"),
         baseline,
-        floor_ms=2.0,
         fraction=0.05,
     )
     assert within_tolerance["behavior_pass"] is True
@@ -770,7 +768,6 @@ def test_gate_uses_only_steady_median_and_requires_exact_output_behavior():
         _measurement(steady_ms=105.1, setup_ms=1.0),
         _output_runs(),
         baseline,
-        floor_ms=2.0,
         fraction=0.05,
     )
     assert too_slow["timing_pass"] is False
@@ -783,7 +780,6 @@ def test_gate_uses_only_steady_median_and_requires_exact_output_behavior():
         _measurement(steady_ms=99.0),
         wrong,
         baseline,
-        floor_ms=2.0,
         fraction=0.05,
     )
     assert wrong_output["timing_pass"] is True
@@ -805,7 +801,6 @@ def test_full_frame_quality_check_catches_single_pixel_corruption():
         _measurement(steady_ms=99.0),
         current,
         baseline,
-        floor_ms=2.0,
         fraction=0.05,
     )
     assert evaluated["timing_pass"] is True
@@ -830,7 +825,6 @@ def test_every_timing_run_is_bound_to_its_own_output_behavior():
         _measurement(steady_ms=1.0),
         output_runs,
         baseline,
-        floor_ms=2.0,
         fraction=0.05,
     )
     assert evaluated["timing_pass"] is True
@@ -842,6 +836,39 @@ def test_every_timing_run_is_bound_to_its_own_output_behavior():
     ]
     assert evaluated["behavior_pass"] is False
     assert evaluated["pass"] is False
+
+
+def test_margin_floor_is_derived_from_baseline_noise_not_a_constant():
+    # The old fixed 2.0 ms/frame floor predated the steady-state protocol,
+    # exceeded the entire steady passthrough baseline, and could bless a ~2x
+    # plumbing regression on a fast chain.  The floor is now the baseline's
+    # own recorded 3-sigma run spread.
+    fast = _baseline()["gates"]["pass"]
+    fast["measurement"]["median"]["steady_ms_per_frame"] = 1.6
+    for run in fast["measurement"]["runs"]:
+        run["steady_ms_per_frame"] = 1.6
+    doubled = bench._evaluate_gate(
+        _measurement(steady_ms=3.1),
+        _output_runs(),
+        fast,
+        fraction=0.10,
+    )
+    assert doubled["allowed_margin_ms"] == pytest.approx(0.16)
+    assert doubled["timing_pass"] is False
+
+    noisy = _baseline()["gates"]["pass"]
+    spread = [96.0, 100.0, 104.0, 100.0]
+    for run, value in zip(noisy["measurement"]["runs"], spread, strict=True):
+        run["steady_ms_per_frame"] = value
+    expected = max(3.0 * statistics.stdev(spread), 0.05 * 100.0)
+    noisy_eval = bench._evaluate_gate(
+        _measurement(steady_ms=100.0 + expected - 0.01),
+        _output_runs(),
+        noisy,
+        fraction=0.05,
+    )
+    assert noisy_eval["allowed_margin_ms"] == pytest.approx(round(expected, 3))
+    assert noisy_eval["timing_pass"] is True
 
 
 def test_recording_rejects_inconsistent_per_run_output_behavior():

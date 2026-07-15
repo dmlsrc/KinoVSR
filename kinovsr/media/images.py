@@ -59,7 +59,7 @@ def _cgimage_to_mx_rgb(cg: Any) -> mx.array:
     buf = bytearray(row * h)
     ctx = Quartz.CGBitmapContextCreate(buf, w, h, 8, row, srgb_colorspace(), _RGBX)
     if ctx is None:
-        raise ValueError("CGBitmapContextCreate failed (sRGB/RGBX)")
+        raise RuntimeError("CGBitmapContextCreate failed (sRGB/RGBX)")
     Quartz.CGContextDrawImage(ctx, Quartz.CGRectMake(0, 0, w, h), cg)
     return mx.array(memoryview(buf), dtype=mx.uint8).reshape(h, w, 4)[:, :, :3]
 
@@ -86,7 +86,7 @@ def _mx_to_cgimage(img: Any) -> Any:
     buf = bytearray(memoryview(mx.contiguous(a)).cast("B"))
     ctx = Quartz.CGBitmapContextCreate(buf, w, h, 8, w * 4, srgb_colorspace(), _RGBX)
     if ctx is None:
-        raise ValueError("CGBitmapContextCreate failed building CGImage")
+        raise RuntimeError("CGBitmapContextCreate failed building CGImage")
     return Quartz.CGBitmapContextCreateImage(ctx)
 
 
@@ -139,7 +139,7 @@ def resize_lanczos(img: Any, width: int, height: int) -> mx.array:
             out, Quartz.CGRectMake(0, 0, int(width), int(height))
         )
         if cg_out is None:
-            raise ValueError("CILanczosScaleTransform render failed")
+            raise RuntimeError("CILanczosScaleTransform render failed")
         return _cgimage_to_mx_rgb(cg_out)
 
 

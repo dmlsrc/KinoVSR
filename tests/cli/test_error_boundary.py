@@ -154,3 +154,37 @@ def test_cli_probe_renders_operational_failure(
     assert "cannot open" in records[0].getMessage()
     assert "injected probe failure" in records[0].getMessage()
     assert records[0].exc_info is None
+
+
+def test_cli_rejects_bad_time_spec_cleanly(monkeypatch, tmp_path, caplog):
+    from kinovsr.cli.commands.run import _run_typed
+    from kinovsr.media import video_reader
+
+    monkeypatch.setattr(video_reader, "probe_video", _successful_probe)
+    options = build_parser().parse_args([
+        "--video", str(tmp_path / "source.mov"),
+        "--output-dir", str(tmp_path / "out"),
+        "--reader", "native",
+        "--start", "0:5:x",
+    ])
+    invocation = SimpleNamespace(
+        options=options,
+        config={"pipeline": []},
+        settings=Settings(
+            mlx_cache_limit_gb=0,
+            shared_temp_dir=tmp_path / "scratch",
+        ),
+    )
+    with caplog.at_level(logging.ERROR, logger="kinovsr.cli.commands.run"):
+        result = _run_typed(invocation)
+
+    records = [
+        record for record in caplog.records
+        if record.name == "kinovsr.cli.commands.run"
+        and record.levelno == logging.ERROR
+    ]
+    assert result == 2
+    assert len(records) == 1
+    assert "bad --start/--end value" in records[0].getMessage()
+    assert records[0].exc_info is None
+    assert "Traceback" not in caplog.text

@@ -117,6 +117,29 @@ def _close_created_fd(fd: int) -> None:
     os.close(fd)
 
 
+def _process_umask() -> int:
+    cur = os.umask(0)
+    os.umask(cur)
+    return cur
+
+
+# Captured once at import (os.umask is process-global; toggling it at temp
+# creation time would race other threads).
+_UMASK = _process_umask()
+
+
+def _widen_temp_mode(path: Path, *, directory: bool = False) -> None:
+    """Give a mkstemp/mkdtemp temporary the mode a normal creation would get.
+
+    mkstemp/mkdtemp deliberately create 0o600/0o700; artifacts published by
+    rename keep that mode, which breaks group conventions for anything the
+    materializer does not itself recreate (cut logs, sidecars, frame dirs).
+    """
+    target = (0o777 if directory else 0o666) & ~_UMASK
+    with contextlib.suppress(OSError):
+        path.chmod(target)
+
+
 def _unlink_temporary(path: Path) -> None:
     """Make one best-effort removal without replacing an active failure."""
     try:
@@ -1007,7 +1030,7 @@ class _ArtifactReservation:
                     digest = hashlib.sha256(
                         os.fsencode(str(path))).hexdigest()
                     lock_path = self._lock_root / f"{digest}.lock"
-                    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+                    fd = self._open_shared_lock(lock_path)
                     try:
                         fcntl.flock(fd, mode | fcntl.LOCK_NB)
                     except OSError as exc:
@@ -1027,6 +1050,38 @@ class _ArtifactReservation:
                 raise
             _RESERVED_NAMESPACES.update(self._namespaces)
             self._held = True
+
+    @staticmethod
+    def _open_shared_lock(lock_path: Path) -> int:
+        """Open (creating if needed) a lock file all accounts can reuse.
+
+        Lock files persist in a shared temp root and are keyed by destination
+        namespace, so every account writing into a shared output tree touches
+        the same files.  0o666 (umask applies) keeps the next account from
+        being locked out permanently; the one-time migration below unlinks a
+        pre-existing owner-only file from before this fix (safe: the locks
+        are advisory and only meaningful while a run holds them - a file we
+        cannot even open is not one we hold).
+        """
+        flags = os.O_RDWR | os.O_CREAT
+        try:
+            fd = os.open(lock_path, flags, 0o666)
+        except PermissionError:
+            try:
+                lock_path.unlink()
+            except OSError as exc:
+                raise MediaError(
+                    f"cannot reset unreadable reservation lock {lock_path}: "
+                    f"{exc}; remove it manually") from exc
+            fd = os.open(lock_path, flags, 0o666)
+        # umask narrows the create mode (0o666 -> 0o644 under 022), which
+        # would lock the sibling account out again; widen when we own the
+        # file (fchmod by a non-owner fails and is suppressed - an existing
+        # shared file needs nothing).
+        with contextlib.suppress(OSError):
+            if (os.fstat(fd).st_mode & 0o666) != 0o666:
+                os.fchmod(fd, 0o666)
+        return fd
 
     def _release_fds(self) -> None:
         for fd in reversed(self._fds):
@@ -1197,6 +1252,7 @@ class _OutputTransaction:
             owned_fd, fd = fd, None
             _close_created_fd(owned_fd)
             temp_path = Path(raw)
+            _widen_temp_mode(temp_path)
             temp_identity = self._require_owned_identity(
                 temp_path, label=f"{label} temporary")
         except BaseException as exc:
@@ -1236,6 +1292,7 @@ class _OutputTransaction:
                 dir=artifact.path.parent,
                 prefix=f".{artifact.path.name}.", suffix=".partial")
             temp_path = Path(raw)
+            _widen_temp_mode(temp_path, directory=True)
             temp_identity = self._require_owned_identity(
                 temp_path, label=f"{label} temporary")
         except BaseException as exc:
@@ -2077,6 +2134,13 @@ def run_file(
     matters for cadence-changing chains).
     """
     chunk_size = _validate_requested_chunk_size(chunk_size)
+    if save_audio_sidecar and not audio:
+        # Without audio carry there is no track to dump; silently reserving
+        # (and preflighting) a sidecar that never gets written is worse than
+        # refusing up front.
+        raise MediaError(
+            "save_audio_sidecar requires audio; enable audio carry or drop "
+            "the sidecar request")
     t0 = time.perf_counter()
     plan = _ArtifactPlan.build(
         video=video,
@@ -2249,12 +2313,17 @@ def _run_file_reserved(
         source.audio_track(max_duration=audio_duration)
         if audio else None
     )
-    if plan.get("audio sidecar") is not None and track is not None:
-        # A WAV sidecar of the (trimmed) carried track, beside the output.
-        sidecar_temp = transaction.temp_file("audio sidecar")
-        with _media_operation(
-                "audio sidecar write failed for", plan.path("audio sidecar")):
-            track.save_wav(sidecar_temp)
+    if plan.get("audio sidecar") is not None:
+        if track is not None:
+            # A WAV sidecar of the (trimmed) carried track, beside the output.
+            sidecar_temp = transaction.temp_file("audio sidecar")
+            with _media_operation(
+                    "audio sidecar write failed for",
+                    plan.path("audio sidecar")):
+                track.save_wav(sidecar_temp)
+        else:
+            _log.warning(
+                "source has no audio track; no audio sidecar written")
     # --skip-post-mp4 parity: process the chain (frame dumps, comparison,
     # sidecar still apply) without writing the post MP4.
     sink = None

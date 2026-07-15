@@ -252,11 +252,9 @@ def _worker(
         "frame_ms": frame_ms,
         "pool_acquisitions": acquisitions,
         "peak_rss_mib": _peak_rss_mib(),
-        "peak_mlx_mib": (
-            float(mx.get_peak_memory()) / (1024.0 * 1024.0)
-            if hasattr(mx, "get_peak_memory")
-            else None
-        ),
+        # Hard requirement: _summarize does float(...) on this, and a None
+        # here would surface as a TypeError long after the run.
+        "peak_mlx_mib": float(mx.get_peak_memory()) / (1024.0 * 1024.0),
         "active_yuv_sha256": _active_yuv_digest(output, width),
         "conditions_start": conditions_start,
         "conditions_end": conditions_end,

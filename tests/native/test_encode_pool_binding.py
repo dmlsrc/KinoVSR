@@ -144,6 +144,9 @@ def test_native_encoder_closes_core_image_owner_on_append_failure(monkeypatch, t
         def finish(self):
             events.append("finish")
 
+        def cancel(self):
+            events.append("cancel")
+
     monkeypatch.setattr(pb, "ci_cache_owner", Lease)
     monkeypatch.setattr(encode, "AVWriter", Writer)
     monkeypatch.setattr(
@@ -160,4 +163,7 @@ def test_native_encoder_closes_core_image_owner_on_append_failure(monkeypatch, t
             fps=24,
         )
 
-    assert events == ["enter", "finish", "exit"]
+    # A failed encode loop must DISCARD the writer, never finalize it:
+    # finish() here would leave a truncated but playable file at the
+    # requested destination and could mask the loop's error.
+    assert events == ["enter", "cancel", "exit"]
