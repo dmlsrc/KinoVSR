@@ -980,9 +980,34 @@ class _ArtifactPlan:
 _RESERVATION_GUARD = threading.RLock()
 _RESERVED_NAMESPACES: set[Path] = set()
 
+# One process-lifetime descriptor for the single shared lock file, plus
+# per-offset refcounts.  POSIX fcntl range locks are process-global (closing
+# ANY descriptor on the file would drop every range this process holds, and a
+# range unlock releases it for the whole process), so concurrent reservations
+# in one process must share the fd and only unlock an offset when its last
+# in-process holder releases.  In-process conflicts are refused by
+# _RESERVED_NAMESPACES before fcntl is ever consulted; the kernel ranges
+# exist to exclude OTHER processes and die with this one.
+_NAMESPACE_LOCK_FDS: dict[Path, int] = {}
+_NAMESPACE_RANGE_HOLDERS: dict[tuple[Path, int], int] = {}
+
+
+def _namespace_offset(path: Path) -> int:
+    """Stable 62-bit byte offset for one namespace's fcntl range."""
+    digest = hashlib.sha256(os.fsencode(str(path))).digest()
+    return int.from_bytes(digest[:8], "big") & ((1 << 62) - 1)
+
 
 class _ArtifactReservation:
-    """Cross-thread/process advisory reservation for a complete artifact set."""
+    """Cross-thread/process advisory reservation for a complete artifact set.
+
+    All processes rendezvous on ONE shared lock file and take fcntl
+    byte-range locks at per-namespace offsets: exclusive on each artifact
+    path, shared on every ancestor (a run publishing INTO a directory
+    conflicts with a run producing that directory).  Ranges cost no disk
+    entries beyond the single file, and the kernel releases them the moment
+    the holding process dies - no stale-lock recovery, no per-path litter.
+    """
 
     def __init__(self, plan: _ArtifactPlan, settings: Settings) -> None:
         self._paths = tuple(sorted(
@@ -996,15 +1021,27 @@ class _ArtifactReservation:
                 requests.setdefault(parent, fcntl.LOCK_SH)
         self._lock_requests = tuple(sorted(requests.items(), key=lambda item: str(item[0])))
         try:
-            self._lock_root = (
+            self._lock_file = (
                 settings.shared_temp_dir.expanduser().resolve(strict=False)
-                / "kinovsr-artifact-locks")
+                / "kinovsr-namespaces.lock")
         except (OSError, RuntimeError) as exc:
             raise MediaError(
-                f"cannot resolve artifact lock directory "
+                f"cannot resolve artifact lock file under "
                 f"{settings.shared_temp_dir}: {exc}") from exc
-        self._fds: list[int] = []
+        self._locked_offsets: list[int] = []
         self._held = False
+
+    def _lock_fd(self) -> int:
+        # Called under _RESERVATION_GUARD.  One descriptor per lock file,
+        # kept for the life of the process: closing it would drop every
+        # range this process holds on that file.  Keyed by path because the
+        # lock file derives from Settings and one process may use several.
+        fd = _NAMESPACE_LOCK_FDS.get(self._lock_file)
+        if fd is None:
+            self._lock_file.parent.mkdir(parents=True, exist_ok=True)
+            fd = self._open_shared_lock(self._lock_file)
+            _NAMESPACE_LOCK_FDS[self._lock_file] = fd
+        return fd
 
     def acquire(self) -> None:
         if self._held:
@@ -1023,28 +1060,28 @@ class _ArtifactReservation:
                 raise MediaError(
                     f"destination hierarchy is already reserved: {path}")
             try:
-                self._lock_root.mkdir(parents=True, exist_ok=True)
+                fd = self._lock_fd()
                 for path, mode in self._lock_requests:
-                    digest = hashlib.sha256(
-                        os.fsencode(str(path))).hexdigest()
-                    lock_path = self._lock_root / f"{digest}.lock"
-                    fd = self._open_shared_lock(lock_path)
-                    try:
-                        fcntl.flock(fd, mode | fcntl.LOCK_NB)
-                    except OSError as exc:
-                        os.close(fd)
-                        if exc.errno in (errno.EACCES, errno.EAGAIN):
-                            raise MediaError(
-                                f"destination hierarchy is already reserved: "
-                                f"{path}") from exc
-                        raise
-                    self._fds.append(fd)
+                    key = (self._lock_file, _namespace_offset(path))
+                    if _NAMESPACE_RANGE_HOLDERS.get(key, 0) == 0:
+                        try:
+                            fcntl.lockf(
+                                fd, mode | fcntl.LOCK_NB, 1, key[1])
+                        except OSError as exc:
+                            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                                raise MediaError(
+                                    f"destination hierarchy is already "
+                                    f"reserved: {path}") from exc
+                            raise
+                    _NAMESPACE_RANGE_HOLDERS[key] = (
+                        _NAMESPACE_RANGE_HOLDERS.get(key, 0) + 1)
+                    self._locked_offsets.append(key[1])
             except BaseException as exc:
-                self._release_fds()
+                self._release_offsets()
                 if isinstance(exc, OSError):
                     raise MediaError(
-                        f"cannot reserve artifact destinations under "
-                        f"{self._lock_root}: {exc}") from exc
+                        f"cannot reserve artifact destinations via "
+                        f"{self._lock_file}: {exc}") from exc
                 raise
             _RESERVED_NAMESPACES.update(self._namespaces)
             self._held = True
@@ -1081,19 +1118,26 @@ class _ArtifactReservation:
                 os.fchmod(fd, 0o666)
         return fd
 
-    def _release_fds(self) -> None:
-        for fd in reversed(self._fds):
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        self._fds.clear()
+    def _release_offsets(self) -> None:
+        # Called under _RESERVATION_GUARD.
+        fd = _NAMESPACE_LOCK_FDS.get(self._lock_file)
+        for offset in reversed(self._locked_offsets):
+            key = (self._lock_file, offset)
+            remaining = _NAMESPACE_RANGE_HOLDERS.get(key, 0) - 1
+            if remaining > 0:
+                _NAMESPACE_RANGE_HOLDERS[key] = remaining
+                continue
+            _NAMESPACE_RANGE_HOLDERS.pop(key, None)
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.lockf(fd, fcntl.LOCK_UN, 1, offset)
+        self._locked_offsets.clear()
 
     def release(self) -> None:
         if not self._held:
             return
         with _RESERVATION_GUARD:
-            self._release_fds()
+            self._release_offsets()
             _RESERVED_NAMESPACES.difference_update(self._namespaces)
             self._held = False
 

@@ -873,17 +873,61 @@ def test_directory_cleanup_failure_keeps_primary_and_residue(tmp_path):
     assert (partials[0] / "owned").read_bytes() == b"owned"
 
 
-def test_reservation_lock_files_are_account_shared(tmp_path):
+def test_reservation_uses_one_account_shared_lock_file(tmp_path):
     plan = _build_plan(tmp_path)
     settings = _settings(tmp_path)
 
     with _OutputTransaction(plan, settings):
-        lock_root = (settings.shared_temp_dir.expanduser().resolve()
-                     / "kinovsr-artifact-locks")
-        locks = list(lock_root.glob("*.lock"))
-        assert locks
-        for lock in locks:
-            assert (lock.stat().st_mode & 0o666) == 0o666
+        scratch = settings.shared_temp_dir.expanduser().resolve()
+        lock_file = scratch / "kinovsr-namespaces.lock"
+        assert lock_file.exists()
+        assert (lock_file.stat().st_mode & 0o666) == 0o666
+        # No per-namespace lock-file litter: the byte-range design keeps
+        # exactly one rendezvous file regardless of how many paths ran.
+        assert [p.name for p in scratch.iterdir()] == [lock_file.name]
+
+
+def test_reservation_excludes_other_processes(tmp_path):
+    import subprocess
+    import sys
+    import textwrap
+
+    plan = _build_plan(tmp_path)
+    settings = _settings(tmp_path)
+    probe = textwrap.dedent("""
+        import sys
+        from pathlib import Path
+        from kinovsr.pipeline.run import _ArtifactPlan, _OutputTransaction
+        from kinovsr.processors.errors import MediaError
+        from kinovsr.settings import Settings
+
+        tmp = Path(sys.argv[1])
+        plan = _ArtifactPlan.build(
+            video=tmp / "input.mp4", output=tmp / "post.mp4",
+            comparison=None, cut_log=None, save_audio_sidecar=False,
+            save_pre_frames=None, save_post_frames=None,
+            skip_post_mp4=False, noise_map_debug=False, overwrite=False)
+        settings = Settings(shared_temp_dir=tmp / "scratch")
+        try:
+            with _OutputTransaction(plan, settings):
+                pass
+        except MediaError as exc:
+            assert "already reserved" in str(exc), str(exc)
+            print("REFUSED")
+        else:
+            print("ACQUIRED")
+    """)
+
+    with _OutputTransaction(plan, settings):
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(tmp_path)],
+            capture_output=True, text=True, timeout=60, check=True)
+    assert result.stdout.strip() == "REFUSED", result.stderr
+    # After release the same probe must succeed.
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(tmp_path)],
+        capture_output=True, text=True, timeout=60, check=True)
+    assert result.stdout.strip() == "ACQUIRED", result.stderr
 
 
 def test_legacy_private_lock_file_is_reset(tmp_path):
