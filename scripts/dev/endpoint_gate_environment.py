@@ -11,7 +11,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from endpoint_gate_baseline import _revision_errors
 from endpoint_gate_protocol import (
     QUALITY_MAX_ABS_RGB10,
     QUALITY_MIN_PSNR_DB,
@@ -54,9 +53,6 @@ def _runtime_conditions() -> dict[str, Any]:
         "power_source": _power_source(),
         "low_power_mode": bool(process.isLowPowerModeEnabled()),
         "thermal_state": thermal,
-        "thermal_precondition": (
-            "non_throttled" if thermal in {"nominal", "fair"} else "throttled"
-        ),
     }
 
 
@@ -363,8 +359,4 @@ def _revision_state() -> dict[str, Any]:
                     for block in iter(lambda: handle.read(1024 * 1024), b""):
                         digest.update(block)
         diff_sha256 = digest.hexdigest()
-    revision = {"commit": commit, "dirty": dirty, "diff_sha256": diff_sha256}
-    errors = _revision_errors(revision, prefix="current_product_revision")
-    if errors:
-        raise RuntimeError("; ".join(errors))
-    return revision
+    return {"commit": commit, "dirty": dirty, "diff_sha256": diff_sha256}

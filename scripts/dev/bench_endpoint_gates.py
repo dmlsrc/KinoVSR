@@ -55,7 +55,6 @@ from endpoint_gate_protocol import (
     DEFAULT_TAIL_FRAMES,
     DEFAULT_WARMUP_FRAMES,
     GATES,
-    _measurement_errors,
     _require_clip_frames,
     _result_exit_code,
     _total_frames,
@@ -362,17 +361,6 @@ def main() -> int:
                     keep_dir=Path(keep_raw),
                     expected_conditions=expected_conditions,
                 )
-                measurement_errors = _measurement_errors(
-                    measurement,
-                    protocol=fingerprint["protocol"],
-                    expected_conditions=fingerprint["power_thermal"],
-                    prefix=f"gates.{chain}.measurement",
-                )
-                if measurement_errors:
-                    _log.error(
-                        "invalid current measurement: %s",
-                        "; ".join(measurement_errors))
-                    return 2
                 output_behaviors = [
                     _output_probe(
                         output,

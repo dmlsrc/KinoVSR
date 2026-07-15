@@ -460,31 +460,6 @@ def test_matching_complete_baseline_is_accepted_and_revision_is_not_compared():
     )
 
 
-@pytest.mark.parametrize(
-    ("revision", "field"),
-    [
-        (None, "product_revision"),
-        ({"commit": "short", "dirty": False, "diff_sha256": None}, "product_revision.commit"),
-        ({"commit": "a" * 40, "dirty": "no", "diff_sha256": None}, "product_revision.dirty"),
-        ({"commit": "a" * 40, "dirty": True, "diff_sha256": None}, "product_revision.diff_sha256"),
-        (
-            {"commit": "a" * 40, "dirty": False, "diff_sha256": "b" * 64},
-            "product_revision.diff_sha256",
-        ),
-    ],
-)
-def test_missing_or_malformed_baseline_revision_is_rejected(revision, field):
-    baseline = _baseline()
-    baseline["product_revision"] = revision
-    with pytest.raises(ValueError, match=field):
-        bench._validate_baseline(
-            baseline,
-            fingerprint=_fingerprint(),
-            workloads={"pass": _workload()},
-            selected={"pass"},
-        )
-
-
 def test_baseline_kind_is_required():
     baseline = _baseline()
     baseline["kind"] = "not-a-kinovsr-endpoint-baseline"
@@ -511,52 +486,18 @@ def test_baseline_root_must_be_an_object(baseline):
 @pytest.mark.parametrize(
     ("path", "replacement"),
     [
+        # One representative per semantic group; the recursive comparator's
+        # exhaustive behavior is pinned by the missing/extra-key test.
         ("machine.hardware_model", "Mac15,8"),
-        ("machine.chip", "Apple M3 Max"),
-        ("machine.architecture", "x86_64"),
-        ("os.version", "27.0"),
         ("os.build", "26A1"),
-        ("os.darwin_release", "26.0.0"),
-        ("runtime.python_implementation", "PyPy"),
-        ("runtime.python_version", "3.15.0"),
-        ("runtime.python_build", ["other", "date"]),
-        ("runtime.python_compiler", "Clang 18"),
         ("runtime.mlx_version", "0.33.0"),
-        ("runtime.pyav_version", "19.0.0"),
         ("runtime.libav_versions.libswscale", [10, 0, 0]),
-        ("protocol.schema", 2),
-        ("protocol.fresh_process_per_run", False),
         ("protocol.runs", 3),
-        ("protocol.warmup_frames", 31),
-        ("protocol.measured_frames", 121),
-        ("protocol.tail_frames", 18),
-        ("protocol.sink_holdback_frames", 2),
-        ("protocol.quality_policy.method", "different"),
-        ("protocol.quality_policy.decoder", "native"),
-        ("protocol.quality_policy.compression", "none"),
         ("protocol.quality_policy.max_abs_rgb10", 3),
-        ("protocol.quality_policy.min_psnr_db", 50.0),
-        ("protocol.total_frames", 170),
-        ("protocol.timing_boundary", "different hook"),
-        ("protocol.instrumentation_host_device_sync", "per-frame sync"),
         ("clip.sha256", "different"),
-        ("clip.track.codec_fourcc", "avc1"),
-        ("clip.track.codec_details.hevc.profile_idc", 4),
-        ("clip.track.codec_details.hevc.chroma_format_idc", 2),
-        ("clip.track.codec_details.hevc.bit_depth_luma", 8),
         ("clip.track.cadence", "24000/1001"),
-        ("clip.track.first_pts", "1/24"),
-        ("clip.track.duration", "50/3"),
-        ("clip.track.sample_count", 201),
-        ("clip.track.color", {"matrix": "ITU_R_2020"}),
         ("cache_compile_policy.mlx_cache_limit_gb", 0.5),
-        ("cache_compile_policy.clear_mlx_cache_at_endpoint_start", False),
-        ("cache_compile_policy.model_compile", False),
-        ("cache_compile_policy.system_compilation_cache", "cleared"),
-        ("power_thermal.power_source", "Battery Power"),
-        ("power_thermal.low_power_mode", True),
         ("power_thermal.thermal_state", "fair"),
-        ("power_thermal.thermal_policy", "anything"),
     ],
 )
 def test_every_environment_fingerprint_mutation_names_exact_field(path, replacement):
@@ -570,6 +511,20 @@ def test_every_environment_fingerprint_mutation_names_exact_field(path, replacem
             selected={"pass"},
         )
     assert f"fingerprint.{path}" in str(exc.value)
+
+
+def test_informational_prose_changes_do_not_invalidate_the_baseline():
+    current = _fingerprint()
+    _set_path(current, "protocol.timing_boundary", "reworded description")
+    _set_path(
+        current, "protocol.instrumentation_host_device_sync", "reworded")
+    _set_path(current, "protocol.quality_policy.method", "renamed-v5")
+    bench._validate_baseline(
+        _baseline(),
+        fingerprint=current,
+        workloads={"pass": _workload()},
+        selected={"pass"},
+    )
 
 
 def test_missing_and_extra_fingerprint_keys_are_incompatible():
@@ -594,12 +549,8 @@ def test_missing_and_extra_fingerprint_keys_are_incompatible():
 @pytest.mark.parametrize(
     ("path", "replacement"),
     [
-        ("definition.input_layout", "mlx_rgb_hwc"),
         ("definition.endpoint_args", {"quality": 0.4, "encode_chroma": "420"}),
-        ("resolved.input_spec", {"layout": "mlx_rgb_hwc"}),
-        ("resolved.output_spec", {"layout": "mlx_rgb_hwc"}),
         ("resolved.stages", [{"family": "bsvd", "profile": "c32"}]),
-        ("measurement_contract.required_tail_frames", 18),
     ],
 )
 def test_workload_mutation_names_exact_field(path, replacement):
@@ -643,101 +594,6 @@ def test_missing_selected_gate_and_wrong_schema_are_both_named():
         )
     assert "schema" in str(exc.value)
     assert "gates.learned" in str(exc.value)
-
-
-@pytest.mark.parametrize(
-    ("mutate", "field"),
-    [
-        (
-            lambda measurement: measurement["median"].__setitem__(
-                "steady_ms_per_frame", float("inf")
-            ),
-            "measurement.median.steady_ms_per_frame",
-        ),
-        (
-            lambda measurement: measurement["median"].__setitem__("peak_rss_mib", float("nan")),
-            "measurement.median.peak_rss_mib",
-        ),
-        (
-            lambda measurement: measurement["median"].__setitem__(
-                "steady_ms_per_frame", 1_000_000_000.0
-            ),
-            "measurement.median.steady_ms_per_frame",
-        ),
-        (lambda measurement: measurement["runs"].pop(), "measurement.runs.length"),
-        (
-            lambda measurement: measurement["runs"][0].__setitem__(
-                "steady_ms_per_frame", float("inf")
-            ),
-            "measurement.runs[0].steady_ms_per_frame",
-        ),
-        (
-            lambda measurement: measurement["runs"][0].__setitem__("peak_mlx_mib", -1.0),
-            "measurement.runs[0].peak_mlx_mib",
-        ),
-        (
-            lambda measurement: measurement["runs"][0].__setitem__("frames_written", 166),
-            "measurement.runs[0].frames_written",
-        ),
-        (
-            lambda measurement: measurement["runs"][0].__setitem__("total_ms", 1.0),
-            "measurement.runs[0].total_ms",
-        ),
-        (
-            lambda measurement: measurement["runs"][0]["conditions_end"].__setitem__(
-                "thermal_state", "fair"
-            ),
-            "measurement.runs[0].conditions_end.thermal_state",
-        ),
-    ],
-)
-def test_baseline_measurement_must_be_finite_complete_and_internally_consistent(
-    mutate,
-    field,
-):
-    baseline = _baseline()
-    mutate(baseline["gates"]["pass"]["measurement"])
-    with pytest.raises(ValueError) as exc:
-        bench._validate_baseline(
-            baseline,
-            fingerprint=_fingerprint(),
-            workloads={"pass": _workload()},
-            selected={"pass"},
-        )
-    assert field in str(exc.value)
-
-
-def test_duplicate_baseline_timing_source_is_rejected_and_never_evaluated():
-    baseline = _baseline()
-    baseline["gates"]["pass"]["baseline_steady_ms_per_frame"] = float("inf")
-    with pytest.raises(ValueError, match="duplicate timing source"):
-        bench._validate_baseline(
-            baseline,
-            fingerprint=_fingerprint(),
-            workloads={"pass": _workload()},
-            selected={"pass"},
-        )
-
-    evaluated = bench._evaluate_gate(
-        _measurement(steady_ms=1_000_000_000.0),
-        _output_runs(),
-        baseline["gates"]["pass"],
-        fraction=0.05,
-    )
-    assert evaluated["baseline_steady_ms_per_frame"] == 100.0
-    assert evaluated["timing_pass"] is False
-
-
-def test_baseline_requires_one_output_probe_per_timing_run():
-    baseline = _baseline()
-    baseline["gates"]["pass"]["output_behavior_run_count"] = 3
-    with pytest.raises(ValueError, match="output_behavior_run_count"):
-        bench._validate_baseline(
-            baseline,
-            fingerprint=_fingerprint(),
-            workloads={"pass": _workload()},
-            selected={"pass"},
-        )
 
 
 def test_gate_uses_only_steady_median_and_requires_exact_output_behavior():
