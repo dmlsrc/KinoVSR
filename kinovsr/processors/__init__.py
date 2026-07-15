@@ -28,13 +28,11 @@ from .catalog import (
 )
 from .errors import (
     MediaError,
-    PipelineCancelled,
     PipelineError,
     PipelineRuntimeError,
     StageConfigError,
     StreamEdgeError,
     UnknownStageError,
-    WeightsError,
 )
 from .protocol import (
     BracketFactory,
@@ -88,7 +86,6 @@ __all__ = [
     "Geometry",
     "Layout",
     "MediaError",
-    "PipelineCancelled",
     "PipelineContext",
     "PipelineError",
     "PipelineRuntimeError",
@@ -105,7 +102,6 @@ __all__ = [
     "UnknownFamilyError",
     "UnknownStageError",
     "VariableCadence",
-    "WeightsError",
     "available_families",
     "catalog_entries",
     "coherence_violations",

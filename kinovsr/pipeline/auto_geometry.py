@@ -27,8 +27,7 @@ from typing import Any
 
 from kinovsr.config import ConfigError
 from kinovsr.config.merge import split_stage_table
-from kinovsr.media.errors import is_native_operation_error
-from kinovsr.processors.errors import MediaError
+from kinovsr.media.errors import media_operation
 
 _log = logging.getLogger(__name__)
 
@@ -60,44 +59,21 @@ def _gather_samples(
     """Decode the harness's sample frames as float32 [0,1] RGB arrays."""
     import mlx.core as mx
 
-    try:
-        chunks = vr.iter_video_buffer_chunks(
-            video, pb.PIX_RGBAHALF, chunk_size=chunk_size)
-        chunk_iterator = iter(chunks)
-    except Exception as exc:
-        if is_native_operation_error(exc):
-            raise MediaError(
-                f"auto-geometry decode failed for {video}: {exc}") from exc
-        raise
-
     samples: list = []
     index = 0
-    while True:
-        try:
-            chunk = next(chunk_iterator)
-        except StopIteration:
-            break
-        except Exception as exc:
-            if is_native_operation_error(exc):
-                raise MediaError(
-                    f"auto-geometry decode failed for {video}: {exc}"
-                ) from exc
-            raise
-        for buffer in chunk:
-            if index in _SAMPLE_INDICES:
-                try:
-                    rgb = pb.read_pixel_buffer_rgb(buffer)
-                except Exception as exc:
-                    if is_native_operation_error(exc):
-                        raise MediaError(
-                            f"auto-geometry pixel read failed for {video}: "
-                            f"{exc}") from exc
-                    raise
-                samples.append(mx.clip(
-                    rgb.astype(mx.float32) / 255.0, 0, 1))
-            index += 1
-        if index > max(_SAMPLE_INDICES):
-            return samples
+    with media_operation("auto-geometry decode failed for", video):
+        for chunk in vr.iter_video_buffer_chunks(
+                video, pb.PIX_RGBAHALF, chunk_size=chunk_size):
+            for buffer in chunk:
+                if index in _SAMPLE_INDICES:
+                    with media_operation(
+                            "auto-geometry pixel read failed for", video):
+                        rgb = pb.read_pixel_buffer_rgb(buffer)
+                    samples.append(mx.clip(
+                        rgb.astype(mx.float32) / 255.0, 0, 1))
+                index += 1
+            if index > max(_SAMPLE_INDICES):
+                return samples
     return samples
 
 

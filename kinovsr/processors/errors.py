@@ -1,10 +1,9 @@
 """Typed pipeline failures.
 
-The taxonomy distinguishes what the user can fix (config, weights, media)
-from cancellation and genuine runtime faults, per the API sequencing plan.
-Everything raised before frame processing carries enough structure to say
-exactly what to change: :class:`StreamEdgeError` names both sides of the
-failing edge and lists field-level violations.
+The taxonomy distinguishes what the user can fix (config, media) from
+genuine runtime faults. Everything raised before frame processing carries
+enough structure to say exactly what to change: :class:`StreamEdgeError`
+names both sides of the failing edge and lists field-level violations.
 """
 
 from __future__ import annotations
@@ -26,10 +25,6 @@ class StageConfigError(PipelineError):
 
 class UnknownStageError(StageConfigError):
     """The stage names an unknown family, capability, or profile."""
-
-
-class WeightsError(PipelineError):
-    """Weights are missing, corrupt, or license-restricted."""
 
 
 class MediaError(PipelineError):
@@ -66,10 +61,6 @@ class StreamEdgeError(PipelineError):
         super().__init__("\n".join(lines))
 
 
-class PipelineCancelled(PipelineError):
-    """Processing was cancelled; cleanup still runs exactly once."""
-
-
 class PipelineRuntimeError(PipelineError):
     """A stage failed while frames were flowing; message carries the stage."""
 
@@ -80,11 +71,9 @@ class PipelineRuntimeError(PipelineError):
 
 __all__ = [
     "MediaError",
-    "PipelineCancelled",
     "PipelineError",
     "PipelineRuntimeError",
     "StageConfigError",
     "StreamEdgeError",
     "UnknownStageError",
-    "WeightsError",
 ]

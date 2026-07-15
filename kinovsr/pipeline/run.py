@@ -40,6 +40,7 @@ from kinovsr.media.chunks import (
     validate_decode_chunk_size,
 )
 from kinovsr.media.errors import is_native_operation_error
+from kinovsr.media.errors import media_operation as _media_operation
 from kinovsr.media.filesystem import rename_exclusive
 from kinovsr.media.timing import (
     AudioTiming,
@@ -85,25 +86,6 @@ _DECODE_BYTES_PER_PIXEL = {
 }
 
 
-@contextlib.contextmanager
-def _media_operation(operation: str, path: Path | str) -> Iterator[None]:
-    """Normalize an explicit native or filesystem operation.
-
-    The scope at each call site must stay narrow: ``RuntimeError`` is the
-    established failure type used by the native media adapters, but can also
-    describe an internal invariant elsewhere. Programmer errors and process
-    control exceptions deliberately pass through unchanged.
-    """
-    try:
-        yield
-    except PipelineError:
-        raise
-    except Exception as exc:
-        if is_native_operation_error(exc):
-            raise MediaError(f"{operation} {path}: {exc}") from exc
-        raise
-
-
 def _close_created_fd(fd: int) -> None:
     """Close a newly-created fd exactly once.
 
@@ -147,6 +129,57 @@ def _unlink_temporary(path: Path) -> None:
         # delete a same-name replacement, so an ambiguous private residue is
         # safer than a second destructive operation.
         _log.warning("could not remove temporary %s: %s", path, exc)
+
+
+def _create_private_temp(
+    destination: Path,
+    label: str,
+    *,
+    directory: bool = False,
+) -> Path:
+    """Create the hidden sibling temporary for ``destination``.
+
+    Owns the complete acquisition dance shared by the writer sink and the
+    transaction temps: mkstemp/mkdtemp beside the final name, close the
+    descriptor exactly once, remove the raw name if any later acquisition
+    step fails (Path conversion itself may be the failing step), widen the
+    umask-narrowed mode, and normalize OSError to MediaError.
+    """
+    raw: str | None = None
+    fd: int | None = None
+    try:
+        if directory:
+            raw = tempfile.mkdtemp(
+                dir=destination.parent,
+                prefix=f".{destination.name}.", suffix=".partial")
+        else:
+            fd, raw = tempfile.mkstemp(
+                dir=destination.parent,
+                prefix=f".{destination.name}.", suffix=".partial")
+            owned_fd, fd = fd, None
+            _close_created_fd(owned_fd)
+        temp_path = Path(raw)
+        _widen_temp_mode(temp_path, directory=directory)
+        return temp_path
+    except BaseException as exc:
+        if fd is not None:
+            try:
+                _close_created_fd(fd)
+            except BaseException as cleanup_exc:
+                exc.add_note(
+                    f"temporary descriptor cleanup also failed: "
+                    f"{cleanup_exc!r}")
+        if raw is not None:
+            if directory:
+                with contextlib.suppress(BaseException):
+                    shutil.rmtree(raw)
+            else:
+                _unlink_created_raw(raw, exc)
+        if isinstance(exc, OSError):
+            raise MediaError(
+                f"cannot create {label} temporary for "
+                f"{destination}: {exc}") from exc
+        raise
 
 
 def _unlink_created_raw(raw: str, primary: BaseException) -> None:
@@ -225,15 +258,8 @@ def _probe_cfr_timing(path: Path, reader: Any) -> VideoTiming | None:
     probe = getattr(_reader_module(reader), "probe_video_timing", None)
     if probe is None:
         return None
-    try:
+    with _media_operation("failed to inspect source timing for", path):
         timing = probe(path)
-    except MediaError:
-        raise
-    except Exception as exc:
-        if is_native_operation_error(exc):
-            raise MediaError(
-                f"failed to inspect source timing for {path}: {exc}") from exc
-        raise
     if timing.cadence is None:
         raise MediaError(
             f"{path.name}: variable frame rate (VFR) is not supported by the "
@@ -253,16 +279,8 @@ def _validate_audio_origin(
     probe = getattr(_reader_module(reader), "probe_audio_timing", None)
     if probe is None:
         return
-    try:
+    with _media_operation("failed to inspect source audio timing for", path):
         audio_timing: AudioTiming | None = probe(path)
-    except MediaError:
-        raise
-    except Exception as exc:
-        if is_native_operation_error(exc):
-            raise MediaError(
-                f"failed to inspect source audio timing for {path}: {exc}"
-            ) from exc
-        raise
     if audio_timing is None:
         return
     # Each reported origin can be rounded by at most half of its own clock
@@ -586,32 +604,13 @@ class FileSink:
             raise MediaError(
                 f"destination already exists: {self._final_path}; pass "
                 f"overwrite=True to replace it")
-        raw: str | None = None
-        fd: int | None = None
         try:
             self._final_path.parent.mkdir(parents=True, exist_ok=True)
-            fd, raw = tempfile.mkstemp(
-                dir=self._final_path.parent,
-                prefix=f".{self._final_path.name}.", suffix=".partial")
-            owned_fd, fd = fd, None
-            _close_created_fd(owned_fd)
-            temp_path = Path(raw)
-        except BaseException as exc:
-            if fd is not None:
-                try:
-                    _close_created_fd(fd)
-                except BaseException as cleanup_exc:
-                    exc.add_note(
-                        f"writer temporary descriptor cleanup also failed: "
-                        f"{cleanup_exc!r}")
-            if raw is not None:
-                _unlink_created_raw(raw, exc)
-            if isinstance(exc, OSError):
-                raise MediaError(
-                    f"failed to create writer temporary for "
-                    f"{self._final_path}: {exc}") from exc
-            raise
-        self._temp_path = temp_path
+        except OSError as exc:
+            raise MediaError(
+                f"cannot create writer parent for "
+                f"{self._final_path}: {exc}") from exc
+        self._temp_path = _create_private_temp(self._final_path, "writer")
         self._published = False
         self._finalized = False
         self._discarded = False
@@ -1226,31 +1225,7 @@ class _OutputTransaction:
         if artifact.directory:
             raise RuntimeError(f"{label} is a directory artifact")
         self._ensure_parent(artifact.path)
-        raw: str | None = None
-        fd: int | None = None
-        try:
-            fd, raw = tempfile.mkstemp(
-                dir=artifact.path.parent,
-                prefix=f".{artifact.path.name}.", suffix=".partial")
-            owned_fd, fd = fd, None
-            _close_created_fd(owned_fd)
-            temp_path = Path(raw)
-            _widen_temp_mode(temp_path)
-        except BaseException as exc:
-            if fd is not None:
-                try:
-                    _close_created_fd(fd)
-                except BaseException as cleanup_exc:
-                    exc.add_note(
-                        f"artifact temporary descriptor cleanup also failed: "
-                        f"{cleanup_exc!r}")
-            if raw is not None:
-                _unlink_created_raw(raw, exc)
-            if isinstance(exc, OSError):
-                raise MediaError(
-                    f"cannot create {artifact.label} temporary for "
-                    f"{artifact.path}: {exc}") from exc
-            raise
+        temp_path = _create_private_temp(artifact.path, artifact.label)
         self._entries[label] = _TransactionEntry(artifact, temp_path)
         return temp_path
 
@@ -1262,22 +1237,8 @@ class _OutputTransaction:
         if not artifact.directory:
             raise RuntimeError(f"{label} is a file artifact")
         self._ensure_parent(artifact.path)
-        raw: str | None = None
-        try:
-            raw = tempfile.mkdtemp(
-                dir=artifact.path.parent,
-                prefix=f".{artifact.path.name}.", suffix=".partial")
-            temp_path = Path(raw)
-            _widen_temp_mode(temp_path, directory=True)
-        except BaseException as exc:
-            if raw is not None:
-                with contextlib.suppress(BaseException):
-                    shutil.rmtree(raw)
-            if isinstance(exc, OSError):
-                raise MediaError(
-                    f"cannot create {artifact.label} temporary for "
-                    f"{artifact.path}: {exc}") from exc
-            raise
+        temp_path = _create_private_temp(
+            artifact.path, artifact.label, directory=True)
         self._entries[label] = _TransactionEntry(artifact, temp_path)
         return temp_path
 
