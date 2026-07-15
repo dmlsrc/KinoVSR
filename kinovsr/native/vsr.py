@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import sys
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Any
 
 from kinovsr.media import pixel_buffers as _pb
@@ -23,6 +24,50 @@ from .frameworks import Quartz, autorelease_pool, vt
 
 _log = logging.getLogger(__name__)
 _NATIVE_STDERR_LOCK = threading.RLock()
+_SYNCHRONOUS_SIGNAL_NAMES = (
+    "SIGBUS",
+    "SIGEMT",
+    "SIGFPE",
+    "SIGILL",
+    "SIGSEGV",
+    "SIGSYS",
+    "SIGTRAP",
+)
+_FD_ACQUISITION_SIGNALS = signal.valid_signals()
+_FD_ACQUISITION_SIGNALS.discard(signal.SIGKILL)
+_FD_ACQUISITION_SIGNALS.discard(signal.SIGSTOP)
+for _signal_name in _SYNCHRONOUS_SIGNAL_NAMES:
+    _signal_number = getattr(signal, _signal_name, None)
+    if _signal_number is not None:
+        _FD_ACQUISITION_SIGNALS.discard(_signal_number)
+_FD_ACQUISITION_SIGNALS = frozenset(_FD_ACQUISITION_SIGNALS)
+
+
+def _duplicate_stderr() -> int:
+    return os.dup(2)
+
+
+def _open_devnull() -> int:
+    return os.open(os.devnull, os.O_WRONLY)
+
+
+def _redirect_stderr(source: int) -> None:
+    os.dup2(source, 2)
+
+
+def _close_fd(fd: int) -> None:
+    os.close(fd)
+
+
+@contextmanager
+def _defer_fd_acquisition_signals():
+    """Defer asynchronous signal handlers until an fd owner is recorded."""
+    previous = signal.pthread_sigmask(
+        signal.SIG_BLOCK, _FD_ACQUISITION_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 @contextmanager
@@ -46,15 +91,69 @@ def _suppress_native_stderr():
     # one thread safe as well.
     with _NATIVE_STDERR_LOCK:
         sys.stderr.flush()
-        saved_fd = os.dup(2)
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_fd: int | None = None
+        devnull_fd: int | None = None
+        failures: list[tuple[str, BaseException]] = []
         try:
-            os.dup2(devnull_fd, 2)
-            yield
+            try:
+                # A Python signal handler can run after dup/open returns but
+                # before the assignment records ownership. Keep asynchronous
+                # signals masked through that publication; the surrounding
+                # finally is already armed before either acquisition starts.
+                with _defer_fd_acquisition_signals():
+                    saved_fd = _duplicate_stderr()
+            except BaseException as exc:
+                failures.append(("duplicate stderr", exc))
+            if saved_fd is not None and not failures:
+                try:
+                    with _defer_fd_acquisition_signals():
+                        devnull_fd = _open_devnull()
+                except BaseException as exc:
+                    failures.append(("open /dev/null", exc))
+            if devnull_fd is not None and not failures:
+                try:
+                    _redirect_stderr(devnull_fd)
+                except BaseException as exc:
+                    failures.append(("redirect stderr", exc))
+                else:
+                    try:
+                        yield
+                    except BaseException as exc:
+                        failures.append(("suppressed body", exc))
+
+                # Once /dev/null was acquired, redirect may have completed
+                # before reporting an exception. Always restore fd 2 before
+                # either owned descriptor is closed.
+                try:
+                    _redirect_stderr(saved_fd)
+                except BaseException as exc:
+                    failures.append(("restore stderr", exc))
         finally:
-            os.dup2(saved_fd, 2)
-            os.close(devnull_fd)
-            os.close(saved_fd)
+            try:
+                if devnull_fd is not None:
+                    owned_devnull, devnull_fd = devnull_fd, None
+                    try:
+                        _close_fd(owned_devnull)
+                    except BaseException as exc:
+                        failures.append(("close /dev/null", exc))
+            finally:
+                if saved_fd is not None:
+                    owned_saved, saved_fd = saved_fd, None
+                    try:
+                        _close_fd(owned_saved)
+                    except BaseException as exc:
+                        failures.append(("close saved stderr", exc))
+
+        if failures:
+            _, primary = failures[0]
+            for label, failure in failures[1:]:
+                if failure is primary:
+                    continue
+                with suppress(BaseException):
+                    primary.add_note(
+                        f"{label} also failed: "
+                        f"{type(failure).__name__}: {failure}")
+            raise primary
 
 
 def scale_for_mode(mode: str) -> int:
