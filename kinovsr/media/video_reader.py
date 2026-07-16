@@ -24,6 +24,7 @@ No ffmpeg, no numpy.
 from __future__ import annotations
 
 import bisect
+import logging
 from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
@@ -33,8 +34,11 @@ from kinovsr.native.frameworks import CoreMedia, Foundation, Quartz, av, vt
 
 from . import pixel_buffers as _pb
 from .chunks import validate_decode_chunk_size
+
+_log = logging.getLogger(__name__)
 from .timing import (
     AudioTiming,
+    EpochUnwrapper,
     SampleTable,
     SampleTiming,
     VideoTiming,
@@ -171,6 +175,7 @@ def read_sample_table(path: Path) -> SampleTable:
     natural_timescale = int(track.naturalTimeScale())
     source_tick = (Fraction(1, natural_timescale)
                    if natural_timescale > 0 else None)
+    unwrapper = EpochUnwrapper()
     while True:
         sample = output.copyNextSampleBuffer()
         if sample is None:
@@ -185,6 +190,7 @@ def read_sample_table(path: Path) -> SampleTable:
         pts = _cm_time_fraction(pts_time)
         duration = _cm_time_fraction(duration_time)
         if pts is not None:
+            pts = unwrapper.push(pts)
             attachments = CoreMedia.CMSampleBufferGetSampleAttachmentsArray(
                 sample, False)
             is_sync = True
@@ -207,11 +213,16 @@ def read_sample_table(path: Path) -> SampleTable:
         raise RuntimeError(f"AVAssetReader timing scan failed: {reader.error()}")
     if source_tick is None:
         raise RuntimeError(f"{path.name}: video track contains no display samples")
+    if unwrapper.resets:
+        _log.info(
+            "%s: unwrapped %d mid-file timestamp reset(s) into one "
+            "declared monotonic clock", path.name, unwrapper.resets)
     try:
         return analyze_sample_table(
             samples,
             nominal_cadence=float(track.nominalFrameRate()),
             source_tick=source_tick,
+            epoch_resets=unwrapper.resets,
         )
     except ValueError as exc:
         raise RuntimeError(f"{path.name}: {exc}") from exc
@@ -517,7 +528,11 @@ def iter_video_buffer_chunks(
         raise RuntimeError(f"AVAssetReader init failed: {err}")
 
     trimming = start_frame > 0 or end_frame is not None
-    if trimming and (keys is not None or fps > 0):
+    # Multi-epoch sources decode linearly: a coarse seek landing inside a
+    # later epoch would start the decode-side unwrapper without the
+    # history that maps its raw stamps onto the table's monotonic clock.
+    seekable_clock = table is None or table.epoch_resets == 0
+    if trimming and seekable_clock and (keys is not None or fps > 0):
         # Seek the reader's timeRange to just before the window so the head of a
         # long clip isn't decoded. Back off one frame; the per-frame PTS check
         # below enforces the exact start. Compute the end from the asset
@@ -579,26 +594,35 @@ def iter_video_buffer_chunks(
         raise RuntimeError(f"AVAssetReader.startReading failed: {reader.error()}")
 
     chunk: list = []
+    # The table's stamps are on the unwrapped monotonic clock; decoded
+    # samples arrive with raw stamps, so the decode path runs the same
+    # streaming mapping. Every sample pushes (kept or not) to keep the
+    # two mappings aligned.
+    trim_unwrapper = EpochUnwrapper() if keys is not None else None
     while True:
         sample_buf = output.copyNextSampleBuffer()
         if sample_buf is None:
             break
         image_buf = CoreMedia.CMSampleBufferGetImageBuffer(sample_buf)
         keep = image_buf is not None
-        if keep and trimming and (keys is not None or fps > 0):
+        if trimming and (keys is not None or fps > 0):
             # Frame-exact window enforcement by presentation timestamp.
             pts = _cm_time_fraction(
                 CoreMedia.CMSampleBufferGetOutputPresentationTimeStamp(
                     sample_buf))
-            if pts is None:
+            if pts is not None and trim_unwrapper is not None:
+                pts = trim_unwrapper.push(pts)
+            if not keep:
+                pass
+            elif pts is None:
                 idx = 0
             elif keys is not None:
                 idx = bisect.bisect_right(keys, pts) - 1
             else:
                 idx = round((pts - origin) * cadence)
-            if idx < start_frame:
+            if keep and idx < start_frame:
                 keep = False
-            elif end_frame is not None and idx >= end_frame:
+            elif keep and end_frame is not None and idx >= end_frame:
                 del sample_buf
                 break
         # Release the owning sample buffer now; the image buffer outlives it.

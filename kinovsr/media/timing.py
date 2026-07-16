@@ -99,6 +99,11 @@ class SampleTable:
     # frame, and recomputing it per call made per-frame GOP metadata
     # quadratic in clip length (a 90-minute clip appeared hung).
     keyframe_indices: tuple[int, ...] = ()
+    # Mid-file timestamp resets the reader unwrapped into this table's
+    # monotonic clock. Nonzero disables coarse decode seeks: a seek that
+    # lands inside a later epoch would start the decode-side unwrapper
+    # without the history that maps raw stamps onto this clock.
+    epoch_resets: int = 0
 
     @property
     def sample_count(self) -> int:
@@ -134,6 +139,59 @@ class SampleTable:
             duration=self.duration,
             source_tick=self.source_tick,
         )
+
+
+# Backward jumps beyond this many seconds are container joins / encoder
+# clock resets, not decode reordering: B-frame dips span a reorder depth
+# of a few frame intervals, while joined transport streams and camera
+# segment resets jump back by minutes or to zero.
+EPOCH_RESET_SECONDS = 10
+
+
+class EpochUnwrapper:
+    """Streaming raw-to-monotonic PTS mapping for mid-file clock resets.
+
+    Concatenated transport streams and camera joins reset PTS mid-file.
+    Globally sorting such stamps interleaves the segments: the later
+    segment's small stamps sort FIRST, so every carried timestamp, sync
+    flag, and coded size lands on the wrong decoded frame. Fed stamps in
+    stream order, this maps each raw PTS onto one declared monotonic
+    clock: a backward jump larger than :data:`EPOCH_RESET_SECONDS` starts
+    a new epoch placed one typical frame interval after the previous
+    epoch's end. Bounded decode reordering passes through untouched, and
+    because reset detection depends only on the large jump - which
+    survives B-frame reordering - the metadata walk (demux order) and the
+    decode path (display order within each epoch) compute identical
+    mappings, so window bisects stay aligned. Segments are assumed not to
+    interleave across a join (falsifiable: a B-frame straddling a
+    concatenation boundary would desync the two mappings).
+    """
+
+    def __init__(self) -> None:
+        self._offset = Fraction(0)
+        self._prev_raw: Fraction | None = None
+        self._max_adjusted: Fraction | None = None
+        self._last_delta: Fraction | None = None
+        self.resets = 0
+
+    def push(self, pts: Fraction) -> Fraction:
+        pts = Fraction(pts)
+        if self._prev_raw is not None:
+            if self._prev_raw - pts > EPOCH_RESET_SECONDS:
+                gap = (self._last_delta
+                       if self._last_delta and self._last_delta > 0
+                       else Fraction(1, 25))
+                assert self._max_adjusted is not None
+                self._offset = self._max_adjusted + gap - pts
+                self._last_delta = None
+                self.resets += 1
+            elif pts > self._prev_raw:
+                self._last_delta = pts - self._prev_raw
+        self._prev_raw = pts
+        adjusted = pts + self._offset
+        if self._max_adjusted is None or adjusted > self._max_adjusted:
+            self._max_adjusted = adjusted
+        return adjusted
 
 
 def rational_cadence(
@@ -313,6 +371,7 @@ def analyze_sample_table(
     *,
     nominal_cadence: Fraction | int | float | str | None,
     source_tick: Fraction,
+    epoch_resets: int = 0,
 ) -> SampleTable:
     """Classify exact display timing records as one grid, gapped, or VFR.
 
@@ -380,6 +439,7 @@ def analyze_sample_table(
         keyframe_indices=tuple(
             index for index, sample in enumerate(ordered)
             if sample.is_sync),
+        epoch_resets=int(epoch_resets),
     )
 
 
@@ -409,6 +469,8 @@ __all__ = [
     "SampleTiming",
     "TimingVerdict",
     "VideoTiming",
+    "EPOCH_RESET_SECONDS",
+    "EpochUnwrapper",
     "analyze_sample_table",
     "analyze_sample_timing",
     "grid_ticks",

@@ -479,20 +479,26 @@ class FileSource:
         return Fraction(25)
 
     def _explicit_time_base(self) -> Fraction:
-        """One exact integer tick base for every carried stamp.
+        """One exact integer tick base for every carried WINDOW stamp.
 
-        The lcm of the product base and each sample's pts/duration
-        denominator: rebased stamps divide it exactly, so unit ticks stay
-        integers. Falls back to the source denominators alone when the
-        combined base overflows CMTime's 32-bit timescale.
+        The lcm of the product base and each rebased in-window
+        pts/duration denominator: rebased stamps divide it exactly, so
+        unit ticks stay integers. Scoped to the emitted window (plus
+        gop-align context) rather than the whole table - an irrelevant
+        out-of-window sample on an exotic clock (an edit-list head, a
+        mixed-epoch join) must not overflow the base for a perfectly
+        representable trim. Falls back to the window denominators alone
+        when the combined base overflows CMTime's 32-bit timescale.
         """
         import math
 
         table = self._table
         assert table is not None
-        denominators = {table.first_pts.denominator}
-        for sample in table.samples:
-            denominators.add(sample.pts.denominator)
+        origin = table.samples[self.start].pts
+        read_start = max(self.start - self.context_frames, 0)
+        denominators = {1}
+        for sample in table.samples[read_start:self.end]:
+            denominators.add((sample.pts - origin).denominator)
             if sample.duration is not None:
                 denominators.add(sample.duration.denominator)
         base = math.lcm(*denominators)
@@ -503,8 +509,8 @@ class FileSource:
         if base <= limit:
             return Fraction(1, base)
         raise MediaError(
-            f"{self.path.name}: source sample clock cannot be represented "
-            f"exactly within CMTime's 32-bit timescale")
+            f"{self.path.name}: the selected window's sample clock cannot "
+            f"be represented exactly within CMTime's 32-bit timescale")
 
     def _window_tail_duration(self) -> Fraction:
         """The final window frame's display duration on the source clock."""
@@ -515,11 +521,19 @@ class FileSource:
             return last.duration
         if table.grid_cadence is not None:
             return 1 / table.grid_cadence
-        if self.end >= 2:
-            delta = last.pts - table.samples[self.end - 2].pts
-            if delta > 0:
-                return delta
-        return Fraction(1, 25)
+        # Never the raw preceding delta: on a true-VFR clip whose last
+        # coded duration is missing, a splice gap right before the end
+        # would hold the final frame for the gap's length (and hand a
+        # conform stage a pile of bogus tail duplicates). The MEDIAN
+        # window delta is the honest typical frame duration, robust to
+        # one discontinuity.
+        deltas = sorted(
+            table.samples[i + 1].pts - table.samples[i].pts
+            for i in range(max(self.start, 0), self.end - 1)
+            if table.samples[i + 1].pts > table.samples[i].pts)
+        if deltas:
+            return deltas[len(deltas) // 2]
+        return 1 / self._nominal_from_table()
 
     def _window_stamps(self, read_start: int) -> list[tuple[int, int]]:
         """(pts, duration) ticks for [read_start, end): the rebased source
@@ -2059,7 +2073,18 @@ def _run_file_reserved(
                 keyframes = vr.keyframe_display_indices(
                     video_path, **keyframe_kwargs)
         if snap_start and keyframes:
-            start = min(keyframes, key=lambda k: abs(k - start))
+            if table is not None and table.sample_count:
+                # Nearest by TIME, not by table position: after a
+                # dropped-frame gap the positionally-adjacent keyframe
+                # can sit minutes away while the temporally-near one is a
+                # frame earlier. Ties break toward the earlier keyframe.
+                target = table.samples[
+                    min(start, table.sample_count - 1)].pts
+                start = min(
+                    keyframes,
+                    key=lambda k: (abs(table.samples[k].pts - target), k))
+            else:
+                start = min(keyframes, key=lambda k: abs(k - start))
         if gop_align:
             from kinovsr.modeling.upscaler_base import plan_gop_windows
 

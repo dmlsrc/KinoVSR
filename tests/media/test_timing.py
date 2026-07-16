@@ -424,3 +424,28 @@ def test_frame_gop_scales_to_long_clips():
         table.frame_gop(index)
     elapsed = time.perf_counter() - t0
     assert elapsed < 1.0, f"frame_gop sampling took {elapsed:.2f}s"
+
+
+def test_epoch_unwrapper_rebases_resets_and_ignores_reordering():
+    from kinovsr.media.timing import EpochUnwrapper
+
+    # Reordering dips pass through untouched.
+    u = EpochUnwrapper()
+    dips = [Fraction(10), Fraction(10) + Fraction(2, 30),
+            Fraction(10) + Fraction(1, 30),        # B-frame style dip
+            Fraction(10) + Fraction(3, 30)]
+    assert [u.push(p) for p in dips] == dips
+    assert u.resets == 0
+
+    # A hard reset to zero rebases the new epoch one frame interval
+    # after the previous epoch's end.
+    u = EpochUnwrapper()
+    a = [Fraction(10) + Fraction(k, 30) for k in range(4)]
+    out = [u.push(p) for p in a]
+    assert out == a
+    b = [Fraction(0), Fraction(1, 30), Fraction(2, 30)]
+    out_b = [u.push(p) for p in b]
+    assert u.resets == 1
+    expected_start = a[-1] + Fraction(1, 30)
+    assert out_b == [expected_start + p for p in b]
+    assert out_b[0] > out[-1]

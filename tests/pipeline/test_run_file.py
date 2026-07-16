@@ -1914,3 +1914,140 @@ def test_batch_host_survives_the_vt_session_capability_cliff(clip, tmp_path):
             {"pipeline": []}, video=clip,
             output=tmp_path / f"batch_{i}.mp4",
             settings=SETTINGS, layout=Layout.CV_RGBA_HALF, max_frames=4)
+
+
+class TestReviewQueueRegressions:
+    """Findings 8, 9, 10 from the timing-arc adversarial review."""
+
+    def test_tail_duration_never_reuses_a_splice_gap(self):
+        from kinovsr.media import pixel_buffers
+        from kinovsr.media.timing import SampleTiming, analyze_sample_table
+
+        # True-VFR deltas (non-multiples) with a 9.9 s gap before the
+        # final frame, whose coded duration is missing.
+        pts = [Fraction(0), Fraction(1, 30),
+               Fraction(1, 30) + Fraction(1, 24), Fraction(10)]
+        table = analyze_sample_table(
+            [SampleTiming(pts=p,
+                          duration=Fraction(1, 30) if i < 3 else None)
+             for i, p in enumerate(pts)],
+            nominal_cadence=30,
+            source_tick=Fraction(1, 90000),
+        )
+        assert table.grid_cadence is None
+        source = FileSource.__new__(FileSource)
+        source._table = table
+        source.start = 0
+        source.end = 4
+        tail = source._window_tail_duration()
+        assert tail == Fraction(1, 24)      # median window delta
+        assert tail < Fraction(1, 2)        # never the splice gap
+
+    def test_time_base_ignores_out_of_window_clocks(self):
+        from kinovsr.media import pixel_buffers
+        from kinovsr.media.timing import SampleTiming, analyze_sample_table
+
+        # An edit-list head sample on a nanosecond-ish clock must not
+        # poison the base for a trim over the normal 90 kHz segment.
+        head = SampleTiming(pts=Fraction(1, 1_000_000_000), duration=None)
+        body = [SampleTiming(pts=Fraction(1, 10) + Fraction(k, 30),
+                             duration=Fraction(1, 30))
+                for k in range(4)]
+        table = analyze_sample_table(
+            [head, *body], nominal_cadence=30,
+            source_tick=Fraction(1, 90000))
+        source = FileSource.__new__(FileSource)
+        source._table = table
+        source.start = 1
+        source.end = 5
+        source.context_frames = 0
+        source._pb = pixel_buffers
+        base = source._explicit_time_base()
+        assert base.denominator <= 2**31 - 1
+        # every rebased window stamp lands exactly on the base
+        origin = table.samples[1].pts
+        for sample in table.samples[1:5]:
+            assert ((sample.pts - origin) / base).denominator == 1
+
+    def test_snap_start_picks_the_temporally_nearest_keyframe(
+            self, gapped_keyframes_clip, tmp_path):
+        # Samples 0..4 sit at slots 0..4 and 5..9 at slots 30..34 with
+        # keyframes at samples 0 and 5. From start=4 (t~0.133s) the
+        # positionally-nearest keyframe is 5 (one frame away) but it sits
+        # at t=1.0s; the temporally-nearest is 0. Snapping must pick 0,
+        # so the whole 10-frame window is processed.
+        result = run_file(
+            {"pipeline": []}, video=gapped_keyframes_clip,
+            output=tmp_path / "snap.mp4", settings=SETTINGS,
+            start=4, snap_start=True)
+        assert result.frames_in == 10
+
+
+def _write_ts_segment(path, *, count, luma_base) -> None:
+    """One clean 30 fps mpegts segment starting at PTS zero."""
+    out = av.open(str(path), "w", format="mpegts")
+    stream = out.add_stream("libx264")
+    stream.width = stream.height = 64
+    stream.pix_fmt = "yuv420p"
+    stream.codec_context.time_base = Fraction(1, 90000)
+    stream.codec_context.framerate = Fraction(30, 1)
+    stream.time_base = Fraction(1, 90000)
+    stream.options = {"g": "10", "bf": "0", "crf": "20",
+                      "sc_threshold": "0"}
+    for index in range(count):
+        frame = av.VideoFrame(64, 64, "gray")
+        frame.planes[0].update(
+            bytes([(luma_base + index * 4) % 240]) * (64 * 64))
+        frame = frame.reformat(format="yuv420p")
+        frame.pts = index * 3000
+        frame.time_base = Fraction(1, 90000)
+        for packet in stream.encode(frame):
+            out.mux(packet)
+    for packet in stream.encode():
+        out.mux(packet)
+    out.close()
+
+
+@pytest.fixture(scope="module")
+def joined_ts_clip(tmp_path_factory):
+    # Two independently-stamped segments byte-concatenated: the second
+    # resets PTS to zero mid-file, the classic joined-capture shape.
+    root = tmp_path_factory.mktemp("run_file_joined")
+    a, b = root / "a.ts", root / "b.ts"
+    _write_ts_segment(a, count=450, luma_base=20)   # 15s so the reset
+    _write_ts_segment(b, count=12, luma_base=160)   # jump exceeds 10s
+    joined = root / "joined.ts"
+    joined.write_bytes(a.read_bytes() + b.read_bytes())
+    return joined
+
+
+class TestEpochResets:
+    def test_joined_segments_read_as_one_monotonic_clock(
+            self, joined_ts_clip):
+        from kinovsr.media import ffmpeg_reader
+
+        table = ffmpeg_reader.read_sample_table(joined_ts_clip)
+        assert table.sample_count == 462
+        stamps = [s.pts for s in table.samples]
+        assert stamps == sorted(stamps)
+        assert stamps[-1] - stamps[0] == Fraction(461, 30)
+        # the join did not interleave: the second segment's frames sit
+        # at the END of the table, sync flags attached to those frames
+        assert table.verdict.value in ("exact_cfr", "cfr")
+
+    def test_joined_segments_carry_through_a_window(
+            self, joined_ts_clip, tmp_path):
+        from kinovsr.media import ffmpeg_reader, video_reader
+
+        # A window spanning the join: five tail frames of segment A and
+        # five head frames of segment B, delivered in stream order with
+        # continuous stamps.
+        result = run_file(
+            {"pipeline": []}, video=joined_ts_clip,
+            output=tmp_path / "joined.mp4", settings=SETTINGS,
+            start=445, end=455, reader=ffmpeg_reader)
+        assert result.frames_in == 10
+        assert result.frames_out == 10
+        out_table = video_reader.read_sample_table(tmp_path / "joined.mp4")
+        rebased = [s.pts - out_table.first_pts for s in out_table.samples]
+        assert rebased == [Fraction(m, 30) for m in range(10)]

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import bisect
 import contextlib
+import logging
 from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
@@ -39,8 +40,11 @@ import mlx.core as mx
 from . import pixel_buffers as _pb
 from .chunks import validate_decode_chunk_size
 from .pixel_buffers import PIX_BGRA, PIX_RGBAHALF
+
+_log = logging.getLogger(__name__)
 from .timing import (
     AudioTiming,
+    EpochUnwrapper,
     SampleTable,
     SampleTiming,
     VideoTiming,
@@ -173,10 +177,11 @@ def read_sample_table(path: Path) -> SampleTable:
     try:
         time_base = Fraction(vs.time_base)
         samples: list[SampleTiming] = []
+        unwrapper = EpochUnwrapper()
         for packet in container.demux(vs):
             if packet.pts is None or packet.size <= 0:
                 continue
-            pts = Fraction(int(packet.pts)) * time_base
+            pts = unwrapper.push(Fraction(int(packet.pts)) * time_base)
             duration = (Fraction(int(packet.duration)) * time_base
                         if packet.duration and packet.duration > 0 else None)
             samples.append(SampleTiming(
@@ -185,9 +190,14 @@ def read_sample_table(path: Path) -> SampleTable:
                 is_sync=bool(packet.is_keyframe),
                 coded_size=int(packet.size),
             ))
+        if unwrapper.resets:
+            _log.info(
+                "%s: unwrapped %d mid-file timestamp reset(s) into one "
+                "declared monotonic clock", path.name, unwrapper.resets)
         try:
             return analyze_sample_table(
-                samples, nominal_cadence=_fps(vs), source_tick=time_base)
+                samples, nominal_cadence=_fps(vs), source_tick=time_base,
+                epoch_resets=unwrapper.resets)
         except ValueError as exc:
             raise RuntimeError(f"{path.name}: {exc}") from exc
     except av.FFmpegError as exc:
@@ -419,7 +429,11 @@ def _iter_chunks(path: Path, out_format: int, chunk_size: int,
                   else Fraction(int(vs.start_time or 0)) * Fraction(vs.time_base))
         time_base = Fraction(vs.time_base)
         attrs = _buffer_attrs(out_format)
-        if start_frame > 0 and (keys is not None or fps > 0):
+        # Multi-epoch sources decode linearly: a coarse seek landing
+        # inside a later epoch would start the decode-side unwrapper
+        # without the history that maps raw stamps onto the table clock.
+        seekable_clock = table is None or table.epoch_resets == 0
+        if start_frame > 0 and seekable_clock and (keys is not None or fps > 0):
             # coarse keyframe seek, then exact per-frame trim below
             if keys is not None:
                 back = min(max(start_frame - 1, 0), len(keys) - 1)
@@ -433,13 +447,19 @@ def _iter_chunks(path: Path, out_format: int, chunk_size: int,
                 container.seek(
                     int(sec / vs.time_base), stream=vs, backward=True)
         chunk: list = []
+        # Decoded frames carry raw stamps; the table's are unwrapped onto
+        # one monotonic clock. Run the same streaming mapping here (reset
+        # detection survives display reordering) so bisects stay aligned.
+        trim_unwrapper = EpochUnwrapper() if keys is not None else None
         for frame in container.decode(vs):
             if frame.pts is None:
                 continue
             if keys is not None:
                 # Exact window indexing for jittered/gapped/variable clocks.
-                idx = bisect.bisect_right(
-                    keys, Fraction(int(frame.pts)) * time_base) - 1
+                assert trim_unwrapper is not None
+                adjusted = trim_unwrapper.push(
+                    Fraction(int(frame.pts)) * time_base)
+                idx = bisect.bisect_right(keys, adjusted) - 1
             elif fps > 0:
                 idx = _pts_index(frame.pts, vs, fps, origin=origin)
             else:
