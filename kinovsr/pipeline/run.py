@@ -43,7 +43,6 @@ from kinovsr.media.errors import is_native_operation_error
 from kinovsr.media.errors import media_operation as _media_operation
 from kinovsr.media.filesystem import rename_exclusive
 from kinovsr.media.timing import (
-    AudioTiming,
     SampleTable,
     VideoTiming,
     grid_ticks,
@@ -285,34 +284,6 @@ def _timing_view(
 ) -> VideoTiming | None:
     """The legacy CFR-or-variable view of whichever probe result exists."""
     return timing.timing() if isinstance(timing, SampleTable) else timing
-
-
-def _validate_audio_origin(
-    path: Path,
-    reader: Any,
-    video_timing: VideoTiming | None,
-) -> None:
-    """Reject audio carry whose source clock cannot yet be preserved."""
-    if video_timing is None:
-        return
-    probe = getattr(_reader_module(reader), "probe_audio_timing", None)
-    if probe is None:
-        return
-    with _media_operation("failed to inspect source audio timing for", path):
-        audio_timing: AudioTiming | None = probe(path)
-    if audio_timing is None:
-        return
-    # Each reported origin can be rounded by at most half of its own clock
-    # tick. A whole coarse video tick is a real frame-scale skew, not harmless
-    # quantization (notably for AVI streams whose time base is 1/fps).
-    tolerance = (
-        video_timing.source_tick + audio_timing.source_tick) / 2
-    if abs(audio_timing.first_pts - video_timing.first_pts) > tolerance:
-        raise MediaError(
-            f"{path.name}: staggered audio/video track origins are not "
-            f"supported (video starts at {float(video_timing.first_pts):.6g}s, "
-            f"audio at {float(audio_timing.first_pts):.6g}s); align or remux "
-            f"the tracks before requesting audio carry")
 
 
 class FileSource:
@@ -658,8 +629,13 @@ class FileSource:
     def audio_track(self, *, max_duration: Fraction | None = None) -> Any:
         """Open the source's bounded audio window, or None when absent.
 
-        Exact rational frame boundaries and an optional output-duration cap
-        are resolved before either backend allocates or decodes PCM.
+        The audio slice and its output placement derive from the video
+        window's REAL bounds on the source clock, so staggered track
+        origins and --start/--end trims compose through one formula:
+        source audio before the window origin is skipped (video-anchored
+        sync), audio starting after it is placed late by exactly the
+        carried offset. Exact rational boundaries and an optional
+        output-duration cap resolve before either backend decodes PCM.
         """
         from kinovsr.media.audio import read_audio_track_from_video
 
@@ -668,19 +644,38 @@ class FileSource:
             # arithmetic has no meaning on a non-uniform grid.
             table = self._table
             assert table is not None
-            first = table.first_pts
-            start_sec = table.samples[self.start].pts - first
-            end_sec = (table.samples[self.end - 1].pts - first
-                       + self._window_tail_duration())
+            win0 = table.samples[self.start].pts
+            win1 = (table.samples[self.end - 1].pts
+                    + self._window_tail_duration())
         else:
-            start_sec = Fraction(self.start) / self.source_cadence
-            end_sec = Fraction(self.end) / self.source_cadence
+            vfirst = (self._timing.first_pts if self._timing is not None
+                      else Fraction(0))
+            win0 = vfirst + Fraction(self.start) / self.source_cadence
+            win1 = vfirst + Fraction(self.end) / self.source_cadence
+        audio_first = Fraction(0)
+        probe = getattr(self._vr, "probe_audio_timing", None)
+        if probe is not None:
+            with _media_operation(
+                    "failed to inspect source audio timing for", self.path):
+                audio_timing = probe(self.path)
+            if audio_timing is not None:
+                audio_first = audio_timing.first_pts
+        slice_start = max(Fraction(0), win0 - audio_first)
+        slice_end = win1 - audio_first
+        place = max(Fraction(0), audio_first - win0)
+        if slice_end <= slice_start:
+            _log.info(
+                "audio track lies entirely outside the video window (audio "
+                "starts at %.6gs, window covers %.6gs-%.6gs); output will "
+                "be silent",
+                float(audio_first), float(win0), float(win1))
+            return None
         try:
-            return read_audio_track_from_video(
+            track = read_audio_track_from_video(
                 self.path,
                 self._vr,
-                start_sec=start_sec,
-                end_sec=end_sec,
+                start_sec=slice_start,
+                end_sec=slice_end,
                 max_duration_sec=max_duration,
             )
         except MediaError:
@@ -691,6 +686,21 @@ class FileSource:
                     f"failed to open bounded audio from {self.path}: {exc}"
                 ) from exc
             raise
+        if track is None:
+            return None
+        lead = win0 - audio_first
+        if lead > 0:
+            _log.info(
+                "audio leads the video window by %.1f ms; skipped %s "
+                "leading samples to preserve sync",
+                float(lead) * 1000.0, round(lead * track.sample_rate))
+        elif place > 0:
+            track.placement_samples = round(place * track.sample_rate)
+            _log.info(
+                "audio starts %.1f ms after the video window origin; "
+                "placed %s samples late to preserve sync",
+                float(place) * 1000.0, track.placement_samples)
+        return track
 
 
 class FileSink:
@@ -1890,10 +1900,9 @@ def run_file(
         # Inspect the complete source sample clock before entering the
         # artifact transaction. Uniform grids keep the regenerated cadence
         # timeline; non-uniform tables are carried verbatim downstream.
+        # Staggered audio origins need no gate: the audio window derives
+        # from the video window's real bounds (FileSource.audio_track).
         timing = _probe_timing(plan.input_path, reader)
-        if audio:
-            _validate_audio_origin(plan.input_path, reader,
-                                   _timing_view(timing))
         from kinovsr.media.pixel_buffers import ci_cache_owner
 
         # The file owner outlives the inner session owner: auto-geometry may render

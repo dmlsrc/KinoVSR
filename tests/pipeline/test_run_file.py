@@ -88,6 +88,53 @@ def _write_vfr_clip(path) -> None:
     out.close()
 
 
+def _write_offset_tracks(
+    path, *, video_start_frames: int, audio_start_sec: float,
+    audio_len_sec: float,
+) -> None:
+    """25 fps video (1 s) and a mono ALAC ramp with independent origins.
+
+    The audio waveform is a linear int16 ramp over its full length, so a
+    decoded sample's VALUE identifies its source position: slicing and
+    placement become directly verifiable.
+    """
+    out = av.open(str(path), "w")
+    video = out.add_stream("mpeg4", rate=25)
+    video.width = video.height = 64
+    video.pix_fmt = "yuv420p"
+    video.options = {"bf": "0"}
+    audio = out.add_stream("alac", rate=SAMPLE_RATE, layout="mono")
+
+    for index in range(25):
+        frame = av.VideoFrame(64, 64, "gray")
+        frame.planes[0].update(bytes([index * 4]) * (64 * 64))
+        frame.pts = video_start_frames + index
+        frame.time_base = Fraction(1, 25)
+        for packet in video.encode(frame.reformat(format="yuv420p")):
+            out.mux(packet)
+    for packet in video.encode():
+        out.mux(packet)
+
+    total = round(audio_len_sec * SAMPLE_RATE)
+    first_pts = round(audio_start_sec * SAMPLE_RATE)
+    chunk = 4096
+    for start in range(0, total, chunk):
+        n = min(chunk, total - start)
+        pcm = b"".join(
+            int(32767 * (start + i) / total).to_bytes(2, "little", signed=True)
+            for i in range(n))
+        frame = av.AudioFrame(format="s16p", layout="mono", samples=n)
+        frame.planes[0].update(pcm)
+        frame.sample_rate = SAMPLE_RATE
+        frame.pts = first_pts + start
+        frame.time_base = Fraction(1, SAMPLE_RATE)
+        for packet in audio.encode(frame):
+            out.mux(packet)
+    for packet in audio.encode():
+        out.mux(packet)
+    out.close()
+
+
 def _write_staggered_tracks(path) -> None:
     """One-second video at t=10 beside one-second audio at t=0."""
     out = av.open(str(path), "w")
@@ -146,6 +193,26 @@ def vfr_clip(tmp_path_factory):
 def staggered_clip(tmp_path_factory):
     path = tmp_path_factory.mktemp("run_file_staggered") / "clip.mp4"
     _write_staggered_tracks(path)
+    return path
+
+
+@pytest.fixture(scope="module")
+def audio_leads_clip(tmp_path_factory):
+    # Video begins at 0.4 s; the 2 s audio ramp begins at 0: audio leads
+    # the video window by 0.4 s.
+    path = tmp_path_factory.mktemp("run_file_lead") / "clip.mp4"
+    _write_offset_tracks(path, video_start_frames=10, audio_start_sec=0.0,
+                         audio_len_sec=2.0)
+    return path
+
+
+@pytest.fixture(scope="module")
+def audio_lags_clip(tmp_path_factory):
+    # Video begins at 0; the audio ramp begins at 0.3 s: audio must be
+    # placed 0.3 s late on the output timeline.
+    path = tmp_path_factory.mktemp("run_file_lag") / "clip.mp4"
+    _write_offset_tracks(path, video_start_frames=0, audio_start_sec=0.3,
+                         audio_len_sec=2.0)
     return path
 
 
@@ -466,63 +533,72 @@ class TestFileSource:
         assert rebased == [Fraction(0), Fraction(1, 30), Fraction(1, 10),
                            Fraction(2, 15), Fraction(7, 30)]
 
-    def test_staggered_audio_video_origins_are_rejected_before_transaction(
-            self, staggered_clip, tmp_path, monkeypatch):
+    def test_audio_outside_the_window_yields_silent_output(
+            self, staggered_clip, tmp_path):
+        # Video runs t=10..11s while the audio ends around t=1.1s: no
+        # overlap. The video-anchored policy carries silence, not an error.
         from kinovsr.media import ffmpeg_reader, video_reader
-        from kinovsr.pipeline import run as run_module
 
-        native_video = video_reader.probe_video_timing(staggered_clip)
         native_audio = video_reader.probe_audio_timing(staggered_clip)
-        fallback_video = ffmpeg_reader.probe_video_timing(staggered_clip)
         fallback_audio = ffmpeg_reader.probe_audio_timing(staggered_clip)
-        assert native_video.first_pts == fallback_video.first_pts == 10
         assert native_audio is not None and fallback_audio is not None
         assert native_audio.first_pts == fallback_audio.first_pts == 0
 
-        def transaction_must_not_start(_self):
-            raise AssertionError(
-                "output transaction started for staggered track origins")
-
-        monkeypatch.setattr(
-            run_module._OutputTransaction, "__enter__",
-            transaction_must_not_start)
         output = tmp_path / "staggered.mp4"
-        with pytest.raises(MediaError, match="staggered audio/video"):
-            run_file(
-                {"pipeline": []}, video=staggered_clip, output=output,
-                settings=SETTINGS, audio=True)
-        assert not output.exists()
-        assert not list(tmp_path.glob("*.partial"))
+        result = run_file(
+            {"pipeline": []}, video=staggered_clip, output=output,
+            settings=SETTINGS, audio=True)
+        assert result.frames_in == result.frames_out == 25
+        with av.open(str(output)) as container:
+            assert len(container.streams.video) == 1
+            assert len(container.streams.audio) == 0
 
-    def test_audio_origin_tolerance_is_only_the_half_tick_error_envelope(self):
-        from kinovsr.media.timing import AudioTiming, VideoTiming
-        from kinovsr.pipeline.run import _validate_audio_origin
+    def _first_track_value(self, track) -> float:
+        import struct
 
-        video = VideoTiming(
-            sample_count=25,
-            cadence=Fraction(25),
-            first_pts=Fraction(0),
-            duration=Fraction(1),
-            source_tick=Fraction(1, 25),
-        )
-        envelope = (Fraction(1, 25) + Fraction(1, 48000)) / 2
+        return struct.unpack(
+            "<f", bytes(track._read_interleaved(0, 1))[:4])[0]
 
-        class BoundaryReader:
-            @staticmethod
-            def probe_audio_timing(_path):
-                return AudioTiming(
-                    first_pts=envelope, source_tick=Fraction(1, 48000))
+    def test_leading_audio_is_trimmed_to_the_video_anchor(
+            self, audio_leads_clip):
+        source = FileSource(audio_leads_clip)
+        track = source.audio_track()
+        assert track is not None
+        assert track.placement_samples == 0
+        # Slice covers [0.4s, 1.4s) of the 2 s ramp.
+        assert abs(track.n_samples - SAMPLE_RATE) <= 2
+        assert self._first_track_value(track) == pytest.approx(
+            0.4 / 2.0, abs=1e-3)
 
-        class WholeTickReader:
-            @staticmethod
-            def probe_audio_timing(_path):
-                return AudioTiming(
-                    first_pts=Fraction(1, 25),
-                    source_tick=Fraction(1, 48000))
+    def test_stagger_composes_with_a_start_trim(self, audio_leads_clip):
+        # --start 5 frames moves the window origin to 0.6 s absolute.
+        source = FileSource(audio_leads_clip, start=5)
+        track = source.audio_track()
+        assert track is not None
+        assert self._first_track_value(track) == pytest.approx(
+            0.6 / 2.0, abs=1e-3)
 
-        _validate_audio_origin(Path("coarse.avi"), BoundaryReader, video)
-        with pytest.raises(MediaError, match="staggered audio/video"):
-            _validate_audio_origin(Path("coarse.avi"), WholeTickReader, video)
+    def test_lagging_audio_is_placed_late_and_forks_carry_it(
+            self, audio_lags_clip):
+        source = FileSource(audio_lags_clip)
+        track = source.audio_track()
+        assert track is not None
+        assert track.placement_samples == round(0.3 * SAMPLE_RATE)
+        # Slice covers [0, 0.7s) of the ramp: starts at its first sample.
+        assert abs(track.n_samples - round(0.7 * SAMPLE_RATE)) <= 2
+        assert self._first_track_value(track) == pytest.approx(0.0, abs=1e-3)
+        assert track.fork().placement_samples == track.placement_samples
+
+    def test_lagging_audio_reaches_the_output_late(
+            self, audio_lags_clip, tmp_path):
+        output = tmp_path / "lag.mp4"
+        run_file(
+            {"pipeline": []}, video=audio_lags_clip, output=output,
+            settings=SETTINGS, audio=True)
+        with av.open(str(output)) as container:
+            stream = container.streams.audio[0]
+            start = float((stream.start_time or 0) * stream.time_base)
+        assert start == pytest.approx(0.3, abs=0.005)
 
     def test_audio_carry_trims_to_the_window(self, clip_with_audio):
         source = FileSource(clip_with_audio, start=4, max_frames=8)

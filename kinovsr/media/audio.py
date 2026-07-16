@@ -103,6 +103,13 @@ class AudioTrack:
     conversion.
     """
 
+    # Output-timeline placement: the writer stamps this track's sample
+    # buffers ``placement_samples`` late, so an audio origin that starts
+    # AFTER the video window origin keeps its carried offset through the
+    # mux (no fabricated silence). Assigned by the file endpoint on the
+    # final sliced track; forks and views inherit it.
+    placement_samples = 0
+
     def __init__(self, waveform: Any, sample_rate: int):
         # Accept an mlx or numpy (channels, samples) array; normalize to mlx f32.
         w = mx.array(waveform, dtype=mx.float32)
@@ -190,7 +197,8 @@ class AudioTrack:
         if err != 0:
             raise RuntimeError(f"CMBlockBufferReplaceDataBytes failed: {err}")
 
-        pts = CoreMedia.CMTimeMake(start_frame, self.sample_rate)
+        pts = CoreMedia.CMTimeMake(
+            start_frame + self.placement_samples, self.sample_rate)
         err, sample_buf = CoreMedia.CMAudioSampleBufferCreateReadyWithPacketDescriptions(
             None, block, self.format_desc, n, pts, None, None,
         )
@@ -217,8 +225,10 @@ class _AudioTrackView(AudioTrack):
             self._offset + start_frame, self._offset + end_frame)
 
     def fork(self) -> AudioTrack:
-        return _AudioTrackView(
+        clone = _AudioTrackView(
             self._parent.fork(), self._offset, self.n_samples)
+        clone.placement_samples = self.placement_samples
+        return clone
 
     def close(self) -> None:
         self._parent.close()
@@ -259,13 +269,15 @@ class StreamingAudioTrack(AudioTrack):
                 self._offset + start_frame, self._offset + end_frame)
 
     def fork(self) -> AudioTrack:
-        return StreamingAudioTrack(
+        clone = StreamingAudioTrack(
             sample_rate=self.sample_rate,
             channels=self.channels,
             n_samples=self.n_samples,
             source_factory=self._source_factory,
             offset=self._offset,
         )
+        clone.placement_samples = self.placement_samples
+        return clone
 
     def close(self) -> None:
         with self._source_lock:
