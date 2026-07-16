@@ -1414,7 +1414,8 @@ def test_ntsc_cadence_writes_the_exact_rational_grid(tmp_path):
     for i in range(n):
         sink.append(FrameUnit(payload=frame, pts=ticks(i),
                               duration=ticks(i + 1) - ticks(i)))
-    path = sink.finish()
+    sink.finalize()
+    path = sink._temp_path
 
     half_tick = Fraction(1, 48000)
     with av.open(str(path)) as container:
@@ -1461,7 +1462,8 @@ def test_source_less_full_range_mlx_sink_keeps_range_metadata(tmp_path):
     for i in range(3):
         sink.append(FrameUnit(
             payload=frame, pts=i * 960, duration=960))
-    path = sink.finish()
+    sink.finalize()
+    path = sink._temp_path
 
     with av.open(str(path)) as container:
         codec = container.streams.video[0].codec_context

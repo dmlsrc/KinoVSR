@@ -719,16 +719,8 @@ class FileSink:
             self._validate_mlx_frame(unit.payload)
             if self._direct_mlx_encode:
                 try:
-                    prepared = self.writer.prepare_mlx_rgb(unit.payload)
-                except Exception as exc:
-                    if is_native_operation_error(exc):
-                        raise MediaError(
-                            f"writer MLX preparation failed for "
-                            f"{self._final_path}: {exc}") from exc
-                    raise
-                try:
-                    self.writer.append_prepared_mlx_rgb(
-                        prepared, pts_ticks=unit.pts,
+                    self.writer.append_mlx_rgb(
+                        unit.payload, pts_ticks=unit.pts,
                         duration_ticks=unit.duration or None)
                 except Exception as exc:
                     if is_native_operation_error(
@@ -774,31 +766,6 @@ class FileSink:
 
     def _mark_published(self) -> None:
         self._published = True
-
-    def finish(self) -> Path:
-        """Finalize the encode and publish it atomically to the requested
-        output path (Darwin exclusive rename closes the no-overwrite race). On ANY
-        failure - a writer-finalization error, or a rename that cannot land
-        (e.g. the output path is an existing directory, or a full disk) -
-        the partial temp is removed and the requested output is left
-        untouched."""
-        self.finalize()
-        try:
-            if self._overwrite:
-                self._temp_path.replace(self._final_path)
-            else:
-                rename_exclusive(self._temp_path, self._final_path)
-        except BaseException as exc:
-            _unlink_temporary(self._temp_path)
-            if isinstance(exc, PipelineError):
-                raise
-            if isinstance(exc, (OSError, RuntimeError)):
-                raise MediaError(
-                    f"writer publication failed for {self._final_path}: {exc}"
-                ) from exc
-            raise
-        self._mark_published()
-        return self._final_path
 
     def discard(self) -> None:
         """Abandon the run: release the writer and delete the partial temp

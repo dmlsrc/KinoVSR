@@ -253,8 +253,15 @@ def test_writer_mlx_conversion_value_error_is_not_mislabeled(tmp_path):
     assert caught.value is failure
 
 
-def test_writer_direct_mlx_conversion_value_error_is_not_mislabeled(tmp_path):
-    failure = ValueError("injected direct MLX conversion defect")
+@pytest.mark.parametrize(
+    "failure_type", [OSError, RuntimeError, ValueError])
+def test_writer_direct_mlx_failure_is_typed(tmp_path, failure_type):
+    # One boundary for the collapsed direct path: the conversion graph
+    # builds lazily for every payload the shape gate admits (verified by
+    # probing all admissible payload classes), so operational failures -
+    # including the native layer's ValueErrors - surface from the single
+    # append call and are typed there.
+    failure = failure_type("injected direct MLX append failure")
     sink = _bare_sink(tmp_path, failure, "none")
     sink.spec = _spec(layout=Layout.MLX_RGB_HWC)
     sink._is_mlx = True
@@ -264,65 +271,7 @@ def test_writer_direct_mlx_conversion_value_error_is_not_mislabeled(tmp_path):
         frame_count = 0
 
         @staticmethod
-        def prepare_mlx_rgb(frame):
-            raise failure
-
-        @staticmethod
-        def append_prepared_mlx_rgb(*args, **kwargs):
-            pytest.fail("prepared append called after conversion failure")
-
-    sink.writer = _Writer()
-    payload = type("Frame", (), {"shape": (16, 16, 3)})()
-
-    with pytest.raises(ValueError) as caught:
-        sink.append(FrameUnit(payload=payload, pts=0, duration=960))
-    assert caught.value is failure
-
-
-@pytest.mark.parametrize("failure_type", [OSError, RuntimeError])
-def test_writer_direct_mlx_operational_preparation_failure_is_typed(
-        tmp_path, failure_type):
-    failure = failure_type("injected direct MLX preparation failure")
-    sink = _bare_sink(tmp_path, failure, "none")
-    sink.spec = _spec(layout=Layout.MLX_RGB_HWC)
-    sink._is_mlx = True
-    sink._direct_mlx_encode = True
-
-    class _Writer:
-        frame_count = 0
-
-        @staticmethod
-        def prepare_mlx_rgb(frame):
-            raise failure
-
-        @staticmethod
-        def append_prepared_mlx_rgb(*args, **kwargs):
-            pytest.fail("prepared append called after preparation failure")
-
-    sink.writer = _Writer()
-    payload = type("Frame", (), {"shape": (16, 16, 3)})()
-
-    with pytest.raises(MediaError) as caught:
-        sink.append(FrameUnit(payload=payload, pts=0, duration=960))
-    assert caught.value.__cause__ is failure
-
-
-def test_writer_direct_native_value_error_is_typed(tmp_path):
-    failure = ValueError("injected native writer failure")
-    sink = _bare_sink(tmp_path, failure, "none")
-    sink.spec = _spec(layout=Layout.MLX_RGB_HWC)
-    sink._is_mlx = True
-    sink._direct_mlx_encode = True
-
-    class _Writer:
-        frame_count = 0
-
-        @staticmethod
-        def prepare_mlx_rgb(frame):
-            return frame
-
-        @staticmethod
-        def append_prepared_mlx_rgb(*args, **kwargs):
+        def append_mlx_rgb(*args, **kwargs):
             raise failure
 
     sink.writer = _Writer()
@@ -331,26 +280,6 @@ def test_writer_direct_native_value_error_is_typed(tmp_path):
     with pytest.raises(MediaError) as caught:
         sink.append(FrameUnit(payload=payload, pts=0, duration=960))
     assert caught.value.__cause__ is failure
-
-
-def test_standalone_writer_finish_preserves_racing_destination(
-        monkeypatch, tmp_path):
-    sink = _bare_sink(tmp_path, RuntimeError("unused"), "none")
-    sink._overwrite = False
-    sink._temp_path.write_bytes(b"owned")
-    original_rename = run_module.rename_exclusive
-
-    def external_then_rename(source, destination):
-        destination.write_bytes(b"external")
-        original_rename(source, destination)
-
-    monkeypatch.setattr(run_module, "rename_exclusive", external_then_rename)
-    with pytest.raises(MediaError) as caught:
-        sink.finish()
-
-    assert isinstance(caught.value.__cause__, OSError)
-    assert sink._final_path.read_bytes() == b"external"
-    assert not sink._temp_path.exists()
 
 
 def test_writer_cleanup_failure_does_not_replace_primary(

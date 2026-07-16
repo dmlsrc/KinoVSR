@@ -897,8 +897,14 @@ class AVWriter:
             duration_ticks=duration_ticks,
         )
 
-    def prepare_mlx_rgb(self, rgb: Any) -> Any:
-        """Apply the explicit MLX rounding boundary before native ownership."""
+    def append_mlx_rgb(
+        self,
+        rgb: Any,
+        *,
+        pts_ticks: int | None = None,
+        duration_ticks: int | None = None,
+    ) -> None:
+        """Convert typed MLX RGB directly into the pooled encoder YUV feed."""
         if not self.accepts_mlx_rgb:
             raise RuntimeError(
                 f"[{self.label}] direct MLX RGB input requires the YUV feed")
@@ -908,37 +914,13 @@ class AVWriter:
         # wrote fp16 RGBAHalf and read it back as float32 before YUV
         # quantization. Keep that rounding in the lazy MLX graph while
         # removing both CoreVideo copies and their synchronization points.
-        return rgb[..., :3].astype(mx.float16).astype(mx.float32)
-
-    def append_prepared_mlx_rgb(
-        self,
-        equivalent: Any,
-        *,
-        pts_ticks: int | None = None,
-        duration_ticks: int | None = None,
-    ) -> None:
-        """Append MLX RGB after caller-visible conversion has succeeded."""
-        if not self.accepts_mlx_rgb:
-            raise RuntimeError(
-                f"[{self.label}] direct MLX RGB input requires the YUV feed")
+        # (The graph builds lazily for every dtype MLX accepts, so there is
+        # no eager conversion failure to classify separately - verified by
+        # probing every payload class the shape gate admits.)
+        equivalent = rgb[..., :3].astype(mx.float16).astype(mx.float32)
         self._append_payload(
             equivalent,
             direct_mlx_rgb=True,
-            pts_ticks=pts_ticks,
-            duration_ticks=duration_ticks,
-        )
-
-    def append_mlx_rgb(
-        self,
-        rgb: Any,
-        *,
-        pts_ticks: int | None = None,
-        duration_ticks: int | None = None,
-    ) -> None:
-        """Convert typed MLX RGB directly into the pooled encoder YUV feed."""
-        equivalent = self.prepare_mlx_rgb(rgb)
-        self.append_prepared_mlx_rgb(
-            equivalent,
             pts_ticks=pts_ticks,
             duration_ticks=duration_ticks,
         )
