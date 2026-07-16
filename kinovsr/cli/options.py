@@ -72,7 +72,7 @@ SHARED_KEYS = frozenset({
 # is a deliberate vocabulary decision (planning 07-cli-vocabulary.md).
 FAMILY_KEYS: dict[str, frozenset[str]] = {
     "mc": frozenset({"sigma", "gate", "clamp", "occlusion", "confidence"}),
-    "fbcnn": frozenset({"quality", "quality_fallback"}),
+    "fbcnn": frozenset({"quality", "quality_fallback", "gop"}),
     "safmn": frozenset({"safm_up", "pool_clamp"}),
     "pvdd": frozenset({"noise_preset", "noise_variance"}),
     "realbasicvsr": frozenset({"clean_iters", "clean_threshold",

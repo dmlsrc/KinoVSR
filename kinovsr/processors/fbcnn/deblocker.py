@@ -53,7 +53,8 @@ class FbcnnDeblocker:
 
     def __init__(self, weights: Any = None, quality: Any = None, strength: float = 1.0,
                  compile: bool = True, dtype: Any = mx.float16,
-                 blockiness_map: Any = None, quality_fallback: float = 50.0):
+                 blockiness_map: Any = None, quality_fallback: float = 50.0,
+                 gop: bool = True):
         self._p = net.load_params(weights, dtype=dtype)
         self._in_nc, self._nb = net._config(self._p)
         if self._in_nc != 3:
@@ -80,6 +81,15 @@ class FbcnnDeblocker:
         self._mask: Any = None
         self._recent: list = []
         self._since_refresh = 0
+        # gop: key conditioning refreshes (the QF map and the blockiness
+        # mask) to the source's sync samples when the pipeline supplies
+        # them. A refresh changes treatment; landing it where the source
+        # itself resets (the I-frame) hides the step that a mid-GOP
+        # counter tick would print at an arbitrary frame. The frame
+        # counter stays as the ceiling for flag-less sources and
+        # longer-than-ceiling GOPs, so refresh never becomes RARER.
+        self._gop = bool(gop)
+        self.qf_refresh_count = 0
         self.last_blockiness_map: Any = None   # fp32 (H,W,1) (debug)
         self._net_strength = 1.0 if self._tracker is not None else self._strength
         self._compile = compile
@@ -151,12 +161,17 @@ class FbcnnDeblocker:
 
     # ---- auto-QF machinery ---------------------------------------------------
 
-    def _refresh_qf(self, inp: Any) -> None:
+    def _refresh_qf(self, inp: Any, *, sync: bool = False) -> None:
         self._qf_frames.append(_to_luma_2d(inp[0]))
         if len(self._qf_frames) > self.QF_WINDOW:
             self._qf_frames.pop(0)
-        due = self._qf_grid is None or self._since_qf >= self.MAP_REFRESH
+        # Sync samples ALIGN refreshes to the source's own resets (once
+        # the comb window has refilled); the counter remains the ceiling.
+        due = (self._qf_grid is None
+               or (sync and self._since_qf >= self.QF_WINDOW)
+               or self._since_qf >= self.MAP_REFRESH)
         if due and len(self._qf_frames) >= self.QF_MIN_FRAMES:
+            self.qf_refresh_count += 1
             m = estimate_qf_map(self._qf_frames, tile=self.QF_TILE,
                                 fallback=self._fallback)
             # re-fill with the partial-coverage semantics: declined-next-to-
@@ -310,12 +325,19 @@ class FbcnnDeblocker:
 
     # ---- main entry ------------------------------------------------------------
 
-    def denoise(self, rgb_f32: Any) -> Any:
-        """Restore one RGB frame (H,W,3) in [0,1]; returns (H,W,3)."""
+    def denoise(self, rgb_f32: Any, source: Any = None) -> Any:
+        """Restore one RGB frame (H,W,3) in [0,1]; returns (H,W,3).
+
+        ``source`` is the unit's raw-stream identity when the pipeline
+        supplies one; its sync flag keys conditioning refreshes to the
+        source's own coding resets (see ``gop``).
+        """
+        sync = bool(self._gop
+                    and getattr(source, "is_sync", None))
         a = rgb_f32 if rgb_f32.ndim == 4 else rgb_f32[None]
         inp = mx.clip(a[..., :3].astype(mx.float32), 0.0, 1.0)
         if self._auto:
-            self._refresh_qf(inp)
+            self._refresh_qf(inp, sync=sync)
             out = mx.clip(self._forward_auto(inp), 0.0, 1.0)
         else:
             out = mx.clip(self._fwd(inp), 0.0, 1.0)
@@ -323,7 +345,9 @@ class FbcnnDeblocker:
             self._recent.append(inp)
             if len(self._recent) > 6:
                 self._recent.pop(0)
-            if self._mask is None or self._since_refresh >= self.MAP_REFRESH:
+            if (self._mask is None
+                    or (sync and self._since_refresh >= 6)
+                    or self._since_refresh >= self.MAP_REFRESH):
                 m = self._tracker.update(self._recent)
                 if m is not None:
                     self.last_blockiness_map = m

@@ -35,6 +35,13 @@ FBCNN_OPTIONS = [
         family='fbcnn',
         key='strength',
         help="Linear dry/wet blend of FBCNN's correction for --deblock fbcnn: out = (1-A)*input + A*fbcnn(input). 1.0 = full; <1 keeps more original texture (and faint residual artifacts) uniformly; >1 over-drives (can ring). Overrides the positional --deblock-strength value for this family (default: the chain value). A QF-independent strength dial, complementary to --fbcnn-quality."),
+    Opt(flag='--fbcnn-gop',
+        group='Deblock',
+        default='on',
+        choices=('off', 'on'),
+        family='fbcnn',
+        key='gop',
+        help="Key --fbcnn-quality auto's conditioning refreshes to the source's sync samples (default on). A QF-map or blockiness-mask refresh changes treatment; landing it on an I-frame hides the step under the source's own coding reset instead of printing it at an arbitrary mid-GOP frame. The frame counter stays as the ceiling, so refreshes never become rarer; off reproduces the counter-only cadence."),
 ]
 
 __all__ = ["FBCNN_WEIGHT_OPTIONS", "FBCNN_OPTIONS"]

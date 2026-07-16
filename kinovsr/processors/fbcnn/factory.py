@@ -57,6 +57,7 @@ class FbcnnStageConfig:
     quality: Any                 # "auto" | None (blind) | float QF
     quality_fallback: float
     strength: float
+    gop: bool
     deblock_map: DeblockMapConfig
 
 
@@ -85,7 +86,7 @@ class FbcnnFactory:
     ) -> FbcnnStageConfig:
         reject_unknown_keys(
             raw, ("weights", "strength", "quality", "quality_fallback",
-                  *DEBLOCK_MAP_KEYS))
+                  "gop", *DEBLOCK_MAP_KEYS))
         strength = typed_value(raw, "strength", float, 1.0)
         if strength < 0.0:
             raise ValueError("strength must be >= 0")
@@ -98,6 +99,7 @@ class FbcnnFactory:
             quality=_parse_quality(typed_value(raw, "quality", str, "auto")),
             quality_fallback=quality_fallback,
             strength=strength,
+            gop=typed_value(raw, "gop", bool, True),
             deblock_map=parse_deblock_map(raw),
         )
 
@@ -113,6 +115,7 @@ class FbcnnFactory:
                 quality=config.quality,
                 strength=config.strength,
                 quality_fallback=config.quality_fallback,
+                gop=config.gop,
                 blockiness_map=build_blockiness_tracker(config.deblock_map)))
 
         return FeedFlushProcessor(make_driver)

@@ -56,13 +56,33 @@ class PerFrameDriver:
     Several single-image families expose ``denoise``/``reset``/``close``
     without the streaming dialect; this adapter gives them the driver
     shape :class:`FeedFlushProcessor` pumps, with reset/close passing
-    through when the engine has them.
+    through when the engine has them. An engine whose ``denoise`` accepts
+    a ``source`` keyword additionally receives the unit's raw-stream
+    identity (``FrameUnit.source``: sync flag, GOP position, coded size),
+    so per-frame families can key conditioning decisions to the source's
+    coding structure.
     """
 
     def __init__(self, engine: Any) -> None:
+        import inspect
+
         self._engine = engine
+        # Construction stays lazy for engines without denoise (test stubs,
+        # engines used only for lifecycle): feed() fails at call time for
+        # those, exactly as before this inspection existed.
+        denoise = getattr(engine, "denoise", None)
+        parameters: Any = {}
+        if denoise is not None:
+            try:
+                parameters = inspect.signature(denoise).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+        self._wants_source = "source" in parameters
 
     def feed(self, frame: Any, token: Any = None) -> list:
+        if self._wants_source:
+            source = getattr(token, "source", None)
+            return [(self._engine.denoise(frame, source=source), token)]
         return [(self._engine.denoise(frame), token)]
 
     def flush(self) -> list:
