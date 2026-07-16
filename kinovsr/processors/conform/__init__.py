@@ -122,8 +122,21 @@ class CfrConformProcessor:
 
     def _emit_through(self, boundary_time: Fraction) -> Iterable[FrameUnit]:
         """Emit the held frame into every slot up to ``boundary_time``."""
-        assert self._prev is not None and self._slot is not None
+        assert (self._prev is not None and self._slot is not None
+                and self._cadence is not None)
         unit, unit_time = self._prev
+        # Bound the fanout BEFORE emitting (the interpolation stage uses
+        # the same ceiling): a recorder clock jump of an hour would
+        # otherwise push ~100k duplicates of one frame through every
+        # downstream stage and the encoder before the ledger ever prints.
+        fanout = (math.floor(boundary_time * self._cadence)
+                  - self._slot + 1)
+        if fanout > 10_000:
+            raise MediaError(
+                f"conform would emit {fanout} duplicates of the frame at "
+                f"{float(unit_time):.6g}s (a clock jump, not a cadence "
+                f"gap); trim the window with --start/--end so it excludes "
+                f"the discontinuity, or process the segments separately")
         count = 0
         while self._slot_time(self._slot) <= boundary_time:
             yield self._emit(unit, self._slot, unit_time)
@@ -167,15 +180,21 @@ class CfrConformProcessor:
     def flush(self, context: PipelineContext) -> Iterable[FrameUnit]:
         if self._prev is None:
             return
-        assert self._time_base is not None
+        assert self._time_base is not None and self._cadence is not None
         unit, unit_time = self._prev
         duration_ticks = unit.duration if unit.duration > 0 else 0
         end = unit_time + Fraction(duration_ticks) * self._time_base
-        # The final frame covers slots strictly before its end (its slot
-        # at exactly `end` belongs to footage that does not exist).
-        if end > unit_time:
-            yield from self._emit_through(
-                end - Fraction(1, 1_000_000_000))
+        # The final frame covers slots whose MIDPOINT lies inside the
+        # footage: a slot start scraping the very end of the last frame's
+        # duration would emit a degenerate duplicate that the
+        # duration-preserving clamp then crushes to a few ticks.
+        half = 1 / (2 * self._cadence)
+        if end - half > unit_time:
+            yield from self._emit_through(end - half)
+        elif end > unit_time:
+            # Degenerate final frame (shorter than half a slot): it still
+            # owns its own slot when nothing else claimed it.
+            yield from self._emit_through(unit_time)
         self._prev = None
 
     def close(self, context: PipelineContext) -> None:

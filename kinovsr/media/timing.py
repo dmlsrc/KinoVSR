@@ -94,16 +94,15 @@ class SampleTable:
     first_pts: Fraction
     duration: Fraction
     source_tick: Fraction
+    # Display-order table positions whose samples are sync samples.
+    # A stored field, not a property: frame_gop() bisects it once per
+    # frame, and recomputing it per call made per-frame GOP metadata
+    # quadratic in clip length (a 90-minute clip appeared hung).
+    keyframe_indices: tuple[int, ...] = ()
 
     @property
     def sample_count(self) -> int:
         return len(self.samples)
-
-    @property
-    def keyframe_indices(self) -> tuple[int, ...]:
-        """Display-order table positions whose samples are sync samples."""
-        return tuple(index for index, sample in enumerate(self.samples)
-                     if sample.is_sync)
 
     def frame_gop(self, index: int) -> tuple[int, int] | None:
         """(gop_ordinal, gop_length) for one display position.
@@ -237,12 +236,24 @@ def _uniform_cadence(
 
     if cadence is not None:
         interval = 1 / cadence
-        durations = [sample.duration for sample in ordered
-                     if sample.duration is not None]
         duration_tolerance = _quantization_tolerance(interval, source_tick)
-        if any(abs(duration - interval) > duration_tolerance
-               for duration in durations):
+        last_index = len(ordered) - 1
+        for index, sample in enumerate(ordered):
+            duration = sample.duration
+            if duration is None:
+                continue
+            if abs(duration - interval) <= duration_tolerance:
+                continue
+            if index == last_index and duration < interval:
+                # A truncated FINAL duration is a container-end artifact
+                # (duration-preserving writers clamp it; editors cut
+                # mid-interval). It cannot lie about mid-stream display
+                # timing, so it does not demote the clock. A LONG tail
+                # still does - it extends playback (see the
+                # silent-truncation pin in the tests).
+                continue
             cadence = None
+            break
 
     return cadence
 
@@ -366,6 +377,9 @@ def analyze_sample_table(
         first_pts=first_pts,
         duration=duration,
         source_tick=source_tick,
+        keyframe_indices=tuple(
+            index for index, sample in enumerate(ordered)
+            if sample.is_sync),
     )
 
 

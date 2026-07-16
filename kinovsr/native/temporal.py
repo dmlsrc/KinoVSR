@@ -330,6 +330,14 @@ class VtfrcSession:
             return
 
         assert self._prev_time is not None
+        if src_time <= self._prev_time:
+            # Checked BEFORE the empty-target fast path: a duplicate
+            # stamp used to swap the buffered frame out silently (the
+            # tied pair emits no targets), dropping a source frame with
+            # no refusal and no ledger entry.
+            raise RuntimeError(
+                f"source times must be strictly increasing; got "
+                f"{float(self._prev_time):.6g}s then {float(src_time):.6g}s")
         target_indices = self._targets_between(self._prev_time, src_time)
         if not target_indices:
             # Identity / downsample case: no output frame falls in this gap.

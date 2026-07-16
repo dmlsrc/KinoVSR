@@ -387,3 +387,40 @@ def test_one_hour_ntsc_grid_never_accumulates_rounding_drift(cadence):
     assert abs(encoded_end - exact_end) <= time_base
     assert previous == grid_ticks(frame_count, cadence, time_base)
     assert pixel_buffers.frame_pts(frame_count, cadence).value == previous
+
+
+def test_short_final_duration_is_a_container_end_artifact():
+    # Duration-preserving writers clamp the last sample; editors cut
+    # mid-interval. A SHORT final duration must not demote the clock.
+    timing = analyze_sample_timing(
+        [(Fraction(0), Fraction(1, 30)),
+         (Fraction(1, 30), Fraction(1, 30)),
+         (Fraction(2, 30), Fraction(1, 30000))],
+        nominal_cadence=30,
+        source_tick=Fraction(1, 30000),
+    )
+    assert timing.cadence == Fraction(30)
+    # The long-tail pin (silent-truncation test above) still holds: only
+    # SHORTER-than-interval final durations are tolerated.
+
+
+def test_frame_gop_scales_to_long_clips():
+    # keyframe_indices is a stored field: per-frame GOP metadata over a
+    # feature-length table must be near-instant, not quadratic (the
+    # recomputing-property version burned ~26e9 comparisons on 90 min).
+    import time
+
+    count = 120_000
+    pairs = [(Fraction(i, 30), Fraction(1, 30)) for i in range(count)]
+    sync = [i % 30 == 0 for i in range(count)]
+    table = analyze_sample_table(
+        _records(pairs, sync=sync),
+        nominal_cadence=30,
+        source_tick=Fraction(1, 30000),
+    )
+    t0 = time.perf_counter()
+    assert table.frame_gop(count - 1) == ((count - 1) % 30, 30)
+    for index in range(0, count, 997):
+        table.frame_gop(index)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 1.0, f"frame_gop sampling took {elapsed:.2f}s"

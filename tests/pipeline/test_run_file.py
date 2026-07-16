@@ -235,6 +235,44 @@ def gapped_keyframes_clip(tmp_path_factory):
     return path
 
 
+def _write_90k_jitter_clip(path) -> None:
+    """Six frames on a 90 kHz clock with one-tick jitter around 30 fps.
+
+    The stamps (0, 3004, 6002, 9003, 12005, 15004 ticks) do not reduce
+    into the product 24000 base family: the explicit carry base becomes
+    lcm-derived (1.8 MHz here), which is exactly the clock a regenerated
+    CFR timeline downstream must keep telling the writer about.
+    """
+    out = av.open(str(path), "w", format="mpegts")
+    stream = out.add_stream("libx264")
+    stream.width = stream.height = 64
+    stream.pix_fmt = "yuv420p"
+    # A fine CODEC clock: rate=30 would set codec time_base 1/30 and
+    # quantize the jitter away before the mux ever sees it.
+    stream.codec_context.time_base = Fraction(1, 90000)
+    stream.codec_context.framerate = Fraction(30, 1)
+    stream.time_base = Fraction(1, 90000)
+    stream.options = {"g": "3", "bf": "0", "crf": "20", "sc_threshold": "0"}
+    for index, ticks in enumerate((0, 3004, 6002, 9003, 12005, 15004)):
+        frame = av.VideoFrame(64, 64, "gray")
+        frame.planes[0].update(bytes([20 + index * 30]) * (64 * 64))
+        frame = frame.reformat(format="yuv420p")
+        frame.pts = ticks
+        frame.time_base = Fraction(1, 90000)
+        for packet in stream.encode(frame):
+            out.mux(packet)
+    for packet in stream.encode():
+        out.mux(packet)
+    out.close()
+
+
+@pytest.fixture(scope="module")
+def jitter_90k_clip(tmp_path_factory):
+    path = tmp_path_factory.mktemp("run_file_90k") / "clip.ts"
+    _write_90k_jitter_clip(path)
+    return path
+
+
 @pytest.fixture(scope="module")
 def audio_leads_clip(tmp_path_factory):
     # Video begins at 0.4 s; the 2 s audio ramp begins at 0: audio leads
@@ -679,6 +717,33 @@ class TestFileSource:
         assert table.verdict is TimingVerdict.EXACT_CFR
         assert table.cadence == Fraction(30)
 
+    def test_regenerated_cfr_keeps_the_carried_tick_base(
+            self, jitter_90k_clip, tmp_path):
+        # A conform (or interpolate) downstream of explicit carry emits
+        # CFR ticks ON THE CARRIED BASE; the writer must be told that
+        # base even though the cadence is now a Fraction. Before the fix
+        # the ticks were read at the 24000 default and this six-frame
+        # 0.2 s clip encoded ~15x too long.
+        from kinovsr.media import ffmpeg_reader, video_reader
+        from kinovsr.media.timing import TimingVerdict
+
+        table = ffmpeg_reader.read_sample_table(jitter_90k_clip)
+        assert table.cadence is None            # jitter beyond one tick
+        config = {
+            "pipeline": ["cfr"],
+            "cfr": {"processor": "conform", "fps": "30"},
+        }
+        output = tmp_path / "conformed_90k.mp4"
+        result = run_file(
+            config, video=jitter_90k_clip, output=output,
+            settings=SETTINGS, reader=ffmpeg_reader)
+        assert result.frames_out == 6
+        out_table = video_reader.read_sample_table(output)
+        assert out_table.verdict is TimingVerdict.EXACT_CFR
+        assert out_table.cadence == Fraction(30)
+        rebased = [s.pts - out_table.first_pts for s in out_table.samples]
+        assert rebased == [Fraction(m, 30) for m in range(6)]
+
     def test_non_uniform_run_preserves_every_source_stamp(
             self, vfr_clip, tmp_path):
         from kinovsr.media import video_reader
@@ -750,6 +815,18 @@ class TestFileSource:
         assert abs(track.n_samples - round(0.7 * SAMPLE_RATE)) <= 2
         assert self._first_track_value(track) == pytest.approx(0.0, abs=1e-3)
         assert track.fork().placement_samples == track.placement_samples
+
+    def test_output_cap_intersects_delayed_audio_placement(
+            self, audio_lags_clip):
+        # Audio begins 0.3s late; a 0.2s output cap ends before it -> no
+        # track (the mux must never receive samples past the session
+        # end). A 0.5s cap admits exactly the 0.2s that fits.
+        source = FileSource(audio_lags_clip)
+        assert source.audio_track(max_duration=Fraction(1, 5)) is None
+        track = source.audio_track(max_duration=Fraction(1, 2))
+        assert track is not None
+        assert track.placement_samples == round(0.3 * SAMPLE_RATE)
+        assert abs(track.n_samples - round(0.2 * SAMPLE_RATE)) <= 2
 
     def test_lagging_audio_reaches_the_output_late(
             self, audio_lags_clip, tmp_path):

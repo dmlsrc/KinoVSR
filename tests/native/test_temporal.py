@@ -87,3 +87,13 @@ def test_non_increasing_times_are_refused():
     session = _bare_session()
     with pytest.raises(RuntimeError, match="strictly increasing"):
         session._phases_between([0], Fraction(1, 25), Fraction(1, 25))
+
+
+def test_duplicate_source_times_are_refused_not_dropped():
+    # A tied stamp used to swap the buffered frame out through the
+    # empty-target fast path, silently discarding a source frame.
+    session = _bare_session(Fraction(30), Fraction(60))
+    session._prev_src_pb = object()
+    session._prev_time = Fraction(0)
+    with pytest.raises(RuntimeError, match="strictly increasing"):
+        list(session.feed_at(object(), Fraction(0)))

@@ -98,3 +98,14 @@ def test_produces_regenerates_uniform_timeline():
     assert up.timeline.cardinality is Cardinality.ONE_TO_MANY
     down = _produces(spec, ConformStageConfig(fps=Fraction(15)))
     assert down.timeline.cardinality is Cardinality.MANY_TO_ONE
+
+
+def test_clock_jump_fanout_is_bounded():
+    # A one-hour recorder discontinuity must refuse BEFORE flooding the
+    # chain with ~100k duplicates, naming an in-tool path forward.
+    from kinovsr.processors.errors import MediaError
+
+    times = [Fraction(0), Fraction(1, 30), Fraction(3600)]
+    durs = [Fraction(1, 30)] * 3
+    with pytest.raises(MediaError, match="duplicates"):
+        _run(times, durs, 30)

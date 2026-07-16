@@ -714,6 +714,19 @@ class FileSource:
                 "be silent",
                 float(audio_first), float(win0), float(win1))
             return None
+        if max_duration is not None:
+            # The cap bounds the OUTPUT timeline; lagging audio occupies
+            # [place, place + decoded). Without intersecting, a capped run
+            # decoded audio that lies entirely past the capped video end
+            # and handed the mux samples outside the session.
+            effective = Fraction(max_duration) - place
+            if effective <= 0:
+                _log.info(
+                    "capped output (%.6gs) ends before the delayed audio "
+                    "begins (%.6gs); output will be silent",
+                    float(max_duration), float(place))
+                return None
+            max_duration = effective
         try:
             track = read_audio_track_from_video(
                 self.path,
@@ -797,20 +810,25 @@ class FileSink:
         timeline = output_spec.timeline
         self._explicit_timeline = not isinstance(timeline.cadence, Fraction)
         self._last_explicit_pts: int | None = None
+        # Unit ticks are ALWAYS interpreted on the timeline's tick base, so
+        # the writer must be told that base whether the cadence is carried
+        # (VariableCadence) or regenerated onto it (conform/interpolate
+        # downstream of an explicit carry keep the carried base). Passing it
+        # only for VariableCadence wrote regenerated-CFR ticks at the
+        # product default and stretched output ~15x on sources whose lcm
+        # base was not a divisor family of 24000.
+        if timeline.time_base.numerator != 1:
+            raise MediaError(
+                f"timeline tick base {timeline.time_base} is not a unit "
+                f"fraction; it cannot map to a CMTime timescale")
         if self._explicit_timeline:
             # An explicit timeline is legal only as a carried source clock:
-            # the file source supplies the nominal rate (encoder hint) and
-            # the unit-fraction tick base the carried stamps live on.
+            # the file source supplies the nominal rate (encoder hint).
             if source is None or getattr(
                     source, "nominal_cadence", None) is None:
                 raise MediaError(
                     "output endpoint requires a CFR cadence unless the "
                     "chain carries an explicit file-source timeline")
-            if timeline.time_base.numerator != 1:
-                raise MediaError(
-                    f"explicit timeline tick base {timeline.time_base} is "
-                    f"not a unit fraction; it cannot map to a CMTime "
-                    f"timescale")
         if audio_track is not None and (
                 timeline.duration_policy is not DurationPolicy.PRESERVED):
             raise MediaError(
@@ -882,8 +900,7 @@ class FileSink:
                 width=geometry.width, height=geometry.height,
                 fps=(source.nominal_cadence if self._explicit_timeline
                      else timeline.cadence),
-                time_scale=(int(timeline.time_base.denominator)
-                            if self._explicit_timeline else None),
+                time_scale=int(timeline.time_base.denominator),
                 source_pixel_format=getattr(_pb, _DECODE_FORMATS[layout]),
                 profile=profile, quality=quality, label=label,
                 audio_track=audio_track, audio_codec=audio_codec,
