@@ -282,41 +282,48 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
             return 2
 
     try:
-        result = process_video_file(
-            config,
-            video=video,
-            output=output,
-            settings=invocation.settings,
-            start=start,
-            end=end,
-            max_output_frames=max_output_frames,
-            max_output_seconds=max_output_seconds,
-            audio=options.audio,
-            audio_codec=options.audio_codec,
-            save_audio_sidecar=options.save_audio_sidecar,
-            quality=options.encode_quality,
-            chunk_size=options.video_chunk_size,
-            source_color=options.source_color,
-            source_range=options.source_range,
-            encode_chroma=options.encode_chroma,
-            save_pre_frames=save_pre,
-            save_post_frames=save_post,
-            comparison=comparison,
-            snap_start=options.snap_start,
-            gop_align=options.gop_align,
-            gop_min_window=options.gop_min_window,
-            gop_max_window=options.gop_max_window,
-            cut_log=options.cut_log,
-            skip_post_mp4=options.skip_post_mp4,
-            noise_map_debug=options.noise_map_debug,
-            overwrite=options.overwrite,
-            layout=_source_layout(
+        from kinovsr.ui import RichReporter
+
+        # Live per-frame progress (harness parity): Rich auto-detects the
+        # console, so piped/logged runs degrade to the phase-summary INFO
+        # line instead of drawing bars.
+        with RichReporter() as reporter:
+            result = process_video_file(
                 config,
+                video=video,
+                output=output,
+                settings=invocation.settings,
+                reporter=reporter,
+                start=start,
+                end=end,
+                max_output_frames=max_output_frames,
+                max_output_seconds=max_output_seconds,
+                audio=options.audio,
+                audio_codec=options.audio_codec,
+                save_audio_sidecar=options.save_audio_sidecar,
+                quality=options.encode_quality,
+                chunk_size=options.video_chunk_size,
                 source_color=options.source_color,
                 source_range=options.source_range,
-            ),
-            reader=reader,
-        )
+                encode_chroma=options.encode_chroma,
+                save_pre_frames=save_pre,
+                save_post_frames=save_post,
+                comparison=comparison,
+                snap_start=options.snap_start,
+                gop_align=options.gop_align,
+                gop_min_window=options.gop_min_window,
+                gop_max_window=options.gop_max_window,
+                cut_log=options.cut_log,
+                skip_post_mp4=options.skip_post_mp4,
+                noise_map_debug=options.noise_map_debug,
+                overwrite=options.overwrite,
+                layout=_source_layout(
+                    config,
+                    source_color=options.source_color,
+                    source_range=options.source_range,
+                ),
+                reader=reader,
+            )
     except (ConfigError, MediaError, PipelineError) as exc:
         _log.error("processing failed: %s", exc)
         return 2

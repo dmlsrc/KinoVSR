@@ -623,6 +623,40 @@ class TestFileSource:
         assert table.cadence == Fraction(30)
         assert table.sample_count == 8
 
+    def test_reporter_receives_per_frame_progress(self, vfr_clip, tmp_path):
+        # The typed path drives the reporter protocol per OUTPUT frame
+        # (the harness's live bars, lost at the M6 flip): one phase,
+        # a truthful total, one advance per written frame, ended once -
+        # on the plain carry path and on a cadence-changing chain alike.
+        class Recorder:
+            def __init__(self):
+                self.events = []
+
+            def phase_start(self, phase, *, total=None, unit="it"):
+                self.events.append(("start", phase, total, unit))
+
+            def phase_advance(self, phase, advance=1.0):
+                self.events.append(("advance", phase, advance))
+
+            def phase_end(self, phase):
+                self.events.append(("end", phase))
+
+        rep = Recorder()
+        run_file({"pipeline": []}, video=vfr_clip,
+                 output=tmp_path / "carry.mp4", settings=SETTINGS,
+                 reporter=rep)
+        assert rep.events[0] == ("start", "process", 5, "frame")
+        assert rep.events[-1] == ("end", "process")
+        assert sum(1 for e in rep.events if e[0] == "advance") == 5
+
+        rep2 = Recorder()
+        run_file({"pipeline": ["cfr"],
+                  "cfr": {"processor": "conform", "fps": "30"}},
+                 video=vfr_clip, output=tmp_path / "conform.mp4",
+                 settings=SETTINGS, reporter=rep2)
+        assert rep2.events[0] == ("start", "process", 8, "frame")
+        assert sum(1 for e in rep2.events if e[0] == "advance") == 8
+
     def test_conform_maps_carried_timeline_to_uniform_grid(
             self, vfr_clip, tmp_path):
         # Nearest-slot dup/drop onto the 30 fps grid: the gapped 5-frame

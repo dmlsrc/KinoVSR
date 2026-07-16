@@ -286,6 +286,20 @@ def _timing_view(
     return timing.timing() if isinstance(timing, SampleTable) else timing
 
 
+@contextlib.contextmanager
+def _reporter_phase(reporter: Any, phase: str, *,
+                    total: int | None, unit: str) -> Iterator[None]:
+    """Bracket one reporter phase; ``phase_end`` fires on any exit path."""
+    if reporter is None:
+        yield
+        return
+    reporter.phase_start(phase, total=total, unit=unit)
+    try:
+        yield
+    finally:
+        reporter.phase_end(phase)
+
+
 class FileSource:
     """Input endpoint: probe a video file into a concrete ``StreamSpec``
     and iterate its decoded frames as ``FrameUnit``s.
@@ -2219,10 +2233,30 @@ def _run_file_reserved(
         source_end_ticks = source.window_end_ticks()
     frames_out = 0
     pending: FrameUnit | None = None
+    # Per-frame progress on the OUTPUT count (the number a user watches):
+    # exact for 1:1 and conform chains, within one frame of the final
+    # count for interpolation's clamped tail.
+    if isinstance(out_cadence, Fraction):
+        expected_out = round(
+            source.window_span(source.frame_count) * out_cadence)
+    else:
+        expected_out = source.frame_count
+    if max_output_frames is not None:
+        expected_out = min(expected_out, max_output_frames)
+    _progress_phase = "process"
+
+    def _advance() -> None:
+        if reporter is not None:
+            reporter.phase_advance(_progress_phase)
+
     # retain_outputs=False: the sink consumes each unit into the encoder
     # synchronously, so outputs need not be copied for retention. A one-unit
     # holdback lets the final frame be clamped before it is written.
-    with session, session.process(
+    # The reporter phase opens first so it closes LAST: its summary line
+    # lands after the session has drained, success or failure.
+    with _reporter_phase(
+            reporter, _progress_phase, total=expected_out,
+            unit="frame"), session, session.process(
             source_units, retain_outputs=False) as run:
         for unit in run:
             if cut_log_path is not None and unit.boundaries:
@@ -2247,6 +2281,7 @@ def _run_file_reserved(
                 if tee is not None:
                     tee.emit(pending)
                 frames_out += 1
+                _advance()
             pending = unit
             if (max_output_frames is not None
                     and frames_out + 1 == max_output_frames):
@@ -2262,6 +2297,7 @@ def _run_file_reserved(
             if tee is not None:
                 tee.emit(pending)
             frames_out += 1
+            _advance()
         # Stage state is still live here (drained, not yet closed).
         diagnostics = session.stage_diagnostics()
         debug_images = (
