@@ -2235,13 +2235,16 @@ def _run_file_reserved(
     pending: FrameUnit | None = None
     # Per-frame progress on the OUTPUT count (the number a user watches):
     # exact for 1:1 and conform chains, within one frame of the final
-    # count for interpolation's clamped tail.
-    if isinstance(out_cadence, Fraction):
-        expected_out = round(
-            source.window_span(source.frame_count) * out_cadence)
-    else:
+    # count for interpolation's clamped tail. Advisory only - a source
+    # adapter without the window-span probe gets an indeterminate bar,
+    # never an error.
+    expected_out: int | None = None
+    window_span = getattr(source, "window_span", None)
+    if not isinstance(out_cadence, Fraction):
         expected_out = source.frame_count
-    if max_output_frames is not None:
+    elif callable(window_span):
+        expected_out = round(window_span(source.frame_count) * out_cadence)
+    if max_output_frames is not None and expected_out is not None:
         expected_out = min(expected_out, max_output_frames)
     _progress_phase = "process"
 
