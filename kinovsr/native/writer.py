@@ -21,7 +21,7 @@ from typing import Any
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media import yuv as _yuv
 from kinovsr.media.audio import AudioTrack, audio_writer_settings
-from kinovsr.media.timing import rational_cadence
+from kinovsr.media.timing import grid_ticks, rational_cadence
 
 from .frameworks import (
     CoreMedia,
@@ -214,6 +214,9 @@ class AVWriter:
     AUDIO_TIMEOUT_S = 120.0
     FINISH_TIMEOUT_S = 120.0
     STATUS_POLL_S = 0.05
+    # Class default keeps partially-constructed writers (tests stub the
+    # native layer) on the product tick base.
+    _time_scale = _pb.VIDEO_TIME_SCALE
 
     def __init__(
         self,
@@ -234,8 +237,18 @@ class AVWriter:
         pixel_aspect: tuple[int, int] | None = None,
         cv_color: tuple | None = None,
         full_range: bool = False,
+        time_scale: int | None = None,
     ):
         cadence = rational_cadence(fps)
+        # The container tick base for every CMTime this writer stamps.
+        # Default: the product base (integer and NTSC-family rates land
+        # bit-exact). An explicit-timeline caller passes the base its
+        # carried source ticks live on so stamps survive byte-exact.
+        if time_scale is None:
+            time_scale = _pb.VIDEO_TIME_SCALE
+        if not isinstance(time_scale, int) or time_scale <= 0:
+            raise ValueError(f"time_scale must be a positive int, got {time_scale!r}")
+        self._time_scale = time_scale
         self._state_lock = threading.RLock()
         self._audio_pump_lock = threading.Lock()
         self._video_append_lock = threading.Lock()
@@ -337,12 +350,12 @@ class AVWriter:
             hevc_video_settings(width, height, quality, profile, color_props, pixel_aspect),
         )
         video_input.setExpectsMediaDataInRealTime_(False)
-        # Pin the track timescale to the product's tick base. The default
+        # Pin the track timescale to this writer's tick base. The default
         # movie scale (600) quantizes CMTime stamps: integer rates divide
         # 600 and survive, but NTSC-family ticks (e.g. 801/24000) snap to
         # 20/600 and re-introduce exactly the index-grid drift the
         # explicit-PTS path exists to avoid.
-        video_input.setMediaTimeScale_(_pb.VIDEO_TIME_SCALE)
+        video_input.setMediaTimeScale_(self._time_scale)
         # Carry the source track's rotation/flip as output metadata. The pixels
         # stay in stored orientation through VSR and the encoder; the container
         # transform makes players display them upright - lossless, no rotate.
@@ -404,10 +417,10 @@ class AVWriter:
         self.audio_input = audio_input
 
         # Start the writer ---------------------------------------------------
-        writer.setMovieTimeScale_(_pb.VIDEO_TIME_SCALE)
+        writer.setMovieTimeScale_(self._time_scale)
         if not writer.startWriting():
             raise RuntimeError(f"AVAssetWriter.startWriting failed: {writer.error()}")
-        writer.startSessionAtSourceTime_(CoreMedia.CMTimeMake(0, _pb.VIDEO_TIME_SCALE))
+        writer.startSessionAtSourceTime_(CoreMedia.CMTimeMake(0, self._time_scale))
 
         self.video_input = video_input
         self.adaptor = adaptor
@@ -799,6 +812,15 @@ class AVWriter:
             rgb, ybuf, self._yuv_matrix, self._yuv_full)
         return ybuf
 
+    def _index_grid_pts(self, frame_index: int) -> Any:
+        """The index-grid CMTime for legacy callers that pass no ticks."""
+        if self._time_scale == _pb.VIDEO_TIME_SCALE:
+            return _pb.frame_pts(frame_index, self.cadence)
+        return CoreMedia.CMTimeMake(
+            grid_ticks(frame_index, self.cadence,
+                       Fraction(1, self._time_scale)),
+            self._time_scale)
+
     def _append_payload(
         self,
         payload: Any,
@@ -846,10 +868,10 @@ class AVWriter:
                             f"[{self.label}] cannot append while writer is "
                             f"{self._state}")
                 if pts_ticks is None:
-                    pts = _pb.frame_pts(frame_index, self.cadence)
+                    pts = self._index_grid_pts(frame_index)
                 else:
                     pts = CoreMedia.CMTimeMake(
-                        int(pts_ticks), _pb.VIDEO_TIME_SCALE)
+                        int(pts_ticks), self._time_scale)
                 called, accepted = self._run_native_mutation(
                     lambda: self.adaptor.appendPixelBuffer_withPresentationTime_(
                         pb, pts,
@@ -992,9 +1014,9 @@ class AVWriter:
                 self._check_native_status("audio drain")
                 if self._explicit_end_ticks is not None:
                     end = CoreMedia.CMTimeMake(
-                        self._explicit_end_ticks, _pb.VIDEO_TIME_SCALE)
+                        self._explicit_end_ticks, self._time_scale)
                 else:
-                    end = _pb.frame_pts(self.frame_count, self.cadence)
+                    end = self._index_grid_pts(self.frame_count)
                 native_done = threading.Event()
                 with self._state_lock:
                     if self._state != "finishing":

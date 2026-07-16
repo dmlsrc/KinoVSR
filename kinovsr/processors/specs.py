@@ -173,6 +173,11 @@ class TimelineSpec:
     timestamp_policy: TimestampPolicy = TimestampPolicy.SOURCE
     cardinality: Cardinality = Cardinality.ONE_TO_ONE
     duration_policy: DurationPolicy = DurationPolicy.PRESERVED
+    # Bookkeeping rate for a VariableCadence timeline (the source's grid
+    # or long-run average): a HINT for stages that want a nominal
+    # frames-per-second (encoder rate control, VT session frame identity),
+    # never a value to do time math with.
+    nominal_cadence: Fraction | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -387,34 +387,84 @@ class TestFileSource:
         with pytest.raises(MediaError, match="empty frame window"):
             FileSource(clip, start=N + 5)
 
-    def test_vfr_is_rejected_from_actual_sample_timestamps(self, vfr_clip):
+    def test_non_uniform_timing_is_carried_not_rejected(self, vfr_clip):
         from kinovsr.media import ffmpeg_reader, video_reader
+        from kinovsr.media.timing import TimingVerdict
+        from kinovsr.processors.specs import VariableCadence
 
-        native = video_reader.probe_video_timing(vfr_clip)
-        fallback = ffmpeg_reader.probe_video_timing(vfr_clip)
+        native = video_reader.read_sample_table(vfr_clip)
+        fallback = ffmpeg_reader.read_sample_table(vfr_clip)
         assert native.sample_count == fallback.sample_count == 5
-        assert native.cadence is fallback.cadence is None
+        # Every interval is a multiple of 1/30: a gapped constant grid.
+        # The legacy CFR view still reports no publishable cadence.
+        assert native.verdict is TimingVerdict.GAPPED_CFR
+        assert native.grid_cadence == Fraction(30)
+        assert native.cadence is None and fallback.cadence is None
         assert native.source_tick == fallback.source_tick == Fraction(1, 15360)
-        with pytest.raises(MediaError, match="variable frame rate"):
-            FileSource(vfr_clip)
 
-    def test_vfr_rejection_precedes_the_output_transaction(
-            self, vfr_clip, tmp_path, monkeypatch):
-        from kinovsr.pipeline import run as run_module
+        source = FileSource(vfr_clip)
+        assert source.spec.timeline.cadence is VariableCadence.VFR
+        base = source.spec.timeline.time_base
+        units = list(source.units())
+        assert [Fraction(u.pts) * base for u in units] == [
+            Fraction(0), Fraction(1, 30), Fraction(1, 10),
+            Fraction(2, 15), Fraction(7, 30)]
+        # Display-until-next durations span the dropped-frame gaps.
+        durations = [Fraction(u.duration) * base for u in units]
+        assert durations[:4] == [Fraction(1, 30), Fraction(1, 15),
+                                 Fraction(1, 30), Fraction(1, 10)]
+        assert durations[4] > 0
 
-        def transaction_must_not_start(_self):
-            raise AssertionError("output transaction started for VFR input")
+    def test_window_on_non_uniform_source_rebases_table_stamps(
+            self, vfr_clip):
+        source = FileSource(vfr_clip, start=1, end=4)
+        base = source.spec.timeline.time_base
+        units = list(source.units())
+        assert [Fraction(u.pts) * base for u in units] == [
+            Fraction(0), Fraction(1, 15), Fraction(1, 10)]
 
-        monkeypatch.setattr(
-            run_module._OutputTransaction, "__enter__",
-            transaction_must_not_start)
-        output = tmp_path / "vfr.mp4"
-        with pytest.raises(MediaError, match="variable frame rate"):
+    def test_non_uniform_readers_agree_on_carried_stamps(self, vfr_clip):
+        from kinovsr.media import ffmpeg_reader
+
+        def stamps(source):
+            base = source.spec.timeline.time_base
+            return [(Fraction(u.pts) * base, Fraction(u.duration) * base)
+                    for u in source.units()]
+
+        assert stamps(FileSource(vfr_clip)) == stamps(
+            FileSource(vfr_clip, reader=ffmpeg_reader))
+
+    def test_interpolation_on_carried_timeline_names_the_stage(
+            self, vfr_clip, tmp_path):
+        from kinovsr.processors.errors import PipelineError
+
+        config = {
+            "pipeline": ["fps"],
+            "fps": {"processor": "videotoolbox", "profile": "normal",
+                    "target_fps": 50},
+        }
+        with pytest.raises(PipelineError) as caught:
             run_file(
-                {"pipeline": []}, video=vfr_clip, output=output,
-                settings=SETTINGS)
-        assert not output.exists()
-        assert not list(tmp_path.glob("*.partial"))
+                config, video=vfr_clip, output=tmp_path / "o.mp4",
+                settings=SETTINGS, layout=Layout.CV_RGBA_HALF)
+        message = str(caught.value)
+        assert "cadence" in message or "variable" in message
+
+    def test_non_uniform_run_preserves_every_source_stamp(
+            self, vfr_clip, tmp_path):
+        from kinovsr.media import video_reader
+
+        output = tmp_path / "vfr.mp4"
+        result = run_file(
+            {"pipeline": []}, video=vfr_clip, output=output,
+            settings=SETTINGS)
+        assert output.exists()
+        assert result.frames_in == result.frames_out == 5
+        table = video_reader.read_sample_table(output)
+        assert table.sample_count == 5
+        rebased = [s.pts - table.first_pts for s in table.samples]
+        assert rebased == [Fraction(0), Fraction(1, 30), Fraction(1, 10),
+                           Fraction(2, 15), Fraction(7, 30)]
 
     def test_staggered_audio_video_origins_are_rejected_before_transaction(
             self, staggered_clip, tmp_path, monkeypatch):

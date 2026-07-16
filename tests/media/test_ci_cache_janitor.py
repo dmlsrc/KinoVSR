@@ -313,7 +313,7 @@ def test_file_owner_covers_work_after_inner_session_release(
             return False
 
     monkeypatch.setattr(run_module, "_OutputTransaction", Transaction)
-    monkeypatch.setattr(run_module, "_probe_cfr_timing", lambda *_args: None)
+    monkeypatch.setattr(run_module, "_probe_timing", lambda *_args: None)
 
     def reserved(*_args, **_kwargs):
         assert janitor._snapshot()[-1] == 1

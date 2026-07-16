@@ -23,6 +23,7 @@ No ffmpeg, no numpy.
 
 from __future__ import annotations
 
+import bisect
 from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
@@ -462,6 +463,7 @@ def iter_forced_color_chunks(
     chunk_size: int = 8, *, start_frame: int = 0, end_frame: int | None = None,
     reinterpret_full_range: bool | None = None,
     timing: VideoTiming | None = None,
+    table: SampleTable | None = None,
 ) -> Iterator[list]:
     """Decode the source as raw 10-bit YUV, FORCE the YCbCr matrix (overriding the
     container tag / VideoToolbox's resolution-based guess), then convert to
@@ -487,7 +489,8 @@ def iter_forced_color_chunks(
         raise RuntimeError(f"VTPixelTransferSessionCreate failed: {err}")
     for chunk in iter_video_buffer_chunks(
             path, yuv_fmt, chunk_size,
-            start_frame=start_frame, end_frame=end_frame, timing=timing):
+            start_frame=start_frame, end_frame=end_frame, timing=timing,
+            table=table):
         out: list = []
         for yuv in chunk:
             if retype_fmt is not None:
@@ -512,6 +515,7 @@ def iter_video_buffer_chunks(
     path: Path, src_format: int, chunk_size: int = 8,
     *, start_frame: int = 0, end_frame: int | None = None,
     timing: VideoTiming | None = None,
+    table: SampleTable | None = None,
 ) -> Iterator[list]:
     """Yield lists of up to `chunk_size` decoded CVPixelBuffers in `src_format`.
 
@@ -528,6 +532,11 @@ def iter_video_buffer_chunks(
     enforced per frame by presentation timestamp, so trimming is frame-exact
     even though the seek is approximate.
 
+    With a `table` (the sample-table walk), window indexing bisects the real
+    display timestamps - exact for jittered, gapped, and variable clocks -
+    and the seek targets the window's true start time; without one it falls
+    back to cadence-grid arithmetic, which requires a constant rate.
+
     The decoded CVPixelBuffer is retained independently of its owning
     CMSampleBuffer (pyobjc holds it for the wrapper's lifetime), so the sample
     buffer is released immediately after the image buffer is extracted; the
@@ -538,11 +547,15 @@ def iter_video_buffer_chunks(
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)
     _assert_decodable(track, path)
+    if table is not None and timing is None:
+        timing = table.timing()
+    keys = ([sample.pts for sample in table.samples]
+            if table is not None else None)
     cadence = (timing.cadence if timing is not None
                else Fraction(float(track.nominalFrameRate())).limit_denominator(1001))
-    if cadence is None or cadence <= 0:
+    if keys is None and (cadence is None or cadence <= 0):
         raise RuntimeError("video track reports no usable constant cadence")
-    fps = float(cadence)
+    fps = float(cadence) if cadence is not None and cadence > 0 else 0.0
     origin = timing.first_pts if timing is not None else Fraction()
 
     reader, err = av.AVAssetReader.alloc().initWithAsset_error_(asset, None)
@@ -550,25 +563,34 @@ def iter_video_buffer_chunks(
         raise RuntimeError(f"AVAssetReader init failed: {err}")
 
     trimming = start_frame > 0 or end_frame is not None
-    if trimming and fps > 0:
+    if trimming and (keys is not None or fps > 0):
         # Seek the reader's timeRange to just before the window so the head of a
         # long clip isn't decoded. Back off one frame; the per-frame PTS check
         # below enforces the exact start. Compute the end from the asset
         # duration when the window is open-ended.
         ts = 24000
-        start_seconds = float(origin) + (start_frame - 1) / fps
+        if keys is not None:
+            back = min(max(start_frame - 1, 0), len(keys) - 1)
+            start_seconds = float(keys[back])
+        else:
+            start_seconds = float(origin) + (start_frame - 1) / fps
         # AVAssetReader time ranges are asset-time ranges. For a legitimate
         # negative edit origin, clamping to zero would skip source frames;
         # leave the range open and let the exact PTS trim below do the work.
         if start_seconds >= 0:
             start_t = CoreMedia.CMTimeMake(int(round(start_seconds * ts)), ts)
-            if end_frame is not None:
-                dur_seconds = (end_frame - start_frame + 2) / fps
-            else:
+            if end_frame is None:
                 dur_seconds = max(
                     0.0,
                     CoreMedia.CMTimeGetSeconds(asset.duration()) - start_seconds,
                 )
+            elif keys is not None:
+                # Cover through the first excluded stamp plus slack; the
+                # per-frame trim below is what enforces exactness.
+                stop = min(end_frame, len(keys) - 1)
+                dur_seconds = max(float(keys[stop]) - start_seconds, 0.0) + 1.0
+            else:
+                dur_seconds = (end_frame - start_frame + 2) / fps
             dur_t = CoreMedia.CMTimeMake(int(round(dur_seconds * ts)), ts)
             reader.setTimeRange_(CoreMedia.CMTimeRangeMake(start_t, dur_t))
 
@@ -609,13 +631,17 @@ def iter_video_buffer_chunks(
             break
         image_buf = CoreMedia.CMSampleBufferGetImageBuffer(sample_buf)
         keep = image_buf is not None
-        if keep and trimming and fps > 0:
+        if keep and trimming and (keys is not None or fps > 0):
             # Frame-exact window enforcement by presentation timestamp.
             pts = _cm_time_fraction(
                 CoreMedia.CMSampleBufferGetOutputPresentationTimeStamp(
                     sample_buf))
-            idx = (round((pts - origin) * cadence)
-                   if pts is not None else 0)
+            if pts is None:
+                idx = 0
+            elif keys is not None:
+                idx = bisect.bisect_right(keys, pts) - 1
+            else:
+                idx = round((pts - origin) * cadence)
             if idx < start_frame:
                 keep = False
             elif end_frame is not None and idx >= end_frame:

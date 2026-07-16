@@ -44,6 +44,7 @@ from kinovsr.media.errors import media_operation as _media_operation
 from kinovsr.media.filesystem import rename_exclusive
 from kinovsr.media.timing import (
     AudioTiming,
+    SampleTable,
     VideoTiming,
     grid_ticks,
     rational_cadence,
@@ -57,6 +58,7 @@ from kinovsr.processors.specs import (
     Layout,
     StreamSpec,
     TimelineSpec,
+    VariableCadence,
     frame_spec_for_matrix,
 )
 from kinovsr.processors.units import FrameUnit
@@ -248,24 +250,41 @@ def _reader_module(reader: Any) -> Any:
     return video_reader
 
 
-def _probe_cfr_timing(path: Path, reader: Any) -> VideoTiming | None:
-    """Return exact CFR metadata or reject VFR before output mutation.
+def _probe_timing(path: Path, reader: Any) -> SampleTable | VideoTiming | None:
+    """Inspect the source's exact sample clock before output mutation.
 
-    Custom reader adapters written before this contract may omit the timing
-    probe; their existing explicit ``probe_video`` cadence remains supported.
-    Both built-in readers implement this metadata-only scan.
+    Both built-in readers return the full :class:`SampleTable`; sources
+    whose clock is not one uniform grid are then CARRIED verbatim by the
+    endpoints instead of rejected. Custom reader adapters written before
+    this contract may expose only the legacy ``probe_video_timing`` view -
+    that view cannot carry variable timing, so a variable verdict there
+    still refuses - or omit the probe entirely (their ``probe_video``
+    cadence remains supported).
     """
-    probe = getattr(_reader_module(reader), "probe_video_timing", None)
+    module = _reader_module(reader)
+    probe = getattr(module, "read_sample_table", None)
+    if probe is not None:
+        with _media_operation("failed to inspect source timing for", path):
+            return probe(path)
+    probe = getattr(module, "probe_video_timing", None)
     if probe is None:
         return None
     with _media_operation("failed to inspect source timing for", path):
         timing = probe(path)
     if timing.cadence is None:
         raise MediaError(
-            f"{path.name}: variable frame rate (VFR) is not supported by the "
-            f"file pipeline ({timing.sample_count} display samples over "
-            f"{float(timing.duration):.6g}s); convert to CFR before processing")
+            f"{path.name}: this reader adapter reports variable timing but "
+            f"exposes no sample table to carry it ({timing.sample_count} "
+            f"display samples over {float(timing.duration):.6g}s); use a "
+            f"built-in reader, or extend the adapter with read_sample_table")
     return timing
+
+
+def _timing_view(
+    timing: SampleTable | VideoTiming | None,
+) -> VideoTiming | None:
+    """The legacy CFR-or-variable view of whichever probe result exists."""
+    return timing.timing() if isinstance(timing, SampleTable) else timing
 
 
 def _validate_audio_origin(
@@ -322,7 +341,7 @@ class FileSource:
         source_range: str = "auto",
         context_frames: int = 0,
         reader: Any = None,
-        timing: VideoTiming | None = None,
+        timing: SampleTable | VideoTiming | None = None,
     ) -> None:
         if layout not in _DECODE_FORMATS:
             supported = ", ".join(k.value for k in _DECODE_FORMATS)
@@ -336,17 +355,24 @@ class FileSource:
         self.path = Path(path)
         self.layout = layout
         if timing is None:
-            timing = _probe_cfr_timing(self.path, self._vr)
+            timing = _probe_timing(self.path, self._vr)
+        self._table = timing if isinstance(timing, SampleTable) else None
+        self._timing = _timing_view(timing)
 
         with _media_operation("failed to probe video source", self.path):
             width, height, fps, total, transform, pixel_aspect = (
                 self._vr.probe_video(self.path))
-        cadence = timing.cadence if timing is not None else _cadence(fps)
-        assert cadence is not None
-        if timing is not None:
-            total = timing.sample_count
-        fps = float(cadence)
-        self._timing = timing
+        if self._timing is not None:
+            total = self._timing.sample_count
+        cadence = (self._timing.cadence if self._timing is not None
+                   else _cadence(fps))
+        # A table whose clock is not one uniform grid is carried verbatim:
+        # the spec below declares an explicit per-frame timeline instead of
+        # a cadence, and units() stamps each frame's rebased source tick.
+        self._explicit_carry = self._table is not None and cadence is None
+        if not self._explicit_carry:
+            assert cadence is not None
+            fps = float(cadence)
         from kinovsr.media import color as _color
 
         with _media_operation("failed to probe source color", self.path):
@@ -391,8 +417,13 @@ class FileSource:
             )
         self.transform = transform
         self.pixel_aspect = pixel_aspect
-        self.source_fps = fps
+        # source_cadence is None only under explicit carry; nominal_cadence
+        # always exists (encoder rate hint, progress display, legacy math).
         self.source_cadence = cadence
+        self.nominal_cadence = (cadence if cadence is not None
+                                else self._nominal_from_table())
+        self.source_fps = (fps if cadence is not None
+                           else float(self.nominal_cadence))
 
         if start < 0:
             raise MediaError(f"start must be >= 0, got {start}")
@@ -428,9 +459,17 @@ class FileSource:
                 layout=layout,
                 domain=domain,
             ),
-            timeline=TimelineSpec(
-                time_base=Fraction(1, _pb.VIDEO_TIME_SCALE),
-                cadence=cadence,
+            timeline=(
+                TimelineSpec(
+                    time_base=self._explicit_time_base(),
+                    cadence=VariableCadence.VFR,
+                    nominal_cadence=self.nominal_cadence,
+                )
+                if self._explicit_carry
+                else TimelineSpec(
+                    time_base=Fraction(1, _pb.VIDEO_TIME_SCALE),
+                    cadence=cadence,
+                )
             ),
             seekable=True,
             lookahead_available=True,
@@ -444,17 +483,124 @@ class FileSource:
         timeline = self.spec.timeline
         return grid_ticks(index, timeline.cadence, timeline.time_base)
 
+    def _nominal_from_table(self) -> Fraction:
+        """Bookkeeping rate for an explicit timeline (hints and display)."""
+        table = self._table
+        assert table is not None
+        if table.grid_cadence is not None:
+            return table.grid_cadence
+        if table.duration > 0:
+            return Fraction(table.sample_count) / table.duration
+        return Fraction(25)
+
+    def _explicit_time_base(self) -> Fraction:
+        """One exact integer tick base for every carried stamp.
+
+        The lcm of the product base and each sample's pts/duration
+        denominator: rebased stamps divide it exactly, so unit ticks stay
+        integers. Falls back to the source denominators alone when the
+        combined base overflows CMTime's 32-bit timescale.
+        """
+        import math
+
+        table = self._table
+        assert table is not None
+        denominators = {table.first_pts.denominator}
+        for sample in table.samples:
+            denominators.add(sample.pts.denominator)
+            if sample.duration is not None:
+                denominators.add(sample.duration.denominator)
+        base = math.lcm(*denominators)
+        combined = math.lcm(base, self._pb.VIDEO_TIME_SCALE)
+        limit = 2**31 - 1
+        if combined <= limit:
+            return Fraction(1, combined)
+        if base <= limit:
+            return Fraction(1, base)
+        raise MediaError(
+            f"{self.path.name}: source sample clock cannot be represented "
+            f"exactly within CMTime's 32-bit timescale")
+
+    def _window_tail_duration(self) -> Fraction:
+        """The final window frame's display duration on the source clock."""
+        table = self._table
+        assert table is not None
+        last = table.samples[self.end - 1]
+        if last.duration is not None:
+            return last.duration
+        if table.grid_cadence is not None:
+            return 1 / table.grid_cadence
+        if self.end >= 2:
+            delta = last.pts - table.samples[self.end - 2].pts
+            if delta > 0:
+                return delta
+        return Fraction(1, 25)
+
+    def _window_stamps(self, read_start: int) -> list[tuple[int, int]]:
+        """(pts, duration) ticks for [read_start, end): the rebased source
+        clock. Durations are display-until-next across the window (spanning
+        any dropped-frame gaps); the final frame keeps its own coded
+        duration, falling back to the grid interval, then the last delta.
+        """
+        table = self._table
+        assert table is not None
+        base = self.spec.timeline.time_base
+        origin = table.samples[self.start].pts
+
+        def ticks(value: Fraction) -> int:
+            scaled = value / base
+            # The base is the lcm of every stamp denominator by
+            # construction, so carried values always land on it.
+            assert scaled.denominator == 1
+            return scaled.numerator
+
+        starts = [ticks(sample.pts - origin)
+                  for sample in table.samples[read_start:self.end]]
+        durations = [starts[i + 1] - starts[i]
+                     for i in range(len(starts) - 1)]
+        durations.append(max(round(self._window_tail_duration() / base), 1))
+        return list(zip(starts, durations, strict=True))
+
+    def window_span(self, frames: int) -> Fraction:
+        """Duration of the window's first ``frames`` frames, in seconds."""
+        count = min(max(frames, 0), self.frame_count)
+        if count <= 0:
+            return Fraction()
+        if not self._explicit_carry:
+            return Fraction(count) / self.source_cadence
+        table = self._table
+        assert table is not None
+        origin = table.samples[self.start].pts
+        if count == self.frame_count:
+            return (table.samples[self.end - 1].pts - origin
+                    + self._window_tail_duration())
+        return table.samples[self.start + count].pts - origin
+
+    def window_end_ticks(self) -> int:
+        """Exact end of the emitted window in the spec's tick base."""
+        assert self._explicit_carry
+        pts, duration = self._window_stamps(self.start)[-1]
+        return pts + duration
+
     def units(self) -> Iterator[FrameUnit]:
         """Decode the window and yield timestamped units, one per frame.
 
         Context frames (gop-align) extend the read BEFORE the window and
         carry negative pts; the window's first frame stays at pts 0.
+        Uniform sources stamp the cadence grid; explicit carry stamps each
+        frame's rebased source tick, preserving the source clock (gaps
+        included) exactly.
         """
         decode_format = getattr(self._pb, _DECODE_FORMATS[self.layout])
         to_mlx = self.layout is Layout.MLX_RGB_HWC
         read_start = self.start - self.context_frames
-        timing_kwargs = ({"timing": self._timing}
-                         if self._timing is not None else {})
+        timing_kwargs: dict[str, Any] = {}
+        if self._table is not None and hasattr(self._vr, "read_sample_table"):
+            timing_kwargs["table"] = self._table
+        elif self._timing is not None:
+            timing_kwargs["timing"] = self._timing
+        stamps = (self._window_stamps(read_start)
+                  if self._explicit_carry else None)
         if self._force_read:
             # Re-decode raw YUV, force the resolved matrix, reinterpret the
             # range: source's actual full_range in, resolved range out.
@@ -474,6 +620,7 @@ class FileSource:
         with _media_operation("failed to open video decode", self.path):
             chunk_iterator = iter(chunks)
         index = -self.context_frames
+        emitted = 0
         while True:
             try:
                 with _media_operation("failed to decode video source", self.path):
@@ -487,11 +634,26 @@ class FileSource:
                         payload = self._pb.read_buffer_rgb_f32(buffer)
                 else:
                     payload = buffer
-                pts = self._grid_ticks(index)
-                yield FrameUnit(
-                    payload=payload, pts=pts,
-                    duration=self._grid_ticks(index + 1) - pts)
+                if stamps is not None:
+                    if emitted >= len(stamps):
+                        raise MediaError(
+                            f"{self.path.name}: decode produced more frames "
+                            f"than the {len(stamps)}-frame sample-table "
+                            f"window; refusing to mislabel carried "
+                            f"timestamps")
+                    pts, duration = stamps[emitted]
+                else:
+                    pts = self._grid_ticks(index)
+                    duration = self._grid_ticks(index + 1) - pts
+                yield FrameUnit(payload=payload, pts=pts, duration=duration)
                 index += 1
+                emitted += 1
+        if stamps is not None and emitted != len(stamps):
+            raise MediaError(
+                f"{self.path.name}: decode produced {emitted} frames for the "
+                f"{len(stamps)}-frame sample-table window; the decoder and "
+                f"the sample table disagree, refusing to mislabel carried "
+                f"timestamps")
 
     def audio_track(self, *, max_duration: Fraction | None = None) -> Any:
         """Open the source's bounded audio window, or None when absent.
@@ -501,8 +663,18 @@ class FileSource:
         """
         from kinovsr.media.audio import read_audio_track_from_video
 
-        start_sec = Fraction(self.start) / self.source_cadence
-        end_sec = Fraction(self.end) / self.source_cadence
+        if self._explicit_carry:
+            # Real window times off the carried source clock: index/cadence
+            # arithmetic has no meaning on a non-uniform grid.
+            table = self._table
+            assert table is not None
+            first = table.first_pts
+            start_sec = table.samples[self.start].pts - first
+            end_sec = (table.samples[self.end - 1].pts - first
+                       + self._window_tail_duration())
+        else:
+            start_sec = Fraction(self.start) / self.source_cadence
+            end_sec = Fraction(self.end) / self.source_cadence
         try:
             return read_audio_track_from_video(
                 self.path,
@@ -527,9 +699,15 @@ class FileSink:
     Audio carry/mux policy lives here (planning 04): a supplied audio
     track is muxed only when the chain preserved clip duration, which is
     exactly what keeps it synchronized. Each appended unit's PTS is
-    verified against the writer's cadence grid so a mistimed chain fails
-    loudly instead of writing a silently-drifting file.
+    verified against the writer's cadence grid - or, for a carried
+    explicit timeline, against strict monotonicity - so a mistimed chain
+    fails loudly instead of writing a silently-drifting file.
     """
+
+    # Class defaults keep partially-constructed sinks (tests stub the
+    # writer) on the uniform-grid verification path.
+    _explicit_timeline = False
+    _last_explicit_pts: int | None = None
 
     def __init__(
         self,
@@ -563,8 +741,22 @@ class FileSink:
                 f"luma width AND height (4:2:0 subsamples both) - crop or pad "
                 f"the chain to an even geometry")
         timeline = output_spec.timeline
-        if not isinstance(timeline.cadence, Fraction):
-            raise MediaError("output endpoint requires a CFR cadence")
+        self._explicit_timeline = not isinstance(timeline.cadence, Fraction)
+        self._last_explicit_pts: int | None = None
+        if self._explicit_timeline:
+            # An explicit timeline is legal only as a carried source clock:
+            # the file source supplies the nominal rate (encoder hint) and
+            # the unit-fraction tick base the carried stamps live on.
+            if source is None or getattr(
+                    source, "nominal_cadence", None) is None:
+                raise MediaError(
+                    "output endpoint requires a CFR cadence unless the "
+                    "chain carries an explicit file-source timeline")
+            if timeline.time_base.numerator != 1:
+                raise MediaError(
+                    f"explicit timeline tick base {timeline.time_base} is "
+                    f"not a unit fraction; it cannot map to a CMTime "
+                    f"timescale")
         if audio_track is not None and (
                 timeline.duration_policy is not DurationPolicy.PRESERVED):
             raise MediaError(
@@ -634,7 +826,10 @@ class FileSink:
             self.writer = AVWriter(
                 self._temp_path,
                 width=geometry.width, height=geometry.height,
-                fps=timeline.cadence,
+                fps=(source.nominal_cadence if self._explicit_timeline
+                     else timeline.cadence),
+                time_scale=(int(timeline.time_base.denominator)
+                            if self._explicit_timeline else None),
                 source_pixel_format=getattr(_pb, _DECODE_FORMATS[layout]),
                 profile=profile, quality=quality, label=label,
                 audio_track=audio_track, audio_codec=audio_codec,
@@ -707,12 +902,28 @@ class FileSink:
         return pb
 
     def append(self, unit: FrameUnit) -> None:
-        expected = self._grid_ticks(self.writer.frame_count)
-        if abs(unit.pts - expected) > 1:
-            raise PipelineError(
-                f"unit {self.writer.frame_count} arrived at pts {unit.pts} "
-                f"but the output cadence grid expects {expected}; the chain "
-                f"broke its declared timeline")
+        if self._explicit_timeline:
+            # A carried source clock has no index grid to verify against;
+            # the invariant a mistimed chain would break is monotonicity.
+            last = self._last_explicit_pts
+            if last is not None and unit.pts <= last:
+                raise PipelineError(
+                    f"unit {self.writer.frame_count} arrived at pts "
+                    f"{unit.pts} but the carried source timeline requires "
+                    f"strictly increasing stamps (previous {last}); the "
+                    f"chain broke its declared timeline")
+            if unit.duration < 0:
+                raise PipelineError(
+                    f"unit {self.writer.frame_count} carries negative "
+                    f"duration {unit.duration}")
+            self._last_explicit_pts = unit.pts
+        else:
+            expected = self._grid_ticks(self.writer.frame_count)
+            if abs(unit.pts - expected) > 1:
+                raise PipelineError(
+                    f"unit {self.writer.frame_count} arrived at pts "
+                    f"{unit.pts} but the output cadence grid expects "
+                    f"{expected}; the chain broke its declared timeline")
         # The chain's timeline is the validated one: stamp the unit's own
         # ticks (the writer's index grid quantizes NTSC-family rates).
         if self._is_mlx:
@@ -1676,12 +1887,13 @@ def run_file(
             noise_map_debug=noise_map_debug,
             overwrite=overwrite,
         )
-        # Inspect the complete source sample clock before entering the artifact
-        # transaction. The file pipeline currently publishes CFR only; rejecting
-        # VFR here prevents both silent retiming/frame loss and partial outputs.
-        timing = _probe_cfr_timing(plan.input_path, reader)
+        # Inspect the complete source sample clock before entering the
+        # artifact transaction. Uniform grids keep the regenerated cadence
+        # timeline; non-uniform tables are carried verbatim downstream.
+        timing = _probe_timing(plan.input_path, reader)
         if audio:
-            _validate_audio_origin(plan.input_path, reader, timing)
+            _validate_audio_origin(plan.input_path, reader,
+                                   _timing_view(timing))
         from kinovsr.media.pixel_buffers import ci_cache_owner
 
         # The file owner outlives the inner session owner: auto-geometry may render
@@ -1757,21 +1969,32 @@ def _run_file_reserved(
     # drive every schedule-capable stage through PipelineContext.windowing.
     windowing = None
     context_frames = 0
+    table = timing if isinstance(timing, SampleTable) else None
+    timing_view = _timing_view(timing)
     if snap_start or gop_align:
-        from kinovsr.media import video_reader as _native_vr
+        if table is not None and any(
+                sample.is_sync is not None for sample in table.samples):
+            # The walk that built the table read the real sync flags; table
+            # positions are exact under jitter, gaps, and VFR, where the
+            # legacy cadence-grid mapping desyncs from sample ordinals.
+            keyframes = list(table.keyframe_indices) or [0]
+        else:
+            from kinovsr.media import video_reader as _native_vr
 
-        vr = reader if reader is not None else _native_vr
-        keyframe_kwargs = ({"timing": timing} if timing is not None else {})
-        with _media_operation("keyframe inspection failed for", video_path):
-            keyframes = vr.keyframe_display_indices(
-                video_path, **keyframe_kwargs)
+            vr = reader if reader is not None else _native_vr
+            keyframe_kwargs = ({"timing": timing_view}
+                               if timing_view is not None else {})
+            with _media_operation(
+                    "keyframe inspection failed for", video_path):
+                keyframes = vr.keyframe_display_indices(
+                    video_path, **keyframe_kwargs)
         if snap_start and keyframes:
             start = min(keyframes, key=lambda k: abs(k - start))
         if gop_align:
             from kinovsr.modeling.upscaler_base import plan_gop_windows
 
-            if timing is not None:
-                total = timing.sample_count
+            if timing_view is not None:
+                total = timing_view.sample_count
             else:
                 with _media_operation(
                         "GOP video probe failed for", video_path):
@@ -1822,15 +2045,22 @@ def _run_file_reserved(
         if max_output_frames is not None:
             raise MediaError(
                 "state max_output_frames or max_output_seconds, not both")
+        if not isinstance(out_cadence, Fraction):
+            raise MediaError(
+                "a time-form output cap needs a constant output cadence; "
+                "this chain carries the source's variable timeline - give "
+                "the cap in frames (e.g. 500 or 500f)")
         max_output_frames = round(max_output_seconds * out_cadence)
     if max_output_frames is not None and max_output_frames < 1:
         raise MediaError(
             f"the output cap must be at least one frame; got "
             f"{max_output_frames}")
-    audio_duration = (
-        Fraction(max_output_frames) / out_cadence
-        if max_output_frames is not None else None
-    )
+    audio_duration = None
+    if max_output_frames is not None:
+        audio_duration = (
+            Fraction(max_output_frames) / out_cadence
+            if isinstance(out_cadence, Fraction)
+            else source.window_span(max_output_frames))
     track = (
         source.audio_track(max_duration=audio_duration)
         if audio else None
@@ -1940,9 +2170,14 @@ def _run_file_reserved(
     # emitted unit's duration so total output duration matches the source.
     preserve_duration = (session.output_spec.timeline.duration_policy
                          is DurationPolicy.PRESERVED)
-    source_end_ticks = grid_ticks(
-        source.frame_count, source.source_cadence,
-        session.output_spec.timeline.time_base)
+    if source.source_cadence is not None:
+        source_end_ticks = grid_ticks(
+            source.frame_count, source.source_cadence,
+            session.output_spec.timeline.time_base)
+    else:
+        # Explicit carry is 1:1 (cadence-changing stages refuse a variable
+        # timeline), so the source window's exact end IS the output end.
+        source_end_ticks = source.window_end_ticks()
     frames_out = 0
     pending: FrameUnit | None = None
     # retain_outputs=False: the sink consumes each unit into the encoder

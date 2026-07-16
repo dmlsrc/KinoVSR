@@ -31,7 +31,7 @@ from kinovsr.processors.capabilities import (
     CapabilitySpec,
     TemporalMode,
 )
-from kinovsr.processors.errors import MediaError
+from kinovsr.processors.errors import MediaError, PipelineError
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
     Cardinality,
@@ -88,6 +88,13 @@ def _parse_fps(value: Any) -> Fraction:
 
 def _produces(spec: StreamSpec, config: object) -> StreamSpec:
     assert isinstance(config, VtInterpolateConfig)
+    if not isinstance(spec.timeline.cadence, Fraction):
+        # The capability's StreamConstraint (cadences=(Fraction,)) names
+        # this properly at build time; guard the cadence arithmetic for
+        # direct spec-transform callers.
+        raise PipelineError(
+            "videotoolbox interpolation requires a constant-cadence input "
+            "timeline; this chain carries the source's variable timing")
     timeline = dataclasses.replace(
         spec.timeline,
         cadence=config.target_fps,
@@ -338,9 +345,15 @@ class VtUpscaleProcessor:
         # harness's mainstream decode->VSR path. MLX frames upload.
         self._cv_input = input_spec.frame.layout is not Layout.MLX_RGB_HWC
         g = input_spec.frame.geometry
+        # The session fps is VT's internal frame-identity grid, a rate hint
+        # only - a carried non-uniform timeline supplies its nominal rate.
+        cadence = input_spec.timeline.cadence
+        rate_hint = (cadence if isinstance(cadence, Fraction)
+                     else input_spec.timeline.nominal_cadence or Fraction(30))
         try:
             self._session = VsrSession(
-                g.width, g.height, mode=self._config.mode, fps=float(input_spec.timeline.cadence)
+                g.width, g.height, mode=self._config.mode,
+                fps=float(rate_hint)
             )
             apply_output_pool(
                 self._session, output_pool_binding, self._session.out_w, self._session.out_h
@@ -406,7 +419,10 @@ class VideoToolboxFactory:
                 layouts=(Layout.MLX_RGB_HWC, Layout.CV_RGBA_HALF, Layout.CV_NV12),
                 dtypes=(DType.FLOAT32, DType.FLOAT16, DType.UINT8),
                 domains=(Domain.UNIT, Domain.UNIT_SANITIZED, Domain.CODED),
-                cadences=(Fraction,),  # CFR sources only
+                # No cadence bound: upscaling is per-frame (balanced threads
+                # one prev frame ORDINALLY) and never consumes the clock, so
+                # carried non-uniform timelines pass through. Only genuine
+                # time-resampling (INTERPOLATE) requires a uniform grid.
             ),
             produces=_upscale_produces,
             # balanced threads one prev frame; declared for all three modes

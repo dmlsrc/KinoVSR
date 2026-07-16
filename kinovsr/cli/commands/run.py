@@ -213,8 +213,29 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
         except (OSError, RuntimeError, PipelineError) as fallback_exc:
             _log.error("cannot open %s: %s", video, fallback_exc)
             return 2
+    # A time-form window needs the real clock when it is not uniform;
+    # frame-form windows are ordinals and need no table walk.
+    trim_table = None
+    from kinovsr.media.timespec import parse_frames_or_seconds as _pfs
+
     try:
-        start, end = resolve_trim(options.start, options.end, fps, total)
+        wants_time_form = any(
+            spec is not None and str(spec).strip() != ""
+            and _pfs(str(spec))[1] is not None
+            for spec in (options.start, options.end))
+    except ValueError:
+        wants_time_form = False  # resolve_trim reports the bad spec
+    if wants_time_form:
+        read_table = getattr(reader or _vr, "read_sample_table", None)
+        if read_table is not None:
+            try:
+                trim_table = read_table(video)
+            except (OSError, RuntimeError, PipelineError) as exc:
+                _log.error("cannot inspect timing of %s: %s", video, exc)
+                return 2
+    try:
+        start, end = resolve_trim(options.start, options.end, fps, total,
+                                  table=trim_table)
     except ValueError as exc:
         _log.error("bad --start/--end value: %s", exc)
         return 2

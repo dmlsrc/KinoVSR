@@ -26,6 +26,7 @@ the native probe at 90/180/270). >8-bit sources are read through rgb48le
 """
 from __future__ import annotations
 
+import bisect
 import contextlib
 from collections.abc import Iterator
 from fractions import Fraction
@@ -395,16 +396,27 @@ def _buffer_attrs(out_format: int) -> dict:
 def _iter_chunks(path: Path, out_format: int, chunk_size: int,
                  start_frame: int, end_frame: int | None,
                  reformat_kwargs: dict,
-                 timing: VideoTiming | None = None) -> Iterator[list]:
+                 timing: VideoTiming | None = None,
+                 table: SampleTable | None = None) -> Iterator[list]:
     container, vs = _open_video(path)
     try:
-        fps = float(timing.cadence) if timing is not None else _fps(vs)
+        if table is not None and timing is None:
+            timing = table.timing()
+        keys = ([sample.pts for sample in table.samples]
+                if table is not None else None)
+        fps = float(timing.cadence) if (
+            timing is not None and timing.cadence is not None) else _fps(vs)
         origin = (timing.first_pts if timing is not None
                   else Fraction(int(vs.start_time or 0)) * Fraction(vs.time_base))
+        time_base = Fraction(vs.time_base)
         attrs = _buffer_attrs(out_format)
-        if start_frame > 0 and fps > 0:
+        if start_frame > 0 and (keys is not None or fps > 0):
             # coarse keyframe seek, then exact per-frame trim below
-            sec = float(origin) + (start_frame - 1) / fps
+            if keys is not None:
+                back = min(max(start_frame - 1, 0), len(keys) - 1)
+                sec = float(keys[back])
+            else:
+                sec = float(origin) + (start_frame - 1) / fps
             # Some edit timelines legitimately begin before zero. Seeking to
             # zero would skip their head; decode from the beginning instead
             # when the desired coarse seek point is negative.
@@ -415,8 +427,14 @@ def _iter_chunks(path: Path, out_format: int, chunk_size: int,
         for frame in container.decode(vs):
             if frame.pts is None:
                 continue
-            idx = (_pts_index(frame.pts, vs, fps, origin=origin)
-                   if fps > 0 else 0)
+            if keys is not None:
+                # Exact window indexing for jittered/gapped/variable clocks.
+                idx = bisect.bisect_right(
+                    keys, Fraction(int(frame.pts)) * time_base) - 1
+            elif fps > 0:
+                idx = _pts_index(frame.pts, vs, fps, origin=origin)
+            else:
+                idx = 0
             if idx < start_frame:
                 continue
             if end_frame is not None and idx >= end_frame:
@@ -437,12 +455,14 @@ def iter_video_buffer_chunks(
     path: Path, src_format: int, chunk_size: int = 8,
     *, start_frame: int = 0, end_frame: int | None = None,
     timing: VideoTiming | None = None,
+    table: SampleTable | None = None,
 ) -> Iterator[list]:
     """Native-surface mirror: lists of CVPixelBuffers in src_format, honoring
     the stream's own color tags (libswscale reads them off each frame)."""
     chunk_size = validate_decode_chunk_size(chunk_size)
     return _iter_chunks(
-        path, src_format, chunk_size, start_frame, end_frame, {}, timing)
+        path, src_format, chunk_size, start_frame, end_frame, {}, timing,
+        table)
 
 
 def iter_forced_color_chunks(
@@ -450,6 +470,7 @@ def iter_forced_color_chunks(
     chunk_size: int = 8, *, start_frame: int = 0, end_frame: int | None = None,
     reinterpret_full_range: bool | None = None,
     timing: VideoTiming | None = None,
+    table: SampleTable | None = None,
 ) -> Iterator[list]:
     """Forced-matrix read: override the YCbCr matrix / range at YUV->RGB time
     (libswscale src_colorspace/src_color_range), the --source-color fix for
@@ -463,7 +484,8 @@ def iter_forced_color_chunks(
         else av.video.reformatter.ColorRange.MPEG
     kw = {"src_colorspace": cs, "src_color_range": rng}
     return _iter_chunks(
-        path, out_format, chunk_size, start_frame, end_frame, kw, timing)
+        path, out_format, chunk_size, start_frame, end_frame, kw, timing,
+        table)
 
 
 # ---------------------------------------------------------------- audio

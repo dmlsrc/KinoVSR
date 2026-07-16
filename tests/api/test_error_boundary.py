@@ -256,7 +256,7 @@ def _patch_public_file_path(monkeypatch, tmp_path, *, track=None, failure=None):
             return track
 
     monkeypatch.setattr(run_module, "FileSource", _Source)
-    monkeypatch.setattr(run_module, "_probe_cfr_timing", lambda *args: None)
+    monkeypatch.setattr(run_module, "_probe_timing", lambda *args: None)
     monkeypatch.setattr(
         session_module,
         "open_pipeline",

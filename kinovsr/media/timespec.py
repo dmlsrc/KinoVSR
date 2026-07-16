@@ -2,10 +2,19 @@
 
 The CLI's --start/--end/--max-frames accept frames, seconds, or clock
 strings; every consumer resolves them against a concrete fps through
-these two helpers (moved verbatim from the inherited harness).
+these helpers (moved verbatim from the inherited harness). On a
+non-uniform source clock, time forms resolve by bisecting the real
+display timestamps instead of the fps grid.
 """
 
 from __future__ import annotations
+
+import bisect
+from fractions import Fraction
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .timing import SampleTable
 
 
 def parse_time_or_frames(spec: str, fps: float) -> int:
@@ -84,20 +93,58 @@ def parse_frames_or_seconds(spec: str) -> tuple[int | None, float | None]:
     return frames, None
 
 
+def _table_window_position(
+    spec: str, table: SampleTable, *, exclusive_end: bool,
+) -> int:
+    """One time/frame spec as a table position on a non-uniform clock.
+
+    Frame forms stay ordinals. A time form picks the frame on screen at
+    that instant for a window start, and excludes frames at or after the
+    instant for a window end.
+    """
+    frames, seconds = parse_frames_or_seconds(spec)
+    if frames is not None:
+        return frames
+    if seconds < 0:
+        raise ValueError(f"time/frame spec {spec!r} is negative")
+    target = table.first_pts + Fraction(str(seconds))
+    keys = [sample.pts for sample in table.samples]
+    if exclusive_end:
+        return bisect.bisect_left(keys, target)
+    return max(bisect.bisect_right(keys, target) - 1, 0)
+
+
 def resolve_trim(
     start_spec: str | None, end_spec: str | None, fps: float, total_frames: int,
+    *, table: SampleTable | None = None,
 ) -> tuple[int, int | None]:
     """Resolve --start/--end specs to a half-open frame window [start, end).
 
     `end` is None for an open-ended window. Clamps end to the input length and
     rejects an empty or out-of-range window with ValueError (callers own the
     exit; a library function must never SystemExit a host process).
+
+    With a non-uniform `table` (jittered, gapped, or variable clocks),
+    time-form specs resolve by bisecting the real display timestamps -
+    `round(seconds * fps)` has no meaning off a uniform grid. Uniform
+    sources keep the fps arithmetic so existing windows stay identical.
     """
+    on_table = table is not None and table.cadence is None
     try:
-        start_frame = parse_time_or_frames(start_spec, fps) if start_spec else 0
-        end_frame = parse_time_or_frames(end_spec, fps) if end_spec else None
+        if on_table:
+            start_frame = (
+                _table_window_position(start_spec, table, exclusive_end=False)
+                if start_spec else 0)
+            end_frame = (
+                _table_window_position(end_spec, table, exclusive_end=True)
+                if end_spec else None)
+        else:
+            start_frame = parse_time_or_frames(start_spec, fps) if start_spec else 0
+            end_frame = parse_time_or_frames(end_spec, fps) if end_spec else None
     except ValueError as e:
         raise ValueError(str(e)) from None
+    if on_table:
+        total_frames = table.sample_count
     if end_frame is not None and end_frame <= start_frame:
         raise ValueError(
             f"--end ({end_frame}f) must be greater than --start ({start_frame}f)"
