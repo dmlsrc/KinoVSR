@@ -261,55 +261,64 @@ def keyframe_display_indices(
 ) -> list[int]:
     """Display-order keyframe indices from packet metadata (no decode).
 
-    Mirrors the native sync-sample scan: demux the coded packets (decode
-    order), keep the keyframes, map each to its display index via its pts.
-    All-intra codecs report every frame; codecs with no keyframe concept
-    degrade to [0], and the gop planner handles both shapes.
+    Table positions from the consolidated demux walk
+    (:func:`read_sample_table`) - exact under jitter, gaps, and variable
+    clocks, where the retired cadence-grid mapping desynced from sample
+    ordinals after any dropped frame. ``timing`` is accepted for
+    adapter-call compatibility and unused. All-intra codecs report every
+    frame; codecs with no keyframe concept degrade to [0], and the gop
+    planner handles both shapes.
     """
-    container, vs = _open_video(path)
-    try:
-        fps = float(timing.cadence) if timing is not None else _fps(vs)
-        if fps <= 0:
-            return [0]
-        origin = timing.first_pts if timing is not None else None
-        kf: set[int] = set()
-        for pkt in container.demux(vs):
-            if pkt.pts is None or not pkt.is_keyframe:
-                continue
-            kf.add(_pts_index(pkt.pts, vs, fps, origin=origin))
-        return sorted(kf) if kf else [0]
-    except av.FFmpegError as exc:
-        _raise_ffmpeg_operation("scanning keyframes in", path, exc)
-    finally:
-        container.close()
+    del timing
+    return list(read_sample_table(path).keyframe_indices) or [0]
 
 
 def coded_frame_sizes(path: Path) -> list[int]:
     """Per-frame coded sizes in DISPLAY order (bytes), no decode.
 
-    Mirrors the native reader: packet sizes from the same demux walk the
-    keyframe scan uses, placed by (start_time-rebased) presentation
-    timestamp. Coded size is a LAST-GENERATION signal: a generous re-encode
-    of damaged footage reads large. Returns [] when the stream cannot be
-    walked.
+    One entry per display SAMPLE from the consolidated walk
+    (:func:`read_sample_table`); unknown sizes read 0. The retired
+    grid-slot version inserted phantom zero entries at dropped-frame
+    slots, misaligning sizes with decoded frame ordinals on gapped
+    sources. Coded size is a LAST-GENERATION signal: a generous
+    re-encode of damaged footage reads large. Returns [] when the
+    stream cannot be walked.
+    """
+    try:
+        table = read_sample_table(path)
+    except RuntimeError:
+        return []
+    return [sample.coded_size or 0 for sample in table.samples]
+
+
+# pix_fmt name -> (bit depth, chroma subsampling) for the descriptor.
+_PIX_FMT_TRAITS = {
+    "yuv420p": (8, "420"), "yuvj420p": (8, "420"), "nv12": (8, "420"),
+    "yuv420p10le": (10, "420"), "yuv420p12le": (12, "420"),
+    "yuv422p": (8, "422"), "yuvj422p": (8, "422"),
+    "yuv422p10le": (10, "422"), "yuv422p12le": (12, "422"),
+    "yuv444p": (8, "444"), "yuvj444p": (8, "444"),
+    "yuv444p10le": (10, "444"), "yuv444p12le": (12, "444"),
+}
+
+
+def probe_stream_descriptor(path: Path) -> dict:
+    """Coarse raw-stream identity for artifact-appropriate processing.
+
+    ``{"codec": name, "profile": str | None, "bit_depth": int | None,
+    "chroma": "420" | "422" | "444" | None}`` with ``None`` where the
+    stream does not say. An MPEG-2 VOB and an H.264 web rip do not
+    deserve the same restoration defaults; this is the cheap signal that
+    tells them apart.
     """
     container, vs = _open_video(path)
     try:
-        fps = _fps(vs)
-        if fps <= 0:
-            return []
-        sized: dict[int, int] = {}
-        for pkt in container.demux(vs):
-            if pkt.pts is None or pkt.size <= 0:
-                continue
-            idx = _pts_index(pkt.pts, vs, fps)
-            sized[idx] = sized.get(idx, 0) + int(pkt.size)
-        if not sized:
-            return []
-        hi = max(sized)
-        return [sized.get(i, 0) for i in range(hi + 1)]
-    except av.FFmpegError as exc:
-        _raise_ffmpeg_operation("scanning coded frames in", path, exc)
+        cc = vs.codec_context
+        depth, chroma = _PIX_FMT_TRAITS.get(
+            str(cc.pix_fmt or ""), (None, None))
+        profile = cc.profile if isinstance(cc.profile, str) else None
+        return {"codec": str(cc.name), "profile": profile,
+                "bit_depth": depth, "chroma": chroma}
     finally:
         container.close()
 
@@ -800,7 +809,7 @@ def read_audio_track(path: Path) -> Any | None:
 
 __all__ = [
     "probe_video", "probe_video_timing", "read_sample_table", "probe_color",
-    "keyframe_display_indices",
+    "probe_stream_descriptor", "keyframe_display_indices",
     "iter_video_buffer_chunks", "iter_forced_color_chunks",
     "probe_audio_timing", "read_audio_track", "read_audio_track_window",
 ]

@@ -60,7 +60,7 @@ from kinovsr.processors.specs import (
     VariableCadence,
     frame_spec_for_matrix,
 )
-from kinovsr.processors.units import FrameUnit
+from kinovsr.processors.units import FrameUnit, SourceFrameInfo
 from kinovsr.settings import Settings
 
 _log = logging.getLogger(__name__)
@@ -553,6 +553,31 @@ class FileSource:
         pts, duration = self._window_stamps(self.start)[-1]
         return pts + duration
 
+    def _window_frame_info(
+        self, read_start: int,
+    ) -> list[SourceFrameInfo] | None:
+        """Raw-stream identity for each frame of [read_start, end).
+
+        GOP ordinals/lengths are ABSOLUTE source properties (a mid-GOP
+        window start reports the frame's true distance from ITS
+        keyframe). ``None`` without a sample table.
+        """
+        table = self._table
+        if table is None:
+            return None
+        infos = []
+        for index in range(read_start, self.end):
+            sample = table.samples[index]
+            gop = table.frame_gop(index)
+            infos.append(SourceFrameInfo(
+                index=index,
+                is_sync=sample.is_sync,
+                gop_ordinal=None if gop is None else gop[0],
+                gop_length=None if gop is None else gop[1],
+                coded_size=sample.coded_size,
+            ))
+        return infos
+
     def units(self) -> Iterator[FrameUnit]:
         """Decode the window and yield timestamped units, one per frame.
 
@@ -572,6 +597,7 @@ class FileSource:
             timing_kwargs["timing"] = self._timing
         stamps = (self._window_stamps(read_start)
                   if self._explicit_carry else None)
+        infos = self._window_frame_info(read_start)
         if self._force_read:
             # Re-decode raw YUV, force the resolved matrix, reinterpret the
             # range: source's actual full_range in, resolved range out.
@@ -616,7 +642,11 @@ class FileSource:
                 else:
                     pts = self._grid_ticks(index)
                     duration = self._grid_ticks(index + 1) - pts
-                yield FrameUnit(payload=payload, pts=pts, duration=duration)
+                source = (infos[emitted]
+                          if infos is not None and emitted < len(infos)
+                          else None)
+                yield FrameUnit(payload=payload, pts=pts, duration=duration,
+                                source=source)
                 index += 1
                 emitted += 1
         if stamps is not None and emitted != len(stamps):

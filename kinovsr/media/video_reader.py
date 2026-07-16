@@ -279,111 +279,65 @@ def keyframe_display_indices(
 ) -> list[int]:
     """Display-order frame indices of the source's keyframes (sync samples).
 
-    A compressed-passthrough pass (AVAssetReaderTrackOutput with no output
-    settings) yields the coded samples in DECODE order; a sample is a keyframe iff
-    its ``kCMSampleAttachmentKey_NotSync`` attachment is absent/false. Each
-    keyframe is mapped to its display index with the same exact cadence and
-    edit-adjusted origin used by the file source; decode-order indices would
-    not line up with B-frame presentation order.
-
-    No decode and no ffprobe: this reads only sample metadata, so it is cheap even
-    on long clips. Used to align sliding restoration/upscaler windows to GOP
-    boundaries (see the harness --gop-align path). Returns a sorted list; a clip
-    with a single keyframe (open-ended GOP) returns ``[0]``.
+    Table positions from the consolidated sample walk
+    (:func:`read_sample_table`): a sample is a keyframe iff its
+    ``kCMSampleAttachmentKey_NotSync`` attachment is absent/false, and
+    its index is its position in display order - exact under jitter,
+    gaps, and variable clocks, where the retired cadence-grid mapping
+    (``round((pts - origin) * cadence)``) desynced from sample ordinals
+    after any dropped frame. ``timing`` is accepted for adapter-call
+    compatibility and unused. Returns a sorted list; a clip with no
+    reported sync samples returns ``[0]``.
     """
-    url = Foundation.NSURL.fileURLWithPath_(str(path))
-    asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
-    track = _first_video_track(asset)
-    cadence = (timing.cadence if timing is not None
-               else Fraction(float(track.nominalFrameRate())).limit_denominator(1001))
-    if cadence is None or cadence <= 0:
-        return [0]
-    reader, err = av.AVAssetReader.alloc().initWithAsset_error_(asset, None)
-    if reader is None:
-        raise RuntimeError(f"AVAssetReader init failed: {err}")
-    out = av.AVAssetReaderTrackOutput.alloc().initWithTrack_outputSettings_(track, None)
-    if not reader.canAddOutput_(out):
-        return [0]
-    reader.addOutput_(out)
-    if not reader.startReading():
-        raise RuntimeError(f"AVAssetReader.startReading failed: {reader.error()}")
-    display_pts: list[Fraction] = []
-    key_pts: list[Fraction] = []
-    while True:
-        sb = out.copyNextSampleBuffer()
-        if sb is None:
-            break
-        if CoreMedia.CMSampleBufferGetNumSamples(sb) < 1:
-            del sb
-            continue
-        pts = _cm_time_fraction(
-            CoreMedia.CMSampleBufferGetOutputPresentationTimeStamp(sb))
-        if pts is None:
-            pts = _cm_time_fraction(
-                CoreMedia.CMSampleBufferGetOutputDecodeTimeStamp(sb))
-        if pts is None:
-            del sb
-            continue
-        display_pts.append(pts)
-        arr = CoreMedia.CMSampleBufferGetSampleAttachmentsArray(sb, False)
-        is_key = True
-        if arr and len(arr) > 0:
-            is_key = not bool(arr[0].get(CoreMedia.kCMSampleAttachmentKey_NotSync))
-        if is_key:
-            key_pts.append(pts)
-        del sb
-    if not display_pts or not key_pts:
-        return [0]
-    origin = timing.first_pts if timing is not None else min(display_pts)
-    keyframes = {round((pts - origin) * cadence) for pts in key_pts}
-    return sorted(index for index in keyframes if index >= 0) or [0]
+    del timing
+    return list(read_sample_table(path).keyframe_indices) or [0]
 
 
 def coded_frame_sizes(path: Path) -> list[int]:
     """Per-frame coded sizes in DISPLAY order (bytes), no decode.
 
-    Same metadata-only pass-through walk as ``keyframe_display_indices``:
-    an AVAssetReaderTrackOutput with nil settings yields compressed samples,
-    and ``CMSampleBufferGetTotalSampleSize`` is their coded size. Sizes come
-    in decode order and are placed by presentation timestamp; zero-size
-    priming/edit samples are skipped. Coded size is a LAST-GENERATION
-    signal: a generous re-encode of damaged footage reads large. Returns []
-    when the track cannot be walked.
+    One entry per display SAMPLE from the consolidated walk
+    (:func:`read_sample_table`); unknown sizes read 0. The retired
+    grid-slot version placed sizes at ``round(pts * fps)`` positions,
+    inserting phantom zero entries at dropped-frame slots and misaligning
+    sizes with decoded frame ordinals on gapped sources. Coded size is a
+    LAST-GENERATION signal: a generous re-encode of damaged footage reads
+    large. Returns [] when the track cannot be walked.
     """
-    import math
+    try:
+        table = read_sample_table(path)
+    except RuntimeError:
+        return []
+    return [sample.coded_size or 0 for sample in table.samples]
+
+
+def probe_stream_descriptor(path: Path) -> dict:
+    """Coarse raw-stream identity for artifact-appropriate processing.
+
+    ``{"codec": fourcc-or-name, "profile": str | None,
+    "bit_depth": int | None, "chroma": "420" | "422" | "444" | None}``
+    with ``None`` where the container does not say. The native format
+    description exposes the codec type cheaply; depth/subsampling
+    extensions are present only for some codecs, so the ffmpeg reader's
+    descriptor is the richer of the two.
+    """
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)
-    fps = float(track.nominalFrameRate())
-    if fps <= 0:
-        return []
-    reader, err = av.AVAssetReader.alloc().initWithAsset_error_(asset, None)
-    if reader is None:
-        raise RuntimeError(f"AVAssetReader init failed: {err}")
-    out = av.AVAssetReaderTrackOutput.alloc().initWithTrack_outputSettings_(track, None)
-    if not reader.canAddOutput_(out):
-        return []
-    reader.addOutput_(out)
-    if not reader.startReading():
-        raise RuntimeError(f"AVAssetReader.startReading failed: {reader.error()}")
-    sized: dict[int, int] = {}
-    while True:
-        sb = out.copyNextSampleBuffer()
-        if sb is None:
-            break
-        n = int(CoreMedia.CMSampleBufferGetTotalSampleSize(sb))
-        if n > 0:
-            pts = CoreMedia.CMTimeGetSeconds(CoreMedia.CMSampleBufferGetPresentationTimeStamp(sb))
-            if math.isnan(pts):
-                pts = CoreMedia.CMTimeGetSeconds(CoreMedia.CMSampleBufferGetDecodeTimeStamp(sb))
-            if not math.isnan(pts):
-                idx = int(round(pts * fps))
-                sized[idx] = sized.get(idx, 0) + n
-        del sb
-    if not sized:
-        return []
-    hi = max(sized)
-    return [sized.get(i, 0) for i in range(hi + 1)]
+    descs = track.formatDescriptions()
+    if not descs or len(descs) == 0:
+        return {"codec": None, "profile": None,
+                "bit_depth": None, "chroma": None}
+    desc = descs[0]
+    subtype = int(CoreMedia.CMFormatDescriptionGetMediaSubType(desc))
+    codec = subtype.to_bytes(4, "big").decode("ascii", "replace").strip()
+    bit_depth = None
+    extensions = CoreMedia.CMFormatDescriptionGetExtensions(desc) or {}
+    depth = extensions.get("BitsPerComponent")
+    if depth is not None:
+        bit_depth = int(depth)
+    return {"codec": codec, "profile": None,
+            "bit_depth": bit_depth, "chroma": None}
 
 
 def probe_color(path: Path) -> dict:

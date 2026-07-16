@@ -30,6 +30,7 @@ forces a host/device synchronization.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 from collections.abc import Callable, Iterable, Iterator
 
 from kinovsr.processors import (
@@ -67,9 +68,10 @@ def _stage_stream(
     def attach(unit: FrameUnit) -> FrameUnit:
         if not pending:
             return unit
-        stamped = FrameUnit(
-            payload=unit.payload, pts=unit.pts, duration=unit.duration,
-            boundaries=(*pending, *unit.boundaries))
+        # dataclasses.replace, not a field-by-field rebuild: every other
+        # unit field (source info included) must survive the re-stamp.
+        stamped = dataclasses.replace(
+            unit, boundaries=(*pending, *unit.boundaries))
         pending.clear()
         return stamped
 
@@ -101,8 +103,7 @@ def _stage_stream(
                 raise wrapped from exc
             pending.extend(unit.boundaries)
             # The family learns about boundaries through reset() only.
-            unit = FrameUnit(payload=unit.payload, pts=unit.pts,
-                             duration=unit.duration)
+            unit = dataclasses.replace(unit, boundaries=())
         started = True
         try:
             outputs = processor.process(unit, context)

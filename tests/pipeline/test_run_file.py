@@ -196,6 +196,45 @@ def staggered_clip(tmp_path_factory):
     return path
 
 
+def _write_gapped_keyframes_clip(path) -> None:
+    """Ten frames on a 30 fps grid with a 25-slot gap and GOP length 5.
+
+    libx264 g=5/bf=0 with scene-cut detection off makes samples 0 and 5
+    the only sync samples while their grid slots are 0 and 30:
+    cadence-grid keyframe mapping would report slot 30 where the real
+    sample position is 5. Textured noise keeps P-frames attractive so
+    the encoder does not insert extra keyframes.
+    """
+    import random
+
+    rng = random.Random(7)
+    out = av.open(str(path), "w")
+    stream = out.add_stream("libx264", rate=30)
+    stream.width = stream.height = 64
+    stream.pix_fmt = "yuv420p"
+    stream.options = {"g": "5", "bf": "0", "crf": "20", "sc_threshold": "0"}
+    slots = [0, 1, 2, 3, 4, 30, 31, 32, 33, 34]
+    for index, slot in enumerate(slots):
+        frame = av.VideoFrame(64, 64, "gray")
+        frame.planes[0].update(bytes(
+            rng.randrange(0, 40) + index for _ in range(64 * 64)))
+        frame = frame.reformat(format="yuv420p")
+        frame.pts = slot
+        frame.time_base = Fraction(1, 30)
+        for packet in stream.encode(frame):
+            out.mux(packet)
+    for packet in stream.encode():
+        out.mux(packet)
+    out.close()
+
+
+@pytest.fixture(scope="module")
+def gapped_keyframes_clip(tmp_path_factory):
+    path = tmp_path_factory.mktemp("run_file_gop") / "clip.mp4"
+    _write_gapped_keyframes_clip(path)
+    return path
+
+
 @pytest.fixture(scope="module")
 def audio_leads_clip(tmp_path_factory):
     # Video begins at 0.4 s; the 2 s audio ramp begins at 0: audio leads
@@ -500,6 +539,63 @@ class TestFileSource:
 
         assert stamps(FileSource(vfr_clip)) == stamps(
             FileSource(vfr_clip, reader=ffmpeg_reader))
+
+    def test_keyframe_indices_are_table_positions_not_grid_slots(
+            self, gapped_keyframes_clip):
+        from kinovsr.media import ffmpeg_reader, video_reader
+
+        # Samples 0..9 sit on grid slots 0..4 and 30..34; the sync
+        # samples are table positions 0 and 5. The retired grid mapping
+        # (round((pts - origin) * cadence)) would have reported slot 30.
+        assert video_reader.keyframe_display_indices(
+            gapped_keyframes_clip) == [0, 5]
+        assert ffmpeg_reader.keyframe_display_indices(
+            gapped_keyframes_clip) == [0, 5]
+
+    def test_coded_sizes_align_with_sample_ordinals_not_grid_slots(
+            self, gapped_keyframes_clip):
+        from kinovsr.media import ffmpeg_reader, video_reader
+
+        native = video_reader.coded_frame_sizes(gapped_keyframes_clip)
+        fallback = ffmpeg_reader.coded_frame_sizes(gapped_keyframes_clip)
+        # One entry per SAMPLE (ten frames), no phantom gap slots.
+        assert len(native) == len(fallback) == 10
+        assert all(size > 0 for size in native)
+
+    def test_units_carry_absolute_gop_metadata_mid_window(
+            self, gapped_keyframes_clip):
+        # A window starting mid-GOP still reports each frame's true
+        # distance from ITS keyframe: the sampling window behaves like
+        # the full run.
+        source = FileSource(gapped_keyframes_clip, start=7)
+        units = list(source.units())
+        infos = [u.source for u in units]
+        assert [i.index for i in infos] == [7, 8, 9]
+        assert [i.gop_ordinal for i in infos] == [2, 3, 4]
+        assert [i.gop_length for i in infos] == [5, 5, 5]
+        assert [i.is_sync for i in infos] == [False, False, False]
+        assert all(i.coded_size and i.coded_size > 0 for i in infos)
+
+    def test_units_carry_sync_flags_on_uniform_sources(self, clip):
+        source = FileSource(clip, max_frames=9)
+        units = list(source.units())
+        assert [u.source.index for u in units] == list(range(9))
+        # The clip fixture encodes mpeg4 with g=8: sample 0 and 8 sync.
+        assert units[0].source.is_sync is True
+        assert units[8].source.is_sync is True
+        assert units[3].source.is_sync is False
+        assert units[3].source.gop_ordinal == 3
+
+    def test_stream_descriptor_reports_codec_identity(
+            self, gapped_keyframes_clip):
+        from kinovsr.media import ffmpeg_reader, video_reader
+
+        rich = ffmpeg_reader.probe_stream_descriptor(gapped_keyframes_clip)
+        assert rich["codec"] == "h264"
+        assert rich["bit_depth"] == 8
+        assert rich["chroma"] == "420"
+        coarse = video_reader.probe_stream_descriptor(gapped_keyframes_clip)
+        assert coarse["codec"] == "avc1"
 
     def test_interpolation_on_carried_timeline_names_the_stage(
             self, vfr_clip, tmp_path):

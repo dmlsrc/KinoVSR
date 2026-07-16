@@ -72,8 +72,10 @@ def test_session_surface_is_video_only():
 
     params = inspect.signature(open_pipeline).parameters
     assert not any("audio" in name.lower() for name in params), params
+    # "source" is the raw-stream identity channel (sync flag, GOP
+    # position, coded size) - video-stream metadata, not audio.
     assert set(FrameUnit.__dataclass_fields__) == {
-        "payload", "pts", "duration", "boundaries"}
+        "payload", "pts", "duration", "boundaries", "source"}
 
 
 def test_open_pipeline_is_the_session_constructor():

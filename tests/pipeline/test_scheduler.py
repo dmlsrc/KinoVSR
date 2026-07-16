@@ -271,6 +271,25 @@ class TestBoundaries:
             Boundary(BoundaryKind.HARD_CUT, source_index=source_index))
         return out
 
+    def test_source_info_survives_boundary_restamps(self):
+        from kinovsr.processors.units import SourceFrameInfo
+
+        a = Recorder("a")
+        feed = [
+            FrameUnit(
+                payload=f"frame{i}", pts=i, duration=1,
+                source=SourceFrameInfo(
+                    index=i, is_sync=i == 0, gop_ordinal=i, gop_length=4))
+            for i in range(4)
+        ]
+        feed = self.cut_at(feed, 2)
+        out = list(run_chain(chain(a), feed, CONTEXT))
+        # Both scheduler re-stamps (the boundary strip before process and
+        # the attach after) must preserve the raw-stream channel.
+        assert [u.source.index for u in out] == [0, 1, 2, 3]
+        assert out[2].source.gop_ordinal == 2
+        assert any(u.boundaries for u in out)
+
     def test_families_never_see_inband_boundaries(self):
         a, b = Recorder("a"), Recorder("b")
         feed = self.cut_at(units(4), 2)

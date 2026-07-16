@@ -16,6 +16,7 @@ caused by rounding one frame duration and multiplying it by the index.
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import enum
 import math
@@ -103,6 +104,27 @@ class SampleTable:
         """Display-order table positions whose samples are sync samples."""
         return tuple(index for index, sample in enumerate(self.samples)
                      if sample.is_sync)
+
+    def frame_gop(self, index: int) -> tuple[int, int] | None:
+        """(gop_ordinal, gop_length) for one display position.
+
+        ``gop_ordinal`` is the frame's distance from its enclosing sync
+        sample and ``gop_length`` that GOP's span (sync to next sync, in
+        samples) - ABSOLUTE source properties, independent of any window.
+        Samples before the first sync sample count from position 0 (an
+        open leading GOP). ``None`` when the reader reported no sync
+        flags at all.
+        """
+        if not 0 <= index < len(self.samples):
+            raise IndexError(f"sample index {index} out of range")
+        keys = self.keyframe_indices
+        if not keys:
+            return None
+        position = bisect.bisect_right(keys, index) - 1
+        start = keys[position] if position >= 0 else 0
+        end = (keys[position + 1] if position + 1 < len(keys)
+               else len(self.samples))
+        return index - start, end - start
 
     def timing(self) -> VideoTiming:
         """The legacy CFR-or-variable view consumed by the file pipeline."""

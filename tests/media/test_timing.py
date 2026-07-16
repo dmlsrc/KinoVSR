@@ -304,6 +304,42 @@ def test_sync_flags_and_coded_sizes_are_carried_in_display_order():
     assert table.keyframe_indices == (0, 3)
 
 
+def test_frame_gop_reports_absolute_ordinals_and_lengths():
+    pairs = [(Fraction(i, 25), Fraction(1, 25)) for i in range(5)]
+    table = analyze_sample_table(
+        _records(pairs, sync=[True, False, False, True, False]),
+        nominal_cadence=25,
+        source_tick=Fraction(1, 25000),
+    )
+    assert table.frame_gop(0) == (0, 3)
+    assert table.frame_gop(2) == (2, 3)
+    assert table.frame_gop(3) == (0, 2)
+    assert table.frame_gop(4) == (1, 2)
+    with pytest.raises(IndexError):
+        table.frame_gop(5)
+
+
+def test_frame_gop_counts_an_open_leading_gop_from_zero():
+    pairs = [(Fraction(i, 25), Fraction(1, 25)) for i in range(4)]
+    table = analyze_sample_table(
+        _records(pairs, sync=[False, False, True, False]),
+        nominal_cadence=25,
+        source_tick=Fraction(1, 25000),
+    )
+    assert table.frame_gop(1) == (1, 2)
+    assert table.frame_gop(2) == (0, 2)
+
+
+def test_frame_gop_is_none_without_sync_flags():
+    pairs = [(Fraction(i, 25), None) for i in range(3)]
+    table = analyze_sample_table(
+        _records(pairs),
+        nominal_cadence=25,
+        source_tick=Fraction(1, 25000),
+    )
+    assert table.frame_gop(1) is None
+
+
 def test_absent_sync_flags_yield_no_keyframe_indices():
     table = analyze_sample_table(
         _records([(Fraction(i, 25), None) for i in range(3)]),

@@ -21,11 +21,31 @@ from .boundaries import Boundary
 
 
 @dataclass(frozen=True, slots=True)
+class SourceFrameInfo:
+    """Raw-stream identity of the source sample a unit decoded from.
+
+    These are ABSOLUTE source properties: a mid-GOP window start still
+    reports each frame's true distance from ITS keyframe, so a sampling
+    window behaves like the full run. ``None`` fields mean the reader
+    did not report that signal. Units created by cadence-changing stages
+    (interpolation) carry no source info - their frames decode no single
+    source sample.
+    """
+
+    index: int                      # display index in the source track
+    is_sync: bool | None = None     # sync sample (I/IDR)
+    gop_ordinal: int | None = None  # frames since the enclosing sync sample
+    gop_length: int | None = None   # that GOP's span in samples
+    coded_size: int | None = None   # coded payload bytes (last generation)
+
+
+@dataclass(frozen=True, slots=True)
 class FrameUnit:
     payload: Any                 # mx.array or CVPixelBuffer, per edge Layout
     pts: int                     # in the stream's TimelineSpec.time_base
     duration: int                # same time base; 0 = unknown/unspecified
     boundaries: tuple[Boundary, ...] = ()
+    source: SourceFrameInfo | None = None
 
     def with_payload(self, payload: Any) -> FrameUnit:
         """Same instant, new payload (the per-frame processing shape)."""
@@ -42,4 +62,4 @@ class FrameUnit:
             self, boundaries=(*self.boundaries, boundary))
 
 
-__all__ = ["FrameUnit"]
+__all__ = ["FrameUnit", "SourceFrameInfo"]
