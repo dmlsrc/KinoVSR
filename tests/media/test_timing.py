@@ -449,3 +449,40 @@ def test_epoch_unwrapper_rebases_resets_and_ignores_reordering():
     expected_start = a[-1] + Fraction(1, 30)
     assert out_b == [expected_start + p for p in b]
     assert out_b[0] > out[-1]
+
+
+def test_epoch_unwrapper_absorbs_a_single_damaged_stamp():
+    # R2: one corrupted timestamp dipping past the reset threshold must
+    # not permanently shift the clock. The dip is pinned mid-interval
+    # and the rebound continues the committed clock untouched.
+    from kinovsr.media.timing import EpochUnwrapper
+
+    u = EpochUnwrapper()
+    stream = [Fraction(999, 10), Fraction(9996, 100), Fraction(100),
+              Fraction(898, 10),          # damaged stamp REPLACING 100.04
+              Fraction(10008, 100), Fraction(10012, 100)]
+    out = [u.push(p) for p in stream]
+    assert u.resets == 0
+    # everything except the dip passes through raw
+    assert out[:3] == stream[:3]
+    assert out[4:] == stream[4:]
+    # the dip is pinned strictly between the last good stamp and the
+    # rebound, keeping the sorted table free of collisions
+    assert out[2] < out[3] < out[4]
+
+
+def test_epoch_unwrapper_stitch_never_duplicates_a_recorder_gap():
+    # R2: a 5-second recorder gap right before a join must not become
+    # the stitch interval (the old rule reused the last positive delta).
+    from kinovsr.media.timing import EpochUnwrapper
+
+    u = EpochUnwrapper()
+    a = [Fraction(k, 25) for k in range(250)]        # 25 fps to 10s
+    a.append(Fraction(15))                           # 5s recorder gap
+    for p in a:
+        u.push(p)
+    b = [u.push(Fraction(k, 25)) for k in range(3)]  # joined segment
+    assert u.resets == 1
+    # epoch B lands one frame interval after 15s, not at 20s
+    assert b[0] == Fraction(15) + Fraction(1, 25)
+    assert b[1] - b[0] == Fraction(1, 25)

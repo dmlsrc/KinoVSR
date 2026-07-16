@@ -171,22 +171,60 @@ class EpochUnwrapper:
         self._offset = Fraction(0)
         self._prev_raw: Fraction | None = None
         self._max_adjusted: Fraction | None = None
-        self._last_delta: Fraction | None = None
+        # The last sub-second positive delta: the typical frame interval.
+        # Bounded so a recorder GAP (a legitimate multi-second forward
+        # jump) can never become the stitch and get duplicated at a join.
+        self._typical: Fraction | None = None
+        # A suspected reset awaiting confirmation: (dip_raw, candidate
+        # offset). One damaged stamp must not permanently shift the
+        # clock, so a reset commits only when the NEXT sample stays in
+        # the dip's neighborhood; a rebound into the committed clock
+        # absorbs the dip as an outlier (it stays pinned mid-interval).
+        # Consecutive damaged stamps beyond one are out of scope and
+        # commit as a reset (falsifiable: two-outlier runs would need a
+        # deeper lookahead).
+        self._pending: tuple[Fraction, Fraction] | None = None
         self.resets = 0
+
+    def _stitch(self) -> Fraction:
+        # One typical interval: a committed epoch continues the prior
+        # cadence seamlessly (a joined 25 fps tape stays on the 25 fps
+        # grid). An absorbed outlier keeps this pin too; the common
+        # damage REPLACES a frame's stamp, so the rebound lands a full
+        # interval later and cannot collide. An EXTRA damaged stamp can
+        # tie the pin with the true next stamp - that degrades to the
+        # loud duplicate-identity refusal downstream, never silence.
+        return self._typical or Fraction(1, 25)
 
     def push(self, pts: Fraction) -> Fraction:
         pts = Fraction(pts)
+        if self._pending is not None:
+            dip_raw, candidate = self._pending
+            self._pending = None
+            assert self._prev_raw is not None
+            if self._prev_raw - pts <= EPOCH_RESET_SECONDS:
+                # Rebound into the committed clock: the dip was one
+                # damaged stamp. It stays pinned; the clock continues.
+                pass
+            else:
+                # The stream stayed in the dip's neighborhood: a real
+                # epoch reset. Commit it for the dip and what follows.
+                self._offset = candidate
+                self._prev_raw = dip_raw
+                self.resets += 1
         if self._prev_raw is not None:
             if self._prev_raw - pts > EPOCH_RESET_SECONDS:
-                gap = (self._last_delta
-                       if self._last_delta and self._last_delta > 0
-                       else Fraction(1, 25))
                 assert self._max_adjusted is not None
-                self._offset = self._max_adjusted + gap - pts
-                self._last_delta = None
-                self.resets += 1
-            elif pts > self._prev_raw:
-                self._last_delta = pts - self._prev_raw
+                candidate = self._max_adjusted + self._stitch() - pts
+                self._pending = (pts, candidate)
+                adjusted = pts + candidate
+                if adjusted > self._max_adjusted:
+                    self._max_adjusted = adjusted
+                return adjusted
+            if pts > self._prev_raw:
+                delta = pts - self._prev_raw
+                if delta < 1:
+                    self._typical = delta
         self._prev_raw = pts
         adjusted = pts + self._offset
         if self._max_adjusted is None or adjusted > self._max_adjusted:

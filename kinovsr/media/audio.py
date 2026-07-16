@@ -505,6 +505,25 @@ def _write_track_wav_float32(track: AudioTrack, path: Any) -> None:
         raise RuntimeError(f"AVAudioFile could not open {path} for writing: {err}")
     bytes_per_frame = 4 * track.channels
     chunk_frames = max(1, _SIDECAR_PCM_BUDGET // bytes_per_frame)
+    # The mux stamps this track's buffers `placement_samples` late (a
+    # lagging audio origin); a sidecar has no timeline, so the placement
+    # is materialized as leading silence - otherwise importing the WAV
+    # beside the video runs the audio early by exactly the offset.
+    placement = int(getattr(track, "placement_samples", 0) or 0)
+    for start in range(0, placement, chunk_frames):
+        frames = min(chunk_frames, placement - start)
+        buf = av.AVAudioPCMBuffer.alloc().initWithPCMFormat_frameCapacity_(
+            out.processingFormat(), frames)
+        buf.setFrameLength_(frames)
+        fcd = buf.floatChannelData()
+        zero = bytes(4 * frames)
+        for channel in range(track.channels):
+            memoryview(fcd[channel].as_buffer(frames))[:] = zero
+        ok, err = out.writeFromBuffer_error_(buf, None)
+        if not ok:
+            raise RuntimeError(
+                f"AVAudioFile write failed for {path} while writing the "
+                f"placement lead-in: {err}")
     for start in range(0, track.n_samples, chunk_frames):
         stop = min(start + chunk_frames, track.n_samples)
         frames = stop - start

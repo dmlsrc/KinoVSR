@@ -2119,3 +2119,119 @@ class TestSampleIdentityPairing:
             FileSource("x.mp4", reader=reader, timing=table).units())
         assert [u.pts for u in units] == [0, 1920, 2880]   # 0, 2, 3 / 25
         assert [u.source.index for u in units] == [0, 2, 3]
+
+    def test_dropped_final_sample_is_refused_on_any_table_backed_path(self):
+        # R2-4: a decoder that eats the last frame exhausts naturally
+        # with consecutive identities; uniform timelines must refuse
+        # exactly like explicit carry instead of committing N-1 frames
+        # while reporting frames_in=N.
+        table = self._table(uniform=True)
+        reader = self._fake_reader(table, [0, 1, 2])   # sample 3 missing
+        with pytest.raises(MediaError, match="silently truncated"):
+            list(FileSource("x.mp4", reader=reader, timing=table).units())
+
+
+
+class TestConformGopWindows:
+    """R2-1: GOP windows must count conformed units, not source ordinals."""
+
+    def test_slot_plan_maps_keyframes_onto_conform_output(self):
+        from kinovsr.media.timing import SampleTiming, analyze_sample_table
+        from kinovsr.pipeline.run import _conform_slot_plan
+
+        # Samples on grid slots 0..4 and 30..34 (the gapped-keyframes
+        # shape), keyframes at samples 0 and 5. Conform to the same 30
+        # grid: sample 4 owns slots 4..17 (through the gap midpoint),
+        # sample 5 starts at slot 18; the window spans 35 slots.
+        pts = [Fraction(s, 30) for s in (*range(5), *range(30, 35))]
+        table = analyze_sample_table(
+            [SampleTiming(pts=p, duration=Fraction(1, 30),
+                          is_sync=i in (0, 5))
+             for i, p in enumerate(pts)],
+            nominal_cadence=30, source_tick=Fraction(1, 90000))
+        first_slot_of, total = _conform_slot_plan(
+            table, start=0, read_start=0, end=10, fps=Fraction(30))
+        assert first_slot_of(0) == 0
+        assert first_slot_of(5) == 18
+        assert total == 35
+
+    def test_conform_with_gop_align_emits_every_slot(
+            self, gapped_keyframes_clip, tmp_path):
+        # The source-ordinal schedule truncated this run; the slot-space
+        # schedule must let every conformed frame through.
+        config = {
+            "pipeline": ["cfr"],
+            "cfr": {"processor": "conform", "fps": "30"},
+        }
+        result = run_file(
+            config, video=gapped_keyframes_clip,
+            output=tmp_path / "conform_gop.mp4", settings=SETTINGS,
+            gop_align=True)
+        assert result.frames_in == 10
+        assert result.frames_out == 35
+
+    def test_mid_chain_conform_with_gop_align_is_refused(
+            self, gapped_keyframes_clip, tmp_path):
+        config = {
+            "pipeline": ["df", "cfr"],
+            "df": {"processor": "deflicker"},
+            "cfr": {"processor": "conform", "fps": "30"},
+        }
+        with pytest.raises(MediaError, match="lead the chain"):
+            run_file(
+                config, video=gapped_keyframes_clip,
+                output=tmp_path / "refused.mp4", settings=SETTINGS,
+                gop_align=True)
+
+
+class TestRoundTwoArtifacts:
+    """R2-5/R2-6: auxiliary artifacts must honor timing identity."""
+
+    def test_sidecar_materializes_lagging_placement_as_silence(
+            self, audio_lags_clip, tmp_path):
+        # The mux stamps the track 0.3s late; the WAV sidecar has no
+        # timeline, so it must carry 0.3s of leading silence or imports
+        # run the audio early.
+        run_file(
+            {"pipeline": []}, video=audio_lags_clip,
+            output=tmp_path / "lag.mp4", settings=SETTINGS,
+            audio=True, save_audio_sidecar=True)
+        sidecars = list(tmp_path.glob("*.wav"))
+        assert len(sidecars) == 1
+        import mlx.core as mx
+
+        with av.open(str(sidecars[0])) as container:
+            frames = [f.to_ndarray() for f in container.decode(audio=0)]
+        pcm = mx.concatenate([mx.array(f).reshape(-1) for f in frames])
+        total = int(pcm.shape[0])
+        lead = round(0.29 * SAMPLE_RATE)
+        assert total == pytest.approx(1.0 * SAMPLE_RATE, abs=SAMPLE_RATE / 100)
+        assert float(mx.max(mx.abs(pcm[:lead]))) == 0.0
+        body = pcm[round(0.31 * SAMPLE_RATE):round(0.6 * SAMPLE_RATE)]
+        assert float(mx.max(mx.abs(body))) > 0.01
+
+    def test_comparison_left_half_matches_the_conform_source_identity(
+            self, vfr_clip, tmp_path):
+        # Conform assigns slot 6 to source sample 4 (nearest); the tee's
+        # old at-or-before rule paired sample 3's image. The luma ramp
+        # (index * 40) makes the difference decisive.
+        config = {
+            "pipeline": ["cfr"],
+            "cfr": {"processor": "conform", "fps": "30"},
+        }
+        result = run_file(
+            config, video=vfr_clip, output=tmp_path / "c.mp4",
+            settings=SETTINGS, comparison=tmp_path / "cmp.mp4")
+        assert result.frames_out == 8
+        with av.open(str(tmp_path / "cmp.mp4")) as container:
+            frames = list(container.decode(video=0))
+        assert len(frames) == 8
+        import mlx.core as mx
+
+        rgb = mx.array(frames[6].to_ndarray(format="rgb24"))
+        height, width = int(rgb.shape[0]), int(rgb.shape[1])
+        left = float(mx.mean(
+            rgb[:, : width // 2, :].astype(mx.float32)))
+        # source sample 4 luma = 160; the stale at-or-before pick
+        # (sample 3) reads 120. Codec tolerance stays far from 120.
+        assert abs(left - 160.0) < 15.0

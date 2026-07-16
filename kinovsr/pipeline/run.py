@@ -30,7 +30,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -286,6 +286,105 @@ def _timing_view(
     return timing.timing() if isinstance(timing, SampleTable) else timing
 
 
+def _table_window_tail(table: SampleTable, start: int, end: int) -> Fraction:
+    """The final window frame's display duration on the source clock.
+
+    Coded duration first, then the grid interval; on a true-VFR clip the
+    MEDIAN window delta (robust to one discontinuity - the raw preceding
+    delta once held a splice gap as the tail). Shared by the file source
+    and the conform slot mapper so both see the same window end.
+    """
+    last = table.samples[end - 1]
+    if last.duration is not None:
+        return last.duration
+    if table.grid_cadence is not None:
+        return 1 / table.grid_cadence
+    deltas = sorted(
+        table.samples[i + 1].pts - table.samples[i].pts
+        for i in range(max(start, 0), end - 1)
+        if table.samples[i + 1].pts > table.samples[i].pts)
+    if deltas:
+        return deltas[len(deltas) // 2]
+    if table.duration > 0 and table.sample_count > 0:
+        return table.duration / table.sample_count
+    return Fraction(1, 25)
+
+
+def _leading_conform_cadence(
+    config: Any, table: SampleTable | None,
+) -> Fraction | None:
+    """The output rate of a chain-leading conform stage, or ``None``.
+
+    A conform stage changes unit cardinality, so source-ordinal GOP
+    windows must be remapped onto its output slots. Only the chain-head
+    position (the CLI contract) is supported; the caller refuses other
+    placements when a schedule is requested.
+    """
+    try:
+        pipeline = list(config.get("pipeline") or [])
+    except AttributeError:
+        return None
+    if not pipeline:
+        return None
+    stage = config.get(pipeline[0])
+    if not isinstance(stage, Mapping) or stage.get("processor") != "conform":
+        return None
+    spec = str(stage.get("fps", "auto")).strip().lower()
+    if spec != "auto":
+        return rational_cadence(spec)
+    if table is None:
+        return None
+    if table.grid_cadence is not None:
+        return table.grid_cadence
+    if table.duration > 0 and table.sample_count > 0:
+        return Fraction(table.sample_count) / table.duration
+    return None
+
+
+def _conform_slot_plan(
+    table: SampleTable, *, start: int, read_start: int, end: int,
+    fps: Fraction,
+) -> tuple[Any, int]:
+    """Source-ordinal to conform-output-slot mapping for GOP windows.
+
+    Returns ``(first_slot_of, total_slots)`` where ``first_slot_of(a)``
+    is the RELATIVE output ordinal of source frame ``a``'s first slot
+    under conform's nearest/midpoint rule (ties to the earlier frame,
+    final slot requires midpoint coverage), and ``total_slots`` is the
+    emitted unit count for [read_start, end). GOP windows planned in
+    this space stay aligned with the keyframes' images after the
+    cardinality change.
+    """
+    import math
+
+    origin = table.samples[start].pts
+
+    def t(a: int) -> Fraction:
+        return table.samples[a].pts - origin
+
+    def absolute_first_slot(a: int) -> int:
+        if a <= read_start:
+            return math.ceil(t(read_start) * fps)
+        mid = (t(a - 1) + t(a)) / 2
+        return math.floor(mid * fps) + 1
+
+    zero = absolute_first_slot(read_start)
+    last_time = t(end - 1)
+    tail = _table_window_tail(table, start, end)
+    half = 1 / (2 * fps)
+    span_end = last_time + tail
+    if span_end - half > last_time:
+        end_slot = math.floor((span_end - half) * fps) + 1
+    else:
+        end_slot = math.floor(last_time * fps) + 1
+    end_slot = max(end_slot, absolute_first_slot(end - 1) + 1)
+
+    def first_slot_of(a: int) -> int:
+        return absolute_first_slot(a) - zero
+
+    return first_slot_of, end_slot - zero
+
+
 @contextlib.contextmanager
 def _reporter_phase(reporter: Any, phase: str, *,
                     total: int | None, unit: str) -> Iterator[None]:
@@ -516,24 +615,7 @@ class FileSource:
         """The final window frame's display duration on the source clock."""
         table = self._table
         assert table is not None
-        last = table.samples[self.end - 1]
-        if last.duration is not None:
-            return last.duration
-        if table.grid_cadence is not None:
-            return 1 / table.grid_cadence
-        # Never the raw preceding delta: on a true-VFR clip whose last
-        # coded duration is missing, a splice gap right before the end
-        # would hold the final frame for the gap's length (and hand a
-        # conform stage a pile of bogus tail duplicates). The MEDIAN
-        # window delta is the honest typical frame duration, robust to
-        # one discontinuity.
-        deltas = sorted(
-            table.samples[i + 1].pts - table.samples[i].pts
-            for i in range(max(self.start, 0), self.end - 1)
-            if table.samples[i + 1].pts > table.samples[i].pts)
-        if deltas:
-            return deltas[len(deltas) // 2]
-        return 1 / self._nominal_from_table()
+        return _table_window_tail(table, self.start, self.end)
 
     def _window_stamps(self, read_start: int) -> list[tuple[int, int]]:
         """(pts, duration) ticks for [read_start, end): the rebased source
@@ -719,6 +801,20 @@ class FileSource:
                 f"{len(stamps)}-frame sample-table window; the decoder and "
                 f"the sample table disagree, refusing to mislabel carried "
                 f"timestamps")
+        # The identity guard above catches mid-stream skips; a decoder
+        # that eats the FINAL sample(s) exhausts naturally with every
+        # delivered identity still consecutive. Any table-backed decode
+        # must reach the window's last sample or say so - silently
+        # committing a truncated timeline while reporting the full
+        # frames_in count is exactly the failure this refuses.
+        if infos is not None and last_table_index != self.end - 1:
+            delivered = ("nothing" if last_table_index is None
+                         else f"through sample {last_table_index}")
+            raise MediaError(
+                f"{self.path.name}: decode delivered {delivered} but the "
+                f"window ends at sample {self.end - 1}; the source's final "
+                f"frame(s) did not decode, refusing to commit a silently "
+                f"truncated timeline")
 
     def audio_track(self, *, max_duration: Fraction | None = None) -> Any:
         """Open the source's bounded audio window, or None when absent.
@@ -1876,6 +1972,7 @@ class _ComparisonTee:
         for unit in units:
             self._retained.append(
                 (unit.pts * self._src_time_base,
+                 unit.source.index if unit.source is not None else None,
                  self._to_uint8_rgb(unit.payload, self._src_layout)))
             yield unit
 
@@ -1883,18 +1980,40 @@ class _ComparisonTee:
         """Composite ``unit`` against its paired source frame and append."""
         import mlx.core as mx
 
-        out_seconds = unit.pts * self._out_time_base
-        # Advance to the LATEST retained source frame at-or-before this
-        # output instant; drop everything strictly earlier (paired frames
-        # can repeat for cadence-upsampled outputs, so keep the pair).
-        while (len(self._retained) >= 2
-               and self._retained[1][0] <= out_seconds + 1e-9):
-            self._retained.popleft()
-        if not self._retained:
-            raise PipelineError(
-                "comparison tee has no retained source frame to pair with "
-                "an emitted output unit; the chain emitted before consuming")
-        pre = self._retained[0][1]
+        wanted = unit.source.index if unit.source is not None else None
+        if wanted is not None and self._retained \
+                and self._retained[0][1] is not None:
+            # The output carries its source sample's identity (conform
+            # keeps it on duplicated slots): pair EXACTLY. The time rule
+            # below picks the latest at-or-before frame, which is the
+            # wrong image whenever a nearest-slot stage assigned the slot
+            # to the LATER source of the pair.
+            while (len(self._retained) >= 2
+                   and self._retained[1][1] is not None
+                   and self._retained[1][1] <= wanted):
+                self._retained.popleft()
+            head = self._retained[0]
+            if head[1] != wanted:
+                raise PipelineError(
+                    f"comparison tee lost the source frame for sample "
+                    f"{wanted} (holding {head[1]}); pairing desynced")
+            pre = head[2]
+        else:
+            out_seconds = unit.pts * self._out_time_base
+            # Advance to the LATEST retained source frame at-or-before
+            # this output instant; drop everything strictly earlier
+            # (paired frames can repeat for cadence-upsampled outputs, so
+            # keep the pair). Identity-less outputs (interpolation
+            # synthesizes between sources) keep this rule.
+            while (len(self._retained) >= 2
+                   and self._retained[1][0] <= out_seconds + 1e-9):
+                self._retained.popleft()
+            if not self._retained:
+                raise PipelineError(
+                    "comparison tee has no retained source frame to pair "
+                    "with an emitted output unit; the chain emitted before "
+                    "consuming")
+            pre = self._retained[0][2]
         pre_up = mx.take(mx.take(pre, self._iy, axis=0), self._ix, axis=1)
         pre_f = pre_up.astype(mx.float32) / 255.0
         if self._out_layout is Layout.MLX_RGB_HWC:
@@ -2134,11 +2253,35 @@ def _run_file_reserved(
             enclosing = [k for k in keyframes if k <= start]
             read_start = max(enclosing) if enclosing else start
             context_frames = start - read_start
-            kf_rel = sorted({k - read_start for k in keyframes
-                             if read_start <= k < end_abs})
+            window_keyframes = [k for k in keyframes
+                                if read_start <= k < end_abs]
+            # A chain-leading conform stage changes unit cardinality: the
+            # schedule the drivers consume counts CONFORMED units, so the
+            # keyframe positions and total are mapped onto its output
+            # slots (source-ordinal windows silently truncated the run).
+            conform_fps = _leading_conform_cadence(config, table)
+            if conform_fps is None and any(
+                    isinstance(config.get(name), Mapping)
+                    and config.get(name, {}).get("processor") == "conform"
+                    for name in (config.get("pipeline") or [])):
+                raise MediaError(
+                    "gop-align windows count conformed units, so the "
+                    "conform stage must lead the chain (the CLI places it "
+                    "first); move it to the front or drop --gop-align")
+            if conform_fps is not None and table is not None:
+                first_slot_of, total_rel = _conform_slot_plan(
+                    table, start=start, read_start=read_start,
+                    end=end_abs, fps=conform_fps)
+                kf_rel = sorted({first_slot_of(k)
+                                 for k in window_keyframes})
+                plan_total = total_rel
+            else:
+                kf_rel = sorted({k - read_start
+                                 for k in window_keyframes})
+                plan_total = end_abs - read_start
             try:
                 windowing = plan_gop_windows(
-                    kf_rel, end_abs - read_start,
+                    kf_rel, plan_total,
                     gop_min_window, gop_max_window)
             except ValueError as exc:
                 raise MediaError(f"invalid GOP window bounds: {exc}") from exc
