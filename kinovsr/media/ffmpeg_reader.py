@@ -38,7 +38,13 @@ import mlx.core as mx
 from . import pixel_buffers as _pb
 from .chunks import validate_decode_chunk_size
 from .pixel_buffers import PIX_BGRA, PIX_RGBAHALF
-from .timing import AudioTiming, VideoTiming, analyze_sample_timing
+from .timing import (
+    AudioTiming,
+    SampleTable,
+    SampleTiming,
+    VideoTiming,
+    analyze_sample_table,
+)
 
 
 def _raise_ffmpeg_operation(
@@ -155,21 +161,31 @@ def probe_video(path: Path) -> tuple[int, int, float, int, Any, tuple[int, int] 
         container.close()
 
 
-def probe_video_timing(path: Path) -> VideoTiming:
-    """Classify exact packet presentation timestamps without decoding."""
+def read_sample_table(path: Path) -> SampleTable:
+    """One metadata-only demux walk of the video stream's packets.
+
+    Collects every packet's exact presentation time and duration plus its
+    keyframe flag and coded size, then classifies the timing as one grid,
+    gapped, or variable. No decode; mirrors the native reader's walk.
+    """
     container, vs = _open_video(path)
     try:
         time_base = Fraction(vs.time_base)
-        samples: list[tuple[Fraction, Fraction | None]] = []
+        samples: list[SampleTiming] = []
         for packet in container.demux(vs):
             if packet.pts is None or packet.size <= 0:
                 continue
             pts = Fraction(int(packet.pts)) * time_base
             duration = (Fraction(int(packet.duration)) * time_base
                         if packet.duration and packet.duration > 0 else None)
-            samples.append((pts, duration))
+            samples.append(SampleTiming(
+                pts=pts,
+                duration=duration,
+                is_sync=bool(packet.is_keyframe),
+                coded_size=int(packet.size),
+            ))
         try:
-            return analyze_sample_timing(
+            return analyze_sample_table(
                 samples, nominal_cadence=_fps(vs), source_tick=time_base)
         except ValueError as exc:
             raise RuntimeError(f"{path.name}: {exc}") from exc
@@ -177,6 +193,14 @@ def probe_video_timing(path: Path) -> VideoTiming:
         _raise_ffmpeg_operation("probing video timing in", path, exc)
     finally:
         container.close()
+
+
+def probe_video_timing(path: Path) -> VideoTiming:
+    """Classify exact packet presentation timestamps without decoding.
+
+    The legacy CFR-or-variable view over :func:`read_sample_table`'s walk.
+    """
+    return read_sample_table(path).timing()
 
 
 # libav color tags -> the CoreVideo token strings the native probe_color emits
@@ -753,7 +777,8 @@ def read_audio_track(path: Path) -> Any | None:
 
 
 __all__ = [
-    "probe_video", "probe_video_timing", "probe_color", "keyframe_display_indices",
+    "probe_video", "probe_video_timing", "read_sample_table", "probe_color",
+    "keyframe_display_indices",
     "iter_video_buffer_chunks", "iter_forced_color_chunks",
     "probe_audio_timing", "read_audio_track", "read_audio_track_window",
 ]

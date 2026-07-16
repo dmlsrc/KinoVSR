@@ -32,7 +32,13 @@ from kinovsr.native.frameworks import CoreMedia, Foundation, Quartz, av, vt
 
 from . import pixel_buffers as _pb
 from .chunks import validate_decode_chunk_size
-from .timing import AudioTiming, VideoTiming, analyze_sample_timing
+from .timing import (
+    AudioTiming,
+    SampleTable,
+    SampleTiming,
+    VideoTiming,
+    analyze_sample_table,
+)
 
 
 def _first_video_track(asset: Any) -> Any:
@@ -134,12 +140,16 @@ def _cm_time_fraction(value: Any) -> Fraction | None:
     return Fraction(int(value.value), timescale)
 
 
-def probe_video_timing(path: Path) -> VideoTiming:
-    """Read exact display PTS metadata and classify the track as CFR or VFR.
+def read_sample_table(path: Path) -> SampleTable:
+    """One metadata-only walk of the video track's coded samples.
 
-    The compressed track output performs no decode. Output presentation time
-    is intentional: unlike the raw sample PTS, it includes the asset's edit
-    mapping and is the clock AVAssetReader presents to decoded consumers.
+    Collects every display sample's exact presentation time and duration
+    plus its sync flag (``kCMSampleAttachmentKey_NotSync`` absent/false)
+    and coded payload size, then classifies the timing as one grid,
+    gapped, or variable. The compressed track output performs no decode.
+    Output presentation time is intentional: unlike the raw sample PTS,
+    it includes the asset's edit mapping and is the clock AVAssetReader
+    presents to decoded consumers.
     """
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
@@ -156,7 +166,7 @@ def probe_video_timing(path: Path) -> VideoTiming:
     if not reader.startReading():
         raise RuntimeError(f"AVAssetReader.startReading failed: {reader.error()}")
 
-    samples: list[tuple[Fraction, Fraction | None]] = []
+    samples: list[SampleTiming] = []
     natural_timescale = int(track.naturalTimeScale())
     source_tick = (Fraction(1, natural_timescale)
                    if natural_timescale > 0 else None)
@@ -174,7 +184,19 @@ def probe_video_timing(path: Path) -> VideoTiming:
         pts = _cm_time_fraction(pts_time)
         duration = _cm_time_fraction(duration_time)
         if pts is not None:
-            samples.append((pts, duration if duration and duration > 0 else None))
+            attachments = CoreMedia.CMSampleBufferGetSampleAttachmentsArray(
+                sample, False)
+            is_sync = True
+            if attachments and len(attachments) > 0:
+                is_sync = not bool(attachments[0].get(
+                    CoreMedia.kCMSampleAttachmentKey_NotSync))
+            coded_size = int(CoreMedia.CMSampleBufferGetTotalSampleSize(sample))
+            samples.append(SampleTiming(
+                pts=pts,
+                duration=duration if duration and duration > 0 else None,
+                is_sync=is_sync,
+                coded_size=coded_size if coded_size > 0 else None,
+            ))
             if natural_timescale <= 0:
                 tick = Fraction(1, int(pts_time.timescale))
                 source_tick = tick if source_tick is None else min(source_tick, tick)
@@ -185,13 +207,21 @@ def probe_video_timing(path: Path) -> VideoTiming:
     if source_tick is None:
         raise RuntimeError(f"{path.name}: video track contains no display samples")
     try:
-        return analyze_sample_timing(
+        return analyze_sample_table(
             samples,
             nominal_cadence=float(track.nominalFrameRate()),
             source_tick=source_tick,
         )
     except ValueError as exc:
         raise RuntimeError(f"{path.name}: {exc}") from exc
+
+
+def probe_video_timing(path: Path) -> VideoTiming:
+    """Read exact display PTS metadata and classify the track as CFR or VFR.
+
+    The legacy CFR-or-variable view over :func:`read_sample_table`'s walk.
+    """
+    return read_sample_table(path).timing()
 
 
 def probe_audio_timing(path: Path) -> AudioTiming | None:

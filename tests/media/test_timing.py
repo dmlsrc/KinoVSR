@@ -7,7 +7,13 @@ from fractions import Fraction
 import pytest
 
 from kinovsr.media import pixel_buffers
-from kinovsr.media.timing import analyze_sample_timing, grid_ticks
+from kinovsr.media.timing import (
+    SampleTiming,
+    TimingVerdict,
+    analyze_sample_table,
+    analyze_sample_timing,
+    grid_ticks,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -129,6 +135,201 @@ def test_one_source_tick_ntsc_quantization_is_still_cfr():
         samples, nominal_cadence=float(cadence), source_tick=tick)
     assert timing.cadence == cadence
     assert timing.sample_count == 120
+
+
+# ------------------------------------------------------------- table
+
+
+def _records(pairs, sync=None, sizes=None):
+    return [SampleTiming(
+        pts=pts,
+        duration=duration,
+        is_sync=None if sync is None else sync[i],
+        coded_size=None if sizes is None else sizes[i],
+    ) for i, (pts, duration) in enumerate(pairs)]
+
+
+def test_exact_grid_classifies_exact_cfr():
+    table = analyze_sample_table(
+        _records([(Fraction(i, 25), Fraction(1, 25)) for i in range(6)]),
+        nominal_cadence=25,
+        source_tick=Fraction(1, 25000),
+    )
+    assert table.verdict is TimingVerdict.EXACT_CFR
+    assert table.cadence == Fraction(25)
+    assert table.grid_cadence == Fraction(25)
+    assert table.timing() == analyze_sample_timing(
+        [(Fraction(i, 25), Fraction(1, 25)) for i in range(6)],
+        nominal_cadence=25,
+        source_tick=Fraction(1, 25000),
+    )
+
+
+def test_one_tick_quantized_grid_classifies_cfr_not_exact():
+    # NTSC on a 1/600 clock: 20.02 ticks per frame, so adjacent stamps
+    # alternate 20- and 21-tick intervals around the true grid.
+    cadence = Fraction(30000, 1001)
+    tick = Fraction(1, 600)
+    pairs = [
+        (round(Fraction(i) / cadence / tick) * tick, None)
+        for i in range(3000)
+    ]
+    table = analyze_sample_table(
+        _records(pairs), nominal_cadence=30, source_tick=tick)
+    assert table.verdict is TimingVerdict.CFR
+    assert table.cadence == cadence
+    assert table.grid_cadence == cadence
+
+
+def test_exact_tick_ntsc_grid_classifies_exact_cfr():
+    # A 1/30000 clock represents 30000/1001 exactly (1001 ticks per
+    # frame), so nothing alternates and the grid is exactly uniform.
+    cadence = Fraction(30000, 1001)
+    tick = Fraction(1, 30000)
+    pairs = [
+        (Fraction(round(Fraction(i) / cadence / tick)) * tick, None)
+        for i in range(120)
+    ]
+    table = analyze_sample_table(
+        _records(pairs), nominal_cadence=float(cadence), source_tick=tick)
+    assert table.verdict is TimingVerdict.EXACT_CFR
+    assert table.cadence == cadence
+
+
+def test_dropped_frame_on_exact_clock_classifies_gapped_cfr():
+    tick = Fraction(1, 25)
+    table = analyze_sample_table(
+        _records([(tick * value, tick) for value in (0, 1, 3, 4)]),
+        nominal_cadence=25,
+        source_tick=tick,
+    )
+    assert table.verdict is TimingVerdict.GAPPED_CFR
+    assert table.cadence is None            # legacy CFR accept unchanged
+    assert table.grid_cadence == Fraction(25)
+    assert table.timing().cadence is None   # the file pipeline's view
+
+
+def test_splice_gap_classifies_gapped_cfr():
+    pts = [Fraction(i, 25) for i in range(5)]
+    pts += [Fraction(i, 25) for i in range(105, 110)]
+    table = analyze_sample_table(
+        _records([(value, Fraction(1, 25)) for value in pts]),
+        nominal_cadence=25,
+        source_tick=Fraction(1, 25000),
+    )
+    assert table.verdict is TimingVerdict.GAPPED_CFR
+    assert table.grid_cadence == Fraction(25)
+
+
+def test_gapped_grid_recovers_from_modal_delta_without_nominal():
+    tick = Fraction(1, 30000)
+    pts = [Fraction(i, 30) for i in (0, 1, 2, 4, 5, 6, 8, 9)]
+    table = analyze_sample_table(
+        _records([(value, None) for value in pts]),
+        nominal_cadence=None,
+        source_tick=tick,
+    )
+    assert table.verdict is TimingVerdict.GAPPED_CFR
+    assert table.grid_cadence == Fraction(30)
+
+
+def test_multiple_of_grid_intervals_classify_gapped_not_vfr():
+    # The reclassification of the module's leading VFR fixture: every
+    # interval is an exact multiple of 1/30, so the clock is a gapped
+    # 30 fps grid; the legacy view still reports variable.
+    pts = [Fraction(0), Fraction(1, 30), Fraction(1, 10),
+           Fraction(2, 15), Fraction(7, 30)]
+    table = analyze_sample_table(
+        _records([(value, Fraction(1, 30)) for value in pts]),
+        nominal_cadence=15,
+        source_tick=Fraction(1, 30000),
+    )
+    assert table.verdict is TimingVerdict.GAPPED_CFR
+    assert table.grid_cadence == Fraction(30)
+    assert table.timing().cadence is None
+
+
+def test_duplicate_timestamps_classify_vfr():
+    table = analyze_sample_table(
+        _records([(Fraction(0), None), (Fraction(0), Fraction(1, 30)),
+                  (Fraction(1, 30), None)]),
+        nominal_cadence=30,
+        source_tick=Fraction(1, 30000),
+    )
+    assert table.verdict is TimingVerdict.VFR
+    assert table.grid_cadence is None
+
+
+def test_non_multiple_intervals_classify_vfr():
+    pts = [Fraction(0), Fraction(1, 30), Fraction(1, 30) + Fraction(1, 24),
+           Fraction(1, 30) + Fraction(1, 24) + Fraction(1, 30)]
+    table = analyze_sample_table(
+        _records([(value, None) for value in pts]),
+        nominal_cadence=30,
+        source_tick=Fraction(1, 90000),
+    )
+    assert table.verdict is TimingVerdict.VFR
+    assert table.grid_cadence is None
+
+
+def test_uniform_pts_with_variable_durations_stay_vfr():
+    # The duration cross-check rejected this as CFR; gapped rules must
+    # not quietly re-admit it (every interval multiple is one).
+    table = analyze_sample_table(
+        _records([(Fraction(0), Fraction(1, 30)),
+                  (Fraction(1, 30), Fraction(1, 30)),
+                  (Fraction(2, 30), Fraction(1))]),
+        nominal_cadence=30,
+        source_tick=Fraction(1, 30000),
+    )
+    assert table.verdict is TimingVerdict.VFR
+    assert table.grid_cadence is None
+
+
+def test_sync_flags_and_coded_sizes_are_carried_in_display_order():
+    pairs = [(Fraction(i, 25), Fraction(1, 25)) for i in range(4)]
+    sync = [True, False, False, True]
+    sizes = [9000, 1200, 1100, 8800]
+    decode_order = [0, 2, 1, 3]
+    table = analyze_sample_table(
+        _records([pairs[i] for i in decode_order],
+                 sync=[sync[i] for i in decode_order],
+                 sizes=[sizes[i] for i in decode_order]),
+        nominal_cadence=25,
+        source_tick=Fraction(1, 25000),
+    )
+    assert [sample.pts for sample in table.samples] == [p for p, _ in pairs]
+    assert [sample.is_sync for sample in table.samples] == sync
+    assert [sample.coded_size for sample in table.samples] == sizes
+    assert table.keyframe_indices == (0, 3)
+
+
+def test_absent_sync_flags_yield_no_keyframe_indices():
+    table = analyze_sample_table(
+        _records([(Fraction(i, 25), None) for i in range(3)]),
+        nominal_cadence=25,
+        source_tick=Fraction(1, 25000),
+    )
+    assert all(sample.is_sync is None for sample in table.samples)
+    assert table.keyframe_indices == ()
+
+
+@pytest.mark.parametrize("pairs,nominal,tick", [
+    ([(Fraction(i, 30), Fraction(1, 30)) for i in range(5)],
+     15, Fraction(1, 30000)),
+    ([(Fraction(1, 25) * v, Fraction(1, 25)) for v in (0, 1, 3, 4)],
+     25, Fraction(1, 25)),
+    ([(Fraction(0), None), (Fraction(0), Fraction(1, 30)),
+      (Fraction(1, 30), None)],
+     30, Fraction(1, 30000)),
+    ([(Fraction(10), Fraction(1, 24))], None, Fraction(1, 24000)),
+])
+def test_pair_view_matches_table_timing(pairs, nominal, tick):
+    assert analyze_sample_timing(
+        pairs, nominal_cadence=nominal, source_tick=tick,
+    ) == analyze_sample_table(
+        _records(pairs), nominal_cadence=nominal, source_tick=tick,
+    ).timing()
 
 
 @pytest.mark.parametrize("cadence", [
