@@ -2051,3 +2051,71 @@ class TestEpochResets:
         out_table = video_reader.read_sample_table(tmp_path / "joined.mp4")
         rebased = [s.pts - out_table.first_pts for s in out_table.samples]
         assert rebased == [Fraction(m, 30) for m in range(10)]
+
+
+class TestSampleIdentityPairing:
+    """Finding 5: frames are labeled by table position, not arrival order."""
+
+    @staticmethod
+    def _fake_reader(table, indices):
+        import mlx.core as mx
+
+        class Reader:
+            @staticmethod
+            def read_sample_table(_path):
+                return table
+
+            @staticmethod
+            def probe_video(_path):
+                return 64, 64, 25.0, table.sample_count, None, None
+
+            @staticmethod
+            def probe_color(_path):
+                return {"primaries": None, "transfer": None, "matrix": None,
+                        "full_range": False, "tagged": False,
+                        "guessed": False}
+
+            @staticmethod
+            def iter_video_buffer_chunks(_path, _fmt, chunk_size=8, *,
+                                         start_frame=0, end_frame=None,
+                                         timing=None, table=None):
+                frame = mx.zeros((64, 64, 3), dtype=mx.float32)
+                yield [(frame, i) for i in indices]
+
+        return Reader
+
+    @staticmethod
+    def _table(uniform):
+        from kinovsr.media.timing import SampleTiming, analyze_sample_table
+
+        if uniform:
+            pts = [Fraction(i, 25) for i in range(4)]
+        else:
+            pts = [Fraction(0), Fraction(1, 25),
+                   Fraction(1, 25) + Fraction(1, 30), Fraction(1, 5)]
+        return analyze_sample_table(
+            [SampleTiming(pts=p, duration=Fraction(1, 25)) for p in pts],
+            nominal_cadence=25, source_tick=Fraction(1, 90000))
+
+    def test_duplicate_sample_delivery_is_refused(self):
+        table = self._table(uniform=True)
+        reader = self._fake_reader(table, [0, 1, 1, 2])
+        with pytest.raises(MediaError, match="two frames for sample"):
+            list(FileSource("x.mp4", reader=reader, timing=table).units())
+
+    def test_skipped_sample_on_carry_is_refused(self):
+        table = self._table(uniform=False)
+        assert table.cadence is None
+        reader = self._fake_reader(table, [0, 2, 3])
+        with pytest.raises(MediaError, match="skipped sample"):
+            list(FileSource("x.mp4", reader=reader, timing=table).units())
+
+    def test_skipped_sample_on_uniform_grid_keeps_later_labels(self):
+        # A decoder drop must not shift every later stamp by one: grid
+        # labels follow the delivered sample identity.
+        table = self._table(uniform=True)
+        reader = self._fake_reader(table, [0, 2, 3])
+        units = list(
+            FileSource("x.mp4", reader=reader, timing=table).units())
+        assert [u.pts for u in units] == [0, 1920, 2880]   # 0, 2, 3 / 25
+        assert [u.source.index for u in units] == [0, 2, 3]

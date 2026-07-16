@@ -468,7 +468,12 @@ def _iter_chunks(path: Path, out_format: int, chunk_size: int,
                 continue
             if end_frame is not None and idx >= end_frame:
                 break
-            chunk.append(_frame_to_buffer(frame, out_format, attrs, reformat_kwargs))
+            buffer = _frame_to_buffer(frame, out_format, attrs, reformat_kwargs)
+            # With a table, label frames by SAMPLE IDENTITY so a decoder
+            # that drops or multiplies frames (packed-bitstream AVIs,
+            # dummy packets) cannot shift every later timestamp and
+            # raw-stream tag by one.
+            chunk.append((buffer, idx) if keys is not None else buffer)
             if len(chunk) >= chunk_size:
                 yield chunk
                 chunk = []

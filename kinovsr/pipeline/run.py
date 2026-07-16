@@ -646,33 +646,69 @@ class FileSource:
             chunk_iterator = iter(chunks)
         index = -self.context_frames
         emitted = 0
+        last_table_index: int | None = None
         while True:
             try:
                 with _media_operation("failed to decode video source", self.path):
                     chunk = next(chunk_iterator)
             except StopIteration:
                 break
-            for buffer in chunk:
+            for item in chunk:
+                # Table-backed readers deliver (buffer, table_index) pairs:
+                # frames are labeled by SAMPLE IDENTITY, so a decoder that
+                # drops or multiplies frames (packed-bitstream AVIs, dummy
+                # packets) fails loudly or keeps later labels correct
+                # instead of shifting every stamp and raw-stream tag.
+                if isinstance(item, tuple):
+                    buffer, table_index = item
+                else:
+                    buffer, table_index = item, None
                 if to_mlx:
                     with _media_operation(
                             "failed to read decoded pixel buffer", self.path):
                         payload = self._pb.read_buffer_rgb_f32(buffer)
                 else:
                     payload = buffer
-                if stamps is not None:
-                    if emitted >= len(stamps):
+                if table_index is not None:
+                    if (last_table_index is not None
+                            and table_index <= last_table_index):
                         raise MediaError(
-                            f"{self.path.name}: decode produced more frames "
-                            f"than the {len(stamps)}-frame sample-table "
-                            f"window; refusing to mislabel carried "
-                            f"timestamps")
-                    pts, duration = stamps[emitted]
+                            f"{self.path.name}: decode delivered two frames "
+                            f"for sample {table_index} (a multi-frame or "
+                            f"packed-bitstream packet); the sample table "
+                            f"cannot label them, refusing to guess")
+                    last_table_index = table_index
+                    rel = table_index - read_start
+                    if stamps is not None:
+                        if rel != emitted:
+                            raise MediaError(
+                                f"{self.path.name}: decode skipped sample "
+                                f"{read_start + emitted} and delivered "
+                                f"{table_index}; refusing to mislabel "
+                                f"carried timestamps")
+                        pts, duration = stamps[rel]
+                    else:
+                        grid_index = table_index - self.start
+                        pts = self._grid_ticks(grid_index)
+                        duration = self._grid_ticks(grid_index + 1) - pts
+                    source = (infos[rel]
+                              if infos is not None and 0 <= rel < len(infos)
+                              else None)
                 else:
-                    pts = self._grid_ticks(index)
-                    duration = self._grid_ticks(index + 1) - pts
-                source = (infos[emitted]
-                          if infos is not None and emitted < len(infos)
-                          else None)
+                    if stamps is not None:
+                        if emitted >= len(stamps):
+                            raise MediaError(
+                                f"{self.path.name}: decode produced more "
+                                f"frames than the {len(stamps)}-frame "
+                                f"sample-table window; refusing to mislabel "
+                                f"carried timestamps")
+                        pts, duration = stamps[emitted]
+                    else:
+                        pts = self._grid_ticks(index)
+                        duration = self._grid_ticks(index + 1) - pts
+                    source = (infos[emitted]
+                              if infos is not None and emitted < len(infos)
+                              else None)
                 yield FrameUnit(payload=payload, pts=pts, duration=duration,
                                 source=source)
                 index += 1

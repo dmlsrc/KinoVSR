@@ -457,7 +457,8 @@ def iter_forced_color_chunks(
             start_frame=start_frame, end_frame=end_frame, timing=timing,
             table=table):
         out: list = []
-        for yuv in chunk:
+        for item in chunk:
+            yuv, idx = item if isinstance(item, tuple) else (item, None)
             if retype_fmt is not None:
                 yuv = _retype_range_copy(yuv, retype_fmt)
             Quartz.CVBufferSetAttachment(
@@ -472,7 +473,7 @@ def iter_forced_color_chunks(
             e = vt.VTPixelTransferSessionTransferImage(xfer, yuv, dst)
             if e != 0:
                 raise RuntimeError(f"forced-color YUV->{out_format:#x} transfer failed: {e}")
-            out.append(dst)
+            out.append((dst, idx) if idx is not None else dst)
         yield out
 
 
@@ -597,7 +598,10 @@ def iter_video_buffer_chunks(
     # The table's stamps are on the unwrapped monotonic clock; decoded
     # samples arrive with raw stamps, so the decode path runs the same
     # streaming mapping. Every sample pushes (kept or not) to keep the
-    # two mappings aligned.
+    # two mappings aligned. With a table, each kept buffer is yielded as
+    # a (buffer, table_index) pair so the consumer labels frames by
+    # SAMPLE IDENTITY instead of arrival ordinal - a decoder that drops
+    # or multiplies frames can then no longer shift every later label.
     trim_unwrapper = EpochUnwrapper() if keys is not None else None
     while True:
         sample_buf = output.copyNextSampleBuffer()
@@ -605,30 +609,31 @@ def iter_video_buffer_chunks(
             break
         image_buf = CoreMedia.CMSampleBufferGetImageBuffer(sample_buf)
         keep = image_buf is not None
-        if trimming and (keys is not None or fps > 0):
+        idx: int | None = None
+        if keys is not None or (trimming and fps > 0):
             # Frame-exact window enforcement by presentation timestamp.
             pts = _cm_time_fraction(
                 CoreMedia.CMSampleBufferGetOutputPresentationTimeStamp(
                     sample_buf))
             if pts is not None and trim_unwrapper is not None:
                 pts = trim_unwrapper.push(pts)
-            if not keep:
-                pass
-            elif pts is None:
+            if pts is None:
                 idx = 0
             elif keys is not None:
                 idx = bisect.bisect_right(keys, pts) - 1
             else:
                 idx = round((pts - origin) * cadence)
-            if keep and idx < start_frame:
+            if trimming and keep and idx < start_frame:
                 keep = False
-            elif keep and end_frame is not None and idx >= end_frame:
+            elif trimming and keep and end_frame is not None \
+                    and idx >= end_frame:
                 del sample_buf
                 break
         # Release the owning sample buffer now; the image buffer outlives it.
         del sample_buf
         if keep:
-            chunk.append(image_buf)
+            chunk.append((image_buf, idx) if keys is not None
+                         else image_buf)
             if len(chunk) >= chunk_size:
                 yield chunk
                 chunk = []
