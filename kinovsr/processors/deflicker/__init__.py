@@ -88,7 +88,8 @@ class StaticStateDeflicker:
                  frac: float = 0.5, max_fix: float = 0.25,
                  tau: float = 0.75, min_valid: int = 6,
                  strength: float = 1.0, jitter: bool = False,
-                 jitter_max: float = 3.0, illum_veto: bool = True):
+                 jitter_max: float = 3.0, illum_veto: bool = True,
+                 gop: bool = True):
         # window: +/-K frames integrated (latency = K).
         # band: luma half-width around the window median that counts as the
         #   same quantization-state cluster; the reference regime's state
@@ -123,6 +124,18 @@ class StaticStateDeflicker:
         # light dynamics (e.g. archival scans) where every oscillation is
         # junk.
         self._illum_veto = bool(illum_veto)
+        # gop: sync-keyed pumping rescue. The oscillatory gate refuses a
+        # single state STEP (net ~ tv reads as a lighting step at window
+        # scale), so a window containing exactly one GOP-boundary reset -
+        # the I-frame pop, the most legible pumping artifact - never fires
+        # when the window is shorter than the GOP. Frames that arrive with
+        # sync flags say exactly where coding state resets: discounting
+        # only the sync-pair deltas from the profile and re-testing makes
+        # a flat -> step-at-I -> flat profile fixable while a real ramp
+        # stays refused (its residual is still monotone after removing one
+        # pair). Real light steps that happen to land on an I-frame are
+        # still caught downstream by the sign-coherence veto.
+        self._gop = bool(gop)
         # gate attribution (run averages); lives OUTSIDE _reset_state so it
         # survives flush() and cut-boundary resets -- it describes the run,
         # not the buffer
@@ -133,11 +146,13 @@ class StaticStateDeflicker:
         self._stat_applied = 0.0
         self._stat_jit_px = 0.0
         self._stat_jit_pairs = 0
+        self._stat_gop_rescued = 0.0
 
         self._reset_state()
 
     def _reset_state(self) -> None:
-        self._buf: list = []             # [(rgb (H,W,3) fp32, luma, token)]
+        # [(rgb (H,W,3) fp32, luma, token, is_sync)]
+        self._buf: list = []
         self._base = 0                   # index of _buf[0]
         self._received = 0
         self._emitted = 0
@@ -165,6 +180,7 @@ class StaticStateDeflicker:
                 "verified": self._stat_verified / n,
                 "oscillatory": self._stat_osc / n,
                 "applied": self._stat_applied / n,
+                "gop_rescued": self._stat_gop_rescued / n,
                 "jitter_px": (self._stat_jit_px / self._stat_jit_pairs
                               if self._stat_jit_pairs else 0.0)}
 
@@ -172,10 +188,12 @@ class StaticStateDeflicker:
         st = self.stats()
         jit = (f", compensated jitter avg {st['jitter_px']:.2f}px"
                if st["jitter_px"] else "")
+        gop = (f", gop-rescued {st['gop_rescued'] * 100:.1f}%"
+               if st["gop_rescued"] else "")
         return [
             f"[deflicker] run avg: static-verified "
             f"{st['verified'] * 100:.1f}% of pixels, oscillatory "
-            f"{st['oscillatory'] * 100:.1f}%, fired "
+            f"{st['oscillatory'] * 100:.1f}%{gop}, fired "
             f"{st['fired'] * 100:.1f}%, applied "
             f"{st['applied'] * 1000:.2f}e-3 luma{jit} "
             f"(verification is the scope gate: bounded by "
@@ -297,7 +315,7 @@ class StaticStateDeflicker:
 
     def _emit_one(self, last: int) -> tuple:
         t = self._emitted
-        cur, cur_l, tok = self._buf[t - self._base]
+        cur, cur_l, tok, _cur_sync = self._buf[t - self._base]
         lo, hi = max(self._base, t - self._k), min(last, t + self._k)
         idx = list(range(lo, hi + 1))
         if len(idx) < 2:
@@ -319,7 +337,7 @@ class StaticStateDeflicker:
                 Ss.append(w)
                 SLs.append(_to_luma_2d(w))
             else:
-                rgbj, lj, _tok = self._buf[j - self._base]
+                rgbj, lj, _tok, _sync = self._buf[j - self._base]
                 Ss.append(rgbj)
                 SLs.append(lj)
             Vs.append(m)
@@ -339,13 +357,40 @@ class StaticStateDeflicker:
         # validity cells the damage prints square seams on lighting changes
         # (user-reported); with it, ramp regions produce no correction at
         # any band setting.
-        dj = mx.abs(SL[1:] - SL[:-1]) * V[1:] * V[:-1]
+        d_signed = (SL[1:] - SL[:-1]) * (V[1:] * V[:-1])
+        dj = mx.abs(d_signed)
         tv = mx.sum(dj, axis=0)
         first_i = mx.argmax(V, axis=0).astype(mx.int32)[None]
         last_i = (M - 1 - mx.argmax(V[::-1], axis=0)).astype(mx.int32)[None]
         y_first = mx.take_along_axis(SL, first_i, axis=0)[0]
         y_last = mx.take_along_axis(SL, last_i, axis=0)[0]
-        oscillatory = mx.abs(y_last - y_first) <= 0.6 * tv + 1.5 / 255.0
+        net = mx.abs(y_last - y_first)
+        oscillatory = net <= 0.6 * tv + 1.5 / 255.0
+        gop_rescued = None
+        if self._gop:
+            # Sync-keyed pumping rescue: a window holding exactly one
+            # GOP-boundary state reset reads as a monotone step (net ~ tv)
+            # and the base gate refuses it - correctly, for an unexplained
+            # step, but this step sits exactly where the coded stream
+            # declares a coding restart. Discount ONLY the deltas of pairs
+            # that straddle a sync sample and re-test: a flat-step-flat
+            # pump profile becomes oscillatory (residual net ~ 0), while a
+            # real ramp stays refused (its residual is still monotone
+            # after removing one pair). A genuine light step landing on an
+            # I-frame is still vetoed downstream by sign-coherence.
+            sync_pairs = [
+                1.0 if self._buf[idx[p + 1] - self._base][3] else 0.0
+                for p in range(M - 1)
+            ]
+            if any(sync_pairs):
+                s = mx.array(sync_pairs, dtype=mx.float32).reshape(
+                    M - 1, 1, 1)
+                sync_net = mx.sum(d_signed * s, axis=0)
+                tv_rest = tv - mx.sum(dj * s, axis=0)
+                osc_gop = (mx.abs((y_last - y_first) - sync_net)
+                           <= 0.6 * tv_rest + 1.5 / 255.0)
+                gop_rescued = osc_gop & ~oscillatory
+                oscillatory = oscillatory | osc_gop
         # median of admitted samples: invalid sort past the [0,1] range
         SL_m = mx.where(V > 0.5, SL, mx.full(SL.shape, 2.0))
         SL_s = mx.sort(SL_m, axis=0)
@@ -400,8 +445,8 @@ class StaticStateDeflicker:
         # leaves one bracket frame contaminated (pair fails or disagrees),
         # so persistent content is safe.
         if t - 1 >= self._base and t + 1 <= last:
-            pv, pv_l, _ = self._buf[t - 1 - self._base]
-            nx_, nx_l, _ = self._buf[t + 1 - self._base]
+            pv, pv_l, _, _ = self._buf[t - 1 - self._base]
+            nx_, nx_l, _, _ = self._buf[t + 1 - self._base]
             # bracket values stay raw: adjacent-pair jitter is sub-tau and
             # the agree/anom gates refuse where a residual shift matters
             br_ok, _bgy, _bgx = self._pair_mask(t - 1, t + 1)
@@ -421,15 +466,20 @@ class StaticStateDeflicker:
             fire = mx.minimum(fire + fire2, 1.0)
         out = mx.clip(out, 0.0, 1.0)
         verified = (n_valid >= self._min_valid)
+        rescued = (mx.mean((gop_rescued & verified).astype(mx.float32))
+                   if gop_rescued is not None
+                   else mx.zeros((), dtype=mx.float32))
         stat = mx.stack([mx.mean(fire), mx.mean(verified.astype(mx.float32)),
                          mx.mean((verified & oscillatory).astype(mx.float32)),
-                         mx.mean(mx.abs(_to_luma_2d(out) - cur_l))])
+                         mx.mean(mx.abs(_to_luma_2d(out) - cur_l)),
+                         rescued])
         mx.eval(out, stat)
         self._stat_frames += 1
         self._stat_fired += float(stat[0])
         self._stat_verified += float(stat[1])
         self._stat_osc += float(stat[2])
         self._stat_applied += float(stat[3])
+        self._stat_gop_rescued += float(stat[4])
         self._emitted += 1
         keep = self._emitted - self._k
         while self._base < keep and self._buf:
@@ -442,7 +492,9 @@ class StaticStateDeflicker:
     def feed(self, rgb: Any, token: Any = None) -> list:
         a = rgb[0] if rgb.ndim == 4 else rgb
         a = mx.clip(a[..., :3].astype(mx.float32), 0.0, 1.0)
-        self._buf.append((a, _to_luma_2d(a), token))
+        source = getattr(token, "source", None)
+        is_sync = bool(getattr(source, "is_sync", None) or False)
+        self._buf.append((a, _to_luma_2d(a), token, is_sync))
         self._received += 1
         last = self._received - 1
         ready = []
@@ -471,6 +523,7 @@ class DeflickerStageConfig:
     max_fix: float
     jitter: bool
     strength: float
+    gop: bool
 
 
 def _passthrough(spec: StreamSpec, config: object) -> StreamSpec:
@@ -509,7 +562,8 @@ class DeflickerFactory:
         settings: Settings,
     ) -> DeflickerStageConfig:
         reject_unknown_keys(
-            raw, ("window", "band", "frac", "max_fix", "jitter", "strength"))
+            raw, ("window", "band", "frac", "max_fix", "jitter", "strength",
+                  "gop"))
         window = typed_value(raw, "window", int, 8)
         if window < 1:
             raise ValueError("window must be >= 1")
@@ -518,11 +572,12 @@ class DeflickerFactory:
         max_fix = typed_value(raw, "max_fix", float, 0.25)
         jitter = typed_value(raw, "jitter", bool, False)
         strength = typed_value(raw, "strength", float, 1.0)
+        gop = typed_value(raw, "gop", bool, True)
         if not 0.0 <= strength <= 1.0:
             raise ValueError("strength must be in [0, 1]")
         return DeflickerStageConfig(
             window=window, band=band, frac=frac, max_fix=max_fix,
-            jitter=jitter, strength=strength)
+            jitter=jitter, strength=strength, gop=gop)
 
     def build(self, config: DeflickerStageConfig, *,
               context: PipelineContext) -> FeedFlushProcessor:
@@ -530,7 +585,7 @@ class DeflickerFactory:
             return StaticStateDeflicker(
                 window=config.window, band=config.band, frac=config.frac,
                 max_fix=config.max_fix, jitter=config.jitter,
-                strength=config.strength)
+                strength=config.strength, gop=config.gop)
 
         return FeedFlushProcessor(make_driver)
 

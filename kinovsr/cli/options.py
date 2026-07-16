@@ -78,7 +78,7 @@ FAMILY_KEYS: dict[str, frozenset[str]] = {
     "realbasicvsr": frozenset({"clean_iters", "clean_threshold",
                                "residual_strength"}),
     "nafnet": frozenset({"pool"}),
-    "deflicker": frozenset({"band", "frac", "max_fix", "jitter"}),
+    "deflicker": frozenset({"band", "frac", "max_fix", "jitter", "gop"}),
     "denoise": frozenset({"first"}),
     # Conditioning subsystems and foundation prefixes lock their keys the
     # same way so the whole prefixed surface stays deliberate.

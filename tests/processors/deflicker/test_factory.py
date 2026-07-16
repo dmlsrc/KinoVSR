@@ -47,7 +47,7 @@ class TestParse:
     def test_defaults_match_the_cli(self):
         assert parse({}) == DeflickerStageConfig(
             window=8, band=0.1, frac=0.5, max_fix=0.25,
-            jitter=False, strength=1.0)
+            jitter=False, strength=1.0, gop=True)
 
     def test_bounds(self):
         with pytest.raises(ValueError, match="window"):

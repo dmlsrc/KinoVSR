@@ -244,3 +244,109 @@ def test_nonmultiple16_margin_passes_through():
     margin_dx = float(mx.max(mx.abs(outs[t][:, 240:] - clip[t][:, 240:])))
     assert interior_fixed > 0.01          # the interior integrates
     assert margin_dy < 1e-6 and margin_dx < 1e-6
+
+
+# ---- sync-keyed GOP-pumping rescue ----------------------------------------
+
+
+def _run_sync(clip, sync_at, **kw):
+    """Run with tokens carrying raw-stream sync flags (the file endpoint's
+    FrameUnit.source shape)."""
+    from types import SimpleNamespace
+
+    from kinovsr.processors.units import SourceFrameInfo
+
+    s = StaticStateDeflicker(**kw)
+    outs = []
+    for i, f in enumerate(clip):
+        token = SimpleNamespace(source=SourceFrameInfo(
+            index=i, is_sync=i in sync_at))
+        outs += s.feed(f, token=token)
+    outs += s.flush()
+    assert [tok.source.index for _o, tok in outs] == list(range(len(clip)))
+    return [o for o, _tok in outs], s
+
+
+def _sign_mixed_step():
+    # A persistent block-scale re-quantization step: half the 8px blocks
+    # land above the old state, half below (sign-mixed, like real codec
+    # block re-rolls; a same-signed field is the illumination veto's job).
+    mx.random.seed(31)
+    sign = mx.where(_blocky((H, W)) > 0.5, 1.0, -1.0)
+    return 0.04 * sign
+
+
+def test_single_gop_step_is_refused_without_sync_keying():
+    # The base oscillatory gate reads one state step as a possible
+    # lighting step (net ~ tv) and correctly refuses it; without sync
+    # flags this footage keeps its I-frame pop. Pins the baseline the
+    # rescue is measured against.
+    base = _base()
+    step = _sign_mixed_step()
+    cut = T // 2
+    clip = [mx.clip(base + (step if t >= cut else 0.0), 0, 1)
+            for t in range(T)]
+    outs, _s = _run_sync(clip, sync_at=set(), gop=True)
+    worst = max(float(mx.max(mx.abs(o - c)))
+                for o, c in zip(outs, clip, strict=True))
+    assert worst < 0.012, f"unexplained step altered by {worst}"
+
+
+def test_gop_step_at_sync_sample_is_softened():
+    # The same step, now landing exactly where the stream declares a
+    # coding restart: the sync-keyed re-test discounts the sync-pair
+    # delta, the profile reads flat-step-flat, and the boundary pop is
+    # integrated toward the dwell mixture.
+    base = _base()
+    step = _sign_mixed_step()
+    cut = T // 2
+    clip = [mx.clip(base + (step if t >= cut else 0.0), 0, 1)
+            for t in range(T)]
+    outs, s = _run_sync(clip, sync_at={cut}, gop=True)
+    pop_in = float(mx.mean(mx.abs(clip[cut] - clip[cut - 1])))
+    pop_out = float(mx.mean(mx.abs(outs[cut] - outs[cut - 1])))
+    assert pop_out < 0.5 * pop_in, (pop_in, pop_out)
+    assert s.stats()["gop_rescued"] > 0.0
+    # far from the boundary the window sees no step: passthrough
+    tail = float(mx.max(mx.abs(outs[T - 2] - clip[T - 2])))
+    assert tail < 0.012, f"far tail altered by {tail}"
+
+
+def test_gop_rescue_off_reproduces_baseline_exactly():
+    base = _base()
+    step = _sign_mixed_step()
+    cut = T // 2
+    clip = [mx.clip(base + (step if t >= cut else 0.0), 0, 1)
+            for t in range(T)]
+    with_flags, _s = _run_sync(clip, sync_at={cut}, gop=False)
+    without_flags, _s2 = _run_sync(clip, sync_at=set(), gop=False)
+    for a, b in zip(with_flags, without_flags, strict=True):
+        assert float(mx.max(mx.abs(a - b))) == 0.0
+
+
+def test_lighting_ramp_with_sync_frames_stays_passthrough():
+    # A ramp crossing an I-frame only loses one pair's delta in the
+    # re-test; the residual profile is still monotone, so the rescue must
+    # not flatten it (the ramp-safety property of discounting ONLY
+    # sync-pair deltas).
+    base = _base()
+    tt = mx.arange(T).astype(mx.float32) / (T - 1)
+    clip = [mx.clip(base * (0.88 + 0.20 * float(g)), 0, 1) for g in tt]
+    outs, _s = _run_sync(clip, sync_at={T // 2}, gop=True)
+    worst = max(float(mx.max(mx.abs(o - c)))
+                for o, c in zip(outs, clip, strict=True))
+    assert worst < 0.012, f"ramp altered by {worst}"
+
+
+def test_coherent_light_step_at_sync_sample_stays_refused():
+    # A real light STEP that happens to land on an I-frame passes the
+    # sync-keyed gate but its correction field is same-signed everywhere:
+    # the sign-coherence veto still refuses it. The residual-risk pin.
+    base = _base()
+    cut = T // 2
+    clip = [mx.clip(base + (0.04 if t >= cut else 0.0), 0, 1)
+            for t in range(T)]
+    outs, _s = _run_sync(clip, sync_at={cut}, gop=True)
+    pop_in = float(mx.mean(mx.abs(clip[cut] - clip[cut - 1])))
+    pop_out = float(mx.mean(mx.abs(outs[cut] - outs[cut - 1])))
+    assert pop_out > 0.85 * pop_in, (pop_in, pop_out)
