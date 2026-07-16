@@ -597,21 +597,53 @@ class TestFileSource:
         coarse = video_reader.probe_stream_descriptor(gapped_keyframes_clip)
         assert coarse["codec"] == "avc1"
 
-    def test_interpolation_on_carried_timeline_names_the_stage(
+    def test_interpolation_on_carried_timeline_yields_a_uniform_grid(
             self, vfr_clip, tmp_path):
-        from kinovsr.processors.errors import PipelineError
+        # The gapped five-frame source (stamps 0, 1/30, 1/10, 2/15, 7/30,
+        # final duration 1/30) spans 8/30 s. Interpolating to a uniform
+        # 30 fps brackets the target slots between REAL source stamps -
+        # synthesizing across the dropped-frame gaps - and the output is
+        # exact CFR: 8 frames on the 30 fps grid.
+        from kinovsr.media import video_reader
+        from kinovsr.media.timing import TimingVerdict
 
         config = {
             "pipeline": ["fps"],
             "fps": {"processor": "videotoolbox", "profile": "normal",
-                    "target_fps": 50},
+                    "target_fps": 30},
         }
-        with pytest.raises(PipelineError) as caught:
-            run_file(
-                config, video=vfr_clip, output=tmp_path / "o.mp4",
-                settings=SETTINGS, layout=Layout.CV_RGBA_HALF)
-        message = str(caught.value)
-        assert "cadence" in message or "variable" in message
+        output = tmp_path / "conformed.mp4"
+        result = run_file(
+            config, video=vfr_clip, output=output,
+            settings=SETTINGS, layout=Layout.CV_RGBA_HALF)
+        assert result.frames_in == 5
+        assert result.frames_out == 8
+        table = video_reader.read_sample_table(output)
+        assert table.verdict is TimingVerdict.EXACT_CFR
+        assert table.cadence == Fraction(30)
+        assert table.sample_count == 8
+
+    def test_conform_maps_carried_timeline_to_uniform_grid(
+            self, vfr_clip, tmp_path):
+        # Nearest-slot dup/drop onto the 30 fps grid: the gapped 5-frame
+        # source (grid slots 0, 1, 3, 4, 7 of 30) fills 8 slots by
+        # duplicating across its gaps - every output frame an ORIGINAL,
+        # nothing synthesized.
+        from kinovsr.media import video_reader
+        from kinovsr.media.timing import TimingVerdict
+
+        config = {
+            "pipeline": ["cfr"],
+            "cfr": {"processor": "conform", "fps": "30"},
+        }
+        output = tmp_path / "conform.mp4"
+        result = run_file(
+            config, video=vfr_clip, output=output, settings=SETTINGS)
+        assert result.frames_in == 5
+        assert result.frames_out == 8
+        table = video_reader.read_sample_table(output)
+        assert table.verdict is TimingVerdict.EXACT_CFR
+        assert table.cadence == Fraction(30)
 
     def test_non_uniform_run_preserves_every_source_stamp(
             self, vfr_clip, tmp_path):

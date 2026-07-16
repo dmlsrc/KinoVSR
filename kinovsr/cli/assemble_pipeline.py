@@ -139,6 +139,19 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
         if slot is not None:
             slot_members.setdefault(slot, []).append(name)
 
+    # ---- timeline: explicit CFR conform (ingest normalization) -----------
+    # First in the chain: it retains one frame of lookahead, which the
+    # bounded zero-copy pools downstream (upscale -> writer) do not budget
+    # for, and dropped frames should not be processed at all.
+    conform_cfr = getattr(options, "conform_cfr", None)
+    if conform_cfr and options.target_fps:
+        raise ValueError(
+            "--conform-cfr and --target-fps are both timeline "
+            "normalizations; pick one (--target-fps interpolates onto its "
+            "grid, --conform-cfr duplicates/drops original frames)")
+    if conform_cfr:
+        add("conform", {"processor": "conform", "fps": str(conform_cfr)})
+
     # ---- geometry: crop (bars + trim + aspect), sanitize fill, square ----
     crop_table: dict[str, Any] = {"processor": "crop"}
     bars_spec = options.crop_bars

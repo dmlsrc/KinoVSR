@@ -85,6 +85,7 @@ FAMILY_KEYS: dict[str, frozenset[str]] = {
     "noise_map": frozenset({"gain", "debug", "refresh", "masking",
                             "motion_cap", "floor_mode", "floor", "pulse"}),
     "deblock_map": frozenset({"gain"}),
+    "conform": frozenset({"fps"}),
     "cut": frozenset({"detect", "threshold", "log"}),
     "crop": frozenset({"bars", "aspect", "anchor", "offset"}),
     "sanitize_edges": frozenset({"fill", "feather"}),

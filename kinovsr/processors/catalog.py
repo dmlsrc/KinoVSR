@@ -80,6 +80,11 @@ _CATALOG: dict[str, CatalogEntry] = {
             "kinovsr.processors.crop:FACTORY",
             (30, "CROP_OPTIONS")),
         _entry(
+            "conform",
+            "kinovsr.processors.conform:FACTORY",
+            (85, "CONFORM_OPTIONS"),
+        ),
+        _entry(
             "cut_detect",
             "kinovsr.processors.cut_detect:FACTORY",
             (50, "CUT_OPTIONS"),

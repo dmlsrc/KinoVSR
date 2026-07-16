@@ -31,7 +31,7 @@ from kinovsr.processors.capabilities import (
     CapabilitySpec,
     TemporalMode,
 )
-from kinovsr.processors.errors import MediaError, PipelineError
+from kinovsr.processors.errors import MediaError
 from kinovsr.processors.protocol import PipelineContext
 from kinovsr.processors.specs import (
     Cardinality,
@@ -88,22 +88,23 @@ def _parse_fps(value: Any) -> Fraction:
 
 def _produces(spec: StreamSpec, config: object) -> StreamSpec:
     assert isinstance(config, VtInterpolateConfig)
-    if not isinstance(spec.timeline.cadence, Fraction):
-        # The capability's StreamConstraint (cadences=(Fraction,)) names
-        # this properly at build time; guard the cadence arithmetic for
-        # direct spec-transform callers.
-        raise PipelineError(
-            "videotoolbox interpolation requires a constant-cadence input "
-            "timeline; this chain carries the source's variable timing")
+    cadence = spec.timeline.cadence
+    # A carried non-uniform timeline interpolates by real source times
+    # (the session's per-destination phase array carries arbitrary
+    # spacing); its unit-count relation to the source is judged against
+    # the nominal rate when one exists.
+    reference = (cadence if isinstance(cadence, Fraction)
+                 else spec.timeline.nominal_cadence)
     timeline = dataclasses.replace(
         spec.timeline,
         cadence=config.target_fps,
         timestamp_policy=TimestampPolicy.REGENERATED,
         cardinality=(
             Cardinality.ONE_TO_MANY
-            if config.target_fps > spec.timeline.cadence
+            if reference is None or config.target_fps > reference
             else Cardinality.MANY_TO_ONE
         ),
+        nominal_cadence=None,
     )
     # VTFrameRateConversion always emits its destination currency,
     # RGBAHalf, regardless of whether the accepted source was BGRA, NV12,
@@ -136,6 +137,8 @@ class VtInterpolateProcessor:
         self._session: Any = None
         self._time_base: Fraction | None = None
         self._source_cadence: Fraction | None = None
+        self._nominal: Fraction | None = None
+        self._last_hold: Fraction | None = None
         self._publication_origin_pts: int | None = None
         self._target_index: int | None = None
         self._input_end_pts: int | None = None
@@ -172,10 +175,16 @@ class VtInterpolateProcessor:
         from kinovsr.native.temporal import VtfrcSession
 
         cadence = input_spec.timeline.cadence
-        assert isinstance(cadence, Fraction)
+        uniform = isinstance(cadence, Fraction)
         geometry = input_spec.frame.geometry
         self._time_base = input_spec.timeline.time_base
-        self._source_cadence = cadence
+        # Uniform sources keep the exact index grid (bit-identical to the
+        # historical mapping); a carried timeline feeds real times and the
+        # nominal rate serves only as the session's identity hint.
+        self._source_cadence = cadence if uniform else None
+        self._nominal = (cadence if uniform
+                         else (input_spec.timeline.nominal_cadence
+                               or Fraction(30)))
         self._publication_origin_pts = context.publication_origin_pts
         output_pool_binding, self._output_pool_binding = (
             self._output_pool_binding,
@@ -190,7 +199,7 @@ class VtInterpolateProcessor:
             self._session = VtfrcSession(
                 geometry.width,
                 geometry.height,
-                source_fps=cadence,
+                source_fps=self._nominal,
                 target_fps=self._config.target_fps,
                 mode=self._config.mode,
             )
@@ -212,24 +221,38 @@ class VtInterpolateProcessor:
                 unit.pts if self._publication_origin_pts is None else self._publication_origin_pts
             )
         assert self._time_base is not None
-        assert self._source_cadence is not None
-        index = round(Fraction(unit.pts - self._origin) * self._time_base * self._source_cadence)
-        source_step = grid_ticks(index + 1, self._source_cadence, self._time_base) - grid_ticks(
-            index, self._source_cadence, self._time_base
-        )
-        self._input_end_pts = unit.pts + (unit.duration if unit.duration > 0 else source_step)
-        if self._target_index is None:
-            self._target_index = math.ceil(
-                Fraction(index) * self._config.target_fps / self._source_cadence
-            )
         payload = unit.payload
         if self._upload_bridge is not None:
             payload = self._upload_bridge.upload(payload)
-        for produced in self._session.feed(payload, index):
-            unit = self._emit(produced)
+        if self._source_cadence is not None:
+            index = round(Fraction(unit.pts - self._origin) * self._time_base * self._source_cadence)
+            source_step = grid_ticks(index + 1, self._source_cadence, self._time_base) - grid_ticks(
+                index, self._source_cadence, self._time_base
+            )
+            self._input_end_pts = unit.pts + (unit.duration if unit.duration > 0 else source_step)
+            if self._target_index is None:
+                self._target_index = math.ceil(
+                    Fraction(index) * self._config.target_fps / self._source_cadence
+                )
+            produced_iter = self._session.feed(payload, index)
+        else:
+            # Carried non-uniform timeline: feed the frame's REAL time; the
+            # session brackets target grid slots between real stamps.
+            assert self._nominal is not None
+            src_time = Fraction(unit.pts - self._origin) * self._time_base
+            fallback = max(round(1 / self._nominal / self._time_base), 1)
+            hold_ticks = unit.duration if unit.duration > 0 else fallback
+            self._last_hold = Fraction(hold_ticks) * self._time_base
+            self._input_end_pts = unit.pts + hold_ticks
+            if self._target_index is None:
+                self._target_index = math.ceil(
+                    src_time * self._config.target_fps)
+            produced_iter = self._session.feed_at(payload, src_time)
+        for produced in produced_iter:
+            out = self._emit(produced)
             if self._pending is not None:
                 yield self._pending
-            self._pending = unit
+            self._pending = out
 
     def reset(self, boundary: Boundary, context: PipelineContext) -> None:
         # The scheduler drained the pre-boundary tail via flush(), which
@@ -240,7 +263,8 @@ class VtInterpolateProcessor:
     def flush(self, context: PipelineContext) -> Iterable[FrameUnit]:
         if self._session is None:
             return
-        for payload in self._session.drain():
+        hold = self._last_hold if self._source_cadence is None else None
+        for payload in self._session.drain(hold=hold):
             unit = self._emit(payload)
             if self._input_end_pts is not None and unit.pts >= self._input_end_pts:
                 continue
@@ -403,7 +427,10 @@ class VideoToolboxFactory:
             profiles=_PROFILES,
             accepts=StreamConstraint(
                 layouts=(Layout.CV_BGRA, Layout.CV_RGBA_HALF, Layout.CV_NV12, Layout.MLX_RGB_HWC),
-                cadences=(Fraction,),  # CFR sources only
+                # No cadence bound: uniform sources ride the exact index
+                # grid; carried non-uniform timelines feed real source
+                # times, which the VT per-destination phase array supports
+                # natively.
             ),
             produces=_produces,
             stateful=True,

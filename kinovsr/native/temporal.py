@@ -29,7 +29,7 @@ from typing import Any
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.media.timing import rational_cadence
 
-from .frameworks import autorelease_pool, vt
+from .frameworks import CoreMedia, autorelease_pool, vt
 
 _log = logging.getLogger(__name__)
 
@@ -136,15 +136,16 @@ class VtfrcSession:
             )
 
         # Per-pair state ----------------------------------------------------
-        # We track source frames by their target-fps frame index so we can
-        # discover output frames that fall in the source-pair's interval by
-        # iterating contiguous integer target indices.
-        # source frame N is at time N / source_fps.
-        # target frame M is at time M / target_fps.
-        # M / target_fps in [N/source_fps, (N+1)/source_fps) means
-        #   M in [N * (target/source), (N+1) * (target/source))
+        # Source frames are tracked by their exact presentation TIME; the
+        # target grid stays integer-indexed (target frame M at M/target_fps),
+        # so a pair (prev_t, curr_t) emits every M with M/target_fps in
+        # [prev_t, curr_t). Uniform sources reach this through the index
+        # shim (frame N at N/source_fps), which reproduces the historical
+        # integer arithmetic exactly; non-uniform sources feed real times
+        # and the per-destination interpolationPhase array carries the
+        # arbitrary spacing natively.
         self._prev_src_pb: Any = None
-        self._prev_src_index: int = -1  # source frame index of buffered prev
+        self._prev_time: Fraction | None = None
         self._next_target_index: int | None = None
 
     def use_dst_pool(self, pool: Any) -> None:
@@ -189,32 +190,42 @@ class VtfrcSession:
         return pb
 
     # ------------------------------------------------------------------------
-    # Phase / target-index math
+    # Phase / target-index math (pure; unit-tested without a VT session)
     # ------------------------------------------------------------------------
 
-    def _target_indices_in_pair(self, src_index: int) -> list[int]:
-        """Target frame indices M such that M's PTS falls in
-        [src_index / source_fps, (src_index + 1) / source_fps).
-        """
-        lower = math.ceil(Fraction(src_index) * self.target_cadence / self.source_cadence)
-        upper = math.ceil(Fraction(src_index + 1) * self.target_cadence / self.source_cadence)
-        start = lower if self._next_target_index is None else max(lower, self._next_target_index)
+    def _targets_between(
+        self, prev_time: Fraction, curr_time: Fraction,
+    ) -> list[int]:
+        """Target frame indices M with M/target_fps in [prev_time, curr_time)."""
+        lower = math.ceil(prev_time * self.target_cadence)
+        upper = math.ceil(curr_time * self.target_cadence)
+        start = (lower if self._next_target_index is None
+                 else max(lower, self._next_target_index))
         if upper - start > 10_000:
             raise RuntimeError(
-                f"pathological frame-rate ratio emits {upper - start} "
-                f"targets for source frame {src_index}"
+                f"pathological frame spacing emits {upper - start} targets "
+                f"for the source pair at {float(prev_time):.6g}s"
             )
         return list(range(start, upper))
 
-    def _phases_for_targets(self, target_indices: list[int], src_index: int) -> list[float]:
-        """For each target index M, return phase = (M/target - src/source) /
-        (1/source) clamped to [0, 1). Phase 0 = source frame, phase 1 = next.
+    def _phases_between(
+        self, target_indices: list[int],
+        prev_time: Fraction, curr_time: Fraction,
+    ) -> list[float]:
+        """For each target index M, phase = (M/target - prev) / (curr - prev)
+        clamped to [0, 1). Phase 0 = the prev source frame, phase 1 = next.
+        The per-destination phase array is what lets arbitrary (non-uniform)
+        source spacing ride the same VT call as the uniform grid.
         """
         phases = []
-        src_time = Fraction(src_index) / self.source_cadence
-        denom = 1 / self.source_cadence
+        denom = curr_time - prev_time
+        if denom <= 0:
+            raise RuntimeError(
+                f"source times must be strictly increasing; got "
+                f"{float(prev_time):.6g}s then {float(curr_time):.6g}s")
         for m in target_indices:
-            phase = float((Fraction(m) / self.target_cadence - src_time) / denom)
+            phase = float((Fraction(m) / self.target_cadence - prev_time)
+                          / denom)
             # Clamp to [0, 1) for robustness against float drift.
             if phase < 0.0:
                 phase = 0.0
@@ -223,6 +234,12 @@ class VtfrcSession:
             phases.append(phase)
         return phases
 
+    def _time_pts(self, value: Fraction) -> Any:
+        """A source time as CMTime on the product tick base (frame identity
+        for the processor; equals frame_pts(N, cadence) on the index shim)."""
+        return CoreMedia.CMTimeMake(
+            round(value * _pb.VIDEO_TIME_SCALE), _pb.VIDEO_TIME_SCALE)
+
     # ------------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------------
@@ -230,9 +247,9 @@ class VtfrcSession:
     def _process_destination_batches(
         self,
         source_pb: Any,
-        source_index: int,
+        source_time: Fraction,
         next_pb: Any,
-        next_index: int,
+        next_time: Fraction,
         target_indices: list[int],
         phases: list[float],
         error_label: str,
@@ -245,13 +262,11 @@ class VtfrcSession:
         """
         batch_size = DESTINATION_BATCH_SIZE
 
-        source_pts = _pb.frame_pts(source_index, self.source_cadence)
-        next_pts = _pb.frame_pts(next_index, self.source_cadence)
         source_frame = vt.VTFrameProcessorFrame.alloc().initWithBuffer_presentationTimeStamp_(
-            source_pb, source_pts
+            source_pb, self._time_pts(source_time)
         )
         next_frame = vt.VTFrameProcessorFrame.alloc().initWithBuffer_presentationTimeStamp_(
-            next_pb, next_pts
+            next_pb, self._time_pts(next_time)
         )
 
         for offset in range(0, len(target_indices), batch_size):
@@ -289,44 +304,56 @@ class VtfrcSession:
         del source_frame, next_frame
 
     def feed(self, src_pb: Any, src_index: int) -> Iterator[Any]:
-        """Feed one source frame. Yields the interpolated destination buffers
-        whose PTSes fall in [prev_src_pts, this_src_pts).
+        """Index shim: feed source frame N at its uniform-grid time
+        N/source_fps. Exact Fraction arithmetic makes this reproduce the
+        historical integer mapping bit-identically."""
+        yield from self.feed_at(
+            src_pb, Fraction(src_index) / self.source_cadence)
+
+    def feed_at(self, src_pb: Any, src_time: Fraction | int | float) -> Iterator[Any]:
+        """Feed one source frame at its exact presentation time. Yields the
+        interpolated destination buffers whose PTSes fall in
+        [prev_time, src_time).
 
         For the very first source frame, this is empty (no pair yet). For
         subsequent frames we compute the target indices in the prev->curr
         gap, process them in bounded destination batches, and yield each
-        output buffer.
+        output buffer. Times must be strictly increasing; their spacing is
+        free (a carried non-uniform timeline feeds real stamps here).
         """
+        src_time = Fraction(src_time)
         if self._prev_src_pb is None:
             self._prev_src_pb = src_pb
-            self._prev_src_index = src_index
+            self._prev_time = src_time
             self._next_target_index = math.ceil(
-                Fraction(src_index) * self.target_cadence / self.source_cadence
-            )
+                src_time * self.target_cadence)
             return
 
-        target_indices = self._target_indices_in_pair(self._prev_src_index)
+        assert self._prev_time is not None
+        target_indices = self._targets_between(self._prev_time, src_time)
         if not target_indices:
             # Identity / downsample case: no output frame falls in this gap.
             self._prev_src_pb = src_pb
-            self._prev_src_index = src_index
+            self._prev_time = src_time
             return
 
-        phases = self._phases_for_targets(target_indices, self._prev_src_index)
+        phases = self._phases_between(
+            target_indices, self._prev_time, src_time)
         yield from self._process_destination_batches(
             self._prev_src_pb,
-            self._prev_src_index,
+            self._prev_time,
             src_pb,
-            src_index,
+            src_time,
             target_indices,
             phases,
-            f"VTFC processWithParameters failed at source pair {self._prev_src_index}->{src_index}",
+            f"VTFC processWithParameters failed at source pair "
+            f"{float(self._prev_time):.6g}s->{float(src_time):.6g}s",
         )
         self._next_target_index = target_indices[-1] + 1
         self._prev_src_pb = src_pb
-        self._prev_src_index = src_index
+        self._prev_time = src_time
 
-    def drain(self) -> Iterator[Any]:
+    def drain(self, hold: Fraction | int | float | None = None) -> Iterator[Any]:
         """After all source frames have been fed, yield the target frames of the
         FINAL source period -- feed() only emits a pair's outputs when the next
         source frame arrives, so the last source frame's targets (its phase-0
@@ -336,23 +363,34 @@ class VtfrcSession:
         With no next frame to interpolate toward, hold the last frame: run the
         processor with the buffered frame as both source and next -- interpolating
         a frame with itself reproduces it exactly at any phase -- producing one
-        held output per remaining target index in [last_pts, last_pts + 1/source).
+        held output per remaining target index in [last_time, last_time + hold).
+        ``hold`` defaults to one uniform source period; a carried timeline
+        passes its final frame's real duration.
         """
         if self._prev_src_pb is None:
             return
-        target_indices = self._target_indices_in_pair(self._prev_src_index)
+        assert self._prev_time is not None
+        hold_span = (Fraction(hold) if hold is not None
+                     else 1 / self.source_cadence)
+        if hold_span <= 0:
+            self._prev_src_pb = None
+            return
+        end_time = self._prev_time + hold_span
+        target_indices = self._targets_between(self._prev_time, end_time)
         if not target_indices:
             self._prev_src_pb = None
             return
-        phases = self._phases_for_targets(target_indices, self._prev_src_index)
+        phases = self._phases_between(
+            target_indices, self._prev_time, end_time)
         yield from self._process_destination_batches(
             self._prev_src_pb,
-            self._prev_src_index,
+            self._prev_time,
             self._prev_src_pb,
-            self._prev_src_index + 1,
+            end_time,
             target_indices,
             phases,
-            f"VTFRC drain failed for final source period at frame {self._prev_src_index}",
+            f"VTFRC drain failed for final source period at "
+            f"{float(self._prev_time):.6g}s",
         )
         self._next_target_index = target_indices[-1] + 1
         self._prev_src_pb = None
