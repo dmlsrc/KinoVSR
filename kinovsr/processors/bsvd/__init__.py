@@ -525,11 +525,13 @@ class BsvdDenoiser:
             nm = mx.clip(nm, max(self.SIGMA_MIN, self._map_floor), self.SIGMA_MAX)
         return mx.concatenate([x, nm], axis=-1)
 
-    def _pulse_gain(self, x3: Any, new_segment: bool = False) -> float:
+    def _pulse_gain(self, x3: Any, new_segment: bool = False,
+                    since_sync: int | None = None) -> float:
         """Per-frame pulse gain from the cropped frame (1.0 when pulse is off)."""
         if self._pulse is None:
             return 1.0
-        g = self._pulse.update(self._crop(x3), new_segment=new_segment)
+        g = self._pulse.update(self._crop(x3), new_segment=new_segment,
+                               since_sync=since_sync)
         self._pulse_log.append(g)
         return g
 
@@ -577,12 +579,14 @@ class BsvdDenoiser:
         return [self._emit(out, tok)]
 
     def feed(self, frame: Any, token: Any = None) -> list:
+        from kinovsr.analysis.noise.track import source_since_sync
+
         x = self._prepare(frame)
         if self._schedule is not None:
             self._frames.append(x)
             self._frame_tokens.append(token)
             return self._feed_scheduled(final=False)
-        gain = self._pulse_gain(x)
+        gain = self._pulse_gain(x, since_sync=source_since_sync(token))
         if self._tracker is not None and self._nm is None:
             # hold the first frames, estimate the spatial map from them, then
             # drain them through the net with that map attached.
@@ -660,11 +664,16 @@ class BsvdDenoiser:
             sig = self._tracker.update([self._crop(f) for f in frames])
             if sig is not None:
                 nm = self._plane_from_map(sig)
+        from kinovsr.analysis.noise.track import source_since_sync
+
         out = []
         for i, x in enumerate(frames):
             # window starts break temporal adjacency (proc ranges overlap), so
             # the pulse tracker restarts its diff chain at each window.
-            gain = self._pulse_gain(x, new_segment=(i == 0))
+            gain = self._pulse_gain(
+                x, new_segment=(i == 0),
+                since_sync=source_since_sync(
+                    tokens[i] if i < len(tokens) else None))
             y = self.net.step(self._with_nm(x, nm, gain=gain))
             idx = i - self.net.SHIFT_NUM
             if emit_start <= idx < emit_end:

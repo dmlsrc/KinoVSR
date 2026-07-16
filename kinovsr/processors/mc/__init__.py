@@ -370,11 +370,12 @@ class McTemporalDenoiser:
         if self._pulse is not None:
             self._pulse.reset()
 
-    def _condition(self, rgb_f32: Any) -> None:
+    def _condition(self, rgb_f32: Any,
+                   since_sync: int | None = None) -> None:
         """Per-frame conditioning upkeep: estimate/refresh the sigma plane from
         recent frames and update the pulse gain."""
         if self._pulse is not None:
-            self._gain = self._pulse.update(rgb_f32)
+            self._gain = self._pulse.update(rgb_f32, since_sync=since_sync)
             self._pulse_log.append(self._gain)
         if self._tracker is None:
             return
@@ -559,10 +560,10 @@ class McTemporalDenoiser:
             return 0.0
         return (self._w_sum / self._w_n) / self.strength
 
-    def denoise(self, rgb_f32: Any) -> Any:
+    def denoise(self, rgb_f32: Any, since_sync: int | None = None) -> Any:
         rgb_f32 = mx.clip(rgb_f32[..., :3].astype(mx.float32), 0.0, 1.0)
         if self._tracker is not None or self._pulse is not None:
-            self._condition(rgb_f32)
+            self._condition(rgb_f32, since_sync=since_sync)
         refs = (
             ([self._prev] if self._prev is not None else [])
             if self.window == 0
@@ -667,9 +668,12 @@ class _McDriver:
         )
 
     def feed(self, rgb: Any, token: Any = None) -> list:
+        from kinovsr.analysis.noise.track import source_since_sync
+
         if self._engine is None:
             self._engine = self._make_engine(int(rgb.shape[0]), int(rgb.shape[1]))
-        return [(self._engine.denoise(rgb), token)]
+        return [(self._engine.denoise(
+            rgb, since_sync=source_since_sync(token)), token)]
 
     def flush(self) -> list:
         return []

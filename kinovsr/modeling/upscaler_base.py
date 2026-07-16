@@ -199,6 +199,12 @@ class WindowedUpscaler:
                 break
             pe, ee = (min(p1, total), min(e1, total)) if final else (p1, e1)
             if p0 < pe and e0 < ee:
+                # The window's tokens, parallel to the frames passed below:
+                # families that key conditioning to raw-stream identity
+                # (e.g. the pulse gain's sync veto) read them from here
+                # without changing the _upscale_window contract.
+                self._window_tokens = self._tokens[
+                    p0 - self._base : pe - self._base]
                 sr = self._upscale_window(self._frames[p0 - self._base : pe - self._base])
                 out.extend((sr[g - p0][0], self._tokens[g - self._base]) for g in range(e0, ee))
             self._sched_i += 1

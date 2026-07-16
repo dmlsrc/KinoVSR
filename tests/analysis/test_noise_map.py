@@ -774,3 +774,65 @@ def test_mc_floor_handles_frames_smaller_than_the_block():
         sig = result[0] if isinstance(result, tuple) else result
         assert sig.shape == (h, w, 1)
         assert bool(mx.all(mx.isfinite(sig)))
+
+
+def test_pulse_gain_sync_veto_blocks_mid_gop_boosts():
+    # The same sigma spike, once inside the post-sync pulse zone and once
+    # deep mid-GOP: raw-stream positions say only the first is an I-frame
+    # grain refresh; the second (content/motion the low-quantile statistic
+    # did not reject) must not boost denoise conditioning.
+    mx.random.seed(6)
+    base = _content()
+
+    def run(spike_at, since_sync_of):
+        pg = PulseGain(lo=0.6, hi=1.8, min_history=8)
+        gains = []
+        for t in range(40):
+            s = 0.09 if spike_at <= t < spike_at + 3 else 0.03
+            f = mx.clip(base + s * mx.random.normal(shape=base.shape), 0, 1)
+            gains.append(pg.update(f, since_sync=since_sync_of(t)))
+        return gains
+
+    # spike lands at ordinals 0..2 of a GOP: boost allowed
+    at_sync = run(30, lambda t: max(t - 30, 0) if t >= 30 else t + 2)
+    assert max(at_sync[30:33]) > 1.5
+    # identical spike at ordinals 10..12: vetoed to neutral
+    mid_gop = run(30, lambda t: t - 20)
+    assert all(g <= 1.0 for g in mid_gop[30:33])
+
+
+def test_pulse_gain_sync_veto_keeps_suppression_and_blind_mode():
+    mx.random.seed(6)
+    base = _content()
+    pg = PulseGain(lo=0.6, hi=1.8, min_history=8)
+    gains = []
+    for t in range(40):
+        # settled 0.06; frames 30+ drop to 0.02 (prediction settled)
+        s = 0.02 if t >= 30 else 0.06
+        f = mx.clip(base + s * mx.random.normal(shape=base.shape), 0, 1)
+        gains.append(pg.update(f, since_sync=25))  # deep mid-GOP
+    # suppression below 1.0 stays allowed at any phase
+    assert min(gains[31:36]) < 0.8
+
+    # blind mode (since_sync=None) is unchanged: boosts allowed anywhere
+    pg2 = PulseGain(lo=0.6, hi=1.8, min_history=8)
+    gains2 = []
+    for t in range(36):
+        s = 0.09 if t >= 30 else 0.03
+        f = mx.clip(base + s * mx.random.normal(shape=base.shape), 0, 1)
+        gains2.append(pg2.update(f))
+    assert max(gains2[30:34]) > 1.5
+
+
+def test_source_since_sync_duck_typing():
+    from types import SimpleNamespace
+
+    from kinovsr.analysis.noise.track import source_since_sync
+
+    assert source_since_sync(None) is None
+    assert source_since_sync(7) is None
+    assert source_since_sync(SimpleNamespace(source=None)) is None
+    assert source_since_sync(
+        SimpleNamespace(source=SimpleNamespace(gop_ordinal=4))) == 4
+    assert source_since_sync(
+        SimpleNamespace(source=SimpleNamespace(gop_ordinal=None))) is None

@@ -62,6 +62,17 @@ class NoiseMapTracker:
 
 
 
+def source_since_sync(token: Any) -> int | None:
+    """A token's distance from its enclosing sync sample, if it says.
+
+    Duck-typed off the pipeline's FrameUnit shape (token.source
+    .gop_ordinal) so plain tokens (ints, None) read as "no flags".
+    """
+    source = getattr(token, "source", None)
+    ordinal = getattr(source, "gop_ordinal", None)
+    return int(ordinal) if ordinal is not None else None
+
+
 class PulseGain:
     """Per-frame noise-pulse gain for GOP-phase noise (I-frame grain refresh).
 
@@ -78,7 +89,8 @@ class PulseGain:
     """
 
     def __init__(self, lo: float = 0.6, hi: float = 1.8, history: int = 48,
-                 min_history: int = 8, sigma_floor: float = 0.002):
+                 min_history: int = 8, sigma_floor: float = 0.002,
+                 pulse_zone: int = 3):
         if not (0.0 < lo <= 1.0 <= hi):
             raise ValueError(f"pulse gain bounds must satisfy 0 < lo <= 1 <= hi; got {lo}, {hi}")
         self.lo = float(lo)
@@ -86,6 +98,10 @@ class PulseGain:
         self.history = int(history)
         self.min_history = int(min_history)
         self.sigma_floor = float(sigma_floor)
+        # How many frames past a sync sample still count as the I-frame
+        # grain-refresh zone when the caller supplies raw-stream GOP
+        # positions (see update's since_sync).
+        self.pulse_zone = int(pulse_zone)
         self.last = 1.0
         self.reset()
 
@@ -94,9 +110,15 @@ class PulseGain:
         self._hist: list[float] = []
         self.last = 1.0
 
-    def update(self, frame: Any, new_segment: bool = False) -> float:
+    def update(self, frame: Any, new_segment: bool = False,
+               since_sync: int | None = None) -> float:
         """Feed the next frame (temporally adjacent to the previous call unless
-        new_segment=True); returns the clamped per-frame gain."""
+        new_segment=True); returns the clamped per-frame gain.
+
+        ``since_sync`` is the frame's distance from its enclosing sync
+        sample when the caller has raw-stream GOP positions; ``None``
+        (no flags) keeps the fully blind behavior.
+        """
         y = _to_luma_2d(frame)
         if new_segment or self._prev is None or self._prev.shape != y.shape:
             self._prev = y
@@ -115,7 +137,17 @@ class PulseGain:
         if ref < self.sigma_floor:
             self.last = 1.0
             return self.last
-        self.last = max(self.lo, min(self.hi, sigma_t / ref))
+        gain = max(self.lo, min(self.hi, sigma_t / ref))
+        if since_sync is not None and since_sync > self.pulse_zone \
+                and gain > 1.0:
+            # The phenomenon this gain models is the I-frame grain
+            # refresh ("elevated for the first frames after a keyframe").
+            # A sigma spike deeper into the GOP than the pulse zone is
+            # content or motion, not a coding pulse: never boost denoise
+            # conditioning for it. Suppression (gain < 1) stays allowed
+            # at any phase - settled prediction is real wherever it sits.
+            gain = 1.0
+        self.last = gain
         return self.last
 
 

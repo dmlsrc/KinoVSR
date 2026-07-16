@@ -78,8 +78,14 @@ class PvddDenoiser(WindowedUpscaler):
     def _upscale_window(self, frames: list) -> list:
         gains = None
         if self._pulse is not None:
+            from kinovsr.analysis.noise.track import source_since_sync
+
+            tokens = getattr(self, "_window_tokens", None) or []
             # windows are separate segments: restart the diff chain each window
-            gains = [self._pulse.update(f, new_segment=(i == 0))
+            gains = [self._pulse.update(
+                        f, new_segment=(i == 0),
+                        since_sync=source_since_sync(
+                            tokens[i] if i < len(tokens) else None))
                      for i, f in enumerate(frames)]
             self._pulse_log.extend(gains)
         if self._tracker is not None:

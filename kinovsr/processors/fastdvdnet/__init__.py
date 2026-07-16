@@ -387,10 +387,13 @@ class FastDvdDenoiser:
 
     def _accept(self, padded: Any, token: Any) -> list:
         if self._pulse is not None:
+            from kinovsr.analysis.noise.track import source_since_sync
+
             # frames reach _accept in stream order for both the normal and the
             # warm-replay path, so the diff chain stays temporally adjacent.
             h, w = self._hw
-            g = self._pulse.update(padded[:, :h, :w, :])
+            g = self._pulse.update(padded[:, :h, :w, :],
+                                   since_sync=source_since_sync(token))
             self._gains[self._received] = g
             self._pulse_log.append(g)
         self._buf.append((padded, token))
