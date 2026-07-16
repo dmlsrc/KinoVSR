@@ -24,7 +24,7 @@ _INFORMATIONAL_FINGERPRINT_PATHS = (
 )
 
 
-def _comparable_fingerprint(fingerprint: Any) -> Any:
+def _comparable_view(fingerprint: Any) -> Any:
     """Strip informational prose from the compared view.
 
     The prose is still recorded for readers; semantic changes are gated
@@ -65,8 +65,8 @@ def _validate_baseline(
         )
     mismatches.extend(
         _signature_mismatches(
-            _comparable_fingerprint(baseline.get("fingerprint", _MISSING)),
-            _comparable_fingerprint(fingerprint),
+            _comparable_view(baseline.get("fingerprint", _MISSING)),
+            _comparable_view(fingerprint),
             prefix="fingerprint",
         )
     )

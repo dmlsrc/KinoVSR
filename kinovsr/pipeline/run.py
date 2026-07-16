@@ -1645,67 +1645,77 @@ def run_file(
     ``max_output_frames`` caps what the sink writes (the distinction
     matters for cadence-changing chains).
     """
-    chunk_size = _validate_requested_chunk_size(chunk_size)
-    if save_audio_sidecar and not audio:
-        # Without audio carry there is no track to dump; silently reserving
-        # (and preflighting) a sidecar that never gets written is worse than
-        # refusing up front.
-        raise MediaError(
-            "save_audio_sidecar requires audio; enable audio carry or drop "
-            "the sidecar request")
-    t0 = time.perf_counter()
-    plan = _ArtifactPlan.build(
-        video=video,
-        output=output,
-        comparison=comparison,
-        cut_log=cut_log,
-        save_audio_sidecar=save_audio_sidecar,
-        save_pre_frames=save_pre_frames,
-        save_post_frames=save_post_frames,
-        skip_post_mp4=skip_post_mp4,
-        noise_map_debug=noise_map_debug,
-        overwrite=overwrite,
-    )
-    # Inspect the complete source sample clock before entering the artifact
-    # transaction. The file pipeline currently publishes CFR only; rejecting
-    # VFR here prevents both silent retiming/frame loss and partial outputs.
-    timing = _probe_cfr_timing(plan.input_path, reader)
-    if audio:
-        _validate_audio_origin(plan.input_path, reader, timing)
-    from kinovsr.media.pixel_buffers import ci_cache_owner
+    from kinovsr.native.frameworks import autorelease_pool
 
-    # The file owner outlives the inner session owner: auto-geometry may render
-    # before the session exists, and comparison/final-frame work can render
-    # after the chain has exhausted. Only this outer release performs the final
-    # cache cleanup for the complete file operation.
-    with ci_cache_owner(), _OutputTransaction(plan, settings) as transaction:
-        return _run_file_reserved(
-            config,
-            plan=plan,
-            transaction=transaction,
-            settings=settings,
-            t0=t0,
-            reporter=reporter,
-            layout=layout,
-            start=start,
-            end=end,
-            max_frames=max_frames,
-            max_output_frames=max_output_frames,
-            max_output_seconds=max_output_seconds,
-            audio=audio,
-            audio_codec=audio_codec,
-            quality=quality,
-            chunk_size=chunk_size,
-            source_color=source_color,
-            source_range=source_range,
-            encode_chroma=encode_chroma,
-            snap_start=snap_start,
-            gop_align=gop_align,
-            gop_min_window=gop_min_window,
-            gop_max_window=gop_max_window,
-            reader=reader,
-            timing=timing,
+    # One pool for the endpoint's complete span. The writer drains each of
+    # its own phases, but objects autoreleased on this thread between those
+    # phases (source probing, chain setup, publication) land in no pool at
+    # all in a run-loop-less host and pin their encoder sessions; after ~32
+    # leaked sessions VideoToolbox drops to a software capability set
+    # without the 4:2:2 profile and writer creation fails (batch-processing
+    # 33 files through this endpoint in one process reproduced it).
+    with autorelease_pool():
+        chunk_size = _validate_requested_chunk_size(chunk_size)
+        if save_audio_sidecar and not audio:
+            # Without audio carry there is no track to dump; silently reserving
+            # (and preflighting) a sidecar that never gets written is worse than
+            # refusing up front.
+            raise MediaError(
+                "save_audio_sidecar requires audio; enable audio carry or drop "
+                "the sidecar request")
+        t0 = time.perf_counter()
+        plan = _ArtifactPlan.build(
+            video=video,
+            output=output,
+            comparison=comparison,
+            cut_log=cut_log,
+            save_audio_sidecar=save_audio_sidecar,
+            save_pre_frames=save_pre_frames,
+            save_post_frames=save_post_frames,
+            skip_post_mp4=skip_post_mp4,
+            noise_map_debug=noise_map_debug,
+            overwrite=overwrite,
         )
+        # Inspect the complete source sample clock before entering the artifact
+        # transaction. The file pipeline currently publishes CFR only; rejecting
+        # VFR here prevents both silent retiming/frame loss and partial outputs.
+        timing = _probe_cfr_timing(plan.input_path, reader)
+        if audio:
+            _validate_audio_origin(plan.input_path, reader, timing)
+        from kinovsr.media.pixel_buffers import ci_cache_owner
+
+        # The file owner outlives the inner session owner: auto-geometry may render
+        # before the session exists, and comparison/final-frame work can render
+        # after the chain has exhausted. Only this outer release performs the final
+        # cache cleanup for the complete file operation.
+        with ci_cache_owner(), _OutputTransaction(plan, settings) as transaction:
+            return _run_file_reserved(
+                config,
+                plan=plan,
+                transaction=transaction,
+                settings=settings,
+                t0=t0,
+                reporter=reporter,
+                layout=layout,
+                start=start,
+                end=end,
+                max_frames=max_frames,
+                max_output_frames=max_output_frames,
+                max_output_seconds=max_output_seconds,
+                audio=audio,
+                audio_codec=audio_codec,
+                quality=quality,
+                chunk_size=chunk_size,
+                source_color=source_color,
+                source_range=source_range,
+                encode_chroma=encode_chroma,
+                snap_start=snap_start,
+                gop_align=gop_align,
+                gop_min_window=gop_min_window,
+                gop_max_window=gop_max_window,
+                reader=reader,
+                timing=timing,
+            )
 
 
 def _run_file_reserved(

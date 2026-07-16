@@ -238,297 +238,302 @@ def encode_video_videotoolbox(
     HW append; the AVAssetWriter's pump runs on its own GCD queue, so
     the second encode is largely parallel to the primary.
     """
-    if reporter is None:
-        reporter = NullReporter()
-    source_cadence = rational_cadence(fps)
-    target_cadence = (rational_cadence(target_fps)
-                      if target_fps is not None else source_cadence)
-    do_temporal = target_cadence != source_cadence
-    fps = float(source_cadence)
-    target_fps = float(target_cadence)
-    output_path = Path(output_path)
-    if output_path.suffix.lower() != ".mp4":
-        output_path = output_path.with_suffix(".mp4")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # One pool for the endpoint's complete span (see run_file): objects
+    # autoreleased on this thread between the writer's phase pools would
+    # otherwise pin encoder sessions until the process dies, and the ~32nd
+    # writer in a batch host loses the 4:2:2 profile.
+    with autorelease_pool():
+        if reporter is None:
+            reporter = NullReporter()
+        source_cadence = rational_cadence(fps)
+        target_cadence = (rational_cadence(target_fps)
+                          if target_fps is not None else source_cadence)
+        do_temporal = target_cadence != source_cadence
+        fps = float(source_cadence)
+        target_fps = float(target_cadence)
+        output_path = Path(output_path)
+        if output_path.suffix.lower() != ".mp4":
+            output_path = output_path.with_suffix(".mp4")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ---- Peek first frame to learn dimensions + dtype ---------------------
-    first, frame_iter, peeked_total = _peek_frames(frames)
-    # Explicit caller-supplied total wins over the peeked one (lets
-    # streaming-decode callers pass the known frame count even though
-    # they hand the encoder an unsized iterator).
-    if n_source_frames is None:
-        n_source_frames = peeked_total
-    if first.ndim != 3:
-        raise ValueError(
-            f"frame must be (H,W,C); got shape {first.shape}, dtype {first.dtype}"
-        )
-    in_h, in_w, in_c = first.shape
-    if in_c not in (3, 4):
-        raise ValueError(f"frame channel dim must be 3 or 4; got {in_c}")
-
-    do_vsr = vsr_spatial_mode is not None
-    if do_vsr:
-        scale = scale_for_mode(vsr_spatial_mode)
-        out_w, out_h = in_w * scale, in_h * scale
-    else:
-        scale = 1
-        out_w, out_h = in_w, in_h
-
-    if not do_temporal:
-        target_cadence = source_cadence
-
-    profile = _pick_hevc_profile(vsr_spatial_mode, encode_chroma)
-
-    # ---- Setup phase ------------------------------------------------------
-    # Session/writer constructors print their status lines to stdout; the
-    # progress phase has not started yet, so they cannot collide with a
-    # live display.
-    # VSR session
-    vsr: VsrSession | None = None
-    if do_vsr:
-        vsr = VsrSession(in_w, in_h, mode=vsr_spatial_mode, fps=fps)
-
-    # VTFRC session
-    vtfrc: VtfrcSession | None = None
-    if do_temporal:
-        vtfrc = VtfrcSession(
-            out_w, out_h,
-            source_fps=source_cadence, target_fps=target_cadence,
-            mode=vsr_temporal_mode,
-        )
-
-    # Audio track
-    audio_track: AudioTrack | None = None
-    if audio_waveform is not None:
-        if audio_sample_rate is None:
+        # ---- Peek first frame to learn dimensions + dtype ---------------------
+        first, frame_iter, peeked_total = _peek_frames(frames)
+        # Explicit caller-supplied total wins over the peeked one (lets
+        # streaming-decode callers pass the known frame count even though
+        # they hand the encoder an unsized iterator).
+        if n_source_frames is None:
+            n_source_frames = peeked_total
+        if first.ndim != 3:
             raise ValueError(
-                "audio_sample_rate is required when audio_waveform is provided"
+                f"frame must be (H,W,C); got shape {first.shape}, dtype {first.dtype}"
             )
-        # Sequence-start onset mitigation.  Runs before the AudioTrack
-        # build while the generated waveform can still stay MLX-native;
-        # `_normalize_audio_for_track` is the final NumPy byte-boundary
-        # adapter for CoreMedia.  See
-        # docs/AUDIO_ISSUES.md -> "Sequence-Start Audio Spike".
-        from .audio import DEFAULT_TRIM_MS, mitigate_onset
+        in_h, in_w, in_c = first.shape
+        if in_c not in (3, 4):
+            raise ValueError(f"frame channel dim must be 3 or 4; got {in_c}")
 
-        onset_trim_ms = (
-            audio_onset_trim_ms
-            if audio_onset_trim_ms is not None
-            else DEFAULT_TRIM_MS
-        )
-        onset_result = mitigate_onset(
-            audio_waveform, int(audio_sample_rate),
-            mode=audio_onset_trim_mode, trim_ms=onset_trim_ms,
-        )
-        arr = _normalize_audio_for_track(onset_result.samples)
-        if onset_result.applied:
-            _log.info(f"audio onset: {onset_result.detail}")
-        audio_track = AudioTrack(arr, sample_rate=int(audio_sample_rate))
-
-    # Pick writer source format.  When VSR or VTFRC is active, the
-    # writer source = the last stage's dst.  When neither is active,
-    # the writer source = NV12 and we upload through CoreImage (keeps
-    # the encoder's RGB->YUV cost in one place).
-    producer = vtfrc if vtfrc is not None else vsr
-    writer_source_attrs = producer.dst_attrs if producer is not None else None
-    writer_src_fmt = (_pb.resolve_pixel_format(writer_source_attrs)
-                      if writer_source_attrs is not None else _pb.PIX_NV12)
-
-    resolved_color = _color.resolve({"full_range": False}, "bt709")
-    color_props = _color.av_color_properties(resolved_color)
-    cv_color = _color.cv_triple(resolved_color)
-    writer_yuv_feed = writer_src_fmt == _pb.PIX_RGBAHALF
-
-    # Writer + pool wiring.  Zero-copy hookups: VTFRC writes into the
-    # writer's adaptor pool when active; VSR writes into its own dst
-    # pool when VTFRC is between (a copy at the VT call boundary), or
-    # directly into the writer's adaptor pool when there is no VTFRC.
-    # If the writer is doing the explicit RGBAHalf->YUV conversion, its
-    # adaptor pool is YUV; keep the producer on its own RGBAHalf pool.
-    writer = AVWriter(
-        output_path,
-        width=out_w, height=out_h, fps=target_cadence,
-        source_pixel_format=writer_src_fmt,
-        profile=profile,
-        quality=encode_quality,
-        label="encode",
-        source_attrs=writer_source_attrs,
-        color_props=color_props,
-        cv_color=cv_color if writer_yuv_feed else None,
-        full_range=False,
-        audio_track=audio_track,
-        audio_codec=audio_codec,
-    )
-    if vtfrc is not None and not writer_yuv_feed:
-        vtfrc.use_dst_pool(writer.adaptor.pixelBufferPool())
-    elif vsr is not None and not writer_yuv_feed:
-        vsr.use_dst_pool(writer.adaptor.pixelBufferPool())
-
-    # Optional "save the un-processed original alongside the VSR/VTFRC
-    # result" companion writer.  Only meaningful when some VT post-
-    # processing is engaged; otherwise the primary writer IS the
-    # original and a duplicate adds zero value.  Shares the same
-    # AudioTrack - CMSampleBuffer is fresh per make_sample_buffer()
-    # call so two GCD pumps on the same track are safe.
-    #
-    # Source format + HEVC profile mirror the primary writer's
-    # precision envelope (`_pick_hevc_profile`): when the user opted
-    # into VSR HQ (balanced / image), the primary is RGBAHalf source
-    # -> HEVC Main42210 (4:2:2 10-bit) and the original should match
-    # so the A/B comparison isn't a precision-floor mismatch.  For
-    # VSR fast and VTFRC-only the primary is NV12 -> Main10 (4:2:0
-    # 10-bit); the original matches that too - upgrading the
-    # original's source format past what its companion uses adds
-    # bits the encoder would just throw away.  When the input frames
-    # are fp16 RGBA from a native decoder or host engine, RGBAHalf
-    # preserves them all the way to the encoder's internal 4:2:2 conversion;
-    # uint8 RGB input goes through upload_frame_to_buffer's RGBA
-    # promotion path with no loss vs. the NV12 alternative.
-    writer_orig: AVWriter | None = None
-    orig_path: Path | None = None
-    do_save_original = vsr_save_original and (vsr is not None or vtfrc is not None)
-    if do_save_original:
-        orig_path = output_path.with_name(
-            f"{output_path.stem}_orig{output_path.suffix}"
-        )
-        if vsr_spatial_mode in ("balanced", "image"):
-            orig_src_fmt = _pb.PIX_RGBAHALF
-            orig_profile = HEVC_PROFILE_MAIN422_10
+        do_vsr = vsr_spatial_mode is not None
+        if do_vsr:
+            scale = scale_for_mode(vsr_spatial_mode)
+            out_w, out_h = in_w * scale, in_h * scale
         else:
-            orig_src_fmt = _pb.PIX_NV12
-            orig_profile = HEVC_PROFILE_MAIN10
-        orig_yuv_feed = orig_src_fmt == _pb.PIX_RGBAHALF
-        writer_orig = AVWriter(
-            orig_path,
-            width=in_w, height=in_h, fps=source_cadence,
-            source_pixel_format=orig_src_fmt,
-            profile=orig_profile,
+            scale = 1
+            out_w, out_h = in_w, in_h
+
+        if not do_temporal:
+            target_cadence = source_cadence
+
+        profile = _pick_hevc_profile(vsr_spatial_mode, encode_chroma)
+
+        # ---- Setup phase ------------------------------------------------------
+        # Session/writer constructors print their status lines to stdout; the
+        # progress phase has not started yet, so they cannot collide with a
+        # live display.
+        # VSR session
+        vsr: VsrSession | None = None
+        if do_vsr:
+            vsr = VsrSession(in_w, in_h, mode=vsr_spatial_mode, fps=fps)
+
+        # VTFRC session
+        vtfrc: VtfrcSession | None = None
+        if do_temporal:
+            vtfrc = VtfrcSession(
+                out_w, out_h,
+                source_fps=source_cadence, target_fps=target_cadence,
+                mode=vsr_temporal_mode,
+            )
+
+        # Audio track
+        audio_track: AudioTrack | None = None
+        if audio_waveform is not None:
+            if audio_sample_rate is None:
+                raise ValueError(
+                    "audio_sample_rate is required when audio_waveform is provided"
+                )
+            # Sequence-start onset mitigation.  Runs before the AudioTrack
+            # build while the generated waveform can still stay MLX-native;
+            # `_normalize_audio_for_track` is the final NumPy byte-boundary
+            # adapter for CoreMedia.  See
+            # docs/AUDIO_ISSUES.md -> "Sequence-Start Audio Spike".
+            from .audio import DEFAULT_TRIM_MS, mitigate_onset
+
+            onset_trim_ms = (
+                audio_onset_trim_ms
+                if audio_onset_trim_ms is not None
+                else DEFAULT_TRIM_MS
+            )
+            onset_result = mitigate_onset(
+                audio_waveform, int(audio_sample_rate),
+                mode=audio_onset_trim_mode, trim_ms=onset_trim_ms,
+            )
+            arr = _normalize_audio_for_track(onset_result.samples)
+            if onset_result.applied:
+                _log.info(f"audio onset: {onset_result.detail}")
+            audio_track = AudioTrack(arr, sample_rate=int(audio_sample_rate))
+
+        # Pick writer source format.  When VSR or VTFRC is active, the
+        # writer source = the last stage's dst.  When neither is active,
+        # the writer source = NV12 and we upload through CoreImage (keeps
+        # the encoder's RGB->YUV cost in one place).
+        producer = vtfrc if vtfrc is not None else vsr
+        writer_source_attrs = producer.dst_attrs if producer is not None else None
+        writer_src_fmt = (_pb.resolve_pixel_format(writer_source_attrs)
+                          if writer_source_attrs is not None else _pb.PIX_NV12)
+
+        resolved_color = _color.resolve({"full_range": False}, "bt709")
+        color_props = _color.av_color_properties(resolved_color)
+        cv_color = _color.cv_triple(resolved_color)
+        writer_yuv_feed = writer_src_fmt == _pb.PIX_RGBAHALF
+
+        # Writer + pool wiring.  Zero-copy hookups: VTFRC writes into the
+        # writer's adaptor pool when active; VSR writes into its own dst
+        # pool when VTFRC is between (a copy at the VT call boundary), or
+        # directly into the writer's adaptor pool when there is no VTFRC.
+        # If the writer is doing the explicit RGBAHalf->YUV conversion, its
+        # adaptor pool is YUV; keep the producer on its own RGBAHalf pool.
+        writer = AVWriter(
+            output_path,
+            width=out_w, height=out_h, fps=target_cadence,
+            source_pixel_format=writer_src_fmt,
+            profile=profile,
             quality=encode_quality,
-            label="encode_orig",
+            label="encode",
+            source_attrs=writer_source_attrs,
             color_props=color_props,
-            cv_color=cv_color if orig_yuv_feed else None,
+            cv_color=cv_color if writer_yuv_feed else None,
             full_range=False,
             audio_track=audio_track,
             audio_codec=audio_codec,
         )
-    else:
-        orig_yuv_feed = False
+        if vtfrc is not None and not writer_yuv_feed:
+            vtfrc.use_dst_pool(writer.adaptor.pixelBufferPool())
+        elif vsr is not None and not writer_yuv_feed:
+            vsr.use_dst_pool(writer.adaptor.pixelBufferPool())
 
-    # Optional audio sidecar WAV.
-    sidecar_path: Path | None = None
-    if audio_track is not None and save_audio_sidecar:
-        sidecar_path = output_path.with_suffix(".wav")
-        audio_track.save_wav(sidecar_path)
-        _log.info(
-            f"audio sidecar: {sidecar_path}  "
-            f"({audio_bit_depth}, {audio_track.sample_rate} Hz)"
-        )
-
-    # Chain description (logged before the encode phase starts).
-    stages: list[str] = []
-    if vsr is not None:
-        stages.append(f"VSR={vsr_spatial_mode}({scale}x)")
-    if vtfrc is not None:
-        stages.append(f"VTFRC={fps:g}->{target_fps:g}fps")
-    chain = " + ".join(stages) if stages else "passthrough"
-    _log.info(f"encode (videotoolbox): {chain} -> HEVC {profile}")
-    _log.info(f"-> {output_path}")
-    if writer_orig is not None:
-        _log.info(
-            f"+ original passthrough -> HEVC {orig_profile} -> {orig_path}"
-        )
-
-    # Total is known for list / ndarray inputs; iterators get an
-    # indeterminate phase (count-only, no ETA).
-    _phase = "VT encode"
-    reporter.phase_start(_phase, total=n_source_frames, unit="frame")
-
-    started = time.perf_counter()
-    n_in = 0
-    n_out = 0
-    completed = False
-    n_orig = 0
-    try:
-        for src_frame in frame_iter:
-            with autorelease_pool():
-                # Companion "original" writer: source frame -> orig_src_fmt
-                # (NV12 or RGBAHalf, matching the primary's precision
-                # envelope) -> append.  Independent of VSR/VTFRC chain;
-                # uses its own source buffer pool.  AVAssetWriter's audio
-                # + video pumps run on their own GCD queues so this second
-                # append is largely parallel to the primary chain's encode
-                # pass.  upload_frame_to_buffer dispatches on the buffer's
-                # pixel format, so the same call works for both src
-                # formats and both source dtypes (uint8 RGB / fp16 RGBA).
-                if writer_orig is not None:
-                    orig_pb = _allocate_writer_src_buffer(
-                        None if orig_yuv_feed else writer_orig.adaptor,
-                        in_w, in_h, orig_src_fmt,
-                    )
-                    _pb.upload_frame_to_buffer(src_frame, orig_pb)
-                    writer_orig.append(orig_pb)
-                    n_orig += 1
-                    del orig_pb
-
-                if vsr is not None:
-                    src_pb = vsr.upscale_to_buffer(src_frame, n_in)
-                else:
-                    src_pb = _allocate_writer_src_buffer(
-                        writer.adaptor, in_w, in_h, writer_src_fmt,
-                    )
-                    _pb.upload_frame_to_buffer(src_frame, src_pb)
-
-                if vtfrc is not None:
-                    for out_pb in vtfrc.feed(src_pb, n_in):
-                        writer.append(out_pb)
-                        n_out += 1
-                        del out_pb
-                else:
-                    writer.append(src_pb)
-                    n_out += 1
-                del src_pb
-            n_in += 1
-            reporter.phase_advance(_phase)
-        # VTFRC drain (no-op today; kept for symmetry with the run path).
-        if vtfrc is not None:
-            for out_pb in vtfrc.drain():
-                writer.append(out_pb)
-                n_out += 1
-                del out_pb
-        completed = True
-    finally:
-        reporter.phase_end(_phase)
-        try:
-            if completed:
-                writer.finish()
-                if writer_orig is not None:
-                    writer_orig.finish()
+        # Optional "save the un-processed original alongside the VSR/VTFRC
+        # result" companion writer.  Only meaningful when some VT post-
+        # processing is engaged; otherwise the primary writer IS the
+        # original and a duplicate adds zero value.  Shares the same
+        # AudioTrack - CMSampleBuffer is fresh per make_sample_buffer()
+        # call so two GCD pumps on the same track are safe.
+        #
+        # Source format + HEVC profile mirror the primary writer's
+        # precision envelope (`_pick_hevc_profile`): when the user opted
+        # into VSR HQ (balanced / image), the primary is RGBAHalf source
+        # -> HEVC Main42210 (4:2:2 10-bit) and the original should match
+        # so the A/B comparison isn't a precision-floor mismatch.  For
+        # VSR fast and VTFRC-only the primary is NV12 -> Main10 (4:2:0
+        # 10-bit); the original matches that too - upgrading the
+        # original's source format past what its companion uses adds
+        # bits the encoder would just throw away.  When the input frames
+        # are fp16 RGBA from a native decoder or host engine, RGBAHalf
+        # preserves them all the way to the encoder's internal 4:2:2 conversion;
+        # uint8 RGB input goes through upload_frame_to_buffer's RGBA
+        # promotion path with no loss vs. the NV12 alternative.
+        writer_orig: AVWriter | None = None
+        orig_path: Path | None = None
+        do_save_original = vsr_save_original and (vsr is not None or vtfrc is not None)
+        if do_save_original:
+            orig_path = output_path.with_name(
+                f"{output_path.stem}_orig{output_path.suffix}"
+            )
+            if vsr_spatial_mode in ("balanced", "image"):
+                orig_src_fmt = _pb.PIX_RGBAHALF
+                orig_profile = HEVC_PROFILE_MAIN422_10
             else:
-                # The encode loop failed: finalizing would leave a truncated
-                # but playable file at the requested destination and could
-                # mask the loop's error with a writer error.  Discard instead.
-                _discard_failed_output(writer, output_path)
-                if writer_orig is not None and orig_path is not None:
-                    _discard_failed_output(writer_orig, orig_path)
-        finally:
+                orig_src_fmt = _pb.PIX_NV12
+                orig_profile = HEVC_PROFILE_MAIN10
+            orig_yuv_feed = orig_src_fmt == _pb.PIX_RGBAHALF
+            writer_orig = AVWriter(
+                orig_path,
+                width=in_w, height=in_h, fps=source_cadence,
+                source_pixel_format=orig_src_fmt,
+                profile=orig_profile,
+                quality=encode_quality,
+                label="encode_orig",
+                color_props=color_props,
+                cv_color=cv_color if orig_yuv_feed else None,
+                full_range=False,
+                audio_track=audio_track,
+                audio_codec=audio_codec,
+            )
+        else:
+            orig_yuv_feed = False
+
+        # Optional audio sidecar WAV.
+        sidecar_path: Path | None = None
+        if audio_track is not None and save_audio_sidecar:
+            sidecar_path = output_path.with_suffix(".wav")
+            audio_track.save_wav(sidecar_path)
+            _log.info(
+                f"audio sidecar: {sidecar_path}  "
+                f"({audio_bit_depth}, {audio_track.sample_rate} Hz)"
+            )
+
+        # Chain description (logged before the encode phase starts).
+        stages: list[str] = []
+        if vsr is not None:
+            stages.append(f"VSR={vsr_spatial_mode}({scale}x)")
+        if vtfrc is not None:
+            stages.append(f"VTFRC={fps:g}->{target_fps:g}fps")
+        chain = " + ".join(stages) if stages else "passthrough"
+        _log.info(f"encode (videotoolbox): {chain} -> HEVC {profile}")
+        _log.info(f"-> {output_path}")
+        if writer_orig is not None:
+            _log.info(
+                f"+ original passthrough -> HEVC {orig_profile} -> {orig_path}"
+            )
+
+        # Total is known for list / ndarray inputs; iterators get an
+        # indeterminate phase (count-only, no ETA).
+        _phase = "VT encode"
+        reporter.phase_start(_phase, total=n_source_frames, unit="frame")
+
+        started = time.perf_counter()
+        n_in = 0
+        n_out = 0
+        completed = False
+        n_orig = 0
+        try:
+            for src_frame in frame_iter:
+                with autorelease_pool():
+                    # Companion "original" writer: source frame -> orig_src_fmt
+                    # (NV12 or RGBAHalf, matching the primary's precision
+                    # envelope) -> append.  Independent of VSR/VTFRC chain;
+                    # uses its own source buffer pool.  AVAssetWriter's audio
+                    # + video pumps run on their own GCD queues so this second
+                    # append is largely parallel to the primary chain's encode
+                    # pass.  upload_frame_to_buffer dispatches on the buffer's
+                    # pixel format, so the same call works for both src
+                    # formats and both source dtypes (uint8 RGB / fp16 RGBA).
+                    if writer_orig is not None:
+                        orig_pb = _allocate_writer_src_buffer(
+                            None if orig_yuv_feed else writer_orig.adaptor,
+                            in_w, in_h, orig_src_fmt,
+                        )
+                        _pb.upload_frame_to_buffer(src_frame, orig_pb)
+                        writer_orig.append(orig_pb)
+                        n_orig += 1
+                        del orig_pb
+
+                    if vsr is not None:
+                        src_pb = vsr.upscale_to_buffer(src_frame, n_in)
+                    else:
+                        src_pb = _allocate_writer_src_buffer(
+                            writer.adaptor, in_w, in_h, writer_src_fmt,
+                        )
+                        _pb.upload_frame_to_buffer(src_frame, src_pb)
+
+                    if vtfrc is not None:
+                        for out_pb in vtfrc.feed(src_pb, n_in):
+                            writer.append(out_pb)
+                            n_out += 1
+                            del out_pb
+                    else:
+                        writer.append(src_pb)
+                        n_out += 1
+                    del src_pb
+                n_in += 1
+                reporter.phase_advance(_phase)
+            # VTFRC drain (no-op today; kept for symmetry with the run path).
             if vtfrc is not None:
-                vtfrc.close()
-            if vsr is not None:
-                vsr.close()
+                for out_pb in vtfrc.drain():
+                    writer.append(out_pb)
+                    n_out += 1
+                    del out_pb
+            completed = True
+        finally:
+            reporter.phase_end(_phase)
+            try:
+                if completed:
+                    writer.finish()
+                    if writer_orig is not None:
+                        writer_orig.finish()
+                else:
+                    # The encode loop failed: finalizing would leave a truncated
+                    # but playable file at the requested destination and could
+                    # mask the loop's error with a writer error.  Discard instead.
+                    _discard_failed_output(writer, output_path)
+                    if writer_orig is not None and orig_path is not None:
+                        _discard_failed_output(writer_orig, orig_path)
+            finally:
+                if vtfrc is not None:
+                    vtfrc.close()
+                if vsr is not None:
+                    vsr.close()
 
-    elapsed = time.perf_counter() - started
-    size = output_path.stat().st_size
-    orig_part = ""
-    if writer_orig is not None and orig_path is not None:
-        orig_size = orig_path.stat().st_size
-        orig_part = (
-            f" + original {_human_size(orig_size)} "
-            f"({n_orig} src frame{'s' if n_orig != 1 else ''})"
+        elapsed = time.perf_counter() - started
+        size = output_path.stat().st_size
+        orig_part = ""
+        if writer_orig is not None and orig_path is not None:
+            orig_size = orig_path.stat().st_size
+            orig_part = (
+                f" + original {_human_size(orig_size)} "
+                f"({n_orig} src frame{'s' if n_orig != 1 else ''})"
+            )
+        _log.info(
+            f"done: {_human_size(size)} in {elapsed:.1f}s "
+            f"({n_in} src frame{'s' if n_in != 1 else ''}, "
+            f"{n_out} written){orig_part}"
         )
-    _log.info(
-        f"done: {_human_size(size)} in {elapsed:.1f}s "
-        f"({n_in} src frame{'s' if n_in != 1 else ''}, "
-        f"{n_out} written){orig_part}"
-    )
 
-    return output_path
+        return output_path

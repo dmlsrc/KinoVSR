@@ -17,7 +17,7 @@ import av
 import pytest
 
 from kinovsr.pipeline import FileSource, run_file
-from kinovsr.processors.errors import MediaError
+from kinovsr.processors.errors import MediaError, PipelineError
 from kinovsr.processors.specs import Domain, DType, Layout
 from kinovsr.settings import Settings
 
@@ -1492,7 +1492,9 @@ def test_source_less_mlx_sink_rejects_non_rgb_payload(tmp_path):
             time_base=Fraction(1, 24000), cadence=Fraction(25)))
     sink = FileSink(tmp_path / "invalid.mp4", spec)
     try:
-        with pytest.raises(MediaError, match=r"shape .* RGB spec"):
+        # A wrong-shaped payload from the chain is a broken chain contract
+        # (PipelineError), not a media-endpoint failure.
+        with pytest.raises(PipelineError, match=r"shape .* RGB spec"):
             sink.append(FrameUnit(
                 payload=mx.zeros((H, W, 4)), pts=0, duration=960))
     finally:
@@ -1529,3 +1531,21 @@ def test_sidecar_without_audio_is_rejected_before_any_io(tmp_path):
             settings=SETTINGS,
             save_audio_sidecar=True,
         )
+
+
+@pytest.mark.integration
+def test_batch_host_survives_the_vt_session_capability_cliff(clip, tmp_path):
+    """One process must be able to run more than 32 file encodes.
+
+    VideoToolbox caps live encoder sessions per process (32 on this
+    hardware) and drops the 4:2:2 profile past the cap. Objects
+    autoreleased on the calling thread between the writer's phase pools
+    used to pin one session per completed run, so the 33rd writer in a
+    batch host failed construction. The endpoint now owns a pool for its
+    complete span; this drives the endpoint past the historical cliff.
+    """
+    for i in range(34):
+        run_file(
+            {"pipeline": []}, video=clip,
+            output=tmp_path / f"batch_{i}.mp4",
+            settings=SETTINGS, layout=Layout.CV_RGBA_HALF, max_frames=4)
