@@ -12,7 +12,6 @@ import pytest
 pytestmark = pytest.mark.unit
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "dev" / "bench_endpoint_gates.py"
-sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("kinovsr_bench_endpoint_gates", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 bench = importlib.util.module_from_spec(SPEC)
@@ -27,28 +26,14 @@ def _fingerprint():
             "chip": "Apple M1 Max",
             "architecture": "arm64",
         },
-        "os": {
-            "name": "macOS",
-            "version": "26.5.1",
-            "build": "25F90",
-            "darwin_release": "25.5.0",
-        },
+        "os": {"macos_version": "26.5.1"},
         "runtime": {
-            "python_implementation": "CPython",
             "python_version": "3.14.6",
-            "python_build": ["main", "Jul 1 2026"],
-            "python_compiler": "Clang 17",
             "mlx_version": "0.32.0",
             "pyav_version": "18.0.0",
-            "libav_versions": {
-                "libavcodec": [62, 28, 102],
-                "libavformat": [62, 12, 102],
-                "libavutil": [60, 26, 102],
-                "libswscale": [9, 5, 102],
-            },
         },
         "protocol": {
-            "schema": 1,
+            "schema": bench.BASELINE_SCHEMA,
             "fresh_process_per_run": True,
             "runs": 4,
             "warmup_frames": 30,
@@ -56,15 +41,7 @@ def _fingerprint():
             "tail_frames": 17,
             "sink_holdback_frames": 1,
             "total_frames": 167,
-            "timing_boundary": "after synchronous FileSink.append",
-            "steady_interval": "after warmup output through measured output",
-            "instrumentation_host_device_sync": (
-                "none; CPU clock only, decoded quality probe runs after timing"
-            ),
-            "quality_policy": {
-                "method": "decoded-rgb10-full-v4",
-                "decoder": "PyAV/libav rgb48le to RGBAHalf",
-                "compression": "zlib",
+            "quality": {
                 "max_abs_rgb10": 2,
                 "min_psnr_db": 60.0,
             },
@@ -81,20 +58,11 @@ def _fingerprint():
                 "duration": "25/3",
                 "source_tick": "1/24000",
                 "codec_fourcc": "hvc1",
-                "codec_details": {
-                    "bits_per_component": 10,
-                    "configuration_atom": "hvcC",
-                    "configuration_sha256": "source-codec-hash",
-                    "hevc": {
-                        "profile_idc": 2,
-                        "profile": "main10",
-                        "tier": "main",
-                        "level_idc": 30,
-                        "chroma_format_idc": 1,
-                        "chroma": "4:2:0",
-                        "bit_depth_luma": 10,
-                        "bit_depth_chroma": 10,
-                    },
+                "hevc": {
+                    "profile_idc": 2,
+                    "chroma": "4:2:0",
+                    "bit_depth_luma": 10,
+                    "bit_depth_chroma": 10,
                 },
                 "pixel_aspect": None,
                 "transform": {"a": 1.0, "b": 0.0, "c": 0.0, "d": 1.0, "tx": 0.0, "ty": 0.0},
@@ -102,12 +70,9 @@ def _fingerprint():
             },
         },
         "cache_compile_policy": {
-            "settings_source": "Settings constructor defaults",
             "mlx_cache_limit_gb": 1.0,
             "clear_mlx_cache_at_endpoint_start": True,
-            "fresh_process_per_run": True,
             "model_compile": True,
-            "system_compilation_cache": "retained",
         },
         "power_thermal": {
             "power_source": "AC Power",
@@ -121,16 +86,11 @@ def _fingerprint():
 def _workload():
     return {
         "definition": {
-            "schema": 1,
             "chain": "pass",
             "input_layout": "cv_rgba_half",
             "endpoint_args": {"quality": 0.65, "encode_chroma": "auto"},
         },
-        "resolved": {
-            "input_spec": {"layout": "cv_rgba_half"},
-            "output_spec": {"layout": "cv_rgba_half"},
-            "stages": [],
-        },
+        "stages": [],
         "measurement_contract": {
             "self_buffered_delay_frames": 0,
             "sink_holdback_frames": 1,
@@ -149,8 +109,6 @@ def _quality_sample(value=0, *, index=0, one_pixel=False):
         "index": index,
         "shape": [2, 2, 3],
         "rgb10_zlib_b64": bench._encode_rgb10_frame(grid),
-        "mean_rgb": [0.0, 0.0, 0.0],
-        "std_rgb": [0.0, 0.0, 0.0],
     }
 
 
@@ -164,27 +122,15 @@ def _output_behavior(value=0, *, one_pixel=False, diagnostic_hash="quality-hash"
             "first_pts": "0/1",
             "duration": "167/24",
             "codec_fourcc": "hvc1",
-            "codec_details": {
-                "bits_per_component": 10,
-                "configuration_atom": "hvcC",
-                "configuration_sha256": "codec-hash",
-                "hevc": {
-                    "profile_idc": 4,
-                    "profile": "range_extensions",
-                    "tier": "main",
-                    "level_idc": 30,
-                    "chroma_format_idc": 2,
-                    "chroma": "4:2:2",
-                    "bit_depth_luma": 10,
-                    "bit_depth_chroma": 10,
-                },
+            "hevc": {
+                "profile_idc": 4,
+                "chroma": "4:2:2",
+                "bit_depth_luma": 10,
+                "bit_depth_chroma": 10,
             },
         },
         "quality": {
-            "method": "decoded-rgb10-full-v4",
-            "decoder": "PyAV/libav rgb48le to RGBAHalf",
             "indices": [0],
-            "compression": "zlib",
             "diagnostic_full_frame_sha256": diagnostic_hash,
             "samples": [_quality_sample(value, one_pixel=one_pixel)],
         },
@@ -362,8 +308,6 @@ def test_learned_workload_is_explicit_and_quality_samples_span_all_intervals():
     assert definition["config"]["up"]["profile"] == "public2x"
     assert definition["config"]["up"]["dtype"] == "float16"
     assert definition["endpoint_args"]["encode_chroma"] == "auto"
-    assert definition["output_encoder"]["profile"] == "HEVC_Main42210_AutoLevel"
-    assert definition["output_encoder"]["chroma"] == "4:2:2"
     assert bench._quality_indices(
         warmup_frames=30,
         measured_frames=120,
@@ -432,13 +376,12 @@ def test_runtime_condition_drift_is_rejected_with_exact_field():
 
 def test_non_nominal_thermal_state_cannot_be_recorded(monkeypatch):
     monkeypatch.setattr(
-        bench._environment,
+        bench,
         "_runtime_conditions",
         lambda: {
             "power_source": "AC Power",
             "low_power_mode": False,
             "thermal_state": "serious",
-            "thermal_precondition": "throttled",
         },
     )
     with pytest.raises(RuntimeError, match="nominal thermal state"):
@@ -491,9 +434,9 @@ def test_baseline_root_must_be_an_object(baseline):
         ("machine.hardware_model", "Mac15,8"),
         ("os.build", "26A1"),
         ("runtime.mlx_version", "0.33.0"),
-        ("runtime.libav_versions.libswscale", [10, 0, 0]),
+        ("runtime.pyav_version", "19.0.0"),
         ("protocol.runs", 3),
-        ("protocol.quality_policy.max_abs_rgb10", 3),
+        ("protocol.quality.max_abs_rgb10", 3),
         ("clip.sha256", "different"),
         ("clip.track.cadence", "24000/1001"),
         ("cache_compile_policy.mlx_cache_limit_gb", 0.5),
@@ -512,19 +455,6 @@ def test_every_environment_fingerprint_mutation_names_exact_field(path, replacem
         )
     assert f"fingerprint.{path}" in str(exc.value)
 
-
-def test_informational_prose_changes_do_not_invalidate_the_baseline():
-    current = _fingerprint()
-    _set_path(current, "protocol.timing_boundary", "reworded description")
-    _set_path(
-        current, "protocol.instrumentation_host_device_sync", "reworded")
-    _set_path(current, "protocol.quality_policy.method", "renamed-v5")
-    bench._validate_baseline(
-        _baseline(),
-        fingerprint=current,
-        workloads={"pass": _workload()},
-        selected={"pass"},
-    )
 
 
 def test_missing_and_extra_fingerprint_keys_are_incompatible():
@@ -550,7 +480,7 @@ def test_missing_and_extra_fingerprint_keys_are_incompatible():
     ("path", "replacement"),
     [
         ("definition.endpoint_args", {"quality": 0.4, "encode_chroma": "420"}),
-        ("resolved.stages", [{"family": "bsvd", "profile": "c32"}]),
+        ("stages", [{"family": "bsvd", "profile": "c32"}]),
     ],
 )
 def test_workload_mutation_names_exact_field(path, replacement):
@@ -738,22 +668,6 @@ def test_recording_rejects_inconsistent_per_run_output_behavior():
     assert [run["pass"] for run in runs] == [False, True, True, True]
     assert any("runs[0].output_behavior.quality.samples[0]" in item for item in mismatches)
 
-
-def test_report_records_both_revisions_without_fingerprinting_them(tmp_path):
-    baseline = _baseline()
-    current = {"commit": "d" * 40, "dirty": True, "diff_sha256": "e" * 64}
-    report = bench._report_header(
-        recording=False,
-        clip=tmp_path / "clip.mp4",
-        baseline_path=tmp_path / "baseline.json",
-        current_revision=current,
-        baseline=baseline,
-        fingerprint=_fingerprint(),
-        workloads={"pass": _workload()},
-    )
-    assert report["current_product_revision"] == current
-    assert report["baseline_product_revision"] == baseline["product_revision"]
-    assert "product_revision" not in report["fingerprint"]
 
 
 def test_baseline_recording_can_never_return_a_passing_gate_status():
