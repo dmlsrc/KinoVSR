@@ -13,13 +13,15 @@ script once fitted.
 Scope notes for restoration eval, MEASURED on this workspace's fixtures
 (absolute values are implementation-scale; mx.linalg.pinv in fp32
 truncates the near-singular covariance directions harder than float64
-numpy did, which rescaled scores -- orderings are what carry meaning):
-NIQE rewards natural sharpness statistics, so over-smoothing scores WORSE
-(blur sigma 1.0/2.5 = 1.9/3.8 vs pristine 0.5 -- the opposite bias to
-PSNR) -- but it reads codec junk (ringing, mosquito, blocking energy) as
-TEXTURE: jpeg q20 scores a mild 0.66, and a truth-verified-better deblock
-output scores no better than its crushed input (2.156 vs 2.160). USE IT
-AS AN OVER-SMOOTHING TRIPWIRE, NOT AS AN OBJECTIVE for deblock tuning: a
+numpy did, which rescaled scores -- orderings are what carry meaning;
+anchors re-measured on REDS val after the AGGD reciprocal-curve fix and
+model refit): NIQE rewards natural sharpness statistics, so
+over-smoothing scores WORSE (blur sigma 1.0/2.5 = 2.2/3.7 vs pristine
+0.5 -- the opposite bias to PSNR) -- but it under-reads codec junk
+(ringing, mosquito, blocking energy) relative to blur: jpeg q20 scores
+1.3, well below the blur range, and a truth-verified-better deblock
+output has scored no better than its crushed input. USE IT AS AN
+OVER-SMOOTHING TRIPWIRE, NOT AS AN OBJECTIVE for deblock tuning: a
 recipe whose NIQE leaps toward blur-range values has been overcooked, but
 ranking deblock recipes by NIQE selects for doing nothing. It is also
 per-frame spatial only: pair it with a temporal-stability measure and a
@@ -61,11 +63,19 @@ _MEANFAC_LIST = [
 ]
 _GAM = mx.array(_GAM_LIST, dtype=mx.float32)
 _R_GAM = mx.array(_R_GAM_LIST, dtype=mx.float32)
+# The AGGD moment ratio rhat = m1^2/m2 (bounded by 1) is matched against the
+# RECIPROCAL curve Gamma(2/g)^2 / (Gamma(1/g)Gamma(3/g)); the GGD path uses
+# the inverted ratio m2/m1^2 against _R_GAM itself.
+_R_GAM_INV = mx.array([1.0 / v for v in _R_GAM_LIST], dtype=mx.float32)
 _MEANFAC = mx.array(_MEANFAC_LIST, dtype=mx.float32)
 
 
 def _alpha_idx(rhat: Any) -> Any:
     return mx.argmin(mx.abs(_R_GAM[None, :] - rhat[:, None]), axis=1)
+
+
+def _alpha_idx_aggd(rhatnorm: Any) -> Any:
+    return mx.argmin(mx.abs(_R_GAM_INV[None, :] - rhatnorm[:, None]), axis=1)
 
 
 def _gauss_kernel(sigma: float = 7.0 / 6.0, truncate: float = 3.0) -> Any:
@@ -132,7 +142,7 @@ def _scale_features(m: Any, p: int) -> Any:
         m2p = mx.mean(prod * prod, axis=1)
         rh = (m1p * m1p) / (m2p + 1e-12)
         rhat = rh * (gh ** 3 + 1.0) * (gh + 1.0) / ((gh * gh + 1.0) ** 2)
-        ai = _alpha_idx(rhat)
+        ai = _alpha_idx_aggd(rhat)
         mean = (sr - sl) * _MEANFAC[ai]
         feats += [_GAM[ai], mean, sl * sl, sr * sr]
     return mx.stack(feats, axis=1)
