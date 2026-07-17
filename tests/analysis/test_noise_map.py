@@ -209,6 +209,8 @@ def test_probe_classifier_flags_source_wide_motion_contamination():
     diag = classify_noise_analysis(analyze_noise(clip))
     assert "source-wide motion contamination" in diag["labels"]
     assert any("motion map" in warning for warning in diag["warnings"])
+    # contamination means an auto map may soften real detail: high risk
+    assert diag["risk"] == "high"
 
 
 def test_probe_classifier_flags_row_coherent_scanlines():

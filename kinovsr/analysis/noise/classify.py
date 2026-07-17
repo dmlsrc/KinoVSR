@@ -380,7 +380,8 @@ def classify_noise_analysis(stats: dict) -> dict:
     if not labels:
         labels.append("mixed/low-confidence")
     risk = "low"
-    if any("ambiguous" in label for label in labels) or any("under-report" in w for w in warnings):
+    if (any("ambiguous" in label for label in labels)
+            or "source-wide motion contamination" in labels):
         risk = "high"
     elif warnings:
         risk = "medium"
