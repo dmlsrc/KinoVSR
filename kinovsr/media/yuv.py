@@ -95,8 +95,16 @@ def _compiled_planes(Kr: float, Kb: float, full_range: bool):
         else:  # video range 10-bit: Y 64..940, chroma 64..960 (mid 512)
             Y10 = Y * 876.0 + 64.0
             Cb10c, Cr10c = Cb * 896.0 + 512.0, Cr * 896.0 + 512.0
-        Cb_s = (Cb10c[:, 0::2] + Cb10c[:, 1::2]) * 0.5   # box-average to 4:2:2
-        Cr_s = (Cr10c[:, 0::2] + Cr10c[:, 1::2]) * 0.5
+        # Co-sited (left) [1,2,1]/4 filter centered on the even columns: the
+        # 4:2:2 siting every decoder assumes. HEVC VUI cannot signal any
+        # other siting for 4:2:2 (chroma_sample_loc_type is 4:2:0-only), so
+        # a centered box-average ships unsignaled and decodes ~0.5 px left.
+        def cosited(c):
+            left = mx.concatenate([c[:, :1], c[:, 1:-1:2]], axis=1)
+            return (left + 2.0 * c[:, 0::2] + c[:, 1::2]) * 0.25
+
+        Cb_s = cosited(Cb10c)
+        Cr_s = cosited(Cr10c)
         luma = (mx.clip(mx.round(Y10), 0, 1023).astype(mx.uint16)) << 6
         cb = mx.clip(mx.round(Cb_s), 0, 1023).astype(mx.uint16)
         cr = mx.clip(mx.round(Cr_s), 0, 1023).astype(mx.uint16)
@@ -118,7 +126,8 @@ def rgb_to_yuv422_10(rgb: Any, dst_buffer: Any, matrix: Any, full_range: bool = 
     below touches CoreVideo. No CoreImage, no colorspace metadata.
 
     The 10-bit samples are left-justified (<< 6) in their 16-bit words, which is what
-    the BiPlanar10 formats expect. Chroma is box-averaged to 4:2:2.
+    the BiPlanar10 formats expect. Chroma decimates to 4:2:2 with a co-sited (left)
+    [1,2,1]/4 filter, matching the siting decoders assume for unsignaled 4:2:2.
     """
     Kr, Kb = coef_for_matrix(matrix)
     luma, chroma = _compiled_planes(Kr, Kb, full_range)(rgb)

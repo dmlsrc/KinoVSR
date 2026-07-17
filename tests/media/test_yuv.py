@@ -1,4 +1,4 @@
-"""luma_chroma_blend: per-channel-group recombination of two RGB frames."""
+"""luma_chroma_blend recombination + the 4:2:2 chroma decimation siting."""
 from __future__ import annotations
 
 import mlx.core as mx
@@ -127,3 +127,30 @@ def test_direct_yuv_matches_the_legacy_rgbahalf_boundary(
     yuv.rgb_to_yuv422_10(equivalent, direct, matrix, full_range)
 
     assert _active_yuv_bytes(direct, width) == _active_yuv_bytes(legacy, width)
+
+
+def test_chroma_decimation_is_cosited_121():
+    """4:2:2 chroma must be the left/co-sited [1,2,1]/4 filter: HEVC cannot
+    signal any other siting for 4:2:2, and decoders assume co-sited."""
+    from kinovsr.media.yuv import _compiled_planes
+
+    mx.random.seed(9)
+    H, W = 4, 16
+    rgb = mx.random.uniform(shape=(H, W, 3))
+    Kr, Kb = 0.2126, 0.0722
+    _, chroma = _compiled_planes(Kr, Kb, False)(rgb)
+    cb = (chroma.reshape(H, W // 2, 2)[..., 0] >> 6).astype(mx.float32)
+
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    Y = Kr * R + (1.0 - Kr - Kb) * G + Kb * B
+    c = ((B - Y) / (2.0 * (1.0 - Kb))) * 896.0 + 512.0
+    left = mx.concatenate([c[:, :1], c[:, 1:-1:2]], axis=1)
+    want = mx.clip(mx.round((left + 2.0 * c[:, 0::2] + c[:, 1::2]) * 0.25),
+                   0, 1023)
+    assert float(mx.max(mx.abs(cb - want))) <= 1.0
+
+    # constants are preserved exactly (the filter weights sum to 1)
+    flat = mx.full((2, 8, 3), 0.25)
+    _, chroma_c = _compiled_planes(Kr, Kb, False)(flat)
+    cbc = (chroma_c.reshape(2, 4, 2)[..., 0] >> 6).astype(mx.float32)
+    assert float(mx.max(cbc) - mx.min(cbc)) == 0.0
