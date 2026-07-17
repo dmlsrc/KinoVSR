@@ -486,3 +486,48 @@ def test_epoch_unwrapper_stitch_never_duplicates_a_recorder_gap():
     # epoch B lands one frame interval after 15s, not at 20s
     assert b[0] == Fraction(15) + Fraction(1, 25)
     assert b[1] - b[0] == Fraction(1, 25)
+
+
+def test_epoch_unwrapper_stitches_slow_cadences_at_their_interval():
+    # A joined 1 fps interval-timer capture stitches at ~1 s, not at the
+    # 1/25 s fallback (the old rule discarded every delta >= 1 s).
+    from kinovsr.media.timing import EpochUnwrapper
+
+    u = EpochUnwrapper()
+    for k in range(25):
+        u.push(Fraction(k))                          # 1 fps to 24 s
+    b = [u.push(Fraction(k)) for k in range(3)]
+    assert u.resets == 1
+    assert b[0] == Fraction(25)                      # 24 s + one 1 s interval
+    assert b[1] - b[0] == Fraction(1)
+
+
+def test_epoch_unwrapper_stitch_survives_one_damaged_delta():
+    # One near-duplicate damaged stamp (1 ms delta) must not become the
+    # stitch: the median of the recent intervals stays on the cadence.
+    from kinovsr.media.timing import EpochUnwrapper
+
+    u = EpochUnwrapper()
+    pts = [Fraction(k, 25) for k in range(300)]      # 25 fps to ~12 s
+    pts.insert(290, Fraction(289, 25) + Fraction(1, 1000))
+    for p in pts:
+        u.push(p)
+    b = [u.push(Fraction(k, 25)) for k in range(2)]
+    assert u.resets == 1
+    assert b[0] == Fraction(300, 25)                 # cadence stitch, not 1 ms
+
+
+def test_epoch_unwrapper_gap_veto_holds_on_slow_sources():
+    # A 31 s mid-recording pause on a 1 fps source is a gap to carry, not
+    # the cadence: the join still stitches at ~1 s.
+    from kinovsr.media.timing import EpochUnwrapper
+
+    u = EpochUnwrapper()
+    for k in range(10):
+        u.push(Fraction(k))                          # 1 fps to 9 s
+    for p in (Fraction(40), Fraction(41), Fraction(42)):
+        u.push(p)                                    # pause, then resume
+    b = [u.push(Fraction(k)) for k in range(2)]
+    assert u.resets == 1
+    assert b[0] == Fraction(43)                      # 42 s + one 1 s interval
+    assert b[1] - b[0] == Fraction(1)

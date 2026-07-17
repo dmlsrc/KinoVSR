@@ -20,7 +20,7 @@ import bisect
 import dataclasses
 import enum
 import math
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Iterable
 from fractions import Fraction
 
@@ -174,7 +174,11 @@ class EpochUnwrapper:
         # The last sub-second positive delta: the typical frame interval.
         # Bounded so a recorder GAP (a legitimate multi-second forward
         # jump) can never become the stitch and get duplicated at a join.
-        self._typical: Fraction | None = None
+        # Recent inter-frame intervals feeding the stitch estimate. A short
+        # window keeps one damaged stamp pair (a near-duplicate delta) from
+        # poisoning the stitch, and the push-side gap veto keeps recorder
+        # gaps out without excluding legitimately slow (>= 1 s) cadences.
+        self._deltas: deque[Fraction] = deque(maxlen=15)
         # A suspected reset awaiting confirmation: (dip_raw, candidate
         # offset). One damaged stamp must not permanently shift the
         # clock, so a reset commits only when the NEXT sample stays in
@@ -189,12 +193,21 @@ class EpochUnwrapper:
     def _stitch(self) -> Fraction:
         # One typical interval: a committed epoch continues the prior
         # cadence seamlessly (a joined 25 fps tape stays on the 25 fps
-        # grid). An absorbed outlier keeps this pin too; the common
-        # damage REPLACES a frame's stamp, so the rebound lands a full
-        # interval later and cannot collide. An EXTRA damaged stamp can
-        # tie the pin with the true next stamp - that degrades to the
-        # loud duplicate-identity refusal downstream, never silence.
-        return self._typical or Fraction(1, 25)
+        # grid; a joined 1 fps interval-timer capture stays on its 1 s
+        # grid). The estimate is the median of the recent intervals, so
+        # one damaged stamp pair cannot poison it. An absorbed outlier
+        # keeps this pin too; the common damage REPLACES a frame's stamp,
+        # so the rebound lands a full interval later and cannot collide.
+        # An EXTRA damaged stamp can tie the pin with the true next stamp
+        # - that degrades to the loud duplicate-identity refusal
+        # downstream, never silence.
+        if not self._deltas:
+            return Fraction(1, 25)
+        return self._delta_median()
+
+    def _delta_median(self) -> Fraction:
+        ds = sorted(self._deltas)
+        return ds[(len(ds) - 1) // 2]
 
     def push(self, pts: Fraction) -> Fraction:
         pts = Fraction(pts)
@@ -223,8 +236,13 @@ class EpochUnwrapper:
                 return adjusted
             if pts > self._prev_raw:
                 delta = pts - self._prev_raw
-                if delta < 1:
-                    self._typical = delta
+                # Gap veto: once a cadence estimate exists, exclude deltas
+                # far above it (a mid-recording pause is a gap to preserve,
+                # not the cadence). The absolute floor of 1 s keeps slow
+                # interval-timer cadences admissible from the start.
+                if (not self._deltas
+                        or delta <= max(Fraction(1), 4 * self._delta_median())):
+                    self._deltas.append(delta)
         self._prev_raw = pts
         adjusted = pts + self._offset
         if self._max_adjusted is None or adjusted > self._max_adjusted:
