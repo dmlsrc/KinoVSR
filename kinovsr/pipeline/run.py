@@ -921,6 +921,7 @@ class FileSink:
     # writer) on the uniform-grid verification path.
     _explicit_timeline = False
     _last_explicit_pts: int | None = None
+    _last_grid_pts: int | None = None
 
     def __init__(
         self,
@@ -968,11 +969,11 @@ class FileSink:
             raise MediaError(
                 f"timeline tick base {timeline.time_base} is not a unit "
                 f"fraction; it cannot map to a CMTime timescale")
-        if self._explicit_timeline:
-            # An explicit timeline is legal only as a carried source clock:
-            # the file source supplies the nominal rate (encoder hint).
-            if source is None or getattr(
-                    source, "nominal_cadence", None) is None:
+        # An explicit timeline is legal only as a carried source clock:
+        # the file source supplies the nominal rate (encoder hint).
+        if self._explicit_timeline and (
+                source is None
+                or getattr(source, "nominal_cadence", None) is None):
                 raise MediaError(
                     "output endpoint requires a CFR cadence unless the "
                     "chain carries an explicit file-source timeline")
