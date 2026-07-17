@@ -4,6 +4,68 @@ import mlx.core as mx
 import pytest
 
 
+def _torch_bins(size, out):
+    """The torch adaptive-pooling bin boundaries, straight from the spec."""
+    return [((i * size) // out, -(-((i + 1) * size) // out))
+            for i in range(out)]
+
+
+def test_adaptive_maxpool_matches_torch_bins_on_odd_sizes():
+    from kinovsr.processors.safmn.net import _adaptive_maxpool
+
+    mx.random.seed(3)
+    x = mx.random.uniform(shape=(1, 61, 90, 2))       # 486-class odd height
+    out_h, out_w = 61 // 8, 90 // 8                   # 7 x 11 bins
+    got = _adaptive_maxpool(x, out_h, out_w)
+    assert got.shape == (1, out_h, out_w, 2)
+    for bi, (hs, he) in enumerate(_torch_bins(61, out_h)):
+        for bj, (ws_, we) in enumerate(_torch_bins(90, out_w)):
+            want = mx.max(x[:, hs:he, ws_:we, :], axis=(1, 2))
+            assert float(mx.max(mx.abs(got[:, bi, bj, :] - want))) < 1e-6
+
+
+def test_adaptive_avgpool_matches_torch_bins_on_odd_sizes():
+    from kinovsr.processors.safmn.net import _adaptive_avgpool
+
+    mx.random.seed(4)
+    x = mx.random.uniform(shape=(1, 13, 22, 3))
+    out_h, out_w = 3, 5
+    got = _adaptive_avgpool(x, out_h, out_w)
+    for bi, (hs, he) in enumerate(_torch_bins(13, out_h)):
+        for bj, (ws_, we) in enumerate(_torch_bins(22, out_w)):
+            want = mx.mean(x[:, hs:he, ws_:we, :], axis=(1, 2))
+            assert float(mx.max(mx.abs(got[:, bi, bj, :] - want))) < 1e-6
+
+
+def test_adaptive_pools_keep_the_divisible_fast_path_exact():
+    from kinovsr.processors.safmn.net import (
+        _adaptive_avgpool,
+        _adaptive_maxpool,
+    )
+
+    mx.random.seed(5)
+    x = mx.random.uniform(shape=(1, 24, 32, 4))
+    ref_max = mx.max(x.reshape(1, 3, 8, 4, 8, 4), axis=(2, 4))
+    ref_avg = mx.mean(x.reshape(1, 3, 8, 4, 8, 4), axis=(2, 4))
+    assert float(mx.max(mx.abs(_adaptive_maxpool(x, 3, 4) - ref_max))) == 0.0
+    assert float(mx.max(mx.abs(_adaptive_avgpool(x, 3, 4) - ref_avg))) < 1e-7
+
+
+def test_nearest_to_matches_torch_index_formula():
+    from kinovsr.processors.safmn.net import _nearest_to
+
+    x = mx.arange(7 * 11, dtype=mx.float32).reshape(1, 7, 11, 1)
+    out = _nearest_to(x, 61, 90)
+    assert out.shape == (1, 61, 90, 1)
+    for i in (0, 30, 60):
+        for j in (0, 45, 89):
+            src = x[0, (i * 7) // 61, (j * 11) // 90, 0]
+            assert float(out[0, i, j, 0]) == float(src)
+    # integer-multiple targets reduce to the repeat path
+    up = _nearest_to(x, 14, 22)
+    assert float(mx.max(mx.abs(up[:, ::2, ::2] - x))) == 0.0
+
+
 def test_safmn_bicubic_up_matches_torch_reference():
     from kinovsr.processors.safmn.net import _bicubic_up
 

@@ -167,24 +167,85 @@ def _layernorm(x: Any, w: Any, b: Any, eps: float = 1e-6) -> Any:
     return (y * w.astype(mx.float32) + b.astype(mx.float32)).astype(x.dtype)
 
 
-def _maxpool(x: Any, k: int) -> Any:
-    """k x k max pool, stride k (H, W multiples of k -- guaranteed by the pad-to-8).
-    Matches torch adaptive_max_pool2d to (H/k, W/k) exactly under divisibility."""
-    n, h, w, c = x.shape
-    return mx.max(x.reshape(n, h // k, k, w // k, k, c), axis=(2, 4))
+def _adaptive_bins(size: int, out: int) -> tuple:
+    """torch adaptive-pooling bins: bin i covers [floor(i*size/out),
+    ceil((i+1)*size/out)). Returns (idx (out,maxk) with clamped duplicate
+    tail entries, weight (out,maxk) = 1/count for valid slots else 0)."""
+    starts = [(i * size) // out for i in range(out)]
+    ends = [-(-((i + 1) * size) // out) for i in range(out)]
+    maxk = max(e - s for s, e in zip(starts, ends))
+    idx = [[min(s + j, e - 1) for j in range(maxk)]
+           for s, e in zip(starts, ends)]
+    weight = [[1.0 / (e - s) if s + j < e else 0.0 for j in range(maxk)]
+              for s, e in zip(starts, ends)]
+    return mx.array(idx, dtype=mx.int32), mx.array(weight, dtype=mx.float32)
 
 
-def _avgpool(x: Any, k: int) -> Any:
-    """k x k average pool, stride k; matches torch adaptive_avg_pool2d under
-    divisibility (the PureScale fixed-SAFM branch)."""
+def _pool_axis(x: Any, out: int, axis: int, op: str) -> Any:
+    idx, weight = _adaptive_bins(x.shape[axis], out)
+    maxk = idx.shape[1]
+    g = mx.take(x, idx.reshape(-1), axis=axis)
+    shape = list(x.shape)
+    shape[axis:axis + 1] = [out, maxk]
+    g = g.reshape(shape)
+    if op == "max":
+        return mx.max(g, axis=axis + 1)
+    wshape = [1] * len(shape)
+    wshape[axis], wshape[axis + 1] = out, maxk
+    return mx.sum(g * weight.reshape(wshape).astype(g.dtype), axis=axis + 1)
+
+
+def _adaptive_maxpool(x: Any, out_h: int, out_w: int) -> Any:
+    """torch adaptive_max_pool2d on NHWC. Divisible sizes take the exact
+    reshape fast path (the compiled hot path for multiple-of-8 frames);
+    other sizes use torch's floor/ceil bin boundaries (max pooling needs no
+    weights: the clamped duplicate tail entries cannot change a max)."""
     n, h, w, c = x.shape
-    return mx.mean(x.reshape(n, h // k, k, w // k, k, c), axis=(2, 4))
+    if h % out_h == 0 and w % out_w == 0:
+        kh, kw = h // out_h, w // out_w
+        return mx.max(x.reshape(n, out_h, kh, out_w, kw, c), axis=(2, 4))
+    return _pool_axis(_pool_axis(x, out_h, 1, "max"), out_w, 2, "max")
+
+
+def _adaptive_avgpool(x: Any, out_h: int, out_w: int) -> Any:
+    """torch adaptive_avg_pool2d on NHWC (separable: per-axis bin counts
+    factorize, so mean-of-means over the bins is the rectangle mean)."""
+    n, h, w, c = x.shape
+    if h % out_h == 0 and w % out_w == 0:
+        kh, kw = h // out_h, w // out_w
+        return mx.mean(x.reshape(n, out_h, kh, out_w, kw, c), axis=(2, 4))
+    return _pool_axis(_pool_axis(x, out_h, 1, "avg"), out_w, 2, "avg")
 
 
 def _nearest_up(x: Any, r: int) -> Any:
     n, h, w, c = x.shape
     x = mx.broadcast_to(x[:, :, None, :, None, :], (n, h, r, w, r, c))
     return x.reshape(n, h * r, w * r, c)
+
+
+def _nearest_to(x: Any, out_h: int, out_w: int) -> Any:
+    """torch F.interpolate(mode='nearest') to an explicit size: src index =
+    floor(dst * in/out). Integer-multiple targets take the broadcast path."""
+    n, h, w, c = x.shape
+    if out_h % h == 0 and out_w % w == 0 and out_h // h == out_w // w:
+        return _nearest_up(x, out_h // h)
+    ri = mx.array([(i * h) // out_h for i in range(out_h)], dtype=mx.int32)
+    ci = mx.array([(j * w) // out_w for j in range(out_w)], dtype=mx.int32)
+    return mx.take(mx.take(x, ri, axis=1), ci, axis=2)
+
+
+def _pad_to(x: Any, out_h: int, out_w: int) -> Any:
+    """Replicate-extend bottom/right rows/cols up to (out_h, out_w)."""
+    n, h, w, c = x.shape
+    if h < out_h:
+        x = mx.concatenate(
+            [x, mx.broadcast_to(x[:, h - 1:h], (n, out_h - h, w, c))], axis=1)
+    if w < out_w:
+        n2, h2, _, c2 = x.shape
+        x = mx.concatenate(
+            [x, mx.broadcast_to(x[:, :, w - 1:w], (n2, h2, out_w - w, c2))],
+            axis=2)
+    return x
 
 
 
@@ -194,17 +255,6 @@ def _pixel_shuffle(x: Any, r: int) -> Any:
     x = x.reshape(n, h, w, c, r, r)
     x = mx.transpose(x, (0, 1, 4, 2, 5, 3))
     return x.reshape(n, h * r, w * r, c)
-
-
-def _replicate_pad(x: Any, m: int) -> Any:
-    """Replicate-pad bottom/right so H, W are multiples of m."""
-    _, h, w, _ = x.shape
-    ph, pw = (-h) % m, (-w) % m
-    if ph:
-        x = mx.concatenate([x, mx.broadcast_to(x[:, h - 1:h, :, :], (x.shape[0], ph, x.shape[2], x.shape[3]))], axis=1)
-    if pw:
-        x = mx.concatenate([x, mx.broadcast_to(x[:, :, w - 1:w, :], (x.shape[0], x.shape[1], pw, x.shape[3]))], axis=2)
-    return x
 
 
 # ---- "real" variant blocks (SAFMN-L) ----------------------------------------
@@ -247,6 +297,7 @@ def _safm(x: Any, p: dict, pre: str, mode: str = "stock", up: str = "nearest",
     lattice). The POOLING is trained in and not swappable; the UPSAMPLER is a mild
     shape-only choice and may be overridden. clamp > 0 winsorizes the pooled
     features (see _pool_clamp)."""
+    h, w = x.shape[1], x.shape[2]
     c4 = x.shape[-1] // 4
     outs = []
     for i in range(4):
@@ -254,11 +305,21 @@ def _safm(x: Any, p: dict, pre: str, mode: str = "stock", up: str = "nearest",
         if i == 0:
             s = _dw3x3(xc, p, f"{pre}.mfr.0")
         else:
-            s = _avgpool(xc, 2 ** i) if mode == "fixed" else _maxpool(xc, 2 ** i)
+            # Reference: adaptive pooling to (h//2^i, w//2^i) on the un-padded
+            # frame, then interpolate back to (h, w).
+            ph, pw = max(1, h // 2 ** i), max(1, w // 2 ** i)
+            s = (_adaptive_avgpool(xc, ph, pw) if mode == "fixed"
+                 else _adaptive_maxpool(xc, ph, pw))
             if clamp > 0.0:
                 s = _pool_clamp(s, clamp)
             s = _dw3x3(s, p, f"{pre}.mfr.{i}")
-            s = _bicubic_up(s, 2 ** i) if up == "bicubic" else _nearest_up(s, 2 ** i)
+            if up == "bicubic":
+                # The PureScale retrains have no public arch source; keep
+                # their trained-in scale-factor bicubic and replicate-extend
+                # the sub-pixel remainder on non-multiple-of-2^i frames.
+                s = _pad_to(_bicubic_up(s, 2 ** i), h, w)
+            else:
+                s = _nearest_to(s, h, w)
         outs.append(s)
     out = _conv(mx.concatenate(outs, axis=-1), p, f"{pre}.aggr")
     return _gelu(out) * x
@@ -288,7 +349,7 @@ def _simple_safm(x: Any, p: dict, pre: str) -> Any:
     y = _conv(x, p, f"{pre}.proj", pad=1)
     d = y.shape[-1] // 2
     x0, x1 = y[..., :d], y[..., d:]
-    s = _maxpool(x0, 8)
+    s = _adaptive_maxpool(x0, max(1, h // 8), max(1, w // 8))
     s = _dw3x3(s, p, f"{pre}.dwconv")
     s = _resize_bilinear(s, h, w, False)
     s = _gelu(s) * x0
@@ -311,16 +372,17 @@ def safmn(x: Any, p: dict, cfg: tuple | None = None) -> Any:
         cfg = _config(p)
     variant, _dim, n_blocks, scale, safm_mode, safm_up, pool_clamp = cfg
     dt = p["to_feat.weight"].dtype
-    n, h, w, _ = x.shape
-    xp = _replicate_pad(x.astype(dt), 8)
-    feat = _conv(xp, p, "to_feat", pad=1)
+    # No pad: the reference runs arbitrary sizes through adaptive pooling
+    # (its release harnesses feed odd frames un-padded), and the SAFM grids
+    # differ frame-wide if pooling bins move.
+    feat = _conv(x.astype(dt), p, "to_feat", pad=1)
     y = feat
     for i in range(n_blocks):
         y = (_att_block_real(y, p, i, safm_mode, safm_up, pool_clamp)
              if variant == "real" else _att_block_light(y, p, i))
     y = y + feat
     out = _pixel_shuffle(_conv(y, p, "to_img.0", pad=1), scale)
-    return mx.clip(out[:, :h * scale, :w * scale, :], 0.0, 1.0)
+    return mx.clip(out, 0.0, 1.0)
 
 
 _COMPILE_CACHE: dict = {}
