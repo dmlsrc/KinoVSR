@@ -94,9 +94,11 @@ def _expand_rpe(table: Any, heads: int) -> Any:
     w = (side + 1) // 2
     pos = mx.arange(w * w)
     qh, qw = pos // w, pos % w
-    rel_h = qh[None, :] - qh[:, None] + w - 1         # k - q, transposed below
+    # Entry [q, k]: rows are queries, so rel = k - q (matches the reference
+    # create_table_idxs / apply_rpe orientation; the table is not symmetric).
+    rel_h = qh[None, :] - qh[:, None] + w - 1
     rel_w = qw[None, :] - qw[:, None] + w - 1
-    idx = (rel_h * side + rel_w).T                    # [q, k] with rel = k - q
+    idx = rel_h * side + rel_w
     return table[:, idx.reshape(-1)].reshape(heads, w * w, w * w)
 
 
