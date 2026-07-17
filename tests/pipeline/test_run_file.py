@@ -2115,7 +2115,69 @@ def joined_ts_clip(tmp_path_factory):
     return joined
 
 
+def _write_bframe_ts_segment(path, *, count, seed) -> None:
+    """A textured moving mpegts segment WITH B-frames (decode order
+    differs from display order, including at the segment tail)."""
+    import random
+
+    rng = random.Random(seed)
+    out = av.open(str(path), "w", format="mpegts")
+    stream = out.add_stream("libx264", rate=30)
+    stream.width = stream.height = 64
+    stream.pix_fmt = "yuv420p"
+    stream.options = {"g": "12", "bf": "2", "crf": "18",
+                      "sc_threshold": "0"}
+    base = bytes(rng.randrange(30, 220) for _ in range(64 * 64))
+    for index in range(count):
+        frame = av.VideoFrame(64, 64, "gray")
+        roll = (index * 64) % len(base)
+        frame.planes[0].update(base[roll:] + base[:roll])
+        frame = frame.reformat(format="yuv420p")
+        frame.pts = index * 3000
+        frame.time_base = Fraction(1, 90000)
+        for packet in stream.encode(frame):
+            out.mux(packet)
+    for packet in stream.encode():
+        out.mux(packet)
+    out.close()
+
+
+@pytest.fixture(scope="module")
+def joined_bframe_ts_clip(tmp_path_factory):
+    # The open-GOP-adjacent shape: B-frames straddle both sides of the
+    # join, so decode order differs from display order right where the
+    # epoch resets.
+    root = tmp_path_factory.mktemp("run_file_joined_bf")
+    a, b = root / "a.ts", root / "b.ts"
+    _write_bframe_ts_segment(a, count=450, seed=3)
+    _write_bframe_ts_segment(b, count=45, seed=9)
+    joined = root / "joined.ts"
+    joined.write_bytes(a.read_bytes() + b.read_bytes())
+    return joined
+
+
 class TestEpochResets:
+    def test_bframe_join_delivers_every_frame_monotonic(
+            self, joined_bframe_ts_clip):
+        # The two-walk delivery-order assumption at an epoch head: the
+        # metadata walk sees decode order, the decode walk display order,
+        # and B-frames straddle the join. Every frame must come through
+        # exactly once with strictly increasing stamps.
+        from kinovsr.media import ffmpeg_reader
+
+        table = ffmpeg_reader.read_sample_table(joined_bframe_ts_clip)
+        assert table.sample_count == 495
+        stamps = [s.pts for s in table.samples]
+        assert stamps == sorted(stamps)
+        assert len(set(stamps)) == len(stamps)
+
+        units = list(FileSource(
+            joined_bframe_ts_clip, reader=ffmpeg_reader).units())
+        assert len(units) == 495
+        pts = [u.pts for u in units]
+        assert all(later > earlier
+                   for earlier, later in zip(pts, pts[1:]))
+
     def test_joined_segments_read_as_one_monotonic_clock(
             self, joined_ts_clip):
         from kinovsr.media import ffmpeg_reader

@@ -331,6 +331,30 @@ class TestBoundaries:
                             for b in u.boundaries)]
         assert cut_units == [3]
 
+    def test_deep_delay_survives_cuts_on_shots_shorter_than_its_window(self):
+        # A stage's REAL delay can exceed any declared radius (deflicker
+        # windows beyond 8, toflow at 3 passes) and can exceed a whole
+        # shot: a cut then arrives while the buffer still holds the entire
+        # previous scene. The drain-before-reset protocol must hold anyway:
+        # every frame out exactly once, in order, resets in cut order.
+        log = []
+        deep = Buffering("deep", log, depth=9)
+        after = Recorder("after", log)
+        feed = self.cut_at(self.cut_at(units(14), 4), 6)   # 2-frame shot
+        out = list(run_chain(chain(deep, after), feed, CONTEXT))
+        assert [u.pts for u in out] == list(range(14))
+        resets = [i for i, e in enumerate(log) if e == ("deep", "reset", "hard_cut")]
+        flushes = [i for i, e in enumerate(log) if e == ("deep", "flush", "")]
+        assert len(resets) == 2
+        # each cut drained the held tail before resetting the stage
+        assert flushes[0] < resets[0] < resets[1]
+        assert sum(1 for f in flushes if f < resets[1]) >= 2
+        # boundaries ride exactly the first frame of each new shot
+        cut_pts = [u.pts for u in out
+                   if any(b.kind is BoundaryKind.HARD_CUT
+                          for b in u.boundaries)]
+        assert cut_pts == [4, 6]
+
     def test_boundary_crosses_a_buffering_stage_to_reset_downstream(self):
         log = []
         buffer = Buffering("buf", log, depth=2)
