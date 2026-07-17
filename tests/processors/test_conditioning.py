@@ -32,10 +32,12 @@ class TestParse:
             "noise_map_floor_mode": "flat",
             "noise_map_floor": 0.02,
             "noise_map_pulse": True,
+            "noise_map_upsample": "box",
         })
         assert config == NoiseMapConfig(
             mode="auto", gain=1.5, refresh=0, masking=0.5,
-            motion_cap="loose", floor_mode="flat", floor=0.02, pulse=True)
+            motion_cap="loose", floor_mode="flat", floor=0.02, pulse=True,
+            upsample="box")
 
     @pytest.mark.parametrize("raw,match", [
         ({"noise_map": "blur"}, "noise_map must"),
@@ -45,6 +47,7 @@ class TestParse:
         ({"noise_map_motion_cap": "hard"}, "motion_cap must"),
         ({"noise_map_floor_mode": "avg"}, "floor_mode must"),
         ({"noise_map_floor": 2.0}, r"floor must be in \[0, 1\]"),
+        ({"noise_map_upsample": "bilinear"}, "upsample must"),
     ])
     def test_open_time_validation(self, raw, match):
         with pytest.raises(ValueError, match=match):
@@ -66,7 +69,8 @@ class TestBuild:
         assert tracker.gain == 1.5
         assert tracker.est_kwargs == {
             "motion_cap": "loose", "masking": 0.5,
-            "pulse_robust": False, "floor_mode": "flat"}
+            "pulse_robust": False, "floor_mode": "flat",
+            "upsample": "edge"}
 
     def test_pulse_builds_a_pulse_gain_independent_of_mode(self):
         # pulse conditions in constant mode too (matching the flat CLI).
@@ -173,3 +177,16 @@ class TestDiagnosticsHelpers:
             last_noise_map=mx.full((2, 2, 1), 0.15, dtype=mx.float32))
         image = noise_map_debug_image(drv)["noisemap"]
         assert float(image.max()) == 1.0
+
+
+def test_tracker_receives_the_upsample_choice():
+    from kinovsr.processors.conditioning import (
+        NoiseMapConfig,
+        build_conditioning,
+    )
+
+    tracker, _ = build_conditioning(NoiseMapConfig(mode="auto",
+                                                   upsample="box"))
+    assert tracker.est_kwargs["upsample"] == "box"
+    tracker, _ = build_conditioning(NoiseMapConfig(mode="auto"))
+    assert tracker.est_kwargs["upsample"] == "edge"

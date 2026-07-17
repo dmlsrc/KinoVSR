@@ -143,6 +143,61 @@ def resize_lanczos(img: Any, width: int, height: int) -> mx.array:
         return _cgimage_to_mx_rgb(cg_out)
 
 
+def edge_preserve_upsample_map(
+    small: Any,
+    guide_luma: Any,
+    width: int,
+    height: int,
+    *,
+    spatial_sigma: float = 3.0,
+    luma_sigma: float = 0.15,
+) -> Any:
+    """Upsample a coarse scalar map to (height, width), guided by a luma frame.
+
+    CoreImage ``CIEdgePreserveUpsampleFilter``: the map follows the guide's
+    edges instead of bleeding across them (gate-verified against the
+    repeat+box incumbent on sigma maps: 18-31 percent lower MAE on
+    content-aligned fields, parity on uniform ones; the alternative
+    CIGuidedFilter recipe injects guide structure into flat maps and was
+    rejected). ``small`` is a (bh, bw) or (bh, bw, 1) float map;
+    ``guide_luma`` is (height, width) float in [0, 1]. Values pass through
+    an 8-bit plane scaled to the map's maximum, and the result is clipped
+    back to the input map's range so upsampling never extrapolates.
+    """
+    a = mx.array(small).astype(mx.float32)
+    if a.ndim == 3:
+        a = a[:, :, 0]
+    top = float(mx.max(a))
+    if not top > 0.0:
+        return mx.zeros((int(height), int(width)), dtype=mx.float32)
+
+    def gray3(x01):
+        u = mx.clip(x01 * 255.0 + 0.5, 0, 255).astype(mx.uint8)
+        return mx.stack([u, u, u], axis=-1)
+
+    small_u8 = gray3(mx.clip(a / top, 0.0, 1.0))
+    guide_u8 = gray3(mx.clip(mx.array(guide_luma).astype(mx.float32), 0.0, 1.0))
+    with ci_render_scope() as context:
+        f = Quartz.CIFilter.filterWithName_("CIEdgePreserveUpsampleFilter")
+        if f is None:
+            raise RuntimeError("CIEdgePreserveUpsampleFilter is unavailable")
+        f.setValue_forKey_(
+            Quartz.CIImage.imageWithCGImage_(_mx_to_cgimage(small_u8)),
+            "inputSmallImage")
+        f.setValue_forKey_(
+            Quartz.CIImage.imageWithCGImage_(_mx_to_cgimage(guide_u8)),
+            "inputImage")
+        f.setValue_forKey_(float(spatial_sigma), "inputSpatialSigma")
+        f.setValue_forKey_(float(luma_sigma), "inputLumaSigma")
+        out = f.valueForKey_("outputImage")
+        cg = context.createCGImage_fromRect_(
+            out, Quartz.CGRectMake(0, 0, int(width), int(height)))
+        if cg is None:
+            raise RuntimeError("CIEdgePreserveUpsampleFilter render failed")
+        plane = _cgimage_to_mx_rgb(cg)[..., 0].astype(mx.float32) / 255.0
+    return mx.clip(plane * top, float(mx.min(a)), top)
+
+
 def save_image(img: Any, path: str | Path) -> Path:
     """Encode an (H, W, 3|4) uint8 array to an image file via ImageIO.
 

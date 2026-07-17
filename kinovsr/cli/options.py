@@ -83,7 +83,8 @@ FAMILY_KEYS: dict[str, frozenset[str]] = {
     # Conditioning subsystems and foundation prefixes lock their keys the
     # same way so the whole prefixed surface stays deliberate.
     "noise_map": frozenset({"gain", "debug", "refresh", "masking",
-                            "motion_cap", "floor_mode", "floor", "pulse"}),
+                            "motion_cap", "floor_mode", "floor", "pulse",
+                            "upsample"}),
     "deblock_map": frozenset({"gain"}),
     "conform": frozenset({"fps"}),
     "cut": frozenset({"detect", "threshold", "log"}),

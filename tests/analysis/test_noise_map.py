@@ -7,6 +7,7 @@ motion cap, unit conversion, and the tracker's gain/EMA behavior.
 import math
 
 import mlx.core as mx
+import pytest
 
 from kinovsr.analysis.noise import (
     NoiseMapTracker,
@@ -838,3 +839,49 @@ def test_source_since_sync_duck_typing():
         SimpleNamespace(source=SimpleNamespace(gop_ordinal=4))) == 4
     assert source_since_sync(
         SimpleNamespace(source=SimpleNamespace(gop_ordinal=None))) is None
+
+
+def test_edge_upsample_tracks_content_aligned_sigma_better_than_box():
+    # doc-12 gate, wired as the default: a two-level sigma field aligned to
+    # a luma edge upsamples with less cross-edge bleed under the guided
+    # path than under repeat+box; on a uniform field the two agree.
+    ys = mx.broadcast_to(mx.linspace(0, 1, H).reshape(H, 1), (H, W))
+    xs = mx.broadcast_to(mx.linspace(0, 1, W).reshape(1, W), (H, W))
+    n = mx.sin(xs * 977.13 + ys * 631.77) * 43758.5453
+    tex = (n - mx.floor(n)) * 0.2
+    left = (xs < 0.5).astype(mx.float32)
+    content = mx.clip(0.15 + 0.55 * left + tex, 0, 1)
+    clean = mx.broadcast_to(content[..., None], (H, W, 3))
+    sigma_true = 0.02 + 0.05 * left
+    mx.eval(clean, sigma_true)
+
+    mx.random.seed(21)
+    frames = [mx.clip(clean + sigma_true[..., None]
+                      * mx.random.normal(shape=clean.shape), 0, 1)
+              for _ in range(10)]
+    mx.eval(*frames)
+
+    edge = estimate_sigma_map(frames, block=16, upsample="edge")[:, :, 0]
+    boxm = estimate_sigma_map(frames, block=16, upsample="box")[:, :, 0]
+    mx.eval(edge, boxm)
+    err_edge = float(mx.mean(mx.abs(edge - sigma_true)))
+    err_box = float(mx.mean(mx.abs(boxm - sigma_true)))
+    assert err_edge < err_box
+
+    flat_true = mx.full((H, W), 0.04)
+    flat_frames = [mx.clip(clean + 0.04 * mx.random.normal(shape=clean.shape),
+                           0, 1) for _ in range(10)]
+    mx.eval(*flat_frames)
+    fe = estimate_sigma_map(flat_frames, block=16, upsample="edge")[:, :, 0]
+    fb = estimate_sigma_map(flat_frames, block=16, upsample="box")[:, :, 0]
+    fe_err = float(mx.mean(mx.abs(fe - flat_true)))
+    fb_err = float(mx.mean(mx.abs(fb - flat_true)))
+    # no structure transfer: the guided default must not lose to box on
+    # uniform noise by more than a whisker
+    assert fe_err < fb_err + 0.001
+
+
+def test_estimator_rejects_unknown_upsample():
+    frames = [mx.zeros((32, 32, 3)) for _ in range(3)]
+    with pytest.raises(ValueError, match="upsample"):
+        estimate_sigma_map(frames, upsample="bilinear")

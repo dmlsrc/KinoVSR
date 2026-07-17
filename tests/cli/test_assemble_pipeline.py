@@ -216,3 +216,11 @@ class TestResolves:
         plan = resolve_pipeline(asm(*argv), input_spec=spec(),
                                 settings=Settings())
         assert plan.output_spec is not None
+
+
+class TestNoiseMapUpsampleDial:
+    def test_upsample_choice_reaches_capable_stages(self):
+        config = asm("--denoise", "mc,bsvd", "--noise-map", "auto",
+                     "--noise-map-upsample", "box")
+        assert config["denoise_mc"]["noise_map_upsample"] == "box"
+        assert config["denoise_bsvd"]["noise_map_upsample"] == "box"

@@ -37,6 +37,7 @@ NOISE_MAP_TRACKER_KEYS = (
     "noise_map_motion_cap",
     "noise_map_floor_mode",
     "noise_map_pulse",
+    "noise_map_upsample",
 )
 NOISE_MAP_STREAM_KEYS = (
     "noise_map_refresh",
@@ -47,6 +48,7 @@ NOISE_MAP_KEYS = (*NOISE_MAP_TRACKER_KEYS, *NOISE_MAP_STREAM_KEYS)
 _MODES = ("constant", "auto")
 _MOTION_CAPS = ("strict", "loose", "off")
 _FLOOR_MODES = ("mc", "flat")
+_UPSAMPLES = ("edge", "box")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -59,6 +61,7 @@ class NoiseMapConfig:
     floor_mode: str = "mc"       # motion-immune floor source: mc/flat
     floor: float = 0.0           # minimum sigma under the map [0, 1]
     pulse: bool = False          # per-frame GOP-phase pulse gain
+    upsample: str = "edge"       # grid -> pixels: edge (guided) / box (repeat)
 
 
 def parse_noise_map(raw: Mapping[str, Any]) -> NoiseMapConfig:
@@ -86,13 +89,17 @@ def parse_noise_map(raw: Mapping[str, Any]) -> NoiseMapConfig:
     floor_mode = typed_value(raw, "noise_map_floor_mode", str, "mc")
     if floor_mode not in _FLOOR_MODES:
         raise ValueError(f"noise_map_floor_mode must be one of {list(_FLOOR_MODES)}")
+    upsample = typed_value(raw, "noise_map_upsample", str, "edge")
+    if upsample not in _UPSAMPLES:
+        raise ValueError(f"noise_map_upsample must be one of {list(_UPSAMPLES)}")
     floor = typed_value(raw, "noise_map_floor", float, 0.0)
     if not 0.0 <= floor <= 1.0:
         raise ValueError("noise_map_floor must be in [0, 1]")
     pulse = typed_value(raw, "noise_map_pulse", bool, False)
     return NoiseMapConfig(
         mode=mode, gain=gain, refresh=refresh, masking=masking,
-        motion_cap=motion_cap, floor_mode=floor_mode, floor=floor, pulse=pulse)
+        motion_cap=motion_cap, floor_mode=floor_mode, floor=floor, pulse=pulse,
+        upsample=upsample)
 
 
 def build_conditioning(config: NoiseMapConfig) -> tuple[Any | None, Any | None]:
@@ -111,7 +118,7 @@ def build_conditioning(config: NoiseMapConfig) -> tuple[Any | None, Any | None]:
         tracker = NoiseMapTracker(
             gain=config.gain, motion_cap=config.motion_cap,
             masking=config.masking, pulse_robust=config.pulse,
-            floor_mode=config.floor_mode)
+            floor_mode=config.floor_mode, upsample=config.upsample)
     if config.pulse:
         from kinovsr.analysis.noise import PulseGain
 

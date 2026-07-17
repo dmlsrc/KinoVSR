@@ -220,6 +220,7 @@ def estimate_sigma_map(
     sigma_floor: float = 0.002,
     sigma_ceil: float = 0.25,
     smooth: bool = True,
+    upsample: str = "edge",
 ) -> Any | None:
     """Estimate a per-pixel noise sigma map from a window of frames.
 
@@ -242,6 +243,8 @@ def estimate_sigma_map(
         return None
     if floor_mode not in ("flat", "mc"):
         raise ValueError(f"floor_mode must be 'flat' or 'mc'; got {floor_mode!r}")
+    if upsample not in ("edge", "box"):
+        raise ValueError(f"upsample must be 'edge' or 'box'; got {upsample!r}")
     runs = _select_runs(len(frames), max_frames)
     lum_all: list = []
     diffs: list = []
@@ -624,9 +627,18 @@ def estimate_sigma_map(
         sig = sig * margin
     if smooth:
         sig = _box_smooth_coarse(sig)
-    full = mx.repeat(mx.repeat(sig, block, axis=0), block, axis=1)[:H, :W]
-    if smooth:
-        full = _box_blur_full(full, block + 1)
+    if upsample == "edge":
+        # Guided upsample (doc-12 gate, 2026-07-17): the map follows luma
+        # edges instead of bleeding sigma across them. The guide is the mean
+        # luma of the very frames the estimate came from.
+        from kinovsr.media.images import edge_preserve_upsample_map
+
+        guide = sum(lum_all) / len(lum_all)
+        full = edge_preserve_upsample_map(sig, guide, W, H)
+    else:
+        full = mx.repeat(mx.repeat(sig, block, axis=0), block, axis=1)[:H, :W]
+        if smooth:
+            full = _box_blur_full(full, block + 1)
     full = mx.clip(full, sigma_floor, sigma_ceil)
     return full[:, :, None].astype(mx.float32)
 
