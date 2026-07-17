@@ -211,8 +211,11 @@ class McTemporalDenoiser:
         self.conf_scale = 10.0  # flow magnitude (px) at which confidence ~1/e
         # gate-openness run stat: mean realized blend weight / strength =
         # the fraction of the possible temporal denoise the flow actually
-        # unlocked (flow-limited clips read low)
-        self._w_sum = 0.0
+        # unlocked (flow-limited clips read low). Accumulated as a RESIDENT
+        # MLX scalar and read once at end of run: a per-frame float() here
+        # forces an extra mid-frame host/device sync (doc 06 forbids that
+        # for diagnostics).
+        self._w_sum: Any = None
         self._w_n = 0
         self._warp_grid = _grid(self.h, self.w)
         self._src_attrs: Any = None
@@ -546,7 +549,8 @@ class McTemporalDenoiser:
         if self.confidence:
             mag = mx.sqrt(mx.sum(fwd**2, axis=-1, keepdims=True) + 1e-8)
             w = w * mx.exp(-((mag / self.conf_scale) ** 2))
-        self._w_sum += float(mx.mean(w))
+        wm = mx.mean(w)
+        self._w_sum = wm if self._w_sum is None else self._w_sum + wm
         self._w_n += 1
         return w
 
@@ -558,7 +562,7 @@ class McTemporalDenoiser:
         better flow engine can)."""
         if not self._w_n or self.strength <= 0:
             return 0.0
-        return (self._w_sum / self._w_n) / self.strength
+        return (float(self._w_sum) / self._w_n) / self.strength
 
     def denoise(self, rgb_f32: Any, since_sync: int | None = None) -> Any:
         rgb_f32 = mx.clip(rgb_f32[..., :3].astype(mx.float32), 0.0, 1.0)
@@ -593,7 +597,12 @@ class McTemporalDenoiser:
             acc = acc + w * warped
             wsum = wsum + w
         out = mx.clip(acc / wsum, 0.0, 1.0)
-        mx.eval(out)
+        # One sync per frame: the gate-openness accumulator rides along
+        # instead of forcing its own mid-frame evaluation per reference.
+        if self._w_sum is None:
+            mx.eval(out)
+        else:
+            mx.eval(out, self._w_sum)
         self._remember(rgb_f32, out)
         return out
 
