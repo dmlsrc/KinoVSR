@@ -79,7 +79,7 @@ class _Adaptor:
 
 
 class _PathWriter:
-    instances: list["_PathWriter"] = []
+    instances: list[_PathWriter] = []
 
     def __init__(self, output_path, *_args, **kwargs):
         from pathlib import Path

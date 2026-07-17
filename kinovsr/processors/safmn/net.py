@@ -173,11 +173,11 @@ def _adaptive_bins(size: int, out: int) -> tuple:
     tail entries, weight (out,maxk) = 1/count for valid slots else 0)."""
     starts = [(i * size) // out for i in range(out)]
     ends = [-(-((i + 1) * size) // out) for i in range(out)]
-    maxk = max(e - s for s, e in zip(starts, ends))
+    maxk = max(e - s for s, e in zip(starts, ends, strict=True))
     idx = [[min(s + j, e - 1) for j in range(maxk)]
-           for s, e in zip(starts, ends)]
+           for s, e in zip(starts, ends, strict=True)]
     weight = [[1.0 / (e - s) if s + j < e else 0.0 for j in range(maxk)]
-              for s, e in zip(starts, ends)]
+              for s, e in zip(starts, ends, strict=True)]
     return mx.array(idx, dtype=mx.int32), mx.array(weight, dtype=mx.float32)
 
 
@@ -313,13 +313,11 @@ def _safm(x: Any, p: dict, pre: str, mode: str = "stock", up: str = "nearest",
             if clamp > 0.0:
                 s = _pool_clamp(s, clamp)
             s = _dw3x3(s, p, f"{pre}.mfr.{i}")
-            if up == "bicubic":
-                # The PureScale retrains have no public arch source; keep
-                # their trained-in scale-factor bicubic and replicate-extend
-                # the sub-pixel remainder on non-multiple-of-2^i frames.
-                s = _pad_to(_bicubic_up(s, 2 ** i), h, w)
-            else:
-                s = _nearest_to(s, h, w)
+            # The PureScale retrains have no public arch source; keep
+            # their trained-in scale-factor bicubic and replicate-extend
+            # the sub-pixel remainder on non-multiple-of-2^i frames.
+            s = (_pad_to(_bicubic_up(s, 2 ** i), h, w)
+                 if up == "bicubic" else _nearest_to(s, h, w))
         outs.append(s)
     out = _conv(mx.concatenate(outs, axis=-1), p, f"{pre}.aggr")
     return _gelu(out) * x

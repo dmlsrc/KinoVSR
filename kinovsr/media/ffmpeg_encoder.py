@@ -50,6 +50,7 @@ Encoder-choice details that aren't obvious from the flags alone:
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import logging
 import subprocess
@@ -381,10 +382,9 @@ def encode_video_ffmpeg(
                         proc.stdin.write(
                             _frame_buffer(frame, preset.frame_bit_depth))
                 finally:
-                    try:
+                    # dead pipe is fine; proc.wait() below reports the rc
+                    with contextlib.suppress(OSError):
                         proc.stdin.close()
-                    except OSError:
-                        pass  # dead pipe; proc.wait() below reports the rc
             except BrokenPipeError:
                 # ffmpeg died before consuming the stream; its diagnostic
                 # went to the inherited stderr.
