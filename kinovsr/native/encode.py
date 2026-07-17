@@ -37,6 +37,8 @@ from __future__ import annotations
 import functools
 import itertools
 import logging
+import os
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from fractions import Fraction
@@ -57,6 +59,20 @@ from .vsr import VsrSession, scale_for_mode
 from .writer import HEVC_PROFILE_MAIN10, HEVC_PROFILE_MAIN422_10, AVWriter
 
 _log = logging.getLogger(__name__)
+
+
+def _partial_sibling(path: Path) -> Path:
+    """A unique hidden temp sibling the writer encodes into.
+
+    The finished file is published onto ``path`` only after ``finish()``
+    succeeds, so a pre-existing deliverable at ``path`` survives any encode
+    failure (overwrite happens at publish time, atomically).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".partial")
+    os.close(fd)
+    return Path(raw)
 
 
 def _discard_failed_output(writer: Any, path: Path) -> None:
@@ -350,8 +366,9 @@ def encode_video_videotoolbox(
         # directly into the writer's adaptor pool when there is no VTFRC.
         # If the writer is doing the explicit RGBAHalf->YUV conversion, its
         # adaptor pool is YUV; keep the producer on its own RGBAHalf pool.
+        temp_path = _partial_sibling(output_path)
         writer = AVWriter(
-            output_path,
+            temp_path,
             width=out_w, height=out_h, fps=target_cadence,
             source_pixel_format=writer_src_fmt,
             profile=profile,
@@ -391,11 +408,13 @@ def encode_video_videotoolbox(
         # promotion path with no loss vs. the NV12 alternative.
         writer_orig: AVWriter | None = None
         orig_path: Path | None = None
+        orig_temp: Path | None = None
         do_save_original = vsr_save_original and (vsr is not None or vtfrc is not None)
         if do_save_original:
             orig_path = output_path.with_name(
                 f"{output_path.stem}_orig{output_path.suffix}"
             )
+            orig_temp = _partial_sibling(orig_path)
             if vsr_spatial_mode in ("balanced", "image"):
                 orig_src_fmt = _pb.PIX_RGBAHALF
                 orig_profile = HEVC_PROFILE_MAIN422_10
@@ -404,7 +423,7 @@ def encode_video_videotoolbox(
                 orig_profile = HEVC_PROFILE_MAIN10
             orig_yuv_feed = orig_src_fmt == _pb.PIX_RGBAHALF
             writer_orig = AVWriter(
-                orig_path,
+                orig_temp,
                 width=in_w, height=in_h, fps=source_cadence,
                 source_pixel_format=orig_src_fmt,
                 profile=orig_profile,
@@ -505,16 +524,35 @@ def encode_video_videotoolbox(
             reporter.phase_end(_phase)
             try:
                 if completed:
-                    writer.finish()
-                    if writer_orig is not None:
-                        writer_orig.finish()
+                    try:
+                        writer.finish()
+                    except BaseException:
+                        _discard_failed_output(writer, temp_path)
+                        if writer_orig is not None and orig_temp is not None:
+                            _discard_failed_output(writer_orig, orig_temp)
+                        raise
+                    # Publish only a durably finished file onto the requested
+                    # destination (overwrite-on-success stays this endpoint's
+                    # contract; a pre-existing file now survives any failure).
+                    temp_path.replace(output_path)
+                    if (writer_orig is not None and orig_temp is not None
+                            and orig_path is not None):
+                        try:
+                            writer_orig.finish()
+                        except BaseException:
+                            # The primary published fine; discard only the
+                            # companion's partial and let its error surface.
+                            _discard_failed_output(writer_orig, orig_temp)
+                            raise
+                        orig_temp.replace(orig_path)
                 else:
                     # The encode loop failed: finalizing would leave a truncated
-                    # but playable file at the requested destination and could
-                    # mask the loop's error with a writer error.  Discard instead.
-                    _discard_failed_output(writer, output_path)
-                    if writer_orig is not None and orig_path is not None:
-                        _discard_failed_output(writer_orig, orig_path)
+                    # but playable file and could mask the loop's error with a
+                    # writer error.  Discard the temps; the destination (and
+                    # anything pre-existing there) is untouched.
+                    _discard_failed_output(writer, temp_path)
+                    if writer_orig is not None and orig_temp is not None:
+                        _discard_failed_output(writer_orig, orig_temp)
             finally:
                 if vtfrc is not None:
                     vtfrc.close()
