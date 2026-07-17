@@ -275,6 +275,24 @@ def _shift_mask(D: int, H: int, W: int, ws: tuple[int, int], shift: tuple[int, i
     return mx.where(am != 0, mx.array(-100.0, mx.float32), mx.array(0.0, mx.float32))
 
 
+def _encoder_layer(x: Any, p: dict, pre: str, depth: int, num_heads: int,
+                   ws: tuple[int, int]) -> Any:
+    """EncoderLayer: (B,D,C,H,W) -> (B,D,C,H,W). depth self-blocks with
+    alternating shift; no cross-fusion tail (that is EncoderLayer02)."""
+    B, D, C, H, W = x.shape
+    x = mx.transpose(x, (0, 1, 3, 4, 2))                 # (B,D,H,W,C)
+    shift = tuple(i // 2 for i in ws)
+    ws_a, shift_a = _get_window_size((H, W), ws, shift)
+    # Shifted blocks exist only at odd depth indices, so the mask is needed
+    # only for depth >= 2.
+    mask = (_shift_mask(D, H, W, ws_a, shift_a)
+            if depth > 1 and any(shift_a) else None)
+    for i in range(depth):
+        sh = (0, 0) if i % 2 == 0 else shift
+        x = _block_self(x, p, f"{pre}.blocks.{i}", num_heads, ws, sh, mask)
+    return mx.transpose(x, (0, 1, 4, 2, 3))              # (B,D,C,H,W)
+
+
 def _encoder_layer02(x: Any, p: dict, pre: str, depth: int, num_heads: int,
                      ws: tuple[int, int]) -> Any:
     """EncoderLayer02: (B,D,C,H,W) -> (B,C,H,W). depth self-blocks + cross last_blk."""
@@ -294,7 +312,8 @@ def _encoder_layer02(x: Any, p: dict, pre: str, depth: int, num_heads: int,
 class PVDDConfig:
     def __init__(self, num_in=3, level=False, num_feat=64, num_block=3, num_block_f=3,
                  num_block_pre=3, depth=2, num_head=8, window_size=(8, 8),
-                 dynamic_refine_thres=255.0):
+                 dynamic_refine_thres=255.0, pre_depth=0, pre_heads=0,
+                 pre_window=(0, 0)):
         self.num_in = num_in
         self.level = level
         self.num_feat = num_feat
@@ -305,6 +324,11 @@ class PVDDConfig:
         self.num_head = num_head
         self.window_size = window_size
         self.thres = dynamic_refine_thres / 255.0
+        # feat_STTB per-frame spatial pre-attention (level checkpoints only;
+        # inferred from the checkpoint at load, 0 depth = not applied).
+        self.pre_depth = pre_depth
+        self.pre_heads = pre_heads
+        self.pre_window = pre_window
 
 
 def _feat_extractor(x: Any, p: dict, cfg: PVDDConfig) -> Any:
@@ -322,6 +346,17 @@ def _process(frames_nhwc: list, p: dict, cfg: PVDDConfig) -> list:
     """frames: list of T (1,H,W,C). Returns list of T denoised (1,H,W,C)."""
     T = len(frames_nhwc)
     feats = [_feat_extractor(f, p, cfg) for f in frames_nhwc]   # each (1,h/4,w/4,64)
+
+    if cfg.pre_depth:
+        # Level nets apply per-frame window self-attention to the extracted
+        # features before the temporal branches (reference applies feat_STTB
+        # with num_frames=1; the blind nets construct it but never call it).
+        def pre_attn(f):
+            s = mx.transpose(f, (0, 3, 1, 2))[:, None]          # (1,1,C,h,w)
+            out = _encoder_layer(s, p, "feat_STTB", cfg.pre_depth,
+                                 cfg.pre_heads, cfg.pre_window)
+            return mx.transpose(out[:, 0], (0, 2, 3, 1))        # (1,h,w,C)
+        feats = [pre_attn(f) for f in feats]
 
     def sttb(pre, fa, fb):
         # stack two (1,h,w,C) frames -> (1,2,C,h,w) logical for encoder_layer02

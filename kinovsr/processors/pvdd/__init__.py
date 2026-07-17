@@ -49,15 +49,35 @@ def _to_params(raw: dict[str, Any], dtype: Any) -> tuple[dict[str, Any], PVDDCon
     """Build the forward param dict from a raw (torch-layout) weight dict.
 
     Conv weights (4D, O,I,kH,kW) transpose to OHWI; Linear/tables/norms/biases
-    stay; relative_position_index becomes int32; feat_STTB.* (unused pre-attention)
-    is dropped. num_in and level are inferred from shapes.
+    stay; relative_position_index becomes int32. feat_STTB.* is the per-frame
+    spatial pre-attention: the blind nets construct it but never call it (the
+    reference comments the call out), so their weights are dropped; the level
+    nets apply it, so their weights are kept and its depth/heads/window are
+    inferred from the checkpoint. num_in and level are inferred from shapes.
     """
     num_in = int(raw["conv_last.weight"].shape[0])              # (num_in,64,3,3)
     clean_in = int(raw["clean_model.conv_in.weight"].shape[1])  # num_in(+1 if level)
     level = clean_in == num_in + 1
+    pre_depth = 0
+    while f"feat_STTB.blocks.{pre_depth}.attn.relative_position_bias_table" in raw:
+        pre_depth += 1
+    pre_heads, pre_window = 0, (0, 0)
+    if level and pre_depth:
+        table = raw["feat_STTB.blocks.0.attn.relative_position_bias_table"]
+        pre_heads = int(table.shape[1])
+        rows = int(table.shape[0])
+        side = int(round(rows ** 0.5))                          # (2w-1)^2, D=1
+        if side * side != rows:
+            raise ValueError(
+                f"unexpected feat_STTB bias-table rows {rows} (expected a "
+                f"square (2w-1)^2 for the single-frame pre-attention)")
+        w = (side + 1) // 2
+        pre_window = (w, w)
+    else:
+        pre_depth = 0
     p: dict[str, Any] = {}
     for k, v in raw.items():
-        if k.startswith("feat_STTB"):
+        if k.startswith("feat_STTB") and not pre_depth:
             continue
         if k.endswith("relative_position_index"):
             p[k] = v.astype(mx.int32)
@@ -65,7 +85,8 @@ def _to_params(raw: dict[str, Any], dtype: Any) -> tuple[dict[str, Any], PVDDCon
         if v.ndim == 4:
             v = mx.transpose(v, (0, 2, 3, 1))                   # OHWI
         p[k] = v.astype(dtype)
-    return p, PVDDConfig(num_in=num_in, level=level)
+    return p, PVDDConfig(num_in=num_in, level=level, pre_depth=pre_depth,
+                         pre_heads=pre_heads, pre_window=pre_window)
 
 
 def load_pvdd(source: str | Path | dict, dtype: Any = mx.float32) -> tuple[dict, PVDDConfig]:

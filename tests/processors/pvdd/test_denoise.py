@@ -95,7 +95,10 @@ def _fake_raw(num_in, level):
         "feat_extractor.main.0.weight": mx.zeros((64, num_in, 3, 3)),
         "backward_STTB.blocks.0.attn.q.weight": mx.zeros((64, 64)),      # Linear: kept as-is
         "backward_STTB.blocks.0.attn.relative_position_index": mx.zeros((128, 128)),
-        "feat_STTB.blocks.0.norm1.weight": mx.zeros((64,)),             # dropped at load
+        "feat_STTB.blocks.0.norm1.weight": mx.zeros((64,)),
+        # 16x16 window, 4 heads: (2*16-1)^2 = 961 rows (single-frame table)
+        "feat_STTB.blocks.0.attn.relative_position_bias_table":
+            mx.zeros((961, 4)),
     }
 
 
@@ -103,8 +106,70 @@ def test_variant_detection_and_load_shapes():
     for num_in, level in [(3, False), (3, True), (4, False), (4, True)]:
         p, cfg = load_pvdd(_fake_raw(num_in, level), dtype=mx.float32)
         assert cfg.num_in == num_in and cfg.level is level
-        # conv weight transposed OHWI; Linear left (O,I); index -> int; feat_STTB dropped
+        # conv weight transposed OHWI; Linear left (O,I); index -> int
         assert p["conv_last.weight"].shape == (num_in, 3, 3, 64)
         assert p["backward_STTB.blocks.0.attn.q.weight"].shape == (64, 64)
         assert p["backward_STTB.blocks.0.attn.relative_position_index"].dtype == mx.int32
-        assert not any(k.startswith("feat_STTB") for k in p)
+        if level:
+            # level nets APPLY the per-frame pre-attention: weights kept,
+            # depth/heads/window inferred from the checkpoint
+            assert any(k.startswith("feat_STTB") for k in p)
+            assert cfg.pre_depth == 1
+            assert cfg.pre_heads == 4
+            assert cfg.pre_window == (16, 16)
+        else:
+            # blind nets construct feat_STTB but never call it: dropped
+            assert not any(k.startswith("feat_STTB") for k in p)
+            assert cfg.pre_depth == 0
+
+
+def _block_params(pre, c=8, heads=2, ws=(4, 4), hf=16):
+    """Random-weight param set for one VSTSREncoderTransformerBlock."""
+    n = ws[0] * ws[1]
+    rows = (2 * ws[0] - 1) * (2 * ws[1] - 1)
+
+    def r(*shape):
+        return mx.random.normal(shape=shape) * 0.2
+
+    return {
+        f"{pre}.norm1.weight": mx.ones((c,)),
+        f"{pre}.norm1.bias": mx.zeros((c,)),
+        f"{pre}.attn.q.weight": r(c, c),
+        f"{pre}.attn.q.bias": mx.zeros((c,)),
+        f"{pre}.attn.kv.weight": r(2 * c, c),
+        f"{pre}.attn.kv.bias": mx.zeros((2 * c,)),
+        f"{pre}.attn.proj.weight": r(c, c),
+        f"{pre}.attn.proj.bias": mx.zeros((c,)),
+        f"{pre}.attn.relative_position_bias_table": r(rows, heads),
+        f"{pre}.attn.relative_position_index": mx.zeros((n, n), dtype=mx.int32),
+        f"{pre}.norm2.weight": mx.ones((c,)),
+        f"{pre}.norm2.bias": mx.zeros((c,)),
+        f"{pre}.mlp.proj_in.weight": r(hf, c),
+        f"{pre}.mlp.proj_in.bias": mx.zeros((hf,)),
+        f"{pre}.mlp.SA.spatial.weight": r(1, 3, 3, 2),
+        f"{pre}.mlp.SA.spatial.bias": mx.zeros((1,)),
+        f"{pre}.mlp.CA.conv_du.0.weight": r(hf // 2, 1, 1, hf),
+        f"{pre}.mlp.CA.conv_du.0.bias": mx.zeros((hf // 2,)),
+        f"{pre}.mlp.CA.conv_du.2.weight": r(hf, 1, 1, hf // 2),
+        f"{pre}.mlp.CA.conv_du.2.bias": mx.zeros((hf,)),
+        f"{pre}.mlp.conv1x1.weight": r(hf, 1, 1, 2 * hf),
+        f"{pre}.mlp.conv1x1.bias": mx.zeros((hf,)),
+        f"{pre}.mlp.TA.spatial.weight": r(1, 1, 1, 2),
+        f"{pre}.mlp.TA.spatial.bias": mx.zeros((1,)),
+        f"{pre}.mlp.proj_out.weight": r(c, hf),
+        f"{pre}.mlp.proj_out.bias": mx.zeros((c,)),
+    }
+
+
+def test_encoder_layer_is_shape_preserving_self_attention():
+    mx.random.seed(7)
+    p = _block_params("feat_STTB.blocks.0")
+    x = mx.random.normal(shape=(1, 1, 8, 6, 10))     # (B,D,C,H,W), sub-window
+    y = net._encoder_layer(x, p, "feat_STTB", 1, 2, (4, 4))
+    assert y.shape == x.shape
+    assert float(mx.max(mx.abs(y - x))) > 1e-4       # attention actually applied
+    # a depth-1 layer is exactly one unshifted self-block (plus the permutes)
+    xb = mx.transpose(x, (0, 1, 3, 4, 2))
+    want = net._block_self(xb, p, "feat_STTB.blocks.0", 2, (4, 4), (0, 0), None)
+    got = mx.transpose(y, (0, 1, 3, 4, 2))
+    assert float(mx.max(mx.abs(got - want))) < 1e-6
