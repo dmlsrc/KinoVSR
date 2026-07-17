@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
 from typing import Any
 
 import mlx.core as mx
 
+# Nearest-resample index vectors are identical per (geometry, zone) pair.
+_INDEX_CACHE: dict[tuple, Any] = {}
 
-def _nn_up(x: Any, ratio: int) -> Any:
-    height, width = x.shape[0], x.shape[1]
-    y = mx.broadcast_to(
-        x[:, None, :, None, :],
-        (height, ratio, width, ratio, x.shape[-1]),
-    )
-    return y.reshape(height * ratio, width * ratio, x.shape[-1])
+
+def _resample_index(out_size: int, src_size: int, out_lo: int, out_n: int,
+                    src_lo: int, src_n: int) -> Any:
+    """Global nearest map of output positions [out_lo, out_lo+out_n) into
+    the source slice [src_lo, src_lo+src_n), clamped to the slice. Using
+    the GLOBAL mapping keeps band pixels aligned with where a uniform
+    resample of the whole frame placed the surrounding content."""
+    key = (out_size, src_size, out_lo, out_n, src_lo, src_n)
+    idx = _INDEX_CACHE.get(key)
+    if idx is None:
+        idx = mx.array(
+            [min(max((p * src_size) // out_size - src_lo, 0), src_n - 1)
+             for p in range(out_lo, out_lo + out_n)],
+            dtype=mx.int32)
+        _INDEX_CACHE[key] = idx
+    return idx
 
 
 def _to_unit(rgb: Any) -> Any:
@@ -44,22 +56,24 @@ def restore_borders(
     edges: tuple[int, int, int, int],
     feather: int = 2,
 ) -> Any:
-    """Composite original edge bands over an integer-upscaled output frame.
+    """Composite original edge bands over the processed output frame.
 
-    The source bands are nearest-upscaled to match and blended into the
-    processed output. Splices are combined per axis, so a frame costs at most
-    two full-size copies; only source edge zones are converted and upscaled.
+    The source bands are nearest-resampled onto the output geometry (any
+    per-axis scale, integer or not - a square-pixels resample between the
+    restore capture and this composite is fine) and blended into the
+    processed output. Splices are combined per axis, so a frame costs at
+    most two full-size copies; only source edge zones are converted and
+    resampled.
     """
     top, bottom, left, right = edges
     feather = max(0, int(feather))
     src_h, src_w = int(src_rgb.shape[0]), int(src_rgb.shape[1])
     out_h, out_w = int(out_rgb.shape[0]), int(out_rgb.shape[1])
-    if out_h % src_h or out_w % src_w or out_h // src_h != out_w // src_w:
-        raise ValueError(
-            f"output {out_h}x{out_w} is not an integer multiple of source "
-            f"{src_h}x{src_w}")
-    ratio = out_h // src_h
     dtype = out_rgb.dtype if out_rgb.dtype != mx.uint8 else mx.float32
+
+    def zone_len(zone_src: int, axis: int) -> int:
+        edge_out, edge_src = (out_h, src_h) if axis == 0 else (out_w, src_w)
+        return max(1, int(round(Fraction(zone_src * edge_out, edge_src))))
 
     def mixed_zone(
         output: Any,
@@ -69,28 +83,32 @@ def restore_borders(
         zone_feather: int,
     ) -> tuple[Any, int]:
         zone_src = band + zone_feather
-        zone_out = zone_src * ratio
+        edge_out, edge_src = (out_h, src_h) if axis == 0 else (out_w, src_w)
+        oth_out, oth_src = (out_w, src_w) if axis == 0 else (out_h, src_h)
+        zone_out = zone_len(zone_src, axis)
+        band_out = min(
+            int(round(Fraction(band * edge_out, edge_src))), zone_out)
+        src_lo = edge_src - zone_src if from_end else 0
+        out_lo = edge_out - zone_out if from_end else 0
         if axis == 0:
-            src_slice = (
-                src_rgb[src_h - zone_src:] if from_end else src_rgb[:zone_src]
-            )
-            out_slice = (
-                output[out_h - zone_out:] if from_end else output[:zone_out]
-            )
+            src_slice = src_rgb[src_lo:src_lo + zone_src]
+            out_slice = output[out_lo:out_lo + zone_out]
         else:
-            src_slice = (
-                src_rgb[:, src_w - zone_src:]
-                if from_end
-                else src_rgb[:, :zone_src]
-            )
-            out_slice = (
-                output[:, out_w - zone_out:]
-                if from_end
-                else output[:, :zone_out]
-            )
-        band_up = _nn_up(_to_unit(src_slice), ratio).astype(dtype)
-        weights = _feather_weights(
-            band * ratio, zone_feather * ratio, dtype)
+            src_slice = src_rgb[:, src_lo:src_lo + zone_src]
+            out_slice = output[:, out_lo:out_lo + zone_out]
+        edge_idx = _resample_index(
+            edge_out, edge_src, out_lo, zone_out, src_lo, zone_src)
+        oth_idx = _resample_index(oth_out, oth_src, 0, oth_out, 0, oth_src)
+        band_unit = _to_unit(src_slice)
+        if axis == 0:
+            band_up = mx.take(
+                mx.take(band_unit, edge_idx, axis=0), oth_idx, axis=1
+            ).astype(dtype)
+        else:
+            band_up = mx.take(
+                mx.take(band_unit, oth_idx, axis=0), edge_idx, axis=1
+            ).astype(dtype)
+        weights = _feather_weights(band_out, zone_out - band_out, dtype)
         if from_end:
             weights = weights[::-1]
         weights = (
@@ -110,8 +128,8 @@ def restore_borders(
     # Rows first, then columns, so column zones blend over restored rows at the
     # corners. Overlapping zones fall back to sequential splices.
     if top or bottom:
-        top_zone = (top + feather_top) * ratio
-        bottom_zone = (bottom + feather_bottom) * ratio
+        top_zone = zone_len(top + feather_top, 0) if top else 0
+        bottom_zone = zone_len(bottom + feather_bottom, 0) if bottom else 0
         if top and bottom and top_zone + bottom_zone <= out_h:
             top_mix, _ = mixed_zone(out_rgb, 0, False, top, feather_top)
             bottom_mix, _ = mixed_zone(
@@ -130,8 +148,8 @@ def restore_borders(
                 out_rgb = mx.concatenate(
                     [out_rgb[:out_h - zone], mixed], axis=0)
     if left or right:
-        left_zone = (left + feather_left) * ratio
-        right_zone = (right + feather_right) * ratio
+        left_zone = zone_len(left + feather_left, 1) if left else 0
+        right_zone = zone_len(right + feather_right, 1) if right else 0
         if left and right and left_zone + right_zone <= out_w:
             left_mix, _ = mixed_zone(out_rgb, 1, False, left, feather_left)
             right_mix, _ = mixed_zone(

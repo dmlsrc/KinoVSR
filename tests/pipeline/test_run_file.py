@@ -1746,6 +1746,49 @@ def test_nafnet_runs_through_the_typed_pipeline(clip, tmp_path):
     assert result.frames_out == 3
 
 
+def _write_anamorphic_clip(path) -> None:
+    """Six 720x576 frames at 25 fps with PAR 64/45 (anamorphic PAL 16:9)."""
+    out = av.open(str(path), "w")
+    stream = out.add_stream("mpeg4", rate=25)
+    stream.width, stream.height = 720, 576
+    stream.pix_fmt = "yuv420p"
+    stream.codec_context.sample_aspect_ratio = Fraction(64, 45)
+    stream.options = {"g": "25", "bf": "0"}
+    for index in range(6):
+        frame = av.VideoFrame(720, 576, "gray")
+        frame.planes[0].update(bytes([40 + index * 30]) * (720 * 576))
+        frame = frame.reformat(format="yuv420p")
+        frame.pts = index
+        frame.time_base = Fraction(1, 25)
+        for packet in stream.encode(frame):
+            out.mux(packet)
+    for packet in stream.encode():
+        out.mux(packet)
+    out.close()
+
+
+def test_sanitize_restore_composes_across_square_pixels(tmp_path):
+    """The anamorphic flag combination: sanitize-edges restore captures at
+    720 wide, --square-pixels resamples to 1024, and the restore companion
+    must composite onto the resampled geometry (it used to abort with
+    'not an integer multiple of source')."""
+    clip = tmp_path / "anamorphic.mp4"
+    _write_anamorphic_clip(clip)
+    config = {
+        "pipeline": ["sanitize", "square"],
+        "sanitize": {"processor": "sanitize_edges", "edges": "6,6,0,0",
+                     "fill": "restore"},
+        "square": {"processor": "square_pixels"},
+    }
+    output = tmp_path / "restored.mp4"
+    result = run_file(config, video=clip, output=output, settings=SETTINGS)
+    assert result.frames_in == 6
+    assert result.frames_out == 6
+    with av.open(str(output)) as container:
+        stream = container.streams.video[0]
+        assert (stream.width, stream.height) == (1024, 576)
+
+
 def test_uniform_grid_sink_accepts_on_grid_holes(tmp_path):
     """A decoder-dropped sample on a uniform-CFR source leaves an on-grid
     hole (labels follow sample identity); the sink must accept the

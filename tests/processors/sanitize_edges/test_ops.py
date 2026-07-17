@@ -44,8 +44,38 @@ def test_restore_borders_composites_original():
     res = restore_borders(out, src8, (1, 0, 0, 0), feather=0)
     assert abs(float(mx.mean(res[0])) - 1.0) < 1e-6
 
-    with pytest.raises(ValueError, match="integer multiple"):
-        restore_borders(mx.zeros((15, 20, 3)), src, (1, 0, 0, 0), feather=0)
+
+def test_restore_borders_resamples_non_integer_geometry():
+    # The anamorphic case: --square-pixels resamples the width between the
+    # restore capture (576x720) and the composite (576x1024, PAR 64/45), so
+    # the width ratio is non-integer and differs from the height ratio.
+    from kinovsr.processors.sanitize_edges.ops import restore_borders
+
+    mx.random.seed(11)
+    src = mx.random.uniform(shape=(576, 720, 3))
+    out = mx.random.uniform(shape=(576, 1024, 3))
+    res = restore_borders(out, src, (6, 6, 0, 0), feather=0)
+    mx.eval(res)
+
+    assert res.shape == out.shape
+    # top band: output col j takes the globally nearest source col
+    for j in (0, 500, 1023):
+        sj = (j * 720) // 1024
+        assert float(mx.max(mx.abs(res[0, j] - src[0, sj]))) < 1e-6
+        assert float(mx.max(mx.abs(res[5, j] - src[5, sj]))) < 1e-6
+    # bottom band restored from the source's last rows
+    assert float(mx.max(mx.abs(res[575, 0] - src[575, 0]))) < 1e-6
+    # interior untouched
+    assert float(mx.max(mx.abs(res[6:570] - out[6:570]))) < 1e-6
+
+    # per-axis non-integer scale (15/8 rows, 2x cols) composites too
+    small_src = mx.random.uniform(shape=(8, 10, 3))
+    res2 = restore_borders(mx.zeros((15, 20, 3)), small_src, (1, 0, 0, 0),
+                           feather=0)
+    zone = max(1, round(1 * 15 / 8))                 # one source row -> 2 out
+    for r in range(zone):
+        sr = (r * 8) // 15
+        assert float(mx.max(mx.abs(res2[r, 0] - small_src[sr, 0]))) < 1e-6
 
 
 def test_restore_borders_feather_ramps_into_content():
