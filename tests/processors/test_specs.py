@@ -18,7 +18,6 @@ from kinovsr.processors import (
     StreamSpec,
     TimelineSpec,
     TransferFunction,
-    VariableCadence,
     coherence_violations,
     describe_spec,
     frame_spec_for_matrix,
@@ -126,14 +125,6 @@ class TestConstraint:
         assert constraint.violations(mlx_stream(lookahead=True)) == ()
         violations = constraint.violations(mlx_stream(lookahead=False))
         assert [v.field for v in violations] == ["lookahead_available"]
-
-    def test_cfr_only_constraint_rejects_vfr(self):
-        constraint = StreamConstraint(cadences=(Fraction,))
-        assert constraint.violations(mlx_stream()) == ()
-        vfr = mlx_stream(cadence=VariableCadence.VFR)
-        violations = constraint.violations(vfr)
-        assert [v.field for v in violations] == ["timeline.cadence"]
-
 
 class TestCoherence:
     def test_valid_spec_is_coherent(self):

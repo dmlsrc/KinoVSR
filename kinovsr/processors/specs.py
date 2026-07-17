@@ -219,11 +219,8 @@ class StreamConstraint:
     domains: tuple[Domain, ...] | None = None
     min_side: int | None = None
     max_side: int | None = None
-    # Chroma-subsampled encode targets need even dimensions.
-    require_even_dims: bool = False
     requires_lookahead: bool = False
     requires_seekable: bool = False
-    cadences: tuple[type, ...] | None = None   # e.g. (Fraction,) = CFR only
 
     def violations(self, spec: StreamSpec) -> tuple[FieldViolation, ...]:
         found: list[FieldViolation] = []
@@ -250,23 +247,11 @@ class StreamConstraint:
             found.append(FieldViolation(
                 "frame.geometry", f"max side <= {self.max_side}",
                 f"{geo.width}x{geo.height}"))
-        if self.require_even_dims and (geo.width % 2 or geo.height % 2):
-            found.append(FieldViolation(
-                "frame.geometry", "even width and height",
-                f"{geo.width}x{geo.height}"))
-
         if self.requires_lookahead and not spec.lookahead_available:
             found.append(FieldViolation(
                 "lookahead_available", "true", "false"))
         if self.requires_seekable and not spec.seekable:
             found.append(FieldViolation("seekable", "true", "false"))
-
-        if self.cadences is not None and not isinstance(
-                spec.timeline.cadence, self.cadences):
-            accepted = " | ".join(t.__name__ for t in self.cadences)
-            found.append(FieldViolation(
-                "timeline.cadence", accepted,
-                type(spec.timeline.cadence).__name__))
 
         return tuple(found)
 

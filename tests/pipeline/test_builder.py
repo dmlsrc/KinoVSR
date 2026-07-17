@@ -325,13 +325,13 @@ class TestInvalidChains:
             "denoise": {"processor": "fakedenoise"},
         }
         output = OutputEndpointSpec(
-            accepts=StreamConstraint(require_even_dims=True))
+            accepts=StreamConstraint(min_side=512))
         with pytest.raises(StreamEdgeError) as exc:
             resolve_pipeline(
                 config, input_spec=stream(641, 480), settings=SETTINGS,
                 output=output)
         assert exc.value.downstream == "output"
-        assert "even width and height" in str(exc.value)
+        assert "min side >= 512" in str(exc.value)
 
     def test_tap_rewriting_the_stream_is_a_config_error(self, families):
         config = {
