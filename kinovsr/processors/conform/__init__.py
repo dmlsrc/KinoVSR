@@ -110,7 +110,8 @@ class CfrConformProcessor:
 
     def _emit(self, unit: FrameUnit, m: int,
               source_time: Fraction) -> FrameUnit:
-        assert self._time_base is not None and self._cadence is not None
+        assert self._time_base is not None
+        assert self._cadence is not None
         origin = self._origin or 0
         pts = grid_ticks(m, self._cadence, self._time_base)
         duration = grid_ticks(m + 1, self._cadence, self._time_base) - pts
@@ -122,8 +123,9 @@ class CfrConformProcessor:
 
     def _emit_through(self, boundary_time: Fraction) -> Iterable[FrameUnit]:
         """Emit the held frame into every slot up to ``boundary_time``."""
-        assert (self._prev is not None and self._slot is not None
-                and self._cadence is not None)
+        assert self._prev is not None
+        assert self._slot is not None
+        assert self._cadence is not None
         unit, unit_time = self._prev
         # Bound the fanout BEFORE emitting (the interpolation stage uses
         # the same ceiling): a recorder clock jump of an hour would
@@ -149,7 +151,8 @@ class CfrConformProcessor:
 
     def process(self, unit: FrameUnit,
                 context: PipelineContext) -> Iterable[FrameUnit]:
-        assert self._time_base is not None and self._cadence is not None
+        assert self._time_base is not None
+        assert self._cadence is not None
         if self._origin is None:
             self._origin = (unit.pts
                             if self._publication_origin_pts is None
@@ -180,7 +183,8 @@ class CfrConformProcessor:
     def flush(self, context: PipelineContext) -> Iterable[FrameUnit]:
         if self._prev is None:
             return
-        assert self._time_base is not None and self._cadence is not None
+        assert self._time_base is not None
+        assert self._cadence is not None
         unit, unit_time = self._prev
         duration_ticks = unit.duration if unit.duration > 0 else 0
         end = unit_time + Fraction(duration_ticks) * self._time_base

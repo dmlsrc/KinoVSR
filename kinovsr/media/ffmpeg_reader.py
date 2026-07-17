@@ -40,8 +40,6 @@ import mlx.core as mx
 from . import pixel_buffers as _pb
 from .chunks import validate_decode_chunk_size
 from .pixel_buffers import PIX_BGRA, PIX_RGBAHALF
-
-_log = logging.getLogger(__name__)
 from .timing import (
     AudioTiming,
     EpochUnwrapper,
@@ -50,6 +48,8 @@ from .timing import (
     VideoTiming,
     analyze_sample_table,
 )
+
+_log = logging.getLogger(__name__)
 
 
 def _raise_ffmpeg_operation(

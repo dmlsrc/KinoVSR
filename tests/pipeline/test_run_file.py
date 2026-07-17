@@ -2015,7 +2015,6 @@ class TestReviewQueueRegressions:
     """Findings 8, 9, 10 from the timing-arc adversarial review."""
 
     def test_tail_duration_never_reuses_a_splice_gap(self):
-        from kinovsr.media import pixel_buffers
         from kinovsr.media.timing import SampleTiming, analyze_sample_table
 
         # True-VFR deltas (non-multiples) with a 9.9 s gap before the
@@ -2324,7 +2323,7 @@ class TestRoundTwoArtifacts:
         import mlx.core as mx
 
         rgb = mx.array(frames[6].to_ndarray(format="rgb24"))
-        height, width = int(rgb.shape[0]), int(rgb.shape[1])
+        width = int(rgb.shape[1])
         left = float(mx.mean(
             rgb[:, : width // 2, :].astype(mx.float32)))
         # source sample 4 luma = 160; the stale at-or-before pick

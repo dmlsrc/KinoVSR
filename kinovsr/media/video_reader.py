@@ -34,8 +34,6 @@ from kinovsr.native.frameworks import CoreMedia, Foundation, Quartz, av, vt
 
 from . import pixel_buffers as _pb
 from .chunks import validate_decode_chunk_size
-
-_log = logging.getLogger(__name__)
 from .timing import (
     AudioTiming,
     EpochUnwrapper,
@@ -44,6 +42,8 @@ from .timing import (
     VideoTiming,
     analyze_sample_table,
 )
+
+_log = logging.getLogger(__name__)
 
 
 def _first_video_track(asset: Any) -> Any:
