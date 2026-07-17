@@ -37,12 +37,8 @@ def spec(w=640, h=480):
 
 
 class TestDefaultsAndOrder:
-    def test_bare_invocation_is_the_balanced_upscale(self):
-        config = asm()
-        assert config["pipeline"] == ["upscale"]
-        assert config["upscale"] == {"processor": "videotoolbox",
-                                     "capability": "upscale",
-                                     "profile": "balanced"}
+    def test_bare_invocation_selects_no_processors(self):
+        assert asm()["pipeline"] == []
 
     def test_upscale_none_omits_the_stage(self):
         assert asm("--upscale", "none")["pipeline"] == []
@@ -50,27 +46,27 @@ class TestDefaultsAndOrder:
     def test_default_slot_order(self):
         config = asm("--restore", "decompress_track1", "--deflicker", "on",
                      "--deblock", "stdf", "--denoise", "mc",
-                     "--nafnet", "gopro")
+                     "--nafnet", "gopro", "--upscale", "balanced")
         assert config["pipeline"] == [
             "restore_decompress_track1", "deflicker", "deblock_stdf",
             "denoise_mc", "nafnet", "upscale"]
 
     def test_denoise_first_swaps_the_pair(self):
         config = asm("--deblock", "stdf", "--denoise", "mc",
-                     "--denoise-first")
+                     "--denoise-first", "--upscale", "balanced")
         assert config["pipeline"] == ["denoise_mc", "deblock_stdf",
                                       "upscale"]
 
     def test_explicit_order_appends_omitted_in_default_order(self):
         config = asm("--denoise", "mc", "--deblock", "stdf",
-                     "--nafnet", "sidd", "--preprocess-order", "denoise")
+                     "--nafnet", "sidd", "--preprocess-order", "denoise",
+                     "--upscale", "balanced")
         assert config["pipeline"] == ["denoise_mc", "deblock_stdf",
                                       "nafnet", "upscale"]
 
     def test_chains_expand_in_order(self):
         config = asm("--denoise", "mc,bsvd")
-        assert config["pipeline"] == ["denoise_mc", "denoise_bsvd",
-                                      "upscale"]
+        assert config["pipeline"] == ["denoise_mc", "denoise_bsvd"]
         assert config["denoise_mc"]["capability"] == "denoise"
         assert config["denoise_bsvd"]["capability"] == "denoise"
 
@@ -86,12 +82,11 @@ class TestDefaultsAndOrder:
     def test_geometry_then_cut_precede_the_slots(self):
         config = asm("--crop-bars", "16,16,0,0", "--square-pixels",
                      "--cut-detect", "simple", "--denoise", "mc")
-        assert config["pipeline"] == ["crop", "square", "cut", "denoise_mc",
-                                      "upscale"]
+        assert config["pipeline"] == ["crop", "square", "cut", "denoise_mc"]
 
     def test_target_fps_appends_the_interpolate_stage(self):
         config = asm("--target-fps", "50", "--temporal-mode", "high")
-        assert config["pipeline"] == ["upscale", "fps"]
+        assert config["pipeline"] == ["fps"]
         assert config["fps"]["profile"] == "high"
         assert config["fps"]["target_fps"] == 50.0
 
@@ -164,7 +159,7 @@ class TestDialRouting:
 
     def test_unused_family_dials_are_ignored(self):
         config = asm("--bsvd-strength", "0.7")   # no bsvd in the chain
-        assert config["pipeline"] == ["upscale"]
+        assert config["pipeline"] == []
 
     def test_nafnet_value_selects_capability_and_profile(self):
         config = asm("--nafnet", "sidd32")

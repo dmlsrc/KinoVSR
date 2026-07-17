@@ -63,7 +63,7 @@ def run_video_command(argv: list[str]) -> int:
 # Flags that select stages on the flag-driven surface; a [pipeline]
 # config owns stage composition, so these cannot be combined with it.
 _STAGE_SELECTORS = (
-    ("upscale", "balanced"),
+    ("upscale", "none"),
     ("denoise", "off"),
     ("deblock", "off"),
     ("restore", "off"),

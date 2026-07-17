@@ -53,7 +53,7 @@ class TestCanonicalVocabulary:
 
     def test_canonical_defaults(self, parser):
         args = parser.parse_args(BASE)
-        assert args.upscale == "balanced"
+        assert args.upscale == "none"
         assert args.fastdvdnet_profile == "clipped"
         assert args.overwrite is False
 
@@ -328,7 +328,7 @@ class TestPipelineOwnedFlags:
         from kinovsr.cli.commands.run import _pipeline_owned_flags
 
         base = {
-            "upscale": "balanced", "denoise": "off", "deblock": "off",
+            "upscale": "none", "denoise": "off", "deblock": "off",
             "restore": "off", "nafnet": "off", "deflicker": "off",
             "cut_detect": "off", "crop_bars": None, "crop_aspect": None,
             "square_pixels": False, "sanitize_edges": None, "snap_start": False,
@@ -342,6 +342,9 @@ class TestPipelineOwnedFlags:
 
     def test_stage_selector_is_flagged(self):
         assert "denoise" in self._flags(denoise="mc,bsvd")
+
+    def test_upscale_selector_is_flagged(self):
+        assert "upscale" in self._flags(upscale="balanced")
 
     def test_geometry_flags_are_flagged(self):
         # C8: crop/anamorphic/sanitize flags were silently ignored alongside
