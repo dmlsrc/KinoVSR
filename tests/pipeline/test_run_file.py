@@ -2176,7 +2176,7 @@ class TestEpochResets:
         assert len(units) == 495
         pts = [u.pts for u in units]
         assert all(later > earlier
-                   for earlier, later in zip(pts, pts[1:]))
+                   for earlier, later in zip(pts, pts[1:], strict=False))
 
     def test_joined_segments_read_as_one_monotonic_clock(
             self, joined_ts_clip):
