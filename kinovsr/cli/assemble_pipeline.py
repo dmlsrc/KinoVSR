@@ -145,7 +145,7 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
     # for, and dropped frames should not be processed at all.
     conform_cfr = getattr(options, "conform_cfr", None)
     if conform_cfr and options.target_fps:
-        raise ValueError(
+        raise ConfigError(
             "--conform-cfr and --target-fps are both timeline "
             "normalizations; pick one (--target-fps interpolates onto its "
             "grid, --conform-cfr duplicates/drops original frames)")

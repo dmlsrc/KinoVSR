@@ -187,8 +187,15 @@ class TestParseDetails:
         assert parse("auto") == "auto"
         assert parse("blind") is None
         assert parse("35") == 35.0
+        # the flag CLI floatifies untyped dials; unquoted TOML yields int
+        assert parse(35.0) == 35.0
+        assert parse(35) == 35.0
         with pytest.raises(ValueError, match="quality"):
             parse("vivid")
+        with pytest.raises(ValueError, match="quality"):
+            parse(True)
+        with pytest.raises(ValueError, match="quality"):
+            parse(0.5)
 
     def test_pvdd_preset_maps_to_variance(self):
         factory = get_factory("pvdd")

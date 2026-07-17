@@ -34,18 +34,28 @@ from kinovsr.settings import Settings
 _PROFILES = ("color",)
 
 
-def _parse_quality(spec: str) -> Any:
-    q = spec.strip().lower()
-    if q == "auto":
-        return "auto"
-    if q in ("blind", "none"):
-        return None
-    try:
-        value = float(q)
-    except ValueError:
+def _parse_quality(spec: Any) -> Any:
+    # Grammar is 'auto' | 'blind' | a number. The number arrives as a str
+    # from a quoted TOML value, but as a float from the flag CLI (untyped
+    # registry dials are floatified) and as an int/float from unquoted TOML.
+    if isinstance(spec, bool) or not isinstance(spec, (str, int, float)):
         raise ValueError(
             f"bad quality {spec!r}: expected 'auto', 'blind', or a "
-            f"number 1-100") from None
+            f"number 1-100")
+    if isinstance(spec, (int, float)):
+        value = float(spec)
+    else:
+        q = spec.strip().lower()
+        if q == "auto":
+            return "auto"
+        if q in ("blind", "none"):
+            return None
+        try:
+            value = float(q)
+        except ValueError:
+            raise ValueError(
+                f"bad quality {spec!r}: expected 'auto', 'blind', or a "
+                f"number 1-100") from None
     if not 1.0 <= value <= 100.0:
         raise ValueError("quality must be in [1, 100]")
     return value
@@ -96,7 +106,7 @@ class FbcnnFactory:
         return FbcnnStageConfig(
             weights_path=typed_value(raw, "weights", str)
             or settings.fbcnn_weights,
-            quality=_parse_quality(typed_value(raw, "quality", str, "auto")),
+            quality=_parse_quality(raw.get("quality", "auto")),
             quality_fallback=quality_fallback,
             strength=strength,
             gop=typed_value(raw, "gop", bool, True),

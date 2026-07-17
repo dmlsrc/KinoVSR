@@ -362,6 +362,9 @@ class TestPipelineOwnedFlags:
         assert "target_fps" in self._flags(target_fps=50.0)
         assert "temporal_mode" in self._flags(temporal_mode="high")
 
+    def test_conform_cfr_is_rejected_with_an_explicit_pipeline(self):
+        assert "conform_cfr" in self._flags(conform_cfr=30.0)
+
     def test_typed_command_returns_config_error_for_target_fps(self):
         from types import SimpleNamespace
 
@@ -371,6 +374,23 @@ class TestPipelineOwnedFlags:
             output_dir="unused",
             target_fps=50.0,
             temporal_mode="normal",
+        )
+        invocation = SimpleNamespace(
+            options=options,
+            config={"pipeline": []},
+        )
+        assert _run_typed(invocation) == 2
+
+    def test_typed_command_returns_config_error_for_conform_cfr(self):
+        from types import SimpleNamespace
+
+        from kinovsr.cli.commands.run import _run_typed
+
+        options = SimpleNamespace(
+            output_dir="unused",
+            target_fps=None,
+            temporal_mode="normal",
+            conform_cfr=30.0,
         )
         invocation = SimpleNamespace(
             options=options,

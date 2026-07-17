@@ -95,6 +95,10 @@ class TestDefaultsAndOrder:
         assert config["fps"]["profile"] == "high"
         assert config["fps"]["target_fps"] == 50.0
 
+    def test_conform_cfr_with_target_fps_is_a_config_error(self):
+        with pytest.raises(ConfigError, match="pick one"):
+            asm("--conform-cfr", "30", "--target-fps", "60")
+
 
 class TestGeometry:
     def test_odd_explicit_bars_get_the_even_bump(self):
@@ -152,6 +156,11 @@ class TestDialRouting:
         config = asm("--deblock", "stdf,fbcnn", "--deblock-map", "auto")
         assert config["deblock_stdf"]["deblock_map"] == "auto"
         assert config["deblock_fbcnn"]["deblock_map"] == "auto"
+
+    def test_fbcnn_quality_number_survives_assembly(self):
+        # the untyped dial floatifies "35"; the stage parser must accept it
+        config = asm("--deblock", "fbcnn", "--fbcnn-quality", "35")
+        assert config["deblock_fbcnn"]["quality"] == 35.0
 
     def test_unused_family_dials_are_ignored(self):
         config = asm("--bsvd-strength", "0.7")   # no bsvd in the chain

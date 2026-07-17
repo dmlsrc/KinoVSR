@@ -84,6 +84,7 @@ _GEOMETRY_FLAGS = (
 _PIPELINE_OPTIONS = (
     ("target_fps", None),
     ("temporal_mode", "normal"),
+    ("conform_cfr", None),
 )
 _UNSET = (None, False, "off", "")
 
