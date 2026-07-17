@@ -22,5 +22,5 @@ license = "MIT"
 [weights.niqe_pristine]
 path = "weights/niqe_pristine_reds.safetensors"
 distribution = "bundled"
-artifact_sha256 = "d0850ab291a1c74bfe89d27a3e03a75f6991d3970b77800b51e2bdbaf5bad0f3"
+artifact_sha256 = "aa148de88e6a2fd80accab935705efa970157b8b6e49693d43f32eeaada05012"
 license = "first-party fitted statistics"
