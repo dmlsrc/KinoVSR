@@ -218,14 +218,39 @@ class _T7Reader:
             raise EOFError("unexpected end of Torch7 storage")
         return arr
 
+    _MAX_TENSOR_DIMS = 8
+
     def _read_tensor(self, dtype: Any) -> np.ndarray:
         ndim = self._read_int()
+        if ndim < 0 or ndim > self._MAX_TENSOR_DIMS:
+            raise ValueError(
+                f"tensor record has implausible ndim {ndim} "
+                f"(limit {self._MAX_TENSOR_DIMS})")
         size = self._read_long_array(ndim)
         stride = self._read_long_array(ndim)
         storage_offset = self._read_long() - 1
         storage = self.read_obj()
         if storage is None or ndim == 0 or not size:
             return np.empty((0,), dtype=dtype)
+        # size/stride/offset come straight from the file; a lying record must
+        # not drive as_strided (and the tobytes/ascontiguousarray that
+        # materialize the view) outside the storage buffer.
+        if any(s < 0 for s in size) or any(s < 0 for s in stride):
+            raise ValueError(
+                f"tensor record has negative size/stride: "
+                f"size={size}, stride={stride}")
+        if storage_offset < 0:
+            raise ValueError(
+                f"tensor record has negative storage offset {storage_offset}")
+        if any(s == 0 for s in size):
+            return np.zeros(tuple(int(s) for s in size), dtype=dtype)
+        last = storage_offset + sum(
+            (s - 1) * st for s, st in zip(size, stride, strict=True))
+        if last >= storage.size:
+            raise ValueError(
+                f"tensor record reaches element {last} of a "
+                f"{storage.size}-element storage (offset {storage_offset}, "
+                f"size={size}, stride={stride})")
         byte_stride = tuple(int(s) * storage.dtype.itemsize for s in stride)
         return np.lib.stride_tricks.as_strided(
             storage[int(storage_offset):],
