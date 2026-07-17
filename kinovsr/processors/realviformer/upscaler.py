@@ -37,9 +37,10 @@ class RealViformerUpscaler:
         history_cleanup: float = 0.25, history_gate_drop: float = 0.85,
         history_risk_decay: float = 0.80, history_static_cap: float = 0.0,
     ):
-        if flow_mode not in ("spynet", "zero", "vt"):
+        if flow_mode not in ("spynet", "zero", "vt", "vision"):
             raise ValueError(
-                f"RealViformer flow_mode must be 'spynet', 'zero', or 'vt'; got {flow_mode!r}"
+                f"RealViformer flow_mode must be 'spynet', 'zero', 'vt', or "
+                f"'vision'; got {flow_mode!r}"
             )
         if history_gate not in ("off", "improve", "holistic"):
             raise ValueError(

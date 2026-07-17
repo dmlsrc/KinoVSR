@@ -43,9 +43,10 @@ class BasicVsrUpscaler(WindowedUpscaler):
         history_gate: str = "off",
         ensemble: bool = False,
     ):
-        if flow_mode not in ("spynet", "zero", "vt"):
+        if flow_mode not in ("spynet", "zero", "vt", "vision"):
             raise ValueError(
-                f"BasicVSR++ flow_mode must be 'spynet', 'zero', or 'vt'; got {flow_mode!r}"
+                f"BasicVSR++ flow_mode must be 'spynet', 'zero', 'vt', or "
+                f"'vision'; got {flow_mode!r}"
             )
         if history_gate not in ("off", "improve"):
             raise ValueError(

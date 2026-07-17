@@ -223,6 +223,7 @@ class McTemporalDenoiser:
         self._workers: list[dict[str, Any]] = []
         self._curr_buf: Any = None
         self._pool: ThreadPoolExecutor | None = None
+        self._vision: Any = None
         self._prev: Any = None
         self._hist: list[Any] = []
         if self.flow_source == "spynet":
@@ -241,6 +242,22 @@ class McTemporalDenoiser:
                     / "spynet_stock_20210409.safetensors"
                 )
             self._spynet_p = dict(mx.load(str(path)))
+            return
+        if self.flow_source == "vision":
+            # Vision revision 1 (Medium accuracy), pinned; see
+            # kinovsr.modeling.vision_flow for the convention and placement.
+            from kinovsr.modeling.vision_flow import VisionFlowEngine
+
+            try:
+                self._vision = VisionFlowEngine(self.w, self.h)
+                if self_test:
+                    self._self_test_flow()
+            except BaseException as active:
+                try:
+                    self.close()
+                except BaseException as cleanup:
+                    _append_cleanup_context(active, cleanup)
+                raise
             return
         cls = vt.VTOpticalFlowConfiguration
         if not cls.isSupported():
@@ -299,7 +316,46 @@ class McTemporalDenoiser:
                 _append_cleanup_context(active, cleanup)
             raise
 
+    def _self_test_frames_vision(self, shift: int) -> tuple[Any, Any]:
+        """Aperiodic self-test content for the Vision pyramid matcher.
+
+        The VT pattern below is built from modular arithmetic, and a
+        modular hash admits EXACT false matches at small displacement
+        combinations (37*dx + 17*dy wraps), which Vision's pyramid locks
+        onto at many geometries. Irrational trig value noise has no exact
+        aliases, and a few Gaussian blobs anchor the coarse levels
+        isotropically (oriented sinusoids bias the unobservable axis via
+        the aperture problem). Measured exact (+shift, 0) from 16x16
+        through 1920x1080. VT itself CANNOT use this pattern: its block
+        matcher needs the high-frequency texture and reads near-zero on
+        this smooth content at HD.
+        """
+        ys, xs = mx.meshgrid(mx.arange(self.h), mx.arange(self.w), indexing="ij")
+        xf, yf = xs.astype(mx.float32), ys.astype(mx.float32)
+        n = mx.sin(xf * 12.9898 + yf * 78.233) * 43758.5453
+        hashn = n - mx.floor(n)
+        s2 = (0.22 * min(self.w, self.h)) ** 2
+
+        def blob(cx, cy, sign):
+            return sign * mx.exp(
+                -((xf - cx * self.w) ** 2 + (yf - cy * self.h) ** 2) / s2)
+
+        blobs = (blob(0.30, 0.35, 1.0) + blob(0.72, 0.60, -1.0)
+                 + blob(0.45, 0.80, 0.8) + blob(0.80, 0.20, -0.7))
+        base = 0.5 + (hashn - 0.5) * 0.5 + blobs * 0.25
+        ref = mx.clip(mx.stack([
+            base,
+            0.45 + (hashn - 0.5) * 0.4 + blobs * 0.22,
+            0.55 + (hashn - 0.5) * 0.45 + blobs * 0.20,
+        ], axis=-1), 0.0, 1.0).astype(mx.float32)
+        left = mx.broadcast_to(ref[:, :1], (self.h, shift, 3))
+        curr = mx.concatenate([left, ref[:, : self.w - shift]], axis=1)
+        mx.eval(ref, curr)
+        return ref, curr
+
     def _self_test_frames(self, shift: int) -> tuple[Any, Any]:
+        if self.flow_source == "vision":
+            return self._self_test_frames_vision(shift)
         ys, xs = mx.meshgrid(mx.arange(self.h), mx.arange(self.w), indexing="ij")
         xi = xs.astype(mx.int32)
         yi = ys.astype(mx.int32)
@@ -328,10 +384,11 @@ class McTemporalDenoiser:
         return ref, curr
 
     def _self_test_flow(self) -> None:
-        """Catch VTOpticalFlow silent-zero and bad-priority failures up front."""
+        """Catch silent-zero, bad-priority, and wrong-sign flow up front."""
+        engine = "VTOpticalFlow" if self.flow_source == "vt" else "Vision optical flow"
         if self.w < 16 or self.h < 16:
             raise RuntimeError(
-                f"VTOpticalFlow self-test requires at least 16x16; got {self.w}x{self.h}"
+                f"{engine} self-test requires at least 16x16; got {self.w}x{self.h}"
             )
         shift = 3 if self.w >= 32 else 1
         ref, curr = self._self_test_frames(shift)
@@ -349,7 +406,7 @@ class McTemporalDenoiser:
         expected = float(shift)
         if max_abs_f < 0.25:
             raise RuntimeError(
-                "VTOpticalFlow self-test returned all-zero/near-zero flow for "
+                f"{engine} self-test returned all-zero/near-zero flow for "
                 f"{self.w}x{self.h}; --denoise mc is unsafe on this clip/device."
             )
         if (
@@ -358,7 +415,7 @@ class McTemporalDenoiser:
             or abs(mean_y_f) > max(0.75, expected * 0.5)
         ):
             raise RuntimeError(
-                "VTOpticalFlow self-test failed for "
+                f"{engine} self-test failed for "
                 f"{self.w}x{self.h}: expected about +{expected:.1f}px horizontal "
                 f"flow, got mean=({mean_x_f:.3f}, {mean_y_f:.3f}), "
                 f"max_abs={max_abs_f:.3f}."
@@ -404,6 +461,12 @@ class McTemporalDenoiser:
         if pool is not None:
             try:
                 pool.shutdown(wait=True)
+            except BaseException as exc:
+                failures.append(exc)
+        vision, self._vision = getattr(self, "_vision", None), None
+        if vision is not None:
+            try:
+                vision.close()
             except BaseException as exc:
                 failures.append(exc)
         for wk in self._workers:
@@ -473,6 +536,17 @@ class McTemporalDenoiser:
                 bwd = None
                 if self.occlusion:
                     bwd = -compiled_spynet_flow(self._spynet_p, ref[None], cur_b)[0]
+                mx.eval(fwd)
+                out.append((fwd, bwd))
+            return out
+        if self.flow_source == "vision":
+            # compute(curr, ref) shares spynet_flow(curr, ref)'s orientation,
+            # so the same negation lands in the warp convention.
+            out = []
+            for ref in refs:
+                fwd = -self._vision.compute(curr, ref)
+                bwd = (-self._vision.compute(ref, curr)
+                       if self.occlusion else None)
                 mx.eval(fwd)
                 out.append((fwd, bwd))
             return out
@@ -619,7 +693,7 @@ class McTemporalDenoiser:
 # Processor family: a causal motion-compensated temporal denoiser
 # ===========================================================================
 
-_FLOW_ENGINES = ("vt", "spynet")
+_FLOW_ENGINES = ("vt", "spynet", "vision")
 _GATES = ("smooth", "curr")
 
 

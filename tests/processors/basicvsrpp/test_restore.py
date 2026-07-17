@@ -157,3 +157,16 @@ def test_restore_variant_tokens_resolve_names():
     assert {"decompress_track1", "decompress_track2", "decompress_track3",
             "denoise", "deblur_dvd", "deblur_gopro"} <= set(v)
     assert len(set(v.values())) == len(v)
+
+
+def test_restore_vision_flow_mode_passes_the_driver_guard():
+    # Regression: the restore driver's flow guard lagged the factory token
+    # list when the vision backend landed ("--restore decompress_track1"
+    # with flow=vision died at build time).
+    import pytest
+
+    from kinovsr.processors.basicvsrpp.restorer import BasicVsrRestorer
+
+    with pytest.raises(FileNotFoundError):
+        BasicVsrRestorer(weights="/nonexistent/weights.safetensors",
+                         flow_mode="vision")

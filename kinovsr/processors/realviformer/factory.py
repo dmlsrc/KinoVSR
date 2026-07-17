@@ -31,7 +31,7 @@ from kinovsr.settings import Settings
 
 _PROFILES = ("x4",)
 _DTYPES = {"float16", "float32"}
-_FLOWS = ("spynet", "zero", "vt")
+_FLOWS = ("spynet", "zero", "vt", "vision")
 _GATES = ("off", "improve", "holistic")
 _SCALE = 4
 

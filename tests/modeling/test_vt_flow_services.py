@@ -10,7 +10,7 @@ pytestmark = pytest.mark.unit
 
 
 class _Service:
-    def __init__(self, key: tuple[int, int]) -> None:
+    def __init__(self, key: tuple) -> None:
         self.key = key
         self.close_count = 0
 
@@ -23,8 +23,8 @@ def _manager(monkeypatch, capacity: int):
 
     made = []
 
-    def make(width, height):
-        service = _Service((width, height))
+    def make(width, height, backend="vt"):
+        service = _Service((backend, width, height))
         made.append(service)
         return service
 
@@ -80,7 +80,7 @@ def test_different_geometry_construction_can_overlap(monkeypatch):
     construction_barrier = threading.Barrier(2)
     made = []
 
-    def make(width, height):
+    def make(width, height, backend="vt"):
         construction_barrier.wait(2)
         service = _Service((width, height))
         made.append(service)
@@ -216,7 +216,7 @@ def test_closed_during_construction_never_publishes(monkeypatch):
     services = VtFlowServices(1)
     service = _Service((16, 12))
 
-    def make(_width, _height):
+    def make(_width, _height, _backend="vt"):
         # A host closes the manager while a service is mid-construction.
         services.close()
         return service
@@ -241,7 +241,7 @@ def test_closed_during_construction_chains_cleanup_failure(monkeypatch):
         def close(self):
             raise cleanup_failure
 
-    def make(_width, _height):
+    def make(_width, _height, _backend="vt"):
         services.close()
         return _FailingClose()
 
@@ -288,3 +288,29 @@ def test_close_with_live_borrow_raises_then_close_succeeds(monkeypatch):
         services.close()
     services.close()
     assert services.size == 0
+
+
+def test_backend_is_part_of_the_service_key(monkeypatch):
+    services, made = _manager(monkeypatch, 2)
+
+    with services.borrow(16, 12) as vt_svc:
+        pass
+    with services.borrow(16, 12, backend="vision") as vision_svc:
+        pass
+    assert vt_svc is not vision_svc
+    assert vt_svc.key == ("vt", 16, 12)
+    assert vision_svc.key == ("vision", 16, 12)
+    with services.borrow(16, 12) as again:
+        assert again is vt_svc
+    assert services.size == 2
+    services.close()
+
+
+def test_unknown_backend_is_rejected(monkeypatch):
+    services, _ = _manager(monkeypatch, 1)
+    with (
+        pytest.raises(ValueError, match="flow backend"),
+        services.borrow(16, 12, backend="raft"),
+    ):
+        pass
+    services.close()

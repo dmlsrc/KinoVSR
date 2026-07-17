@@ -86,3 +86,12 @@ def test_realviformer_pad4_matches_reference_left_top_reflect():
         for r in row_indices
     ]
     assert padded[0, :, :, 0].tolist() == expected
+
+
+def test_vision_flow_mode_passes_the_driver_guard():
+    # Regression: the driver-level flow guard lagged the factory token
+    # list when the vision backend landed, killing runs at build time.
+    # Validation passes and the failure is weight resolution, not flow.
+    with pytest.raises(FileNotFoundError):
+        RealViformerUpscaler(flow_mode="vision",
+                             weights="/nonexistent/weights.safetensors")

@@ -36,7 +36,7 @@ _RESTORE_PROFILES = ("decompress_track1", "decompress_track2",
                      "decompress_track3", "denoise", "deblur_dvd",
                      "deblur_gopro")
 _RESTORE_DEFAULT = "decompress_track1"
-_FLOWS = ("spynet", "zero", "vt")
+_FLOWS = ("spynet", "zero", "vt", "vision")
 _GATES = ("off", "improve")
 _SCALE = 4
 

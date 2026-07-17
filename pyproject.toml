@@ -42,6 +42,7 @@ dependencies = [
     "pyobjc-framework-MetalFX>=12.2",
     "pyobjc-framework-Quartz>=12.2",
     "pyobjc-framework-VideoToolbox>=12.2",
+    "pyobjc-framework-Vision>=12.2",
 ]
 
 [project.optional-dependencies]

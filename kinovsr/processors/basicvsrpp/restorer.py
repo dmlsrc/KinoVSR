@@ -43,9 +43,10 @@ class BasicVsrRestorer(WindowedUpscaler):
         flow_mode: str = "spynet",
         ensemble: bool = False,
     ):
-        if flow_mode not in ("spynet", "zero", "vt"):
+        if flow_mode not in ("spynet", "zero", "vt", "vision"):
             raise ValueError(
-                f"BasicVSR++ restore flow_mode must be 'spynet', 'zero', or 'vt'; got {flow_mode!r}"
+                f"BasicVSR++ restore flow_mode must be 'spynet', 'zero', "
+                f"'vt', or 'vision'; got {flow_mode!r}"
             )
         if not 0.0 <= strength <= 1.0:
             raise ValueError(f"restore strength must be in [0, 1]; got {strength!r}")

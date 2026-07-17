@@ -335,25 +335,28 @@ def _pixelshuffle_pack(x: Any, p: dict, prefix: str, r: int = 2) -> Any:
 def _vt_flows(
     frames: list,
     services: VtFlowServices | None = None,
+    backend: str = "vt",
 ) -> tuple:
-    """VTOpticalFlow for both propagation directions, in _compute_flows'
-    conventions: flows_forward[i] pulls frame i into frame i+1's geometry
-    (anchored at i+1); flows_backward[i] pulls frame i+1 into frame i's.
+    """Native optical flow (VTOpticalFlow or Vision r1) for both propagation
+    directions, in _compute_flows' conventions: flows_forward[i] pulls frame
+    i into frame i+1's geometry (anchored at i+1); flows_backward[i] pulls
+    frame i+1 into frame i's.
 
-    One VT call per direction per pair: the service's forward flow with
+    One native call per direction per pair: the service's forward flow with
     (source=a, next=b) negated is the pull-flow anchored at b -- the mc
     denoiser's own empirically validated convention (warp(ref, -fwd)).
     """
     if not frames:
         return [], []
     if frames[0].shape[0] != 1:
-        raise ValueError("flow_mode='vt' supports batch-1 frames only")
+        raise ValueError(
+            f"flow_mode={backend!r} supports batch-1 frames only")
     if len(frames) == 1:
         return [], []
     h, w = int(frames[0].shape[1]), int(frames[0].shape[2])
     with (
         vt_flow_services_scope(services, max_geometries=1) as flow_services,
-        flow_services.borrow(w, h) as svc,
+        flow_services.borrow(w, h, backend=backend) as svc,
     ):
         dt = frames[0].dtype
         ff, fb = [], []
@@ -387,10 +390,12 @@ def _compute_flows(
         if zeros:
             mx.eval(*zeros)
         return list(zeros), list(zeros)
-    if flow_mode == "vt":
-        return _vt_flows(frames, vt_flow_services)
+    if flow_mode in ("vt", "vision"):
+        return _vt_flows(frames, vt_flow_services, backend=flow_mode)
     if flow_mode != "spynet":
-        raise ValueError(f"unknown flow_mode {flow_mode!r}; expected 'spynet', 'zero', or 'vt'")
+        raise ValueError(
+            f"unknown flow_mode {flow_mode!r}; expected 'spynet', 'zero', "
+            f"'vt', or 'vision'")
     fb, ff = [], []
     for i in range(len(frames) - 1):
         b = compiled_spynet_flow(p, frames[i], frames[i + 1])

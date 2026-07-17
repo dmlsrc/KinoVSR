@@ -30,7 +30,7 @@ from kinovsr.processors.specs import (
 from kinovsr.settings import Settings
 
 _PROFILES = ("x4",)
-_FLOWS = ("spynet", "zero", "vt")
+_FLOWS = ("spynet", "zero", "vt", "vision")
 _GATES = ("off", "improve")
 _SCALE = 4
 
