@@ -28,11 +28,14 @@ dumps) are NOT mapped here - they already thread through
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from kinovsr.config import ConfigError
 
 from .options import PP_STAGE_NAMES
+
+_log = logging.getLogger(__name__)
 
 # --upscale values that select the native VideoToolbox scaler; everything
 # else (bar "none") is a learned family name.
@@ -316,6 +319,33 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
         for name in pipeline:
             if config[name]["processor"] == family:
                 config[name][key] = value
+
+    # ---- broadcast conditioning is capability-scoped, not a build error --
+    # The shared --noise-map dial fans out to every capable denoiser in the
+    # slot; a stage whose loaded model cannot take a map (a blind PVDD
+    # checkpoint) is skipped with a warning instead of refusing the whole
+    # chain. An explicit per-stage noise_map in a hand-written [pipeline]
+    # config still hits the family's loud guard.
+    for name in pipeline:
+        table = config[name]
+        if table.get("processor") != "pvdd":
+            continue
+        if "level" in (table.get("profile") or "pvdd"):
+            continue
+        stripped = [k for k in table if k.startswith("noise_map")]
+        if stripped:
+            for k in stripped:
+                del table[k]
+            _log.warning(
+                "noise map does not apply to %s: PVDD profile %r is blind "
+                "(use --pvdd-profile pvdd_level for map conditioning); the "
+                "stage runs unconditioned",
+                name, table.get("profile", "pvdd"))
+    if getattr(options, "noise_map", None) == "auto" and not any(
+            config[n].get("noise_map") == "auto" for n in pipeline):
+        raise ConfigError(
+            "--noise-map auto applies to no stage in this chain (capable: "
+            "mc, bsvd, fastdvdnet, and pvdd with a level profile)")
 
     config["pipeline"] = pipeline
     return config

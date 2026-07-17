@@ -157,6 +157,40 @@ class TestDialRouting:
         config = asm("--deblock", "fbcnn", "--fbcnn-quality", "35")
         assert config["deblock_fbcnn"]["quality"] == 35.0
 
+    def test_noise_map_skips_blind_pvdd_with_a_warning(self, caplog):
+        # the broadcast dial is capability-scoped: a blind PVDD stage runs
+        # unconditioned (with a warning) instead of refusing the chain
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            config = asm("--denoise", "mc,pvdd", "--noise-map", "auto",
+                         "--noise-map-gain", "1.2")
+        assert config["denoise_mc"]["noise_map"] == "auto"
+        assert config["denoise_mc"]["noise_map_gain"] == 1.2
+        assert not any(k.startswith("noise_map")
+                       for k in config["denoise_pvdd"])
+        assert any("does not apply" in r.message for r in caplog.records)
+
+    def test_noise_map_reaches_a_level_pvdd(self):
+        config = asm("--denoise", "mc,pvdd", "--pvdd-profile", "pvdd_level",
+                     "--noise-map", "auto")
+        assert config["denoise_mc"]["noise_map"] == "auto"
+        assert config["denoise_pvdd"]["noise_map"] == "auto"
+
+    def test_noise_map_with_no_capable_stage_is_a_config_error(self):
+        with pytest.raises(ConfigError, match="applies to no stage"):
+            asm("--denoise", "spatial", "--noise-map", "auto")
+
+    def test_noise_map_on_a_lone_blind_pvdd_is_a_config_error(self, caplog):
+        # the stage-level skip fires its warning, then the chain-level
+        # check refuses: nothing would be conditioned at all
+        import logging
+
+        with caplog.at_level(logging.WARNING), \
+                pytest.raises(ConfigError, match="applies to no stage"):
+            asm("--denoise", "pvdd", "--noise-map", "auto")
+        assert any("does not apply" in r.message for r in caplog.records)
+
     def test_unused_family_dials_are_ignored(self):
         config = asm("--bsvd-strength", "0.7")   # no bsvd in the chain
         assert config["pipeline"] == []
