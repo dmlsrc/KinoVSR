@@ -111,15 +111,19 @@ the complete set transactionally. Source aliases, aliases between outputs,
 hard links, symlinks, and overlapping file/directory targets are rejected
 before output mutation.
 
-The file endpoint currently accepts constant-frame-rate video only. Before
-reserving any output, it scans compressed sample metadata, counts the actual
-display samples, and verifies that their exact presentation timestamps form a
-single cadence (allowing only one-source-tick quantization). Variable-frame-
-rate input raises `MediaError` and leaves no output or partial artifact; convert
-it to CFR explicitly before calling `process_video_file`. Host-managed
-`open_pipeline` sessions can still describe `VariableCadence.VFR`, but file VFR
-timestamp propagation is not yet implemented and is never silently
-approximated.
+The file endpoint carries messy timing exactly. Before reserving any
+output, it scans compressed sample metadata, counts the actual display
+samples, and classifies their exact presentation timestamps: a single
+cadence (allowing only one-source-tick quantization) runs on the uniform
+grid, and anything else - variable-frame-rate phone footage, gapped or
+spliced tapes, staggered origins, mid-file timestamp resets - is carried
+per sample through 1:1 chains and stamped byte-exactly on the output. A
+stage that genuinely requires a uniform cadence refuses by name and
+points at the in-tool normalizations (`conform` duplicates/drops onto an
+explicit grid and prints its dup/drop ledger; frame-rate conversion
+interpolates onto a target grid); nothing is ever silently retimed.
+Host-managed `open_pipeline` sessions describe the same timing through
+`VariableCadence`.
 
 ## Audio
 
@@ -140,10 +144,11 @@ shipping a track that drifts against the video. For a duration-
 preserving cadence change (interpolation), the final output frame is
 trimmed to end exactly at the source-window duration, so the muxed
 audio stays in sync instead of drifting by the target grid's tail
-rounding. Audio carry also requires the source audio and video tracks to
-share an origin. A staggered-track file is rejected before any output is
-reserved; timestamp-aware audio padding and trimming are not implemented, so
-rebasing both tracks independently would silently destroy their offset.
+rounding. Audio carry preserves a staggered track origin: the audio
+window is composed against the video-anchored timeline (a track that
+starts before the video is sliced, one that starts after is placed at
+its recorded offset), so both tracks keep their relationship instead of
+being rebased independently.
 A file carry resolves the exact rational audio sample window before decode.
 Native and compatibility readers then pull approximately 250 ms of float PCM
 only when each writer reports readiness; post and comparison writers own
