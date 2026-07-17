@@ -54,6 +54,14 @@ _NOISE_MAP_FAMILIES = ("mc", "bsvd", "fastdvdnet", "pvdd")
 # Deblock-slot families accepting the deblock-map (blockiness) keys.
 _DEBLOCK_MAP_FAMILIES = ("stdf", "fbcnn")
 
+# Shared slot dials not every member family accepts: the broadcast skips
+# these (family, key) -> processors with a warning (an explicit per-stage
+# key in a hand-written [pipeline] config still hits the family's loud
+# guard). PVDD has no dry/wet dial; its intensity is noise conditioning.
+_SLOT_KEY_UNSUPPORTED = {
+    ("denoise", "strength"): ("pvdd",),
+}
+
 # Flag-groups consumed structurally below; the generic registry
 # distribution skips them.
 _SPECIAL_FAMILIES = frozenset({
@@ -302,9 +310,24 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
             if key is None or key == "first":
                 continue                  # the selector / ordering itself
             names = members(family)
+            blocked = _SLOT_KEY_UNSUPPORTED.get((family, key), ())
+            skipped = []
             for name, slot_value in zip(
                     names, _slot_values(opt, raw_value, names), strict=True):
+                if config[name]["processor"] in blocked:
+                    skipped.append(name)
+                    continue
                 config[name][key] = slot_value
+            for name in skipped:
+                _log.warning(
+                    "%s does not apply to %s: PVDD has no dry/wet dial "
+                    "(its intensity comes from noise conditioning: "
+                    "--pvdd-noise-preset / --pvdd-noise-variance, or "
+                    "--noise-map auto with --pvdd-profile pvdd_level); "
+                    "the stage runs at full effect", opt.flag, name)
+            if names and skipped and len(skipped) == len(names):
+                raise ConfigError(
+                    f"{opt.flag} applies to no stage in this chain")
             continue
         if family == "toflow_sr":
             up = config.get("upscale")

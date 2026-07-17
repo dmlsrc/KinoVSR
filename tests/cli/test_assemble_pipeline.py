@@ -224,3 +224,23 @@ class TestNoiseMapUpsampleDial:
                      "--noise-map-upsample", "box")
         assert config["denoise_mc"]["noise_map_upsample"] == "box"
         assert config["denoise_bsvd"]["noise_map_upsample"] == "box"
+
+
+class TestStrengthBroadcastScoping:
+    def test_strength_skips_pvdd_with_a_warning(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            config = asm("--denoise", "pvdd,mc", "--denoise-strength", "1")
+        assert config["denoise_mc"]["strength"] == 1.0
+        assert "strength" not in config["denoise_pvdd"]
+        assert any("does not apply" in r.message for r in caplog.records)
+
+    def test_positional_strengths_keep_chain_alignment_past_pvdd(self):
+        config = asm("--denoise", "pvdd,mc", "--denoise-strength", "0.3,0.7")
+        assert "strength" not in config["denoise_pvdd"]
+        assert config["denoise_mc"]["strength"] == 0.7
+
+    def test_strength_on_a_lone_pvdd_is_a_config_error(self):
+        with pytest.raises(ConfigError, match="applies to no stage"):
+            asm("--denoise", "pvdd", "--denoise-strength", "0.8")

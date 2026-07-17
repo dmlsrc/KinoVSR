@@ -165,7 +165,7 @@ DENOISE_SLOT_OPTIONS = [
         metavar='S[,S...]',
         family='denoise',
         key='strength',
-        help='Denoise strength 0..1 (default 0.5); with a chained --denoise, give one value per stage (comma list) or one value for all. For mc, the max temporal blend toward motion-compensated history; for spatial, the noise level; for fastdvdnet/bsvd, the noise sigma (mapped onto sigma_255 in [5, 55]). For toflow, a dry/wet output blend (0 = passthrough, 1 = full model). With --noise-map auto the estimated map REPLACES this constant (strength then only serves as the fallback when estimation is impossible); scale the estimate with --noise-map-gain instead.'),
+        help='Denoise strength 0..1 (default 0.5); with a chained --denoise, give one value per stage (comma list) or one value for all. For mc, the max temporal blend toward motion-compensated history; for spatial, the noise level; for fastdvdnet/bsvd, the noise sigma (mapped onto sigma_255 in [5, 55]). For toflow, a dry/wet output blend (0 = passthrough, 1 = full model). pvdd has NO strength dial (skipped with a warning): its intensity is noise conditioning (--pvdd-noise-preset/--pvdd-noise-variance, or --noise-map auto on a level profile). With --noise-map auto the estimated map REPLACES this constant (strength then only serves as the fallback when estimation is impossible); scale the estimate with --noise-map-gain instead.'),
     Opt(flag='--denoise-luma-strength',
         group='Denoise And Noise Maps',
         type=float,
