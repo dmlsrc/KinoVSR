@@ -1746,6 +1746,58 @@ def test_nafnet_runs_through_the_typed_pipeline(clip, tmp_path):
     assert result.frames_out == 3
 
 
+def test_uniform_grid_sink_accepts_on_grid_holes(tmp_path):
+    """A decoder-dropped sample on a uniform-CFR source leaves an on-grid
+    hole (labels follow sample identity); the sink must accept the
+    identity-true stamps instead of demanding contiguity with its append
+    count, while still refusing off-grid and non-increasing stamps."""
+    import mlx.core as mx
+
+    from kinovsr.pipeline import FileSink
+    from kinovsr.processors import (
+        FrameUnit,
+        Geometry,
+        StreamSpec,
+        TimelineSpec,
+        frame_spec_for_matrix,
+    )
+
+    W, H = 64, 48
+    spec = StreamSpec(
+        frame=frame_spec_for_matrix(
+            "bt709", full_range=False, geometry=Geometry(W, H)),
+        timeline=TimelineSpec(time_base=Fraction(1, 24000),
+                              cadence=Fraction(25)))
+    frame = mx.full((H, W, 3), 0.5, dtype=mx.float32)
+
+    sink = FileSink(tmp_path / "hole.mp4", spec)
+    for i in (0, 2, 3):                          # sample 1 dropped upstream
+        sink.append(FrameUnit(payload=frame, pts=i * 960, duration=960))
+    sink.finalize()
+    with av.open(str(sink._temp_path)) as container:
+        stream = container.streams.video[0]
+        times = sorted(
+            Fraction(f.pts) * Fraction(stream.time_base)
+            for f in container.decode(video=0))
+    assert times == [Fraction(0), Fraction(2, 25), Fraction(3, 25)]
+
+    off = FileSink(tmp_path / "offgrid.mp4", spec)
+    try:
+        off.append(FrameUnit(payload=frame, pts=0, duration=960))
+        with pytest.raises(PipelineError, match="cadence grid"):
+            off.append(FrameUnit(payload=frame, pts=1500, duration=960))
+    finally:
+        off.discard()
+
+    back = FileSink(tmp_path / "backward.mp4", spec)
+    try:
+        back.append(FrameUnit(payload=frame, pts=2 * 960, duration=960))
+        with pytest.raises(PipelineError, match="strictly increase"):
+            back.append(FrameUnit(payload=frame, pts=960, duration=960))
+    finally:
+        back.discard()
+
+
 def test_ntsc_cadence_writes_the_exact_rational_grid(tmp_path):
     """The writer's index grid quantizes 30000/1001 to a fixed 801-tick
     frame duration (drifting ~0.2 ticks/frame); the sink must stamp each

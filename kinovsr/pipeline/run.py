@@ -956,6 +956,7 @@ class FileSink:
         timeline = output_spec.timeline
         self._explicit_timeline = not isinstance(timeline.cadence, Fraction)
         self._last_explicit_pts: int | None = None
+        self._last_grid_pts: int | None = None
         # Unit ticks are ALWAYS interpreted on the timeline's tick base, so
         # the writer must be told that base whether the cadence is carried
         # (VariableCadence) or regenerated onto it (conform/interpolate
@@ -1135,12 +1136,28 @@ class FileSink:
                     f"duration {unit.duration}")
             self._last_explicit_pts = unit.pts
         else:
-            expected = self._grid_ticks(self.writer.frame_count)
+            # A decoder-dropped sample on a uniform source leaves an
+            # on-grid HOLE (labels follow sample identity), so the sink
+            # verifies stamps land ON the cadence grid and strictly
+            # increase - not that they are contiguous with its append
+            # count.
+            timeline = self.spec.timeline
+            nearest = round(unit.pts * timeline.time_base
+                            * timeline.cadence)
+            expected = self._grid_ticks(int(nearest))
             if abs(unit.pts - expected) > 1:
                 raise PipelineError(
                     f"unit {self.writer.frame_count} arrived at pts "
-                    f"{unit.pts} but the output cadence grid expects "
-                    f"{expected}; the chain broke its declared timeline")
+                    f"{unit.pts} but the nearest output cadence grid "
+                    f"position is {expected}; the chain broke its "
+                    f"declared timeline")
+            last = self._last_grid_pts
+            if last is not None and unit.pts <= last:
+                raise PipelineError(
+                    f"unit {self.writer.frame_count} arrived at pts "
+                    f"{unit.pts} but the previous unit was stamped "
+                    f"{last}; cadence-grid stamps must strictly increase")
+            self._last_grid_pts = unit.pts
         # The chain's timeline is the validated one: stamp the unit's own
         # ticks (the writer's index grid quantizes NTSC-family rates).
         if self._is_mlx:
