@@ -375,15 +375,38 @@ def encode_video_ffmpeg(
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         try:
-            for frame in frame_stream:
-                proc.stdin.write(_frame_buffer(frame, preset.frame_bit_depth))
-        finally:
-            proc.stdin.close()
-        rc = proc.wait()
-        if rc != 0:
-            raise RuntimeError(
-                f"ffmpeg failed (rc={rc}) for encode tier {tier!r}"
-            )
+            try:
+                try:
+                    for frame in frame_stream:
+                        proc.stdin.write(
+                            _frame_buffer(frame, preset.frame_bit_depth))
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass  # dead pipe; proc.wait() below reports the rc
+            except BrokenPipeError:
+                # ffmpeg died before consuming the stream; its diagnostic
+                # went to the inherited stderr.
+                rc = proc.wait()
+                raise RuntimeError(
+                    f"ffmpeg exited early (rc={rc}) for encode tier "
+                    f"{tier!r}; its diagnostic is on stderr above") from None
+            rc = proc.wait()
+            if rc != 0:
+                raise RuntimeError(
+                    f"ffmpeg failed (rc={rc}) for encode tier {tier!r}"
+                )
+        except BaseException:
+            # Failed encode: reap the child, and never leave the truncated
+            # output masquerading as the deliverable (ffmpeg's -y already
+            # opened/truncated the destination; same discard-on-failure
+            # discipline as the VideoToolbox backend).
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            output_path.unlink(missing_ok=True)
+            raise
     finally:
         if audio_path is not None and not sidecar_kept and audio_path.exists():
             audio_path.unlink()
