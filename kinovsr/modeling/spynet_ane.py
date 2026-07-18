@@ -32,8 +32,13 @@ call to that level. Every consumer of a backing is evaluated within the same
 :meth:`AneSpyNet.flow` call, and the returned array is freshly materialized,
 so no lazy graph referencing a backing survives the call.
 
-CoreML models are geometry-specific, so one set is built per padded geometry
-and cached on disk (about 1.3 s to convert, 0.5 s to load thereafter).
+One model set is built per padded geometry and cached on disk (about 1.3 s to
+convert, 0.5 s to load thereafter). Fixed shapes are a deliberate choice, not
+a CoreML limitation: ``EnumeratedShapes`` also stays entirely on the ANE and
+costs only 2-3 percent, but it still rejects sizes outside its menu, and since
+the models are converted on first use and cached either way, a fixed shape is
+the simplest thing that is also the fastest. (``RangeDim`` is the one to
+avoid: same placement, but 3.7x slower away from its default shape.)
 Conversion needs ``coremltools``; inference does not. Anything unavailable or
 unsupported returns ``None`` from :func:`engine_for` and the caller stays on
 the pure-MLX path.
