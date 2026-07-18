@@ -111,6 +111,11 @@ _CATALOG: dict[str, CatalogEntry] = {
             (140, "FBCNN_OPTIONS"),
         ),
         _entry(
+            "level",
+            "kinovsr.processors.level:FACTORY",
+            (75, "LEVEL_OPTIONS"),
+        ),
+        _entry(
             "mc",
             "kinovsr.processors.mc:FACTORY",
             (170, "MC_STRENGTH_OPTIONS"),

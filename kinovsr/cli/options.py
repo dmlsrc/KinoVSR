@@ -20,7 +20,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 # Preprocess slots, in default execution order.
-PP_STAGE_NAMES = ("restore", "deflicker", "deblock", "denoise", "nafnet")
+PP_STAGE_NAMES = ("level", "restore", "deflicker", "deblock", "denoise",
+                  "nafnet")
 
 
 def pp_order(spec: str) -> list:
@@ -79,6 +80,7 @@ FAMILY_KEYS: dict[str, frozenset[str]] = {
                                "residual_strength"}),
     "nafnet": frozenset({"pool"}),
     "deflicker": frozenset({"band", "frac", "max_fix", "jitter", "gop"}),
+    "level": frozenset({"deadband"}),
     "denoise": frozenset({"first"}),
     # Conditioning subsystems and foundation prefixes lock their keys the
     # same way so the whole prefixed surface stays deliberate.

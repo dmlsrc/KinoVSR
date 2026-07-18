@@ -224,7 +224,10 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
     else:
         order = (["denoise", "deblock"] if options.denoise_first
                  else ["deblock", "denoise"])
-        order = ["restore", "deflicker", *order]
+        # level runs first: a stable exposure improves every temporal
+        # stage after it (deflicker's static verification, mc's gate,
+        # the noise map, learned temporal denoisers).
+        order = ["level", "restore", "deflicker", *order]
     for slot in PP_STAGE_NAMES:      # append any slot not listed
         if slot not in order:
             order.append(slot)
@@ -239,6 +242,8 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
                 add(f"restore_{variant}", {
                     "processor": "basicvsrpp", "capability": "restore",
                     "profile": variant}, slot="restore")
+        elif slot == "level" and options.level != "off":
+            add("level", {"processor": "level"}, slot="level")
         elif slot == "deflicker" and options.deflicker != "off":
             add("deflicker", {"processor": "deflicker"}, slot="deflicker")
         elif slot == "deblock" and options.deblock != "off":
