@@ -53,6 +53,13 @@ class TestParse:
         with pytest.raises(ValueError, match="positive"):
             parse({"threshold": 0.0})
 
+    def test_per_mode_threshold_defaults(self):
+        # The modes' statistics live on different scales; an absent
+        # threshold resolves per mode, an explicit one always wins.
+        assert parse({"detect": "hist"}).threshold == 0.25
+        assert parse({"detect": "vtme"}).threshold == 0.07
+        assert parse({"detect": "vtme", "threshold": 0.1}).threshold == 0.1
+
 
 class TestSpec:
     def test_emits_hard_cut_and_passes_spec_through(self):

@@ -211,9 +211,12 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
         add("square", {"processor": "square_pixels"})
 
     if options.cut_detect != "off":
-        add("cut", {"processor": "cut_detect",
-                    "detect": options.cut_detect,
-                    "threshold": options.cut_threshold})
+        stage = {"processor": "cut_detect", "detect": options.cut_detect}
+        if options.cut_threshold is not None:
+            # Absent means the family resolves its per-mode default; the
+            # modes' statistics live on different scales.
+            stage["threshold"] = options.cut_threshold
+        add("cut", stage)
 
     # ---- preprocess slots (C5 default order + explicit override) --------
     if options.preprocess_order:
@@ -291,7 +294,10 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
         if family in ("gop",):
             continue                      # run-level, threaded separately
         if family == "cut":
-            if key in ("detect", "threshold") and "cut" in config:
+            # An unset threshold stays absent so the family resolves its
+            # per-mode default (the modes' statistics differ in scale).
+            if (key in ("detect", "threshold") and "cut" in config
+                    and value is not None):
                 config["cut"][key] = value
             continue                      # log is run-level
         if family == "noise_map":

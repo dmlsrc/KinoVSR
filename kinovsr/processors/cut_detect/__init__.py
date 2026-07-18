@@ -7,12 +7,22 @@ continuous generated clips with no edits, mode="off" is correct. For
 arbitrary video input on edited footage, enable one of the detection
 modes so VSR resets at cut boundaries.
 
-Two algorithms:
+Three algorithms:
   simple  Downsampled-pixel mean absolute difference. ~1ms/frame. Catches
           hard cuts cleanly; doesn't flag dissolves (which don't ghost in
           VSR anyway because the temporal coherence kinda matches).
   hist    Per-channel 32-bin histogram chi-squared distance. ~3ms/frame.
           More robust to fast motion than simple-pixel diff.
+  vtme    Trackability, not similarity: neighbor incoherence of the
+          VTMotionEstimationSession 16x16 multipass block-motion field
+          (macOS 26+), matched on z-normalized luma and scaled by the
+          frame diagonal. Consecutive frames stay coherent even under
+          fast motion and global gain swings; across a cut the matcher
+          free-associates. On the deflicker-class oscillation fixture
+          (alternating +-30% gain) simple and hist false-fire on EVERY
+          pair while this mode stays quiet, only hard clipped flashes
+          still read as boundaries (arguably correct for temporal
+          state). ~7-10ms/frame on the media engine, zero GPU cost.
 
 False positives are cheap (one frame of "no temporal context", visually
 invisible). False negatives let a cut ghost - tune the threshold down.
@@ -82,6 +92,34 @@ def _frame_histogram(frame: Any, bins: int = 32) -> Any:
     return mx.concatenate(hists).astype(mx.float32)
 
 
+def _normalized_gray(frame: Any) -> Any:
+    """Z-normalized luma replicated to RGB for gain-invariant matching.
+
+    Global flicker (deflicker-class alternating gains) shifts luma
+    wholesale; SAD block matching is not illumination-invariant, so
+    without this a bright/dark swing reads as an incoherent field and
+    false-fires the detector. Mean/std normalization cancels global
+    gain and offset; hard clipping (a blown flash frame) still destroys
+    structure and legitimately reads as a boundary."""
+    rgb = _to_uint8_rgb(frame).astype(mx.float32)
+    luma = rgb @ mx.array([0.2126, 0.7152, 0.0722])
+    z = (luma - mx.mean(luma)) / (mx.sqrt(mx.var(luma)) + 1e-6)
+    g = mx.clip(0.5 + 0.18 * z, 0.0, 1.0)
+    out = mx.stack([g, g, g], axis=-1)
+    mx.eval(out)
+    return out
+
+
+def _block_incoherence(blocks: Any) -> float:
+    """Mean Euclidean difference between adjacent block vectors, px."""
+    dh = blocks[:, 1:, :] - blocks[:, :-1, :]
+    dv = blocks[1:, :, :] - blocks[:-1, :, :]
+    total = (float(mx.sum(mx.sqrt(mx.sum(dh * dh, axis=-1))))
+             + float(mx.sum(mx.sqrt(mx.sum(dv * dv, axis=-1)))))
+    count = (dh.shape[0] * dh.shape[1]) + (dv.shape[0] * dv.shape[1])
+    return total / max(count, 1)
+
+
 class CutDetector:
     """Detects hard cuts between consecutive frames.
 
@@ -89,6 +127,10 @@ class CutDetector:
         "off"     no-op
         "simple"  downsampled-pixel MAD. threshold ~0.2-0.35 typical.
         "hist"    per-channel histogram chi-squared. threshold ~0.4-0.8.
+        "vtme"    block-motion-field incoherence / frame diagonal
+                  (macOS 26+). threshold ~0.05-0.09 typical; the gate
+                  measured non-cut pairs at or under ~0.06 and true cuts
+                  at or over ~0.088 across 854x480 and 426x240.
 
     Always returns False on the first frame (no previous to compare).
     """
@@ -97,6 +139,22 @@ class CutDetector:
         self.mode = mode
         self.threshold = float(threshold)
         self._prev: Any | None = None
+        self._engine: Any = None
+
+    def _vtme_stat(self, frame: Any) -> float | None:
+        curr = _normalized_gray(frame)
+        if self._engine is None:
+            from kinovsr.modeling.vtme_flow import VtmeFlowEngine
+
+            h, w = int(curr.shape[0]), int(curr.shape[1])
+            self._engine = VtmeFlowEngine(w, h, block=16, multipass=True)
+        if self._prev is None:
+            self._prev = curr
+            return None
+        blocks = self._engine.compute_blocks(curr, self._prev)
+        self._prev = curr
+        diagonal = (self._engine.w ** 2 + self._engine.h ** 2) ** 0.5
+        return _block_incoherence(blocks) / diagonal
 
     def is_cut(self, frame: Any) -> bool:
         if self.mode == "off":
@@ -121,14 +179,33 @@ class CutDetector:
             norm = (chi2 / (mx.sum(a) + eps)).item()
             self._prev = curr
             return bool(norm > self.threshold)
+        if self.mode == "vtme":
+            stat = self._vtme_stat(frame)
+            return stat is not None and stat > self.threshold
         raise ValueError(f"Unknown cut-detect mode: {self.mode!r}")
+
+    def reset_state(self) -> None:
+        """Restart the comparison (post-cut); native sessions are kept."""
+        self._prev = None
+
+    def close(self) -> None:
+        engine, self._engine = self._engine, None
+        if engine is not None:
+            engine.close()
+        self._prev = None
 
 
 # ===========================================================================
 # Processor family: a HARD_CUT boundary emitter
 # ===========================================================================
 
-_MODES = ("simple", "hist")
+_MODES = ("simple", "hist", "vtme")
+
+# Per-mode defaults when the user does not pass a threshold: the modes'
+# statistics live on different scales. simple/hist keep the historical
+# 0.25; vtme's 0.07 sits inside the measured non-cut/cut gap at both
+# probed sizes (max non-cut ~0.059, min cut ~0.088).
+_DEFAULT_THRESHOLDS = {"simple": 0.25, "hist": 0.25, "vtme": 0.07}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -154,6 +231,11 @@ class CutDetectProcessor:
 
     def prepare(self, input_spec: StreamSpec,
                 context: PipelineContext) -> None:
+        if self._config.detect == "vtme":
+            # Fail at pipeline assembly, not on the first frame.
+            from kinovsr.modeling.vtme_flow import VtmeFlowEngine
+
+            VtmeFlowEngine.ensure_available()
         self._detector = CutDetector(self._config.detect,
                                      self._config.threshold)
 
@@ -170,15 +252,17 @@ class CutDetectProcessor:
     def reset(self, boundary: Boundary,
               context: PipelineContext) -> None:
         # Post-cut the previous frame belongs to the old shot; restart the
-        # comparison so the next frame cannot re-trigger against it.
-        self._detector = CutDetector(self._config.detect,
-                                     self._config.threshold)
+        # comparison so the next frame cannot re-trigger against it. The
+        # detector keeps its native session (geometry is unchanged).
+        self._detector.reset_state()
 
     def flush(self, context: PipelineContext) -> Iterable[FrameUnit]:
         return ()
 
     def close(self, context: PipelineContext) -> None:
-        self._detector = None
+        detector, self._detector = self._detector, None
+        if detector is not None:
+            detector.close()
 
 
 class CutDetectFactory:
@@ -214,7 +298,9 @@ class CutDetectFactory:
             raise ValueError(
                 f"detect must be one of {_MODES}; a chain without cut "
                 f"detection simply omits this stage")
-        threshold = typed_value(raw, "threshold", float, 0.25)
+        threshold = typed_value(raw, "threshold", float)
+        if threshold is None:
+            threshold = _DEFAULT_THRESHOLDS[detect]
         if threshold <= 0:
             raise ValueError("threshold must be positive")
         return CutDetectStageConfig(detect=detect, threshold=threshold)

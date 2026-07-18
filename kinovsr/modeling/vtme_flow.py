@@ -1,13 +1,16 @@
 """VideoToolbox motion-estimation flow: block matching on the media engine.
 
 ``VTMotionEstimationSession`` (macOS 26+) exposes the video encoder's
-motion estimator. This engine pins the one configuration measured to be
+motion estimator. The default configuration is the one measured to be
 warp-grade: 4x4 search blocks with multipass ("true motion") search,
 which adds quarter-pel refinement and coherent fields (single-pass is
-integer-only encoder-style vectors with ragged fields). The work runs on
-the media engine, off both the MLX GPU queue and the CPU hot path:
-engine latency does not change under full MLX GPU saturation, where
-Vision r1 pays about +45%.
+integer-only encoder-style vectors with ragged fields). ``block=16``
+selects the cheap motion-signal tier (~2 ms/pair at 1080p, tracks
++-224 px vs 4x4's +-64 px) used by the cut detector; multipass stays
+the right choice there too (its consecutive-frame fields are ~5x more
+coherent). The work runs on the media engine, off both the MLX GPU
+queue and the CPU hot path: engine latency does not change under full
+MLX GPU saturation, where Vision r1 pays about +45%.
 
 Convention (empirically verified, and re-checked at session start by the
 mc self-test): ``compute(a, b)`` returns dense (H,W,2) fp32 buffer-px
@@ -47,7 +50,6 @@ import mlx.core as mx
 
 from kinovsr.native.frameworks import Quartz, autorelease_pool, vt
 
-_BLOCK = 4
 _L008 = 0x4C303038  # kCVPixelFormatType_OneComponent8
 _FLOW_16H = 0x32433068  # kCVPixelFormatType_TwoComponent16Half
 _REC709_LUMA = (0.2126, 0.7152, 0.0722)
@@ -61,19 +63,28 @@ class VtmeFlowEngine:
     manager.
     """
 
-    def __init__(self, width: int, height: int) -> None:
-        self.w, self.h = int(width), int(height)
-        if self.w < 1 or self.h < 1:
-            raise ValueError("motion-estimation geometry must be positive")
+    @staticmethod
+    def ensure_available() -> None:
+        """Raise the standard unavailability error without a session."""
         if not hasattr(vt, "VTMotionEstimationSessionCreate"):
             raise SystemExit(
                 "VTMotionEstimationSession is unavailable; "
-                "--mc-flow vtme requires macOS 26 or newer.")
+                "vtme motion estimation requires macOS 26 or newer.")
+
+    def __init__(self, width: int, height: int, block: int = 4,
+                 multipass: bool = True) -> None:
+        self.w, self.h = int(width), int(height)
+        self.block = int(block)
+        if self.w < 1 or self.h < 1:
+            raise ValueError("motion-estimation geometry must be positive")
+        if self.block not in (4, 16):
+            raise ValueError("motion-estimation block size must be 4 or 16")
+        self.ensure_available()
         options = {
             vt.kVTMotionEstimationSessionCreationOption_MotionVectorSize:
-                _BLOCK,
+                self.block,
             vt.kVTMotionEstimationSessionCreationOption_UseMultiPassSearch:
-                True,
+                bool(multipass),
         }
         err, session = vt.VTMotionEstimationSessionCreate(
             None, options, self.w, self.h, None)
@@ -142,7 +153,7 @@ class VtmeFlowEngine:
                 f"VTMotionEstimation failed: {result['status']}")
         return result["buf"]
 
-    def _read_dense(self, mv_buf: Any) -> Any:
+    def _read_blocks(self, mv_buf: Any) -> Any:
         bw = int(Quartz.CVPixelBufferGetWidth(mv_buf))
         bh = int(Quartz.CVPixelBufferGetHeight(mv_buf))
         fmt = int(Quartz.CVPixelBufferGetPixelFormatType(mv_buf))
@@ -150,7 +161,7 @@ class VtmeFlowEngine:
             raise RuntimeError(
                 f"VTMotionEstimation returned pixel format {fmt:#x}, "
                 f"expected TwoComponent16Half")
-        if bw * _BLOCK < self.w or bh * _BLOCK < self.h:
+        if bw * self.block < self.w or bh * self.block < self.h:
             raise RuntimeError(
                 f"VTMotionEstimation returned {bw}x{bh} blocks for a "
                 f"{self.w}x{self.h} request")
@@ -162,21 +173,29 @@ class VtmeFlowEngine:
             blocks = (raw.view(mx.float16)
                       .reshape(bh, bpr // 2)[:, : bw * 2]
                       .reshape(bh, bw, 2).astype(mx.float32))
-            dense = mx.repeat(mx.repeat(blocks, _BLOCK, axis=0),
-                              _BLOCK, axis=1)[: self.h, : self.w]
-            mx.eval(dense)
+            mx.eval(blocks)
         finally:
             Quartz.CVPixelBufferUnlockBaseAddress(mv_buf, 1)
-        return dense
+        return blocks
 
-    def compute(self, from_rgb: Any, to_rgb: Any) -> Any:
-        """(H,W,2) fp32 buffer-px flow: ``from_rgb[p] ~= to_rgb[p+flow[p]]``."""
+    def compute_blocks(self, from_rgb: Any, to_rgb: Any) -> Any:
+        """(ceil(H/block), ceil(W/block), 2) fp32 block vectors in the
+        ``compute`` orientation, without densification -- the raw signal
+        for detectors and gating consumers."""
         if self._from_buf is None:
             raise RuntimeError("motion-estimation engine is closed")
         with autorelease_pool():
             self._upload(from_rgb, self._from_buf)
             self._upload(to_rgb, self._to_buf)
-            return self._read_dense(self._estimate())
+            return self._read_blocks(self._estimate())
+
+    def compute(self, from_rgb: Any, to_rgb: Any) -> Any:
+        """(H,W,2) fp32 buffer-px flow: ``from_rgb[p] ~= to_rgb[p+flow[p]]``."""
+        blocks = self.compute_blocks(from_rgb, to_rgb)
+        dense = mx.repeat(mx.repeat(blocks, self.block, axis=0),
+                          self.block, axis=1)[: self.h, : self.w]
+        mx.eval(dense)
+        return dense
 
     def close(self) -> None:
         session, self._session = self._session, None
