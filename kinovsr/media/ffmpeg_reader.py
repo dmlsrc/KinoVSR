@@ -179,8 +179,14 @@ def read_sample_table(path: Path) -> SampleTable:
         samples: list[SampleTiming] = []
         unwrapper = EpochUnwrapper()
         for packet in container.demux(vs):
-            if packet.pts is None or packet.size <= 0:
+            if packet.pts is None:
                 continue
+            # Zero-size packets that carry a timestamp are timeline slots
+            # (Ogg/Theora "repeat previous frame" markers): record them so
+            # the decode loop can place the re-materialized duplicate on
+            # its own sample. Only the timestampless flush sentinel is
+            # skipped. (The native reader never sees such containers, so
+            # the walks stay mirrored in practice.)
             pts = unwrapper.push(Fraction(int(packet.pts)) * time_base)
             duration = (Fraction(int(packet.duration)) * time_base
                         if packet.duration and packet.duration > 0 else None)
@@ -451,32 +457,110 @@ def _iter_chunks(path: Path, out_format: int, chunk_size: int,
         # one monotonic clock. Run the same streaming mapping here (reset
         # detection survives display reordering) so bisects stay aligned.
         trim_unwrapper = EpochUnwrapper() if keys is not None else None
-        for frame in container.decode(vs):
-            if frame.pts is None:
-                continue
+
+        def frame_index(pts: int) -> int:
             if keys is not None:
                 # Exact window indexing for jittered/gapped/variable clocks.
                 assert trim_unwrapper is not None
-                adjusted = trim_unwrapper.push(
-                    Fraction(int(frame.pts)) * time_base)
-                idx = bisect.bisect_right(keys, adjusted) - 1
-            elif fps > 0:
-                idx = _pts_index(frame.pts, vs, fps, origin=origin)
-            else:
-                idx = 0
-            if idx < start_frame:
+                adjusted = trim_unwrapper.push(Fraction(int(pts)) * time_base)
+                return bisect.bisect_right(keys, adjusted) - 1
+            if fps > 0:
+                return _pts_index(pts, vs, fps, origin=origin)
+            return 0
+
+        # Ogg/Theora encodes "this frame repeats the previous one" as a
+        # ZERO-BYTE packet carrying a real timestamp. libavcodec's
+        # send_packet rejects empty packets (EINVAL) even though
+        # libavformat's own demuxer emits them; ffmpeg's CLI skips them
+        # in application code and silently DROPS the repeat frames. This
+        # loop re-materializes each marker as a duplicate of the previous
+        # decoded frame at the marker's timestamp, so quirky-but-legal
+        # old files keep their exact timeline. PyAV's end-of-stream flush
+        # sentinel is also zero-size but carries no timestamps and must
+        # still reach decode() to drain reordering codecs.
+        last_frame: Any = None
+        last_index: int | None = None
+        dup_emitted = 0
+        dup_dropped = 0
+        stop = False
+        for packet in container.demux(vs):
+            if packet.size == 0 and not (
+                    packet.pts is None and packet.dts is None):
+                pts = packet.pts if packet.pts is not None else packet.dts
+                idx = frame_index(int(pts))
+                if last_frame is None or (
+                        last_index is not None and idx <= last_index):
+                    # No decodable predecessor (marker leads the stream or
+                    # follows a seek), or the index grid has no slot for
+                    # it: dropping is the only safe move.
+                    dup_dropped += 1
+                    if dup_dropped == 1:
+                        _log.warning(
+                            "%s: zero-byte repeat-frame packet at pts %s "
+                            "has no usable predecessor; dropping it "
+                            "(ffmpeg CLI parity)", path.name, pts)
+                    continue
+                dup_emitted += 1
+                if dup_emitted == 1:
+                    _log.warning(
+                        "%s: zero-byte repeat-frame packet(s) (Ogg/Theora "
+                        "duplicate markers; libavcodec rejects empty "
+                        "packets): re-materializing each as a duplicate "
+                        "of the previous frame at the marker's timestamp, "
+                        "first at pts %s", path.name, pts)
+                last_index = idx
+                if idx < start_frame:
+                    continue
+                if end_frame is not None and idx >= end_frame:
+                    break
+                buffer = _frame_to_buffer(
+                    last_frame, out_format, attrs, reformat_kwargs)
+                chunk.append((buffer, idx) if keys is not None else buffer)
+                if len(chunk) >= chunk_size:
+                    yield chunk
+                    chunk = []
                 continue
-            if end_frame is not None and idx >= end_frame:
+            try:
+                frames = packet.decode()
+            except av.FFmpegError:
+                if packet.size == 0:
+                    # A malformed empty packet that dodged both branches
+                    # (e.g. timestamped like a flush sentinel): skip it
+                    # rather than kill the run.
+                    dup_dropped += 1
+                    _log.warning(
+                        "%s: undecodable zero-byte packet skipped",
+                        path.name)
+                    continue
+                raise
+            for frame in frames:
+                if frame.pts is None:
+                    continue
+                idx = frame_index(int(frame.pts))
+                last_frame = frame
+                last_index = idx
+                if idx < start_frame:
+                    continue
+                if end_frame is not None and idx >= end_frame:
+                    stop = True
+                    break
+                buffer = _frame_to_buffer(
+                    frame, out_format, attrs, reformat_kwargs)
+                # With a table, label frames by SAMPLE IDENTITY so a decoder
+                # that drops or multiplies frames (packed-bitstream AVIs,
+                # dummy packets) cannot shift every later timestamp and
+                # raw-stream tag by one.
+                chunk.append((buffer, idx) if keys is not None else buffer)
+                if len(chunk) >= chunk_size:
+                    yield chunk
+                    chunk = []
+            if stop:
                 break
-            buffer = _frame_to_buffer(frame, out_format, attrs, reformat_kwargs)
-            # With a table, label frames by SAMPLE IDENTITY so a decoder
-            # that drops or multiplies frames (packed-bitstream AVIs,
-            # dummy packets) cannot shift every later timestamp and
-            # raw-stream tag by one.
-            chunk.append((buffer, idx) if keys is not None else buffer)
-            if len(chunk) >= chunk_size:
-                yield chunk
-                chunk = []
+        if dup_emitted or dup_dropped:
+            _log.warning(
+                "%s: %d duplicate frame(s) re-materialized from zero-byte "
+                "packets to keep the source timeline exact; %d dropped",
+                path.name, dup_emitted, dup_dropped)
         if chunk:
             yield chunk
     except av.FFmpegError as exc:

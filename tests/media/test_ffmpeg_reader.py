@@ -405,3 +405,97 @@ def test_corrupt_media_raises_operational_error(tmp_path):
 def test_missing_file_keeps_oserror_typing(tmp_path):
     with pytest.raises(OSError):
         fr.probe_video(tmp_path / "absent.mp4")
+
+
+# ------------------------------------------------- zero-byte repeat markers
+
+class _InjectingContainer:
+    """Wrap a real container, splicing zero-size packets into demux().
+
+    Ogg/Theora represents "repeat the previous frame" as a ZERO-BYTE
+    packet with a real timestamp, and libavformat's muxers refuse to
+    write such packets, so the condition cannot be synthesized as a
+    self-contained file; splicing at the demux seam exercises the exact
+    reader path the real streams hit.
+    """
+
+    def __init__(self, container, position: str, pts_delta: int):
+        self._c = container
+        self._position = position          # "tail" | "head"
+        self._delta = pts_delta
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+    def demux(self, *args, **kwargs):
+        def marker(pts):
+            pkt = av.Packet(0)
+            pkt.pts = pts
+            pkt.dts = pts
+            return pkt
+
+        emitted_head = False
+        last_pts = None
+        for pkt in self._c.demux(*args, **kwargs):
+            if pkt.size > 0 and pkt.pts is not None:
+                if self._position == "head" and not emitted_head:
+                    emitted_head = True
+                    yield marker(pkt.pts)
+                last_pts = pkt.pts
+            elif (pkt.size == 0 and pkt.pts is None
+                    and self._position == "tail" and last_pts is not None):
+                yield marker(last_pts + self._delta)   # before the sentinel
+            yield pkt
+
+
+def _patched_open(monkeypatch, position: str):
+    real_open = fr._open_video
+
+    def open_video(path):
+        container, vs = real_open(path)
+        c = av.open(str(path))
+        s = [x for x in c.streams if x.type == "video"][0]
+        pts = [p.pts for p in c.demux(s) if p.size > 0][:2]
+        c.close()
+        delta = int(pts[1] - pts[0])
+        return _InjectingContainer(container, position, delta), vs
+
+    monkeypatch.setattr(fr, "_open_video", open_video)
+
+
+def test_zero_byte_marker_rematerializes_previous_frame(
+        clip, monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="kinovsr.media.ffmpeg_reader")
+    _patched_open(monkeypatch, "tail")
+    frames = [pb for chunk in fr.iter_video_buffer_chunks(
+        clip, PIX_BGRA, chunk_size=7) for pb in chunk]
+    assert len(frames) == N + 1
+    dup = read_buffer_rgb_f32(frames[N])
+    prev = read_buffer_rgb_f32(frames[N - 1])
+    assert float(mx.max(mx.abs(dup - prev))) == 0.0
+    text = caplog.text
+    assert "re-materializing each as a duplicate" in text
+    assert "1 duplicate frame(s) re-materialized" in text
+
+
+def test_zero_byte_marker_without_predecessor_is_dropped(
+        clip, monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="kinovsr.media.ffmpeg_reader")
+    _patched_open(monkeypatch, "head")
+    frames = [pb for chunk in fr.iter_video_buffer_chunks(
+        clip, PIX_BGRA, chunk_size=7) for pb in chunk]
+    assert len(frames) == N                       # nothing extra, no crash
+    assert "no usable predecessor" in caplog.text
+    assert "0 duplicate frame(s) re-materialized" in caplog.text
+    assert "1 dropped" in caplog.text
+
+
+def test_sample_table_records_zero_byte_slots(clip, monkeypatch):
+    _patched_open(monkeypatch, "tail")
+    table = fr.read_sample_table(clip)
+    assert len(table.samples) == N + 1
+    assert table.samples[-1].coded_size == 0
