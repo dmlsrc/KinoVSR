@@ -134,6 +134,19 @@ class Settings:
         metadata={"env": "{{KINOVSR_MLX_CACHE_LIMIT_GB}}"},
     )
 
+    # Where converted CoreML models are cached (one set per SpyNet geometry).
+    cache_dir: str = field(
+        default="~/Library/Caches/KinoVSR",
+        metadata={"env": ["{{KINOVSR_CACHE_DIR}}", "{{XDG_CACHE_HOME}}/KinoVSR",
+                          "~/Library/Caches/KinoVSR"]},
+    )
+
+    # Which SpyNet implementation runs: "auto" (Neural Engine convolutions
+    # with an automatic fall back to MLX), "ane" (require the ANE path), or
+    # "mlx" (pure MLX only).
+    spynet_backend: str = field(
+        default="auto", metadata={"env": "{{SPYNET_BACKEND}}"})
+
     # ---- Legacy per-family weight overrides ---------------------------------
     #
     # Variant token or filesystem path; ``None`` means "use the family
@@ -232,6 +245,19 @@ def default_settings() -> Settings:
     if _DEFAULT is None:
         _DEFAULT = Settings.from_env()
     return _DEFAULT
+
+
+def set_default_settings(settings: Settings) -> None:
+    """Publish a fully resolved ``Settings`` as the process-wide default.
+
+    An invocation resolves settings from the environment, the config table,
+    and the command line in that order; code that cannot be handed the
+    instance directly (deep inside a model implementation, below the layers
+    that thread it) reads it through :func:`default_settings`, which would
+    otherwise see environment values only and silently ignore a flag.
+    """
+    global _DEFAULT
+    _DEFAULT = settings
 
 
 def _reset_default_settings() -> None:

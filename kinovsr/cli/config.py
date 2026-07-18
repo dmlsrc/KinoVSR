@@ -25,7 +25,11 @@ from typing import Any
 
 from kinovsr.config import ConfigError, compose_config, validate_config
 from kinovsr.processors.catalog import available_families
-from kinovsr.settings import Settings, settings_from_args
+from kinovsr.settings import (
+    Settings,
+    set_default_settings,
+    settings_from_args,
+)
 
 
 @dataclass(frozen=True)
@@ -130,4 +134,8 @@ def assemble(args: argparse.Namespace,
     settings = base if base is not None else Settings.from_env()
     settings = _settings_from_table(settings, config.get("settings", {}))
     settings = settings_from_args(args, settings)
+    # Publish the resolved result so consumers too deep to be handed the
+    # instance (model internals below the threading layers) see the config
+    # table and command line, not just the environment.
+    set_default_settings(settings)
     return Invocation(settings=settings, options=args, config=config)

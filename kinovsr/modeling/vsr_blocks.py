@@ -269,7 +269,7 @@ def spynet_flow(p: dict, ref: Any, supp: Any) -> Any:
 _SPYNET_COMPILE_CACHE: dict = {}
 
 
-def compiled_spynet_flow(p: dict, ref: Any, supp: Any) -> Any:
+def mlx_spynet_flow(p: dict, ref: Any, supp: Any) -> Any:
     """spynet_flow, mx.compiled + cached per checkpoint (~1.1x).
 
     The reference runs SPyNet in fp32; this port runs it in fp16, and compiling the
@@ -280,6 +280,35 @@ def compiled_spynet_flow(p: dict, ref: Any, supp: Any) -> Any:
         _SPYNET_COMPILE_CACHE, id(p), lambda: mx.compile(lambda r, s: spynet_flow(p, r, s))
     )
     return fn(ref, supp)
+
+
+def compiled_spynet_flow(p: dict, ref: Any, supp: Any) -> Any:
+    """SpyNet flow through the configured backend.
+
+    Defaults to running the convolutions on the Neural Engine with MLX
+    keeping the warps and pyramid (about 2.5x the pure-MLX path at 640x352,
+    within 0.004 px), and falls back to :func:`mlx_spynet_flow` whenever that
+    is unavailable: batched calls, tiny frames, missing CoreML bindings, or a
+    first-use conversion that cannot run. ``spynet_backend`` selects
+    explicitly -- ``mlx`` never touches the ANE, ``ane`` refuses to fall back.
+    """
+    from kinovsr.settings import default_settings
+
+    backend = (default_settings().spynet_backend or "auto").lower()
+    if backend == "mlx":
+        return mlx_spynet_flow(p, ref, supp)
+
+    from kinovsr.modeling import spynet_ane
+
+    engine = spynet_ane.engine_for(p, ref.shape)
+    if engine is None:
+        if backend == "ane":
+            raise RuntimeError(
+                f"spynet_backend='ane' but the Neural Engine path is "
+                f"unavailable: "
+                f"{spynet_ane.unavailable_reason() or 'unsupported input'}")
+        return mlx_spynet_flow(p, ref, supp)
+    return engine.flow(ref, supp).astype(ref.dtype)
 
 
 # ---- residual blocks + pixel-shuffle ---------------------------------------

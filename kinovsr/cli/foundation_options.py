@@ -208,6 +208,11 @@ RUNTIME_OPTIONS = [
         type=float,
         settings_backed=True,
         help="Cap MLX's buffer cache (GB) so per-frame allocation churn does not grow into swap; 0 disables. Default 1.0."),
+    Opt(flag='--spynet-backend',
+        group='Runtime And Diagnostics',
+        choices=('auto', 'ane', 'mlx'),
+        settings_backed=True,
+        help="Which SpyNet implementation runs wherever spynet flow is used (--mc-flow spynet and the SR families' --*-flow spynet). auto (default): the convolutions run on the Neural Engine while MLX keeps the warps and pyramid -- measured 2.5x the pure-MLX path at 640x352 (20.8 vs 52.2 ms) within 0.004 px end-point error, and it leaves the GPU free for the learned stages. It falls back to MLX by itself for batched or very small inputs, or when the one-time per-geometry model build cannot run. mlx: pure MLX, the reference implementation. ane: require the Neural Engine path and fail loudly rather than fall back. The first run at a new frame geometry converts and caches six small CoreML models (about 1.3 s, needs coremltools installed; later runs load them in about 0.5 s and never need it). Cache location: $KINOVSR_CACHE_DIR, else the platform cache directory."),
 ]
 
 __all__ = [
