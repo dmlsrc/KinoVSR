@@ -33,12 +33,15 @@ call to that level. Every consumer of a backing is evaluated within the same
 so no lazy graph referencing a backing survives the call.
 
 One model set is built per padded geometry and cached on disk (about 1.3 s to
-convert, 0.5 s to load thereafter). Fixed shapes are a deliberate choice, not
-a CoreML limitation: ``EnumeratedShapes`` also stays entirely on the ANE and
-costs only 2-3 percent, but it still rejects sizes outside its menu, and since
-the models are converted on first use and cached either way, a fixed shape is
-the simplest thing that is also the fastest. (``RangeDim`` is the one to
-avoid: same placement, but 3.7x slower away from its default shape.)
+convert, then loaded from the compiled form). Fixed shapes are a deliberate
+choice, not a CoreML limitation - flexible inputs also stay entirely on the
+Neural Engine. ``EnumeratedShapes`` matches a fixed model at each listed size
+but rejects everything else; a wide ``RangeDim`` loaded with the
+``reshapeFrequency = Infrequent`` optimization hint accepts any size and runs
+within 4-27 percent of a size-specific model, which would trade one build ever
+for a permanent per-frame tax. Since a run holds one geometry for thousands of
+frames, the per-geometry build wins here - see planning doc 20 for the
+measurements and when the flexible arrangement would be preferable.
 Conversion needs ``coremltools``; inference does not. Anything unavailable or
 unsupported returns ``None`` from :func:`engine_for` and the caller stays on
 the pure-MLX path.
