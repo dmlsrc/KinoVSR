@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -169,10 +170,7 @@ def _convert_models(params: dict, levels: int, h_up: int, w_up: int,
         # conversion cannot leave a half-written package in the cache. The
         # staging name keeps the .mlpackage suffix that the writer requires.
         staging = directory / f"level{lvl}.partial.mlpackage"
-        if staging.exists():
-            import shutil
-
-            shutil.rmtree(staging)
+        shutil.rmtree(staging, ignore_errors=True)
         model.save(str(staging))
         staging.replace(package)
 
@@ -185,24 +183,53 @@ class _LevelRunner:
 
     def __init__(self, packages: list[Path]):
         import CoreML
-        from Foundation import NSURL
 
         self._CoreML = CoreML
         config = CoreML.MLModelConfiguration.alloc().init()
         config.setComputeUnits_(CoreML.MLComputeUnitsCPUAndNeuralEngine)
         self.levels: list[dict] = []
         for package in packages:
-            compiled, err = CoreML.MLModel.compileModelAtURL_error_(
-                NSURL.fileURLWithPath_(str(package)), None)
-            if compiled is None:
-                raise RuntimeError(f"CoreML compile failed: {err}")
-            model, err = CoreML.MLModel.modelWithContentsOfURL_configuration_error_(
-                compiled, config, None)
-            if model is None:
-                raise RuntimeError(f"CoreML load failed: {err}")
-            description = model.modelDescription()
-            entry = self._bind(model, description)
-            self.levels.append(entry)
+            model = self._load(package, config)
+            self.levels.append(self._bind(model, model.modelDescription()))
+
+    def _load(self, package: Path, config: Any) -> Any:
+        """Load a level, preferring a persisted compiled model.
+
+        Compiling an .mlpackage costs about 110 ms per level; loading the
+        compiled .mlmodelc beside it costs about 10 ms, so persisting the
+        compiled form takes engine construction from ~655 ms to ~57 ms for
+        the six levels. Compiled models are tied to the OS and hardware, so
+        a stale one that fails to load is rebuilt rather than trusted.
+        """
+        import CoreML
+        from Foundation import NSURL
+
+        compiled_dir = package.with_suffix(".mlmodelc")
+        if compiled_dir.exists():
+            model, _ = CoreML.MLModel.modelWithContentsOfURL_configuration_error_(
+                NSURL.fileURLWithPath_(str(compiled_dir)), config, None)
+            if model is not None:
+                return model
+            shutil.rmtree(compiled_dir, ignore_errors=True)
+
+        compiled, err = CoreML.MLModel.compileModelAtURL_error_(
+            NSURL.fileURLWithPath_(str(package)), None)
+        if compiled is None:
+            raise RuntimeError(f"CoreML compile failed: {err}")
+        try:
+            staging = package.with_suffix(".partial.mlmodelc")
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.copytree(compiled.path(), staging)
+            staging.replace(compiled_dir)
+        except OSError:
+            # A cache that cannot be written costs startup time, not
+            # correctness; the freshly compiled model is still usable.
+            pass
+        model, err = CoreML.MLModel.modelWithContentsOfURL_configuration_error_(
+            compiled, config, None)
+        if model is None:
+            raise RuntimeError(f"CoreML load failed: {err}")
+        return model
 
     def _multi_array(self, array: Any, shape: list[int]) -> Any:
         view = memoryview(array)
@@ -411,21 +438,23 @@ def engine_for(params: dict, shape: tuple) -> AneSpyNet | None:
     if engine is not None:
         return engine
     directory = cache_root() / "spynet-ane" / f"{key[0]}-{w_up}x{h_up}"
-    try:
-        import coremltools  # noqa: F401
-    except ImportError as exc:
-        if not all((directory / f"level{i}.mlpackage").exists()
-                   for i in range(levels)):
+    packages = [directory / f"level{i}.mlpackage" for i in range(levels)]
+    # Import coremltools ONLY when something actually has to be converted: it
+    # pulls in its torch integration and costs over a second, which would be
+    # charged to every warm start for no reason.
+    needs_conversion = not all(p.exists() for p in packages)
+    if needs_conversion:
+        try:
+            import coremltools  # noqa: F401
+        except ImportError as exc:
             _UNAVAILABLE = (
                 f"coremltools is needed once per geometry to build the ANE "
                 f"models ({exc})")
             return None
     try:
-        _convert_models(params, levels, h_up, w_up, directory)
-        engine = AneSpyNet(
-            params,
-            [directory / f"level{i}.mlpackage" for i in range(levels)],
-            levels, h_up, w_up)
+        if needs_conversion:
+            _convert_models(params, levels, h_up, w_up, directory)
+        engine = AneSpyNet(params, packages, levels, h_up, w_up)
     except Exception as exc:  # noqa: BLE001 - any failure falls back
         _UNAVAILABLE = f"ANE SpyNet setup failed ({type(exc).__name__}: {exc})"
         return None

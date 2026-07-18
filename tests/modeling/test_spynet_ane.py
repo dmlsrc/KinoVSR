@@ -176,3 +176,44 @@ class TestCliOverrideReachesTheBackend:
         monkeypatch.delenv("SPYNET_BACKEND", raising=False)
         args = build_parser().parse_args(["--video", "clip.mp4"])
         assert assemble(args).settings.spynet_backend == "auto"
+
+
+@pytest.mark.integration
+class TestWarmStartCost:
+    """Inference must not need coremltools, and must not recompile models
+    that were already compiled - both regressed once and cost ~1.5 s per run."""
+
+    def test_warm_start_skips_coremltools_and_reuses_compiled_models(
+            self, params, tmp_path):
+        import subprocess
+        import sys
+
+        cache = tmp_path / "cache"
+        script = (
+            "import warnings, sys, time; warnings.filterwarnings('ignore')\n"
+            "import mlx.core as mx\n"
+            "from pathlib import Path\n"
+            "import kinovsr.modeling as M\n"
+            "from kinovsr.modeling import spynet_ane\n"
+            "w = Path(M.__file__).parent/'spynet'/'weights'/"
+            "'spynet_stock_20210409.safetensors'\n"
+            "p = {k: v.astype(mx.float32) for k, v in mx.load(str(w)).items()}\n"
+            "eng = spynet_ane.engine_for(p, (1, 352, 640, 3))\n"
+            "print('OK' if eng is not None else 'NONE',"
+            " 'coremltools' in sys.modules)\n"
+        )
+        env = {**dict(__import__("os").environ), "KINOVSR_CACHE_DIR": str(cache)}
+        first = subprocess.run([sys.executable, "-c", script], env=env,
+                               capture_output=True, text=True, timeout=600)
+        if "OK" not in first.stdout:
+            pytest.skip(f"ANE unavailable: {first.stdout} {first.stderr[-300:]}")
+        # The cold run converts and compiles; both artifacts must persist.
+        geometry = next((cache / "spynet-ane").iterdir())
+        assert (geometry / "level0.mlpackage").exists()
+        assert (geometry / "level0.mlmodelc").exists()
+
+        second = subprocess.run([sys.executable, "-c", script], env=env,
+                                capture_output=True, text=True, timeout=600)
+        assert "OK" in second.stdout, second.stderr[-300:]
+        assert second.stdout.split()[1] == "False", (
+            "warm start imported coremltools; inference must not need it")
