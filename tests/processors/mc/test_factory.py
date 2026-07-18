@@ -47,6 +47,8 @@ class TestParse:
 
     def test_flow_vocabulary(self):
         assert parse({"flow": "spynet"}).flow == "spynet"
+        assert parse({"flow": "vision"}).flow == "vision"
+        assert parse({"flow": "vtme"}).flow == "vtme"
         with pytest.raises(ValueError, match="flow must be"):
             parse({"flow": "zero"})
 

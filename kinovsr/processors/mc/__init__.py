@@ -1,10 +1,11 @@
 """Motion-compensated temporal denoise on optical flow.
 
 Recursive/causal: keeps previous denoised frames, warps them into
-alignment (VTOpticalFlow on CPU/AMX by default, the shared SpyNet
-for accuracy at GPU cost), and blends where the photometric gate
-verifies the warp - so static regions integrate over time and
-moving edges do not ghost. MLX-array in / out, zero output delay.
+alignment (VTOpticalFlow on CPU/AMX by default; Vision r1, the
+media-engine block matcher, or the shared SpyNet as measured
+alternatives), and blends where the photometric gate verifies the
+warp - so static regions integrate over time and moving edges do
+not ghost. MLX-array in / out, zero output delay.
 """
 
 from __future__ import annotations
@@ -157,8 +158,17 @@ class McTemporalDenoiser:
         # MLX implementation: +3-5 dB warp-PSNR in every motion regime
         # (static/moving/fast 40.7/29.6/20.1 vs VT 36.9/25.0/16.1), so more
         # pixels pass the photometric gate and get denoised -- at the cost
-        # of MLX GPU time. Flow errors only lower the ceiling either way:
-        # the residual gate audits every warp before it blends.
+        # of MLX GPU time. "vision" = Vision optical flow revision 1: the
+        # denoise-quality pick (best e2e mc output on every measured clip).
+        # "vtme" = VTMotionEstimationSession block matching on the media
+        # engine (macOS 26+): the speed/isolation pick -- cheapest accurate
+        # engine at SD and fully immune to MLX GPU saturation, at a
+        # measured 0.2-0.5 dB e2e cost vs vision (its 4x4-block-constant
+        # field aligns sub-pixel detail slightly worse, and photometric
+        # matching partially matches the noise it should average away --
+        # winning warp-PSNR does not mean winning denoise). Flow errors
+        # only lower the ceiling either way: the residual gate audits
+        # every warp before it blends.
         self.flow_source = str(flow)
         self.strength = float(strength)  # max blend weight toward a reference
         self.window = max(0, int(window))
@@ -224,6 +234,7 @@ class McTemporalDenoiser:
         self._curr_buf: Any = None
         self._pool: ThreadPoolExecutor | None = None
         self._vision: Any = None
+        self._vtme: Any = None
         self._prev: Any = None
         self._hist: list[Any] = []
         if self.flow_source == "spynet":
@@ -250,6 +261,22 @@ class McTemporalDenoiser:
 
             try:
                 self._vision = VisionFlowEngine(self.w, self.h)
+                if self_test:
+                    self._self_test_flow()
+            except BaseException as active:
+                try:
+                    self.close()
+                except BaseException as cleanup:
+                    _append_cleanup_context(active, cleanup)
+                raise
+            return
+        if self.flow_source == "vtme":
+            # Media-engine block matching (4x4 multipass pinned); see
+            # kinovsr.modeling.vtme_flow for the convention and placement.
+            from kinovsr.modeling.vtme_flow import VtmeFlowEngine
+
+            try:
+                self._vtme = VtmeFlowEngine(self.w, self.h)
                 if self_test:
                     self._self_test_flow()
             except BaseException as active:
@@ -342,6 +369,10 @@ class McTemporalDenoiser:
 
         blobs = (blob(0.30, 0.35, 1.0) + blob(0.72, 0.60, -1.0)
                  + blob(0.45, 0.80, 0.8) + blob(0.80, 0.20, -0.7))
+        # The vtme block matcher also reads this content exactly at every
+        # probed geometry: the trig value noise is block-distinctive (no
+        # repeats inside the search window) and the smooth blobs cost it
+        # nothing, so vision and vtme share these frames.
         base = 0.5 + (hashn - 0.5) * 0.5 + blobs * 0.25
         ref = mx.clip(mx.stack([
             base,
@@ -354,7 +385,7 @@ class McTemporalDenoiser:
         return ref, curr
 
     def _self_test_frames(self, shift: int) -> tuple[Any, Any]:
-        if self.flow_source == "vision":
+        if self.flow_source in ("vision", "vtme"):
             return self._self_test_frames_vision(shift)
         ys, xs = mx.meshgrid(mx.arange(self.h), mx.arange(self.w), indexing="ij")
         xi = xs.astype(mx.int32)
@@ -385,7 +416,10 @@ class McTemporalDenoiser:
 
     def _self_test_flow(self) -> None:
         """Catch silent-zero, bad-priority, and wrong-sign flow up front."""
-        engine = "VTOpticalFlow" if self.flow_source == "vt" else "Vision optical flow"
+        engine = {
+            "vt": "VTOpticalFlow",
+            "vtme": "VTMotionEstimation",
+        }.get(self.flow_source, "Vision optical flow")
         if self.w < 16 or self.h < 16:
             raise RuntimeError(
                 f"{engine} self-test requires at least 16x16; got {self.w}x{self.h}"
@@ -469,6 +503,12 @@ class McTemporalDenoiser:
                 vision.close()
             except BaseException as exc:
                 failures.append(exc)
+        vtme, self._vtme = getattr(self, "_vtme", None), None
+        if vtme is not None:
+            try:
+                vtme.close()
+            except BaseException as exc:
+                failures.append(exc)
         for wk in self._workers:
             proc, wk["proc"] = wk["proc"], None
             if proc is not None:
@@ -539,13 +579,14 @@ class McTemporalDenoiser:
                 mx.eval(fwd)
                 out.append((fwd, bwd))
             return out
-        if self.flow_source == "vision":
+        if self.flow_source in ("vision", "vtme"):
             # compute(curr, ref) shares spynet_flow(curr, ref)'s orientation,
             # so the same negation lands in the warp convention.
+            eng = self._vision if self.flow_source == "vision" else self._vtme
             out = []
             for ref in refs:
-                fwd = -self._vision.compute(curr, ref)
-                bwd = (-self._vision.compute(ref, curr)
+                fwd = -eng.compute(curr, ref)
+                bwd = (-eng.compute(ref, curr)
                        if self.occlusion else None)
                 mx.eval(fwd)
                 out.append((fwd, bwd))
@@ -693,7 +734,7 @@ class McTemporalDenoiser:
 # Processor family: a causal motion-compensated temporal denoiser
 # ===========================================================================
 
-_FLOW_ENGINES = ("vt", "spynet", "vision")
+_FLOW_ENGINES = ("vt", "spynet", "vision", "vtme")
 _GATES = ("smooth", "curr")
 
 
