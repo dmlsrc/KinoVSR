@@ -218,6 +218,86 @@ class TestResolves:
         assert plan.output_spec is not None
 
 
+class TestOffOnDialsAreBooleans:
+    """An off|on choice pair is a boolean spelled for the command line.
+
+    The stage parsers type these keys with ``typed_value(..., bool, ...)``,
+    and ``_set_flags`` only routes a value that differs from the registry
+    default - so the only routable value is the one that used to be handed
+    to the family as the string 'on'/'off' and refused at preflight.
+    """
+
+    @pytest.mark.parametrize("argv, stage, key, expected", [
+        (["--deflicker", "on", "--deflicker-jitter", "on"],
+         "deflicker", "jitter", True),
+        (["--deflicker", "on", "--deflicker-gop", "off"],
+         "deflicker", "gop", False),
+        (["--deblock", "fbcnn", "--fbcnn-gop", "off"],
+         "deblock_fbcnn", "gop", False),
+    ])
+    def test_off_on_dial_reaches_the_stage_as_a_bool(
+            self, argv, stage, key, expected):
+        config = asm(*argv)
+        assert config[stage][key] is expected
+
+    @pytest.mark.parametrize("argv", [
+        ["--deflicker", "on", "--deflicker-jitter", "on"],
+        ["--deflicker", "on", "--deflicker-gop", "off"],
+        ["--deblock", "fbcnn", "--fbcnn-gop", "off"],
+    ])
+    def test_off_on_dial_survives_preflight(self, argv):
+        plan = resolve_pipeline(asm(*argv), input_spec=spec(),
+                                settings=Settings())
+        assert plan.output_spec is not None
+
+    def test_a_wider_choice_set_stays_a_token(self):
+        config = asm("--denoise", "bsvd", "--noise-map-motion-cap", "loose")
+        assert config["denoise_bsvd"]["noise_map_motion_cap"] == "loose"
+
+
+class TestRepeatedFamilyInOneSlot:
+    """Each occurrence is an independent pass and needs its own table.
+
+    Sharing one table made the positional dial list collapse to its last
+    value while still reporting the right number of stages.
+    """
+
+    def test_repeat_gets_distinct_stage_names(self):
+        config = asm("--denoise", "mc,mc")
+        assert config["pipeline"] == ["denoise_mc", "denoise_mc_2"]
+        assert config["denoise_mc"] is not config["denoise_mc_2"]
+
+    def test_positional_dials_address_each_instance(self):
+        config = asm("--denoise", "mc,mc", "--denoise-strength", "0.3,0.7")
+        assert config["denoise_mc"]["strength"] == 0.3
+        assert config["denoise_mc_2"]["strength"] == 0.7
+
+    def test_three_of_a_kind_keep_ascending_suffixes(self):
+        config = asm("--denoise", "mc,mc,mc",
+                     "--denoise-strength", "0.1,0.2,0.3")
+        assert config["pipeline"] == [
+            "denoise_mc", "denoise_mc_2", "denoise_mc_3"]
+        assert [config[n]["strength"] for n in config["pipeline"]] == [
+            0.1, 0.2, 0.3]
+
+    def test_mixed_chain_is_unchanged(self):
+        config = asm("--denoise", "mc,bsvd", "--denoise-strength", "0.3,0.7")
+        assert config["pipeline"] == ["denoise_mc", "denoise_bsvd"]
+        assert config["denoise_mc"]["strength"] == 0.3
+        assert config["denoise_bsvd"]["strength"] == 0.7
+
+    def test_a_family_dial_still_reaches_every_instance(self):
+        config = asm("--denoise", "mc,mc", "--mc-sigma", "0.09")
+        assert config["denoise_mc"]["sigma"] == 0.09
+        assert config["denoise_mc_2"]["sigma"] == 0.09
+
+    def test_repeated_chain_preflights(self):
+        plan = resolve_pipeline(
+            asm("--denoise", "mc,mc", "--denoise-strength", "0.3,0.7"),
+            input_spec=spec(), settings=Settings())
+        assert plan.output_spec is not None
+
+
 class TestNoiseMapUpsampleDial:
     def test_upsample_choice_reaches_capable_stages(self):
         config = asm("--denoise", "mc,bsvd", "--noise-map", "auto",

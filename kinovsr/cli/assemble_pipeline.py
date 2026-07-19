@@ -89,8 +89,18 @@ def _set_flags(options: Any) -> list:
 
 def _coerce(opt: Any, value: Any) -> Any:
     """Untyped registry flags parse as strings; numeric ones become the
-    numbers the stage parsers expect ('1.0' -> 1.0), tokens stay strings."""
+    numbers the stage parsers expect ('1.0' -> 1.0), tokens stay strings.
+
+    An ``off|on`` choice pair is a boolean spelled for the command line:
+    the stage parsers type those keys with ``typed_value(..., bool, ...)``,
+    which refuses a string, and the only routable value is the non-default
+    one, so handing the family 'on' verbatim failed every such flag on the
+    only value worth passing. A wider choice set (``off|on|auto``) is a real
+    token set and stays a string.
+    """
     if getattr(opt, "type", None) is None and isinstance(value, str):
+        if tuple(getattr(opt, "choices", None) or ()) == ("off", "on"):
+            return value == "on"
         try:
             return float(value)
         except ValueError:
@@ -145,6 +155,15 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
     slot_members: dict[str, list[str]] = {}   # slot -> stage names, in order
 
     def add(name: str, table: dict, slot: str | None = None) -> None:
+        # A family repeated in one chain (--denoise mc,mc) is a request for
+        # two independently configured passes, so each instance needs its
+        # own table. Sharing one would make the positional dial lists
+        # (--denoise-strength 0.3,0.7) silently collapse to the last value.
+        if name in config:
+            suffix = 2
+            while f"{name}_{suffix}" in config:
+                suffix += 1
+            name = f"{name}_{suffix}"
         config[name] = table
         pipeline.append(name)
         if slot is not None:
