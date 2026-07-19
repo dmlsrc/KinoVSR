@@ -342,16 +342,19 @@ def drain_schedule(length: int, steps: int = 16):
         writes = [[0.0 if (unprimed[k][i] and (k + 1 >= length
                                                or not unprimed[k + 1][i]))
                    else 1.0 for i in range(16)] for k in range(length)]
-        gates, pushes, emitted = [], [], 0
+        gates, pushes, emits = [], [], []
         for _ in range(steps):
             record["gates"], record["pushes"] = [False] * 16, [False] * 6
             result = net.step(None)
             gates.append(list(record["gates"]))
             pushes.append(list(record["pushes"]))
-            emitted += result is not None
+            # WHICH steps emit, not how many. The tail is always 16 steps; a
+            # clip shorter than the fill emits in the LAST length of them, so
+            # running only `sum(emits)` steps collects nothing at all.
+            emits.append(result is not None)
     finally:
         B._BiBufferConv.__call__, B._MemSkip.push = original_call, original_push
-    return gates, pushes, emitted, writes
+    return gates, pushes, emits, writes
 
 
 
@@ -655,7 +658,7 @@ def drive(compiled: Path, units, sequence, skips):
 
 
 def drain_tail(compiled, sequence, skips, channels, height, width,
-               gates, pushes, emitted, writes, gated: bool):
+               gates, pushes, emits, writes, gated: bool):
     """Feed the stream, then the tail, and return the tail outputs.
 
     With `gated` false this is what the graph can do without a drain flag -
@@ -694,15 +697,16 @@ def drain_tail(compiled, sequence, skips, channels, height, width,
 
     zero = np.zeros((1, channels, height, width), dtype=np.float16)
     tail = []
-    for step in range(emitted):
+    for step in range(len(gates)):
         gate = ones.copy()
         if gated:
             for unit in range(16):
                 if gates[step][unit]:
                     gate[0, unit, 0, 0] = 0.0
         result = advance(zero, gate, pushes[step] if gated else every)
-        tail.append(np.transpose(
-            np.asarray(result["out"], dtype=np.float32), (0, 2, 3, 1)))
+        if emits[step]:
+            tail.append(np.transpose(
+                np.asarray(result["out"], dtype=np.float32), (0, 2, 3, 1)))
     return tail
 
 
@@ -791,17 +795,18 @@ def main() -> int:
               f"max {stats['max_abs']:.3e}{note}")
         gc.collect()
 
-    gates, pushes, emitted, writes = drain_schedule(arguments.steps)
-    _log.info("\ndrain: schedule derived for a %d-frame stream, %d tail outputs",
-              arguments.steps, emitted)
+    gates, pushes, emits, writes = drain_schedule(arguments.steps)
+    _log.info(f"\ndrain: schedule derived for a {arguments.steps}-frame stream, "
+              f"{sum(emits)} tail outputs over {len(emits)} tail steps")
     product = B.BSVD(B.default_weights_path(arguments.variant), dtype=mx.float32)
     product.reset()
     for frame in sequence:
         product.step(frame)
     truth = []
-    for _ in range(emitted):
+    for _ in range(len(emits)):
         result = product.step(None)
-        truth.append(None if result is None else np.asarray(result))
+        if result is not None:
+            truth.append(np.asarray(result))
     # A full fp32 BSVD holds its 16 states and six skip queues live - about
     # 2.2 GB at 480x640 - and nothing needs it once the tail is captured.
     del product
@@ -811,13 +816,14 @@ def main() -> int:
     tails = {}
     for label in ("ungated", "gated"):
         tails[label] = drain_tail(compiled, sequence, skips, channels, height, width,
-                                  gates, pushes, emitted, writes,
+                                  gates, pushes, emits, writes,
                                   gated=(label == "gated"))
-    _log.info("tail against the product's own fp32 step(None), worst of %d frames:", emitted)
+    _log.info(f"tail against the product's own fp32 step(None), worst of "
+              f"{len(truth)} frames:")
     for label, tail in tails.items():
         worst = max(float(np.abs(w - g).mean())
-                    for w, g in zip(truth, tail, strict=True) if w is not None)
-        _log.info("  %-8s %.3e", label, worst)
+                    for w, g in zip(truth, tail, strict=True))
+        _log.info(f"  {label:8s} {worst:.3e}")
 
     separation, accuracy = canary(compiled, reference, sequence, skips)
     _log.info("CPU-fallback canary: ANE and CPU differ by %.3e (floor %.0e), "
