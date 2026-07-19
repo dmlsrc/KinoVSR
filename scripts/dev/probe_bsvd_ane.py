@@ -25,9 +25,16 @@ loads is worth nothing: the fold is proven in float64, and the recurrence is
 checked on CPU and ANE separately, since a state encoding can be right on one
 compute unit and silently shifted on the other.
 
-Known constraint: the Core ML **CPU** runtime miscomputes these state updates
-(about 1.5e-3 against fp32, versus 8.4e-5 on ANE), so a deployment must not
-silently fall back to CPU.
+Two known constraints:
+
+* The Core ML **CPU** runtime miscomputes these state updates (about 3.0e-3
+  against fp32 over 64 steps, versus 2.5e-4 on ANE), so a deployment must not
+  silently fall back to CPU.
+* **Small geometries fail at runtime.** 32x32 converts and reports every
+  operation ANE-preferred, then the first prediction fails with
+  `ANEProgramProcessRequestDirect() ... status=0x1d`. 96x128 and 480x640 are
+  fine. Whatever the threshold is, do not validate this graph at a toy size
+  and assume the result carries.
 
 Run with the project venv, e.g. `"$KINOVSR_PYTHON" scripts/dev/probe_bsvd_ane.py`.
 """
@@ -472,7 +479,12 @@ def main() -> int:
     parser.add_argument("--variant", default="c64")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--steps", type=int, default=12)
+    # 64, not 12: recurrent error keeps growing well past a short window, and
+    # it grows at different rates for different backends, so a short run
+    # misranks them. Over 12 steps the ANE looks 3.6x worse than MLX fp16;
+    # over 64 it is slightly better, because MLX fp16 degrades 12x across that
+    # span against the ANE's 3x.
+    parser.add_argument("--steps", type=int, default=64)
     parser.add_argument("--directory", type=Path, default=None)
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
