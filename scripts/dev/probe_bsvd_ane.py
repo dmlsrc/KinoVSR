@@ -73,6 +73,8 @@ BIBUF = (("d0c1", 2), ("d0c2", 2), ("d1c1", 4), ("d1c2", 4),
 # product's own dynamic queues.
 SKIP_DEPTH = {"skip1": 8, "skip2": 8, "skip3": 4}
 _MLMULTIARRAY_FLOAT16 = 0x10000 | 16
+# Between the ANE's ~2.5e-4 and the CPU path's ~3e-3 on this graph.
+CPU_DETECTION_THRESHOLD = 1e-3
 
 
 def scratch_root() -> Path:
@@ -173,7 +175,7 @@ def conv(x, spec, relu6: bool = False):
     return F.relu6(value) if relu6 else value
 
 
-def bibuffer(x, state, spec, gate):
+def bibuffer(x, state, spec, gate, write):
     """One BiBufferConv. `state` is packed as [center(C), left(C/8)].
 
     `gate` scales the `right` contribution: 1 for a normal step, 0 for a
@@ -189,12 +191,18 @@ def bibuffer(x, state, spec, gate):
     left = state[:, channels: channels + fold]
     packed = torch.cat([x[:, :fold] * gate, left, center[:, 2 * fold:]], dim=1)
     value = conv(packed, spec, relu6=True)
-    return value, torch.cat([x, center[:, fold: 2 * fold]], dim=1)
+    # `write` gates the centre. During fill the product does not compute at
+    # all, so what leaks into a static graph is not the discarded output but
+    # the STATE: at the step a unit is primed the product sets `left` to
+    # zeros, while the graph sets `left = centre_prev[fold:2fold]` from
+    # garbage computed on the zero prologue. Zeroing the centre write while a
+    # unit is unprimed makes `left` zero at the priming step for free.
+    return value, torch.cat([x * write, center[:, fold: 2 * fold]], dim=1)
 
 
-def mem_block(x, state_a, state_b, spec_a, spec_b, gate_a, gate_b):
-    value, new_a = bibuffer(x, state_a, spec_a, gate_a)
-    value, new_b = bibuffer(value, state_b, spec_b, gate_b)
+def mem_block(x, state_a, state_b, spec_a, spec_b, gates, writes):
+    value, new_a = bibuffer(x, state_a, spec_a, gates[0], writes[0])
+    value, new_b = bibuffer(value, state_b, spec_b, gates[1], writes[1])
     return value, new_a, new_b
 
 
@@ -221,8 +229,9 @@ class BsvdStep(torch.nn.Module):
         return F.conv_transpose2d(
             torch.cat([x, ones], dim=1), self.folded[block][key], stride=2, padding=2)
 
-    def forward(self, frame, gate, sk0, sk1, sk2, sk3, sk4, sk5):
+    def forward(self, frame, gate, write, sk0, sk1, sk2, sk3, sk4, sk5):
         gates = [gate[:, i: i + 1] for i in range(16)]
+        writes = [write[:, i: i + 1] for i in range(16)]
         popped = [sk0, sk1, sk2, sk3, sk4, sk5]
         pushed = []
         x = frame
@@ -237,16 +246,16 @@ class BsvdStep(torch.nn.Module):
             pushed.append(x0)
 
             x1 = conv(x0, p["d0"], relu6=True)
-            x1, s0, s1 = mem_block(x1, states[0], states[1], p["d0c1"], p["d0c2"], gates[g + 0], gates[g + 1])
+            x1, s0, s1 = mem_block(x1, states[0], states[1], p["d0c1"], p["d0c2"], (gates[g + 0], gates[g + 1]), (writes[g + 0], writes[g + 1]))
             pushed.append(x1)
 
             x2 = conv(x1, p["d1"], relu6=True)
-            x2, s2, s3 = mem_block(x2, states[2], states[3], p["d1c1"], p["d1c2"], gates[g + 2], gates[g + 3])
-            x2, s4, s5 = mem_block(x2, states[4], states[5], p["u2c1"], p["u2c2"], gates[g + 4], gates[g + 5])
+            x2, s2, s3 = mem_block(x2, states[2], states[3], p["d1c1"], p["d1c2"], (gates[g + 2], gates[g + 3]), (writes[g + 2], writes[g + 3]))
+            x2, s4, s5 = mem_block(x2, states[4], states[5], p["u2c1"], p["u2c2"], (gates[g + 4], gates[g + 5]), (writes[g + 4], writes[g + 5]))
             x2 = self._upsample(x2, block, "u2")
 
             merged, s6, s7 = mem_block(
-                x2 + skip3_pop, states[6], states[7], p["u1c1"], p["u1c2"], gates[g + 6], gates[g + 7])
+                x2 + skip3_pop, states[6], states[7], p["u1c1"], p["u1c2"], (gates[g + 6], gates[g + 7]), (writes[g + 6], writes[g + 7]))
             x1o = self._upsample(merged, block, "u1")
 
             prediction = conv(conv(x1o + skip2_pop, p["out0"], relu6=True), p["out3"])
@@ -267,7 +276,7 @@ class BsvdStep(torch.nn.Module):
 # --------------------------------------------------------------------------
 
 def drain_schedule(length: int, steps: int = 16):
-    """Per tail step: which units are gated, and which skip lines still push.
+    """Stream schedule: fill write gates, then drain gates and skip pushes.
 
     Derived from the product's own `step(None)`, not from a rule, because the
     push side is non-monotonic for streams shorter than the 16-frame fill: a
@@ -291,13 +300,16 @@ def drain_schedule(length: int, steps: int = 16):
     for index, line in enumerate(lines):
         line._probe_id = index
 
-    record = {"gates": None, "pushes": None}
+    record = {"gates": None, "pushes": None, "unprimed": None}
     original_call, original_push = B._BiBufferConv.__call__, B._MemSkip.push
 
     def patched_call(self, input_right):
         identity = getattr(self, "_probe_id", None)
         if identity is not None and record["gates"] is not None:
             record["gates"][identity] = input_right is None
+        if identity is not None and record["unprimed"] is not None:
+            # exactly the branch that returns None without computing
+            record["unprimed"][identity] = self._center is None
         return original_call(self, input_right)
 
     def patched_push(self, value):
@@ -313,10 +325,19 @@ def drain_schedule(length: int, steps: int = 16):
     try:
         net.reset()
         generator = np.random.default_rng(3)
+        unprimed = []
         for _ in range(length):
             frame = mx.array(generator.random((1, 16, 16, net.input_channels),
                                               dtype=np.float32))
+            record["unprimed"] = [False] * 16
             net.step(frame)
+            unprimed.append(list(record["unprimed"]))
+        record["unprimed"] = None
+        # Centre-write gate: zero only on steps BEFORE the priming one. At the
+        # priming step the product writes the real input to `centre`, so
+        # gating there destroys the priming instead of reproducing it.
+        writes = [[0.0 if (unprimed[k][i] and k + 1 < length and unprimed[k + 1][i])
+                   else 1.0 for i in range(16)] for k in range(length)]
         gates, pushes, emitted = [], [], 0
         for _ in range(steps):
             record["gates"], record["pushes"] = [False] * 16, [False] * 6
@@ -326,7 +347,46 @@ def drain_schedule(length: int, steps: int = 16):
             emitted += result is not None
     finally:
         B._BiBufferConv.__call__, B._MemSkip.push = original_call, original_push
-    return gates, pushes, emitted
+    return gates, pushes, emitted, writes
+
+
+
+def assert_all_ane(compiled: Path) -> dict:
+    """Refuse a model that would run any operation off the ANE.
+
+    Placement is a preference reported by `MLComputePlan`, not a realized
+    trace, so this is necessary and not sufficient - see `canary` for the
+    runtime half.
+    """
+    preferred = placement(compiled)
+    stray = {k: v for k, v in preferred.items() if "NeuralEngine" not in k}
+    if stray:
+        raise RuntimeError(
+            f"refusing: {stray} operations are not ANE-preferred. The Core ML "
+            f"CPU runtime miscomputes this graph's state updates, so a partial "
+            f"fallback is silently wrong rather than merely slow.")
+    return preferred
+
+
+def canary(compiled: Path, reference, sequence, skips) -> float:
+    """Detect CPU execution from the output itself.
+
+    The CPU path's recurrent error runs about an order of magnitude above the
+    ANE's - measured 2.957e-3 against 2.487e-4 at 480x640 over 64 steps, and
+    3.539e-3 against 1.568e-4 at 128x96 over 24 - so a threshold between them
+    separates the two cleanly. This catches a fallback that placement did not
+    predict.
+    """
+    import coremltools as ct
+
+    got = drive(compiled, ct.ComputeUnit.CPU_AND_NE, sequence, skips)
+    stats = compare(reference, got, skip_first=2)
+    if stats["mean_abs"] > CPU_DETECTION_THRESHOLD:
+        raise RuntimeError(
+            f"refusing: recurrent error {stats['mean_abs']:.3e} exceeds "
+            f"{CPU_DETECTION_THRESHOLD:.0e}, which is the signature of the Core "
+            f"ML CPU state-update defect rather than ANE numerics.")
+    return stats["mean_abs"]
 
 
 # --------------------------------------------------------------------------
@@ -343,12 +403,12 @@ def convert(model, shapes, skips, input_channels, height, width, directory: Path
     compiled = directory / "model.mlmodelc"
 
     sample = tuple([torch.zeros(1, input_channels, height, width),
-                    torch.ones(1, 16, 1, 1)]
+                    torch.ones(1, 16, 1, 1), torch.ones(1, 16, 1, 1)]
                    + [torch.zeros(*shape) for shape in skips])
     with torch.no_grad():
         traced = torch.jit.trace(model, sample)
 
-    names = ["frame", "gate"] + [f"skip_{i}" for i in range(len(skips))]
+    names = ["frame", "gate", "write"] + [f"skip_{i}" for i in range(len(skips))]
     outputs = ["out"] + [f"skip_out_{i}" for i in range(len(skips))]
     converted = ct.convert(
         traced,
@@ -434,7 +494,8 @@ class BackedRunner:
         self._options = options
 
         ones = np.ones((1, 16, 1, 1), dtype=np.float16)
-        self._in["gate"][1][:] = memoryview(ones).cast("B")
+        for name in ("gate", "write"):
+            self._in[name][1][:] = memoryview(ones).cast("B")
 
         self._fifos = []
         for index in range(6):
@@ -522,7 +583,7 @@ def torch_reference(model, sequence, shapes, skips):
         for frame in sequence:
             nchw = torch.from_numpy(np.ascontiguousarray(
                 np.transpose(np.asarray(frame.astype(mx.float32)), (0, 3, 1, 2))))
-            result = reference(nchw, torch.ones(1, 16, 1, 1),
+            result = reference(nchw, torch.ones(1, 16, 1, 1), torch.ones(1, 16, 1, 1),
                                *[fifos[i][-1] for i in range(len(skips))])
             outputs.append(np.transpose(result[0].numpy(), (0, 2, 3, 1)))
             for i, value in enumerate(result[1:]):
@@ -544,7 +605,8 @@ def drive(compiled: Path, units, sequence, skips):
         feed = {"frame": np.ascontiguousarray(
             np.transpose(np.asarray(frame.astype(mx.float32)), (0, 3, 1, 2)),
             dtype=np.float16),
-            "gate": np.ones((1, 16, 1, 1), dtype=np.float16)}
+            "gate": np.ones((1, 16, 1, 1), dtype=np.float16),
+            "write": np.ones((1, 16, 1, 1), dtype=np.float16)}
         for i in range(len(skips)):
             feed[f"skip_{i}"] = fifos[i][-1]
         result = model.predict(feed, state=state)
@@ -558,7 +620,7 @@ def drive(compiled: Path, units, sequence, skips):
 
 
 def drain_tail(compiled, sequence, skips, channels, height, width,
-               gates, pushes, emitted, gated: bool):
+               gates, pushes, emitted, writes, gated: bool):
     """Feed the stream, then the tail, and return the tail outputs.
 
     With `gated` false this is what the graph can do without a drain flag -
@@ -574,8 +636,9 @@ def drain_tail(compiled, sequence, skips, channels, height, width,
              for i in range(len(skips))}
     ones = np.ones((1, 16, 1, 1), dtype=np.float16)
 
-    def advance(frame_nchw, gate, pushing):
-        feed = {"frame": frame_nchw, "gate": gate}
+    def advance(frame_nchw, gate, pushing, write=None):
+        feed = {"frame": frame_nchw, "gate": gate,
+                "write": ones if write is None else write}
         for i in range(len(skips)):
             feed[f"skip_{i}"] = fifos[i][-1]
         result = model.predict(feed, state=state)
@@ -587,10 +650,13 @@ def drain_tail(compiled, sequence, skips, channels, height, width,
         return result
 
     every = [True] * 6
-    for frame in sequence:
+    for index, frame in enumerate(sequence):
+        write = ones
+        if gated:
+            write = np.asarray(writes[index], dtype=np.float16).reshape(1, 16, 1, 1)
         advance(np.ascontiguousarray(
             np.transpose(np.asarray(frame.astype(mx.float32)), (0, 3, 1, 2)),
-            dtype=np.float16), ones, every)
+            dtype=np.float16), ones, every, write)
 
     zero = np.zeros((1, channels, height, width), dtype=np.float16)
     tail = []
@@ -677,7 +743,7 @@ def main() -> int:
         _log.info(f"  {label:11s} mean {stats['mean_abs']:.3e}  "
               f"max {stats['max_abs']:.3e}{note}")
 
-    gates, pushes, emitted = drain_schedule(arguments.steps)
+    gates, pushes, emitted, writes = drain_schedule(arguments.steps)
     _log.info("\ndrain: schedule derived for a %d-frame stream, %d tail outputs",
               arguments.steps, emitted)
     product = B.BSVD(B.default_weights_path(arguments.variant), dtype=mx.float32)
@@ -692,12 +758,17 @@ def main() -> int:
     tails = {}
     for label in ("ungated", "gated"):
         tails[label] = drain_tail(compiled, sequence, skips, channels, height, width,
-                                  gates, pushes, emitted, gated=(label == "gated"))
+                                  gates, pushes, emitted, writes,
+                                  gated=(label == "gated"))
     _log.info("tail against the product's own fp32 step(None), worst of %d frames:", emitted)
     for label, tail in tails.items():
         worst = max(float(np.abs(w - g).mean())
                     for w, g in zip(truth, tail, strict=True) if w is not None)
         _log.info("  %-8s %.3e", label, worst)
+
+    measured = canary(compiled, reference, sequence, skips)
+    _log.info("CPU-fallback canary: %.3e (threshold %.0e) - passed",
+              measured, CPU_DETECTION_THRESHOLD)
 
     runner = BackedRunner(compiled)
     frame = memoryview(np.zeros((1, channels, height, width), dtype=np.float16)).cast("B")
