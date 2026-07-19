@@ -336,16 +336,16 @@ def drain_schedule(length: int, steps: int = 16):
             record["unprimed"] = [False] * 16
             net.step(frame)
             unprimed.append(list(record["unprimed"]))
-        record["unprimed"] = None
-        # `left` gate: fires ON the priming step, which is the last step a
-        # unit reports itself unprimed.
-        writes = [[0.0 if (unprimed[k][i] and (k + 1 >= length
-                                               or not unprimed[k + 1][i]))
-                   else 1.0 for i in range(16)] for k in range(length)]
+        # Deliberately left recording through the tail: a clip shorter than
+        # the 16-frame fill leaves units unprimed when the stream ends, and
+        # they prime DURING the drain. Their left gate therefore falls in the
+        # tail, and a fill-only schedule misses it entirely.
         gates, pushes, emits = [], [], []
         for _ in range(steps):
             record["gates"], record["pushes"] = [False] * 16, [False] * 6
+            record["unprimed"] = [False] * 16
             result = net.step(None)
+            unprimed.append(list(record["unprimed"]))
             gates.append(list(record["gates"]))
             pushes.append(list(record["pushes"]))
             # WHICH steps emit, not how many. The tail is always 16 steps; a
@@ -354,6 +354,13 @@ def drain_schedule(length: int, steps: int = 16):
             emits.append(result is not None)
     finally:
         B._BiBufferConv.__call__, B._MemSkip.push = original_call, original_push
+    record["unprimed"] = None
+    # `left` gate fires ON the priming step - the last step a unit reports
+    # itself unprimed - over the whole fill-then-drain timeline.
+    total = len(unprimed)
+    writes = [[0.0 if (unprimed[k][i] and (k + 1 >= total
+                                           or not unprimed[k + 1][i]))
+               else 1.0 for i in range(16)] for k in range(total)]
     return gates, pushes, emits, writes
 
 
@@ -696,6 +703,7 @@ def drain_tail(compiled, sequence, skips, channels, height, width,
             dtype=np.float16), ones, every, write)
 
     zero = np.zeros((1, channels, height, width), dtype=np.float16)
+    fill = len(sequence)
     tail = []
     for step in range(len(gates)):
         gate = ones.copy()
@@ -703,7 +711,14 @@ def drain_tail(compiled, sequence, skips, channels, height, width,
             for unit in range(16):
                 if gates[step][unit]:
                     gate[0, unit, 0, 0] = 0.0
-        result = advance(zero, gate, pushes[step] if gated else every)
+        # Units that never primed during a stream shorter than the fill prime
+        # HERE, so their left gate lives in the tail part of the schedule.
+        # Passing all-ones through the tail costs 1.7e-3 on a four-frame clip.
+        tail_write = ones
+        if gated and fill + step < len(writes):
+            tail_write = np.asarray(writes[fill + step],
+                                    dtype=np.float16).reshape(1, 16, 1, 1)
+        result = advance(zero, gate, pushes[step] if gated else every, tail_write)
         if emits[step]:
             tail.append(np.transpose(
                 np.asarray(result["out"], dtype=np.float32), (0, 2, 3, 1)))
