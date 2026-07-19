@@ -134,7 +134,6 @@ _CATALOG: dict[str, CatalogEntry] = {
         _entry(
             "pvdd",
             "kinovsr.processors.pvdd.factory:FACTORY",
-            (210, "PVDD_STRENGTH_OPTIONS"),
             (250, "PVDD_OPTIONS"),
         ),
         _entry(

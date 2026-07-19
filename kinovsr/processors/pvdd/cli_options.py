@@ -2,15 +2,11 @@
 
 from kinovsr.cli.options import Opt
 
-PVDD_STRENGTH_OPTIONS = [
-    Opt(flag='--pvdd-strength',
-        group='Denoise And Noise Maps',
-        type=float,
-        metavar='S',
-        family='pvdd',
-        key='strength',
-        help='Strength for --denoise pvdd, overriding the positional --denoise-strength value for this family (default: the chain value).'),
-]
+# PVDD has no dry/wet strength dial: its intensity is noise conditioning
+# (--pvdd-noise-preset / --pvdd-noise-variance on the level variants), so
+# there is deliberately no --pvdd-strength row here. The shared
+# --denoise-strength broadcast skips PVDD stages with a warning naming the
+# real dials; see _SLOT_KEY_UNSUPPORTED in cli/assemble_pipeline.py.
 
 PVDD_OPTIONS = [
     Opt(flag='--pvdd-profile',
@@ -66,4 +62,4 @@ PVDD_OPTIONS = [
         help='MLX dtype for --denoise pvdd (default float16; use float32 for parity probes).'),
 ]
 
-__all__ = ["PVDD_STRENGTH_OPTIONS", "PVDD_OPTIONS"]
+__all__ = ["PVDD_OPTIONS"]

@@ -1,6 +1,8 @@
 """Foundation and cross-family slot CLI option rows."""
 
-from .options import Opt, pp_order
+from .options import PP_STAGE_NAMES, Opt, pp_order
+
+_PP_STAGES = ", ".join(PP_STAGE_NAMES)
 
 SOURCE_AND_OUTPUT_OPTIONS = [
     Opt(flag='--video',
@@ -123,7 +125,7 @@ PREPROCESS_SLOT_OPTIONS = [
         group='Preprocess Ordering',
         type=pp_order,
         metavar='A,B,C',
-        help="Explicit order for the preprocess stages, comma-separated from {restore, deflicker, deblock, denoise, nafnet}, e.g. 'deflicker,deblock,denoise'. Only enabled stages run; any enabled stage you omit is appended in the default order (restore, deflicker, deblock, denoise, nafnet). Overrides --denoise-first when set."),
+        help=f"Explicit order for the preprocess stages, comma-separated from {{{_PP_STAGES}}}, e.g. 'deflicker,deblock,denoise'. Only enabled stages run; any enabled stage you omit is appended after the ones you listed, in the default order ({_PP_STAGES}). Note that level runs first by default because a stable exposure improves every temporal stage after it, so listing an explicit order without level moves it last. Overrides --denoise-first when set."),
     Opt(flag='--denoise-first',
         group='Preprocess Ordering',
         kind='flag',
