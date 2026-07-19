@@ -46,6 +46,7 @@ Run with the project venv, e.g. `"$KINOVSR_PYTHON" scripts/dev/probe_bsvd_ane.py
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -73,8 +74,9 @@ BIBUF = (("d0c1", 2), ("d0c2", 2), ("d1c1", 4), ("d1c2", 4),
 # product's own dynamic queues.
 SKIP_DEPTH = {"skip1": 8, "skip2": 8, "skip3": 4}
 _MLMULTIARRAY_FLOAT16 = 0x10000 | 16
-# Between the ANE's ~2.5e-4 and the CPU path's ~3e-3 on this graph.
-CPU_DETECTION_THRESHOLD = 1e-3
+# Two devices running this graph disagree by ~1e-3; the same device
+# agrees exactly. Anything below this floor means no ANE ran.
+CPU_DIVERGENCE_FLOOR = 1e-6
 
 
 def scratch_root() -> Path:
@@ -191,13 +193,15 @@ def bibuffer(x, state, spec, gate, write):
     left = state[:, channels: channels + fold]
     packed = torch.cat([x[:, :fold] * gate, left, center[:, 2 * fold:]], dim=1)
     value = conv(packed, spec, relu6=True)
-    # `write` gates the centre. During fill the product does not compute at
-    # all, so what leaks into a static graph is not the discarded output but
-    # the STATE: at the step a unit is primed the product sets `left` to
-    # zeros, while the graph sets `left = centre_prev[fold:2fold]` from
-    # garbage computed on the zero prologue. Zeroing the centre write while a
-    # unit is unprimed makes `left` zero at the priming step for free.
-    return value, torch.cat([x * write, center[:, fold: 2 * fold]], dim=1)
+    # `write` gates `left`. During fill the product does not compute at all,
+    # so what leaks into a static graph is not the discarded output but the
+    # STATE: at the step a unit is primed the product sets `left` to zeros,
+    # while the graph sets `left = centre_prev[fold:2fold]` from garbage
+    # computed on the zero prologue. Gating `left` on the priming step fixes
+    # that directly. Zeroing the centre on every earlier step is equivalent
+    # and was measured bit-exact too, but multiplies C channels rather than
+    # C/8 and cost about five percent of the step.
+    return value, torch.cat([x, center[:, fold: 2 * fold] * write], dim=1)
 
 
 def mem_block(x, state_a, state_b, spec_a, spec_b, gates, writes):
@@ -333,10 +337,10 @@ def drain_schedule(length: int, steps: int = 16):
             net.step(frame)
             unprimed.append(list(record["unprimed"]))
         record["unprimed"] = None
-        # Centre-write gate: zero only on steps BEFORE the priming one. At the
-        # priming step the product writes the real input to `centre`, so
-        # gating there destroys the priming instead of reproducing it.
-        writes = [[0.0 if (unprimed[k][i] and k + 1 < length and unprimed[k + 1][i])
+        # `left` gate: fires ON the priming step, which is the last step a
+        # unit reports itself unprimed.
+        writes = [[0.0 if (unprimed[k][i] and (k + 1 >= length
+                                               or not unprimed[k + 1][i]))
                    else 1.0 for i in range(16)] for k in range(length)]
         gates, pushes, emitted = [], [], 0
         for _ in range(steps):
@@ -369,24 +373,57 @@ def assert_all_ane(compiled: Path) -> dict:
 
 
 def canary(compiled: Path, reference, sequence, skips) -> float:
-    """Detect CPU execution from the output itself.
+    """Detect a CPU fallback by DIFFERENCE, not by an absolute error bound.
 
-    The CPU path's recurrent error runs about an order of magnitude above the
-    ANE's - measured 2.957e-3 against 2.487e-4 at 480x640 over 64 steps, and
-    3.539e-3 against 1.568e-4 at 128x96 over 24 - so a threshold between them
-    separates the two cleanly. This catches a fallback that placement did not
-    predict.
+    An earlier version compared the recurrent error against a fixed threshold
+    sitting between the ANE's and the CPU path's. That is not robust: changing
+    the graph moved the CPU figure from 3.5e-3 to 7.7e-4 and the threshold
+    silently stopped separating them.
+
+    This asks the question directly. The Core ML CPU runtime miscomputes this
+    graph's state updates, so a genuine ANE run and a CPU run disagree. If
+    CPU_AND_NE and CPU_ONLY produce the SAME numbers, CPU_AND_NE ran on the
+    CPU. That holds whatever the magnitudes happen to be.
     """
     import coremltools as ct
 
-    got = drive(compiled, ct.ComputeUnit.CPU_AND_NE, sequence, skips)
-    stats = compare(reference, got, skip_first=2)
-    if stats["mean_abs"] > CPU_DETECTION_THRESHOLD:
+    # A short window suffices: the CPU state defect shows within a few steps,
+    # and a full-length CPU run at production size is slow and allocates its
+    # own Core ML arena for no extra information.
+    probe_length = min(len(sequence), 8)
+    on_ane = drive(compiled, ct.ComputeUnit.CPU_AND_NE, sequence[:probe_length], skips)
+    on_cpu = drive(compiled, ct.ComputeUnit.CPU_ONLY, sequence[:probe_length], skips)
+    separation = compare(on_ane, on_cpu, skip_first=2)["mean_abs"]
+    if separation < CPU_DIVERGENCE_FLOOR:
         raise RuntimeError(
-            f"refusing: recurrent error {stats['mean_abs']:.3e} exceeds "
-            f"{CPU_DETECTION_THRESHOLD:.0e}, which is the signature of the Core "
-            f"ML CPU state-update defect rather than ANE numerics.")
-    return stats["mean_abs"]
+            f"refusing: CPU_AND_NE and CPU_ONLY agree to {separation:.3e}, so "
+            f"the requested ANE run is executing on the CPU. This graph's "
+            f"state updates are miscomputed there, so a fallback is silently "
+            f"wrong rather than merely slow.")
+    accuracy = compare(reference[:probe_length], on_ane, skip_first=2)["mean_abs"]
+    return separation, accuracy
+
+
+
+_MODELS: dict = {}
+
+
+def load_once(compiled: Path, units):
+    """One `CompiledMLModel` per compute unit, reused.
+
+    A model costs nothing to load but about 1.1 GB of device-backed arena on
+    its first prediction, and roughly 0.5 GB for each further instance -
+    memory that is only partly reclaimed when the model is released. It shows
+    up in Activity Monitor's Memory column rather than Real Mem, because it is
+    IOSurface-backed rather than resident heap. Creating a model per
+    measurement pushed this script's peak footprint past 16 GB. Fresh
+    recurrent state comes from `make_state()`, which needs no new model.
+    """
+    key = (str(compiled), str(units))
+    if key not in _MODELS:
+        from coremltools.models import CompiledMLModel
+        _MODELS[key] = CompiledMLModel(str(compiled), units)
+    return _MODELS[key]
 
 
 # --------------------------------------------------------------------------
@@ -593,9 +630,7 @@ def torch_reference(model, sequence, shapes, skips):
 
 
 def drive(compiled: Path, units, sequence, skips):
-    from coremltools.models import CompiledMLModel
-
-    model = CompiledMLModel(str(compiled), units)
+    model = load_once(compiled, units)
     state = model.make_state()
     fifos = {i: [np.zeros(tuple(skips[i]), dtype=np.float16)
                  for _ in range(SKIP_DEPTH[("skip1", "skip2", "skip3")[i % 3]])]
@@ -627,9 +662,8 @@ def drain_tail(compiled, sequence, skips, channels, height, width,
     feed zero frames - which is what the tail currently costs.
     """
     import coremltools as ct
-    from coremltools.models import CompiledMLModel
 
-    model = CompiledMLModel(str(compiled), ct.ComputeUnit.CPU_AND_NE)
+    model = load_once(compiled, ct.ComputeUnit.CPU_AND_NE)
     state = model.make_state()
     fifos = {i: [np.zeros(tuple(skips[i]), dtype=np.float16)
                  for _ in range(SKIP_DEPTH[("skip1", "skip2", "skip3")[i % 3]])]
@@ -705,6 +739,11 @@ def main() -> int:
     parser.add_argument("--directory", type=Path, default=None)
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    # Cap the MLX buffer cache: uncapped it distorts both peak memory
+    # and timing. It is not the bulk of this script's footprint -
+    # that is Core ML arena - but leaving it unbounded while
+    # benchmarking is exactly the mistake the workspace rule names.
+    mx.set_cache_limit(1024 ** 3)
 
     height, width = arguments.height, arguments.width
     directory = arguments.directory or (
@@ -735,13 +774,22 @@ def main() -> int:
     import coremltools as ct
     _log.info("\naccuracy against the same graph, fp32 compute / fp16 state (steps 2+):")
     results = {}
-    for label, units in (("CPU_AND_NE", ct.ComputeUnit.CPU_AND_NE),
-                         ("CPU_ONLY", ct.ComputeUnit.CPU_ONLY)):
-        stats = compare(reference, drive(compiled, units, sequence, skips), 2)
+    # The ANE side runs the whole stream; the CPU side is a short contrast.
+    # Core ML's CPU arena is ordinary heap rather than IOSurface-backed, so a
+    # full-length CPU run at production size dominates this script's resident
+    # memory - around 7 GB at 480x640 - for a number the canary already makes.
+    cpu_window = min(len(sequence), 8)
+    for label, units, window in (
+            ("CPU_AND_NE", ct.ComputeUnit.CPU_AND_NE, len(sequence)),
+            ("CPU_ONLY", ct.ComputeUnit.CPU_ONLY, cpu_window)):
+        stats = compare(reference[:window],
+                        drive(compiled, units, sequence[:window], skips), 2)
         results[label] = stats
-        note = "" if label == "CPU_AND_NE" else "   <- known Core ML CPU state defect"
+        note = ("" if label == "CPU_AND_NE"
+                else f"   <- known Core ML CPU state defect, {window} steps")
         _log.info(f"  {label:11s} mean {stats['mean_abs']:.3e}  "
               f"max {stats['max_abs']:.3e}{note}")
+        gc.collect()
 
     gates, pushes, emitted, writes = drain_schedule(arguments.steps)
     _log.info("\ndrain: schedule derived for a %d-frame stream, %d tail outputs",
@@ -754,6 +802,11 @@ def main() -> int:
     for _ in range(emitted):
         result = product.step(None)
         truth.append(None if result is None else np.asarray(result))
+    # A full fp32 BSVD holds its 16 states and six skip queues live - about
+    # 2.2 GB at 480x640 - and nothing needs it once the tail is captured.
+    del product
+    gc.collect()
+    mx.clear_cache()
 
     tails = {}
     for label in ("ungated", "gated"):
@@ -766,9 +819,9 @@ def main() -> int:
                     for w, g in zip(truth, tail, strict=True) if w is not None)
         _log.info("  %-8s %.3e", label, worst)
 
-    measured = canary(compiled, reference, sequence, skips)
-    _log.info("CPU-fallback canary: %.3e (threshold %.0e) - passed",
-              measured, CPU_DETECTION_THRESHOLD)
+    separation, accuracy = canary(compiled, reference, sequence, skips)
+    _log.info("CPU-fallback canary: ANE and CPU differ by %.3e (floor %.0e), "
+              "ANE accuracy %.3e - passed", separation, CPU_DIVERGENCE_FLOOR, accuracy)
 
     runner = BackedRunner(compiled)
     frame = memoryview(np.zeros((1, channels, height, width), dtype=np.float16)).cast("B")
