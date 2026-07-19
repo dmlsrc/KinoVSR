@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import statistics
@@ -49,6 +50,8 @@ import torch
 import torch.nn.functional as F
 
 from kinovsr.processors import bsvd as B
+
+_log = logging.getLogger("kinovsr.dev.probe_bsvd_ane")
 
 BLOCKS = ("temp1", "temp2")
 # The eight BiBufferConvs of a DenBlock, in execution order, with the
@@ -242,8 +245,8 @@ class BsvdStep(torch.nn.Module):
 # --------------------------------------------------------------------------
 
 def convert(model, shapes, skips, input_channels, height, width, directory: Path):
-    import coremltools as ct
     import CoreML
+    import coremltools as ct
     from Foundation import NSURL
 
     directory.mkdir(parents=True, exist_ok=True)
@@ -260,7 +263,7 @@ def convert(model, shapes, skips, input_channels, height, width, directory: Path
     converted = ct.convert(
         traced,
         inputs=[ct.TensorType(name=n, shape=tuple(t.shape), dtype=np.float16)
-                for n, t in zip(names, sample)],
+                for n, t in zip(names, sample, strict=True)],
         outputs=[ct.TensorType(name=n) for n in outputs],
         states=[ct.StateType(
             wrapped_type=ct.TensorType(shape=tuple(shape), dtype=np.float16),
@@ -289,6 +292,7 @@ def convert(model, shapes, skips, input_channels, height, width, directory: Path
 
 def placement(compiled: Path) -> dict:
     from collections import Counter
+
     import coremltools as ct
     from coremltools.models.compute_plan import MLComputePlan
 
@@ -421,7 +425,6 @@ def torch_reference(model, sequence, shapes, skips):
 
 
 def drive(compiled: Path, units, sequence, skips):
-    import coremltools as ct
     from coremltools.models import CompiledMLModel
 
     model = CompiledMLModel(str(compiled), units)
@@ -446,7 +449,7 @@ def drive(compiled: Path, units, sequence, skips):
 
 
 def compare(reference, candidate, skip_first: int) -> dict:
-    rows = [np.abs(a - b) for a, b in zip(reference[skip_first:], candidate[skip_first:])]
+    rows = [np.abs(a - b) for a, b in zip(reference[skip_first:], candidate[skip_first:], strict=True)]
     if not rows:
         return {}
     return {"mean_abs": float(np.mean([r.mean() for r in rows])),
@@ -472,6 +475,7 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=12)
     parser.add_argument("--directory", type=Path, default=None)
     arguments = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     height, width = arguments.height, arguments.width
     directory = arguments.directory or (
@@ -482,39 +486,39 @@ def main() -> int:
     state_bytes = sum(int(np.prod(s)) for s in shapes) * 2
 
     worst = audit_fold(params, height, width)
-    print(f"fold algebra, all four upsamples, float64: max abs {worst:.2e}")
+    _log.info(f"fold algebra, all four upsamples, float64: max abs {worst:.2e}")
     if worst > 1e-9:
-        print("fold is not exact; refusing to continue")
+        _log.info("fold is not exact; refusing to continue")
         return 1
 
     folded = {block: {key: fold_weights(*params[block][key][:2])
                       for key in ("u2", "u1")} for block in BLOCKS}
     model = BsvdStep(params, folded, shapes).eval()
     compiled = convert(model, shapes, skips, channels, height, width, directory)
-    print(f"compiled: {compiled}")
-    print(f"device placement: {placement(compiled)}")
-    print(f"MLState carries {state_bytes / 1e6:.0f} MB, keeping "
+    _log.info(f"compiled: {compiled}")
+    _log.info(f"device placement: {placement(compiled)}")
+    _log.info(f"MLState carries {state_bytes / 1e6:.0f} MB, keeping "
           f"{2 * state_bytes / 1e6:.0f} MB per step off the boundary")
 
     sequence = frames(arguments.steps, channels, height, width)
     reference = torch_reference(model, sequence, shapes, skips)
 
     import coremltools as ct
-    print("\naccuracy against the same graph in torch fp32 (steps 2+):")
+    _log.info("\naccuracy against the same graph in torch fp32 (steps 2+):")
     results = {}
     for label, units in (("CPU_AND_NE", ct.ComputeUnit.CPU_AND_NE),
                          ("CPU_ONLY", ct.ComputeUnit.CPU_ONLY)):
         stats = compare(reference, drive(compiled, units, sequence, skips), 2)
         results[label] = stats
         note = "" if label == "CPU_AND_NE" else "   <- known Core ML CPU state defect"
-        print(f"  {label:11s} mean {stats['mean_abs']:.3e}  "
+        _log.info(f"  {label:11s} mean {stats['mean_abs']:.3e}  "
               f"max {stats['max_abs']:.3e}{note}")
 
     runner = BackedRunner(compiled)
     frame = memoryview(np.zeros((1, channels, height, width), dtype=np.float16)).cast("B")
     prediction_ms = median(runner.predict)
     step_ms = median(lambda: runner.step(frame))
-    print(f"\n{width}x{height} with output backings: "
+    _log.info(f"\n{width}x{height} with output backings: "
           f"prediction {prediction_ms:.1f} ms, full step {step_ms:.1f} ms")
 
     report = {"variant": arguments.variant, "height": height, "width": width,
@@ -522,7 +526,7 @@ def main() -> int:
               "accuracy": results, "prediction_ms": prediction_ms,
               "step_ms": step_ms}
     (directory / "report.json").write_text(json.dumps(report, indent=2))
-    print(f"wrote {directory / 'report.json'}")
+    _log.info(f"wrote {directory / 'report.json'}")
     return 0
 
 
