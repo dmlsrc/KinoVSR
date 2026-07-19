@@ -17,8 +17,10 @@ Neural Engine was both slow and inaccurate. Three findings are baked in:
    before anything is converted.
 
 3. **`MLState` works on the ANE at production scale.** Sixteen BiBuffer states
-   convert, place entirely on ANE, and compute identically to explicit state
-   I/O, while keeping 531 MB per step off the boundary.
+   convert, are reported ANE-preferred for every operation, and compute
+   identically to explicit state I/O, while keeping 531 MB per step off the
+   boundary. Note "ANE-preferred" is what `MLComputePlan` reports, which is a
+   placement preference and not a realized runtime trace.
 
 Correctness is gated before any timing, because a stateful graph that merely
 loads is worth nothing: the fold is proven in float64, and the recurrence is
@@ -27,9 +29,11 @@ compute unit and silently shifted on the other.
 
 Two known constraints:
 
-* The Core ML **CPU** runtime miscomputes these state updates (about 3.0e-3
-  against fp32 over 64 steps, versus 2.5e-4 on ANE), so a deployment must not
-  silently fall back to CPU.
+* The Core ML **CPU** path is about an order of magnitude worse than the ANE
+  on this graph (about 3.0e-3 over 64 steps against 2.5e-4), so a deployment
+  must not silently fall back to CPU. This script does not isolate the cause;
+  a state-update defect is the likely candidate but CPU fp16 behavior
+  generally is not ruled out here.
 * **Small geometries fail at runtime.** 32x32 converts and reports every
   operation ANE-preferred, then the first prediction fails with
   `ANEProgramProcessRequestDirect() ... status=0x1d`. 96x128 and 480x640 are
@@ -410,7 +414,20 @@ def frames(count: int, channels: int, height: int, width: int):
 
 
 def torch_reference(model, sequence, shapes, skips):
-    """fp32 ground truth from the same graph, on zeroed state."""
+    """Reference from the same graph, on zeroed state.
+
+    Compute is fp32; the recurrent buffers are fp16 and each update rounds
+    through `.half()`, deliberately, because `ct.StateType` is fp16-only and
+    the reference has to carry the same state precision the graph does. So
+    this is NOT an fp32-throughout oracle - it isolates the Core ML/ANE
+    execution of this graph, not the graph's own state quantization.
+
+    It also shares `BsvdStep` with the model under test, so a transcription
+    error in `BsvdStep` would pass. That was closed out of band by comparing
+    against the product MLX path (2.8e-8), but this script does not re-gate
+    it; treat a green run here as evidence about execution, not about the
+    transcription.
+    """
     reference = BsvdStep(model.params, model.folded, shapes).eval()
     carried = [torch.zeros(*shape) for shape in shapes]
     fifos = {i: [torch.zeros(*skips[i])
@@ -516,7 +533,7 @@ def main() -> int:
     reference = torch_reference(model, sequence, shapes, skips)
 
     import coremltools as ct
-    _log.info("\naccuracy against the same graph in torch fp32 (steps 2+):")
+    _log.info("\naccuracy against the same graph, fp32 compute / fp16 state (steps 2+):")
     results = {}
     for label, units in (("CPU_AND_NE", ct.ComputeUnit.CPU_AND_NE),
                          ("CPU_ONLY", ct.ComputeUnit.CPU_ONLY)):
