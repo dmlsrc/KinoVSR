@@ -50,6 +50,7 @@ class BlobFile:
 
     def __init__(self):
         self._entries: list[bytes] = []
+        self._offsets: dict[bytes, int] = {}
         self._cursor = 64
 
     @staticmethod
@@ -57,6 +58,11 @@ class BlobFile:
         return (value + 63) & ~63
 
     def add_fp16(self, raw: bytes) -> int:
+        # Unrolled and multi-function graphs reuse the same convolution
+        # weights many times.  Blob references are immutable, so one exact
+        # byte payload can safely serve every const operation that names it.
+        if raw in self._offsets:
+            return self._offsets[raw]
         meta_offset = self._align(self._cursor)
         data_offset = meta_offset + 64
         meta = struct.pack("<IIQQ", _BLOB_SENTINEL, _BLOB_DTYPE_FLOAT16,
@@ -65,6 +71,7 @@ class BlobFile:
         self._entries.append(b"\x00" * (meta_offset - self._cursor)
                              + meta + padded)
         self._cursor = data_offset + len(padded)
+        self._offsets[raw] = meta_offset
         return meta_offset
 
     def serialize(self) -> bytes:
@@ -89,9 +96,9 @@ def _fp16_bytes(array) -> tuple[bytes, tuple]:
 class Graph:
     """Sequential MIL emitter with shape tracking and a weights blob."""
 
-    def __init__(self):
+    def __init__(self, blob: BlobFile | None = None):
         self._block = schema.Block()
-        self.blob = BlobFile()
+        self.blob = blob if blob is not None else BlobFile()
         self.shape: dict[str, tuple] = {}
         self._seq = 0
 
@@ -393,6 +400,78 @@ class Graph:
         target.CopyFrom(self._block)
         target.outputs.extend(output_names)
         return model.SerializeToString(deterministic=True)
+
+
+def finish_functions(functions, short_description: str,
+                     default_function: str | None = None,
+                     opset: str = "CoreML9",
+                     spec_version: int = 10) -> bytes:
+    """Serialize several graphs as functions of one ML Program asset.
+
+    Each entry is ``(name, graph, inputs, states, output_names)`` and all
+    graphs must have been constructed with the same :class:`BlobFile`.
+    Core ML selects a function when loading the asset; sharing one package
+    keeps repeated weights on disk exactly once.
+    """
+    functions = list(functions)
+    if not functions:
+        raise ValueError("at least one function is required")
+    names = [name for name, *_rest in functions]
+    if len(set(names)) != len(names):
+        raise ValueError("function names must be unique")
+    default_function = default_function or names[0]
+    if default_function not in names:
+        raise ValueError(f"unknown default function {default_function!r}")
+    shared_blob = functions[0][1].blob
+    if any(graph.blob is not shared_blob
+           for _name, graph, *_rest in functions):
+        raise ValueError("all functions must share one BlobFile")
+
+    model = schema.Model()
+    model.specificationVersion = spec_version
+    desc = model.description
+    desc.defaultFunctionName = default_function
+    desc.metadata.shortDescription = short_description
+    program = model.mlProgram
+    program.version = 1
+
+    for name, graph, inputs, states, output_names in functions:
+        function_desc = desc.functions.add()
+        function_desc.name = name
+        for input_name, dims in inputs:
+            feature = function_desc.input.add()
+            feature.name = input_name
+            feature.type.multiArrayType.shape.extend(int(d) for d in dims)
+            feature.type.multiArrayType.dataType = schema.FEATURE_FLOAT16
+        for output_name in output_names:
+            feature = function_desc.output.add()
+            feature.name = output_name
+            feature.type.multiArrayType.shape.extend(graph.shape[output_name])
+            feature.type.multiArrayType.dataType = schema.FEATURE_FLOAT16
+        for state_name, dims in states:
+            feature = function_desc.state.add()
+            feature.name = state_name
+            array = feature.type.stateType.arrayType
+            array.shape.extend(int(d) for d in dims)
+            array.dataType = schema.FEATURE_FLOAT16
+
+        function = program.functions[name]
+        for input_name, dims in inputs:
+            named = function.inputs.add()
+            named.name = input_name
+            _set_tensor_type(named.type.tensorType, schema.FLOAT16, dims)
+        for state_name, dims in states:
+            named = function.inputs.add()
+            named.name = state_name
+            _set_tensor_type(
+                named.type.stateType.wrappedType.tensorType,
+                schema.FLOAT16, dims)
+        function.opset = opset
+        target = function.block_specializations[opset]
+        target.CopyFrom(graph._block)
+        target.outputs.extend(output_names)
+
+    return model.SerializeToString(deterministic=True)
 
 
 def write_package(directory: Path, model_bytes: bytes, blob: BlobFile) -> None:

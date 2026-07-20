@@ -16,13 +16,20 @@ Numerically it is slightly closer to fp32 than the shipping MLX fp16 path
 
 Fill and drain reproduce the product schedule exactly. The MLX network
 propagates ``None`` through a 16-step fill and drains the same way; this
-graph always computes, so two (1,16,1,1) vector inputs close the gap:
+ordinary streaming graph always computes, so two (1,16,1,1) vector inputs
+close the gap:
 ``write`` zeroes each unit's carried ``left`` fold on its priming step
 (what actually leaks from a zero prologue is state, not output), and
 ``gate`` zeroes each unit's ``right`` contribution on its drained steps.
 Both schedules, the skip-push gating, and the emit pattern come from a
 boolean mirror of the product's own None propagation (`_NoneFlowNet`),
 kept equivalent to the real network by test.
+
+GOP-scheduled windows have their full frame list available up front.
+For those, :mod:`.ane_phases` unrolls each fixed fill/drain half eight steps
+at a time and omits the operations and skip outputs whose product value is
+``None``.  The phase functions, ordinary step, host rings, and MLState are
+one exact-replay-gated multifunction asset.
 
 Safety: the Core ML CPU runtime miscomputes this graph's MLState updates
 (coherent garbage, not noise), so a CPU fallback is silently wrong rather
@@ -93,6 +100,11 @@ def cache_root() -> Path:
     from kinovsr.settings import default_settings
 
     return Path(default_settings().cache_dir).expanduser() / "bsvd-ane"
+
+
+def _cache_directory(params: dict, height: int, width: int) -> Path:
+    return cache_root() / (
+        f"{_weights_key(params)}-{width}x{height}-v{GRAPH_VERSION}")
 
 
 def _weights_key(params: dict) -> str:
@@ -254,12 +266,13 @@ def _audit_fold(params: dict, height: int, width: int) -> float:
 
 # ----------------------------------------------------------------- emission
 
-def _emit_program(params: dict, input_channels: int, height: int, width: int):
-    """One BSVD step as an MLState mlprogram, on the verified spellings."""
+def _emit_graph(params: dict, input_channels: int, height: int, width: int,
+                blob=None):
+    """Emit one BSVD step and return its graph plus function signature."""
     from kinovsr.native.anemil import builder
 
     state_shapes, skip_shapes = _shapes(params, input_channels, height, width)
-    g = builder.Graph()
+    g = builder.Graph(blob)
 
     g.register_input("frame", (1, input_channels, height, width))
     g.register_input("gate", (1, 16, 1, 1))
@@ -384,8 +397,16 @@ def _emit_program(params: dict, input_channels: int, height: int, width: int):
               + [(f"skip_{i}", skip_shapes[i])
                  for i in range(len(skip_shapes))])
     states = [(f"st{i}", state_shapes[i]) for i in range(len(state_shapes))]
-    model_bytes = g.finish(inputs, states, output_names, "KinoVSR BSVD ANE")
-    return model_bytes, g.blob
+    return g, inputs, states, output_names
+
+
+def _emit_program(params: dict, input_channels: int, height: int, width: int):
+    """One BSVD step as an MLState mlprogram, on the verified spellings."""
+    graph, inputs, states, output_names = _emit_graph(
+        params, input_channels, height, width)
+    model_bytes = graph.finish(
+        inputs, states, output_names, "KinoVSR BSVD ANE")
+    return model_bytes, graph.blob
 
 
 def _convert(params: dict, input_channels: int, height: int, width: int,
@@ -415,9 +436,12 @@ class BsvdRunner:
     `_verify_build` gates at exact equality.
     """
 
-    def __init__(self, compiled: Path, compute_units: str = "ane"):
+    def __init__(self, compiled: Path, compute_units: str = "ane",
+                 function_name: str | None = None, state: Any | None = None):
         self.model = runtime.ModelRunner(compiled, compute_units,
-                                         dynamic=("skip_",))
+                                         dynamic=("skip_",),
+                                         function_name=function_name,
+                                         state=state)
         for required in ("frame", "gate", "write"):
             if required not in self.model.inputs:
                 raise RuntimeError(f"model is missing input '{required}'")
@@ -435,22 +459,33 @@ class BsvdRunner:
         self._spares = [
             runtime.bind_array(self.model.dynamic_inputs[f"skip_{i}"])
             for i in range(self._skips)]
+        # Ring slots are logically zero until a graph actually pushes them.
+        # Keeping one immutable zero backing per line avoids physically
+        # clearing hundreds of MiB at every independently reset window, and
+        # lets phase-specialized graphs omit outputs for non-push steps.
+        self._zeros = [
+            runtime.bind_array(self.model.dynamic_inputs[f"skip_{i}"])
+            for i in range(self._skips)]
+        self._valid = [
+            [False] * len(ring) for ring in self._rings]
         self._cursor = [0] * self._skips
         self.reset()
 
     def reset(self) -> None:
         self.model.reset_state()
-        for ring in self._rings:
-            for _array, view, _multi in ring:
-                view[:] = bytes(len(view))
-        for _array, view, _multi in self._spares:
-            view[:] = bytes(len(view))
+        for valid in self._valid:
+            valid[:] = [False] * len(valid)
         self._cursor = [0] * self._skips
         self.model.input_view("gate")[:] = self._ones
         self.model.input_view("write")[:] = self._ones
 
+    def _input_multi(self, line: int, slot: int):
+        if self._valid[line][slot]:
+            return self._rings[line][slot][2]
+        return self._zeros[line][2]
+
     def _bindings(self):
-        features = {f"skip_{i}": self._rings[i][self._cursor[i]][2]
+        features = {f"skip_{i}": self._input_multi(i, self._cursor[i])
                     for i in range(self._skips)}
         backings = {f"skip_out_{i}": self._spares[i][2]
                     for i in range(self._skips)}
@@ -482,6 +517,7 @@ class BsvdRunner:
             slot = self._cursor[i]
             self._rings[i][slot], self._spares[i] = (
                 self._spares[i], self._rings[i][slot])
+            self._valid[i][slot] = True
             self._cursor[i] = (slot + 1) % len(self._rings[i])
         return self.model.output_array("out")
 
@@ -490,11 +526,10 @@ class BsvdRunner:
         return self.dispatch()
 
     def zero_last_push(self, line: int) -> None:
-        """Zero the slot the last step pushed into (drain-gated skip lines:
-        the product pushes nothing there, so the ring must hold zeros)."""
+        """Logically zero the last slot (the product pushed nothing there)."""
         ring = self._rings[line]
-        _array, view, _multi = ring[(self._cursor[line] - 1) % len(ring)]
-        view[:] = bytes(len(view))
+        slot = (self._cursor[line] - 1) % len(ring)
+        self._valid[line][slot] = False
 
 
 class ByteCopyBsvdRunner:
@@ -502,8 +537,10 @@ class ByteCopyBsvdRunner:
     bindings. Verification only - it pays the copy cost the rebinding
     runner removes."""
 
-    def __init__(self, compiled: Path, compute_units: str = "ane"):
-        self.model = runtime.ModelRunner(compiled, compute_units)
+    def __init__(self, compiled: Path, compute_units: str = "ane",
+                 function_name: str | None = None, state: Any | None = None):
+        self.model = runtime.ModelRunner(
+            compiled, compute_units, function_name=function_name, state=state)
         self._skips = sum(1 for n in self.model.inputs
                           if n.startswith("skip_"))
         ones = mx.ones((1, 16, 1, 1), dtype=mx.float16)
@@ -661,8 +698,7 @@ def build_runner(params: dict, input_channels: int, height: int,
             f"{width}x{height} is below the verified ANE floor ({MIN_SIDE} "
             f"px); small stateful graphs convert and then fail at the first "
             f"prediction.")
-    key = _weights_key(params)
-    directory = cache_root() / f"{key}-{width}x{height}-v{GRAPH_VERSION}"
+    directory = _cache_directory(params, height, width)
     complete = all((directory / name).exists() for name in
                    ("model.mlpackage", "verify.json", "replay.safetensors"))
     if not complete:
@@ -840,6 +876,8 @@ class AneBSVD:
         self.params, self.input_channels = load_bsvd(
             weights_path, dtype=mx.float32)
         self._runner: BsvdRunner | None = None
+        self._directory: Path | None = None
+        self._phase_suite: Any | None = None
         self._geometry: tuple[int, int] | None = None
         self._width = 0
         self._padded_width = 0
@@ -847,23 +885,69 @@ class AneBSVD:
         self._mirror = _NoneFlowNet()
         self._tail: list[dict] | None = None
         self._tail_cursor = 0
+        self._window_complete = False
         self._worker: threading.Thread | None = None
         self._go = threading.Event()
         self._done = threading.Event()
         self._stop = False
+        self._closed = False
+        self._dirty = False
         self._pending: dict | None = None
         self._worker_error: BaseException | None = None
 
     def reset(self) -> None:
+        self._require_open()
         self._join_pending(discard=True)
-        if self._runner is not None:
+        if self._runner is not None and self._dirty:
             self._runner.reset()
+            if self._phase_suite is not None:
+                self._phase_suite.set_state(self._runner.model._state)
+        self._dirty = False
         self._mirror = _NoneFlowNet()
         self._tail = None
         self._tail_cursor = 0
+        self._window_complete = False
 
-    def _ensure_runner(self, height: int, width: int) -> None:
-        if self._runner is not None:
+    def close(self) -> None:
+        """Release the dispatch worker and the runner's large state buffers.
+
+        The pipeline owns this object through an explicit lifecycle, so do
+        not rely on a destructor: the worker's bound method retains ``self``
+        (and therefore the Core ML state plus skip rings) until it is told to
+        exit.  Cleanup remains complete even when an in-flight prediction
+        failed; that error is re-raised after the worker has stopped.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._join_pending(discard=True)
+        finally:
+            self._stop = True
+            self._go.set()
+            worker = self._worker
+            if worker is not None and worker is not threading.current_thread():
+                worker.join()
+            if self._phase_suite is not None:
+                self._phase_suite.close()
+            self._phase_suite = None
+            self._worker = None
+            self._runner = None
+            self.params = {}
+            self._geometry = None
+            self._directory = None
+            self._zero_frame = None
+            self._tail = None
+            self._mirror = None
+            self._dirty = False
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("BSVD ANE backend is closed")
+
+    def _configure_geometry(self, height: int, width: int) -> None:
+        self._require_open()
+        if self._geometry is not None:
             if self._geometry != (height, width):
                 raise RuntimeError(
                     f"BSVD ANE stream changed resolution from "
@@ -875,16 +959,40 @@ class AneBSVD:
                 f"({MIN_SIDE} px per side); use --bsvd-backend mlx for "
                 f"smaller frames.")
         padded = -(-width // ANE_WIDTH_QUANTUM) * ANE_WIDTH_QUANTUM
-        self._runner, _directory = build_runner(
-            self.params, self.input_channels, height, padded)
         self._geometry = (height, width)
         self._width = width
         self._padded_width = padded
-        self._zero_frame = bytes(
-            len(self._runner.model.input_view("frame")))
+
+    def _ensure_worker(self) -> None:
+        if self._worker is not None:
+            return
         self._worker = threading.Thread(
             target=self._worker_loop, name="bsvd-ane-dispatch", daemon=True)
         self._worker.start()
+
+    def _ensure_runner(self, height: int, width: int) -> None:
+        self._configure_geometry(height, width)
+        if self._runner is None:
+            self._runner, self._directory = build_runner(
+                self.params, self.input_channels, height, self._padded_width)
+            self._zero_frame = bytes(
+                len(self._runner.model.input_view("frame")))
+        self._ensure_worker()
+
+    def _ensure_scheduled_runner(self, height: int, width: int) -> None:
+        self._configure_geometry(height, width)
+        if self._phase_suite is not None:
+            return
+        from .ane_phases import build_suite
+
+        self._directory = _cache_directory(
+            self.params, height, self._padded_width)
+        self._phase_suite = build_suite(
+            self.params, self.input_channels, height,
+            self._padded_width, self._directory)
+        self._runner = self._phase_suite.runner
+        self._zero_frame = bytes(
+            len(self._runner.model.input_view("frame")))
 
     # ------------------------------------------------ dispatch pipelining
 
@@ -904,6 +1012,7 @@ class AneBSVD:
                 pushes: list | None = None) -> None:
         self._runner.load_inputs(frame_bytes, gate_bytes, write_bytes)
         self._pending = {"emit": emit, "pushes": pushes}
+        self._dirty = True
         self._done.clear()
         self._go.set()
 
@@ -935,8 +1044,7 @@ class AneBSVD:
         mx.eval(vector)
         return memoryview(mx.contiguous(vector)).cast("B")
 
-    def _materialize_out(self):
-        raw = self._runner.model.output_array("out")
+    def _materialize_array(self, raw):
         # Fresh copy, NCHW backing -> NHWC cropped to the caller's width:
         # the backing is rewritten by the next prediction, so no lazy
         # graph over it may leave this method.
@@ -944,6 +1052,49 @@ class AneBSVD:
             mx.transpose(raw, (0, 2, 3, 1))[:, :, :self._width, :])
         mx.eval(out)
         return out
+
+    def _materialize_out(self):
+        return self._materialize_array(
+            self._runner.model.output_array("out"))
+
+    def run_window(self, frames: list[Any]) -> list[Any]:
+        """Run one independently reset window through phase-specialized ANE.
+
+        Schedule windows are already fully buffered by ``BsvdDenoiser``.
+        Unrolling their fixed 16-step fill and drain removes convolutions
+        whose product value is ``None`` and halves the number of dispatches;
+        the steady middle still uses the verified one-step runner.  The
+        returned list is in input-frame order and has exactly ``len(frames)``
+        entries.
+        """
+        self._require_open()
+        if len(frames) < 16:
+            raise ValueError("BSVD ANE phase path needs at least 16 frames")
+        if self._dirty or self._pending is not None:
+            raise RuntimeError("reset BSVD ANE before running a schedule window")
+        first = frames[0]
+        height, width = int(first.shape[1]), int(first.shape[2])
+        self._ensure_scheduled_runner(height, width)
+
+        packed = []
+        for frame in frames:
+            if (int(frame.shape[1]), int(frame.shape[2])) != (height, width):
+                raise RuntimeError(
+                    "BSVD ANE schedule window changed resolution")
+            padded = _pad_width_reflect(
+                frame.astype(mx.float16), self._padded_width)
+            nchw = mx.contiguous(mx.transpose(padded, (0, 3, 1, 2)))
+            mx.eval(nchw)
+            packed.append(memoryview(nchw).cast("B"))
+        outputs = self._phase_suite.run(
+            packed, memoryview(self._zero_frame), self._materialize_array)
+        if len(outputs) != len(frames):
+            raise RuntimeError(
+                f"BSVD ANE phase path returned {len(outputs)} outputs for "
+                f"{len(frames)} frames")
+        self._dirty = True
+        self._window_complete = True
+        return outputs
 
     def _assemble_tail(self) -> list[dict]:
         """Mirror the product's 16 drain steps and derive the schedule.
@@ -973,6 +1124,12 @@ class AneBSVD:
         return tail
 
     def step(self, x: Any | None) -> Any | None:
+        self._require_open()
+        if self._window_complete:
+            raise RuntimeError(
+                "BSVD ANE schedule window is complete; reset() first")
+        if self._runner is not None:
+            self._ensure_worker()
         if x is None:
             if self._runner is None:
                 return None            # drained before any input frame

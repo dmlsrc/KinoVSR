@@ -63,13 +63,16 @@ def compile_package(package: Path) -> Path:
     return compiled_dir
 
 
-def placement(compiled: Path, timeout: float = 300.0) -> dict:
+def placement(compiled: Path, timeout: float = 300.0,
+              function_name: str | None = None) -> dict:
     """Preferred compute device counts, by device class name."""
     import CoreML
     from Foundation import NSURL
 
     config = CoreML.MLModelConfiguration.alloc().init()
     config.setComputeUnits_(CoreML.MLComputeUnitsCPUAndNeuralEngine)
+    if function_name is not None:
+        config.setFunctionName_(function_name)
     holder: dict[str, Any] = {}
     done = threading.Event()
 
@@ -87,7 +90,8 @@ def placement(compiled: Path, timeout: float = 300.0) -> dict:
     program = plan.modelStructure().program()
     if program is None:
         raise RuntimeError("compiled model is not an ML program")
-    main = program.functions()["main"]
+    selected = function_name or "main"
+    main = program.functions()[selected]
     preferred: dict[str, int] = {}
     for operation in main.block().operations():
         usage = plan.computeDeviceUsageForMLProgramOperation_(operation)
@@ -98,13 +102,14 @@ def placement(compiled: Path, timeout: float = 300.0) -> dict:
     return preferred
 
 
-def assert_all_ane(compiled: Path) -> dict:
+def assert_all_ane(compiled: Path,
+                   function_name: str | None = None) -> dict:
     """Refuse a model that would run any operation off the ANE.
 
     Placement is a preference, not a realized trace; pair this with a
     runtime oracle (replay or differential canary) per processor.
     """
-    preferred = placement(compiled)
+    preferred = placement(compiled, function_name=function_name)
     stray = {k: v for k, v in preferred.items() if "NeuralEngine" not in k}
     if stray:
         raise RuntimeError(
@@ -128,7 +133,9 @@ class ModelRunner:
 
     def __init__(self, compiled: Path, compute_units: str = "ane",
                  fast_prediction: bool = False,
-                 dynamic: tuple[str, ...] = ()):
+                 dynamic: tuple[str, ...] = (),
+                 function_name: str | None = None,
+                 state: Any | None = None):
         import CoreML
         from Foundation import NSURL
 
@@ -137,6 +144,8 @@ class ModelRunner:
         config.setComputeUnits_(
             CoreML.MLComputeUnitsCPUOnly if compute_units == "cpu"
             else CoreML.MLComputeUnitsCPUAndNeuralEngine)
+        if function_name is not None:
+            config.setFunctionName_(function_name)
         if fast_prediction:
             # MLSpecializationStrategyFastPrediction: spend more at load
             # specializing the plan for faster predictions afterward.
@@ -158,7 +167,11 @@ class ModelRunner:
         self._dynamic = tuple(dynamic)
         description = model.modelDescription()
         self._stateful = len(description.stateDescriptionsByName()) > 0
-        self._state = model.newState() if self._stateful else None
+        if state is not None and not self._stateful:
+            raise ValueError("cannot attach MLState to a stateless function")
+        self._state = (state if state is not None
+                       else model.newState() if self._stateful else None)
+        self.function_name = function_name
 
         self.inputs, self.dynamic_inputs = self._bind(
             description.inputDescriptionsByName())

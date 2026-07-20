@@ -3,6 +3,8 @@ selection plumbing, and (slow) end-to-end parity against the MLX net."""
 
 from __future__ import annotations
 
+import threading
+
 import mlx.core as mx
 import pytest
 
@@ -238,6 +240,164 @@ class TestBackendSelection:
         monkeypatch.delenv("BSVD_BACKEND", raising=False)
         args = build_parser().parse_args(["--video", "clip.mp4"])
         assert assemble(args).settings.bsvd_backend == "mlx"
+
+
+# --------------------------------------------------------------------------
+# Explicit lifecycle: worker ownership and cheap repeated resets
+# --------------------------------------------------------------------------
+
+class _FakeRunner:
+    def __init__(self, error: BaseException | None = None):
+        self.error = error
+        self.dispatches = 0
+        self.resets = 0
+
+    def load_inputs(self, *_args):
+        pass
+
+    def dispatch(self):
+        self.dispatches += 1
+        if self.error is not None:
+            raise self.error
+
+    def reset(self):
+        self.resets += 1
+
+
+def _lifecycle_net(monkeypatch) -> A.AneBSVD:
+    monkeypatch.setattr(B, "load_bsvd", lambda *_args, **_kwargs: ({}, 4))
+    return A.AneBSVD("unused.safetensors", dtype=mx.float16)
+
+
+class TestAneLifecycle:
+    def test_runner_uses_logical_zero_slots(self):
+        runner = object.__new__(A.BsvdRunner)
+        zero_multi = object()
+        ring_multi = object()
+        runner._zeros = [(None, None, zero_multi)]
+        runner._rings = [[(None, None, ring_multi)] * 4]
+        runner._valid = [[False] * 4]
+        runner._cursor = [1]
+
+        assert runner._input_multi(0, 1) is zero_multi
+        runner._valid[0][1] = True
+        assert runner._input_multi(0, 1) is ring_multi
+
+        # The last pushed slot is cursor - 1; invalidation must not need to
+        # touch its (potentially very large) physical buffer.
+        runner._valid[0][0] = True
+        runner.zero_last_push(0)
+        assert runner._valid[0] == [False, True, False, False]
+
+    def test_clean_reset_does_not_rezero_runner(self, monkeypatch):
+        net = _lifecycle_net(monkeypatch)
+        runner = _FakeRunner()
+        net._runner = runner
+
+        net.reset()
+        assert runner.resets == 0
+        net._dirty = True
+        net.reset()
+        assert runner.resets == 1
+        net.reset()
+        assert runner.resets == 1
+        net.close()
+
+    def test_close_stops_worker_and_releases_runner(self, monkeypatch):
+        net = _lifecycle_net(monkeypatch)
+        runner = _FakeRunner()
+        net._runner = runner
+        worker = threading.Thread(
+            target=net._worker_loop, name="test-bsvd-ane-dispatch")
+        net._worker = worker
+        worker.start()
+
+        net._submit(b"", b"", b"", emit=False)
+        net.close()
+
+        assert runner.dispatches == 1
+        assert not worker.is_alive()
+        assert net._worker is None
+        assert net._runner is None
+        net.close()  # lifecycle cleanup is idempotent
+        with pytest.raises(RuntimeError, match="closed"):
+            net.step(None)
+
+    def test_close_stops_worker_when_prediction_failed(self, monkeypatch):
+        net = _lifecycle_net(monkeypatch)
+        runner = _FakeRunner(RuntimeError("prediction failed"))
+        net._runner = runner
+        worker = threading.Thread(
+            target=net._worker_loop, name="test-bsvd-ane-dispatch-error")
+        net._worker = worker
+        worker.start()
+        net._submit(b"", b"", b"", emit=False)
+
+        with pytest.raises(RuntimeError, match="prediction failed"):
+            net.close()
+        assert not worker.is_alive()
+        assert net._runner is None
+
+
+class TestDenoiserLifecycle:
+    def test_close_delegates_and_releases_stream_buffers(self):
+        class Net:
+            def __init__(self):
+                self.closes = 0
+
+            def close(self):
+                self.closes += 1
+
+        net = Net()
+        denoiser = object.__new__(B.BsvdDenoiser)
+        denoiser.net = net
+        denoiser._nm = object()
+        denoiser._tokens = [object()]
+        denoiser._frames = [object()]
+        denoiser._frame_tokens = [object()]
+        denoiser._warm = [object()]
+        denoiser._recent = [object()]
+
+        denoiser.close()
+        denoiser.close()
+
+        assert net.closes == 1
+        assert denoiser.net is None
+        assert denoiser._nm is None
+        assert not denoiser._tokens
+        assert not denoiser._frames
+        assert not denoiser._frame_tokens
+        assert not denoiser._warm
+        assert not denoiser._recent
+
+    def test_schedule_window_uses_backend_batch_path_when_available(self):
+        class Net:
+            def __init__(self):
+                self.resets = 0
+                self.windows = []
+
+            def reset(self):
+                self.resets += 1
+
+            def run_window(self, frames):
+                self.windows.append(list(frames))
+                return [frame + 100 for frame in frames]
+
+        denoiser = object.__new__(B.BsvdDenoiser)
+        denoiser.net = Net()
+        denoiser._tracker = None
+        denoiser._pulse_gain = lambda _x, **_kwargs: 1.0
+        denoiser._with_nm = lambda x, _nm, gain: x
+        denoiser._emit = lambda value, token: (value, token)
+        frames = list(range(16))
+        tokens = [f"token-{index}" for index in range(16)]
+
+        out = denoiser._run_window(frames, tokens, 3, 7)
+
+        assert denoiser.net.windows == [frames]
+        assert denoiser.net.resets == 2
+        assert out == [(103, "token-3"), (104, "token-4"),
+                       (105, "token-5"), (106, "token-6")]
 
 
 # --------------------------------------------------------------------------

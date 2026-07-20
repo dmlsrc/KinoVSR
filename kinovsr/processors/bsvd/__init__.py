@@ -488,7 +488,22 @@ class BsvdDenoiser:
         return noise_map_debug_image(self)
 
     def close(self) -> None:
-        pass
+        net, self.net = self.net, None
+        try:
+            close = getattr(net, "close", None)
+            if callable(close):
+                close()
+        finally:
+            # Release delayed frames/tokens and conditioning tensors even if
+            # the backend reports an in-flight prediction failure while it
+            # shuts down.  FeedFlushProcessor has already captured diagnostics
+            # before calling this lifecycle edge.
+            self._nm = None
+            self._tokens = []
+            self._frames = []
+            self._frame_tokens = []
+            self._warm = []
+            self._recent = []
 
     def _prepare(self, frame: Any) -> Any:
         """Clip + pad one frame to a 3-channel net-dtype tensor (no noise map yet;
@@ -676,7 +691,7 @@ class BsvdDenoiser:
                 nm = self._plane_from_map(sig)
         from kinovsr.analysis.noise.track import source_since_sync
 
-        out = []
+        conditioned = []
         for i, x in enumerate(frames):
             # window starts break temporal adjacency (proc ranges overlap), so
             # the pulse tracker restarts its diff chain at each window.
@@ -684,7 +699,19 @@ class BsvdDenoiser:
                 x, new_segment=(i == 0),
                 since_sync=source_since_sync(
                     tokens[i] if i < len(tokens) else None))
-            y = self.net.step(self._with_nm(x, nm, gain=gain))
+            conditioned.append(self._with_nm(x, nm, gain=gain))
+
+        run_window = getattr(self.net, "run_window", None)
+        if callable(run_window) and len(conditioned) >= 16:
+            window_outputs = run_window(conditioned)
+            out = [self._emit(window_outputs[index], tokens[index])
+                   for index in range(emit_start, emit_end)]
+            self.net.reset()
+            return out
+
+        out = []
+        for i, x in enumerate(conditioned):
+            y = self.net.step(x)
             idx = i - self.net.SHIFT_NUM
             if emit_start <= idx < emit_end:
                 if y is None:
