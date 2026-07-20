@@ -87,6 +87,18 @@ MIN_SIDE = 96
 # Probed 2026-07-19: widths 128/256/384/640 run; 32/320/352/704 compile,
 # place all-ANE, then fail the first prediction with status=0x1d.
 ANE_WIDTH_QUANTUM = 128
+# The phase-specialized window functions are only reliable up to this
+# padded width. At 640x480, RE-EXECUTING a phase function after other
+# work fails with ANEProgramProcessRequestDirect status=0x16 - probed
+# 2026-07-20, deterministic single-threaded, timing-dependent otherwise;
+# WHICH function dies depends on execution history (fill_08 back to
+# back; drain_00 only after ~185 intervening dispatches; the ordinary
+# single-step function never, at any size, across thousands of
+# executions). At 384-wide, every function re-executes cleanly across
+# many windows. Between 384 and 640 is uncharacterized; raise only with
+# multi-window probe evidence. Scheduled windows beyond this width run
+# entirely as gated singles on the main function instead.
+PHASE_MAX_WIDTH = 384
 CPU_DIVERGENCE_FLOOR = 1e-6
 REPLAY_TOLERANCE = 5e-3
 REPLAY_STEPS = 12  # past the depth-8 ring wraparound (first re-read at step 8)
@@ -470,8 +482,22 @@ class BsvdRunner:
         self._cursor = [0] * self._skips
         self.reset()
 
-    def reset(self) -> None:
-        self.model.reset_state()
+    def reset(self, reuse_state: bool = False) -> None:
+        """Reset the stream; ``reuse_state`` keeps the current MLState.
+
+        The phase-specialized window graphs never READ pre-window state -
+        every unit primes in-graph (SSA) before its first state read and
+        each dispatch clears the states it did not write - so scheduled
+        windows can share one MLState for the runner's lifetime. That is
+        not a luxury: allocating a fresh state per window (265 MB at
+        640x480) and dropping the old one into deferred release raced the
+        next window's dispatches into ANEProgramProcessRequestDirect
+        status=0x16 failures at production scale. The ORDINARY gated
+        graph does read initial state through its fill, so continuous
+        streams keep the default fresh (zeroed) state.
+        """
+        if not reuse_state:
+            self.model.reset_state()
         for valid in self._valid:
             valid[:] = [False] * len(valid)
         self._cursor = [0] * self._skips
@@ -890,6 +916,7 @@ class AneBSVD:
         self._preheat_pool: Any = None
         self._closed = False
         self._dirty = False
+        self._state_needs_zero = False
         self._pending: dict | None = None
 
     def reset(self) -> None:
@@ -900,7 +927,12 @@ class AneBSVD:
             # the suite pipeline; settle it before touching shared state.
             self._phase_suite.pipeline.drain()
         if self._runner is not None and self._dirty:
-            self._runner.reset()
+            # Scheduled windows reuse the MLState (see BsvdRunner.reset);
+            # a later PER-STEP stream on this net must first zero it,
+            # because the ordinary gated graph reads state through fill.
+            reuse = self._phase_suite is not None
+            self._runner.reset(reuse_state=reuse)
+            self._state_needs_zero = reuse
             if self._phase_suite is not None:
                 self._phase_suite.set_state(self._runner.model._state)
         self._dirty = False
@@ -1009,7 +1041,7 @@ class AneBSVD:
         except RuntimeError:
             return   # first real use raises the descriptive error
         directory = _cache_directory(self.params, height, self._padded_width)
-        if scheduled:
+        if scheduled and self.window_capable(height, width):
             from .ane_phases import PHASE_GRAPH_VERSION
 
             stem = f"scheduled8-v{PHASE_GRAPH_VERSION}"
@@ -1089,6 +1121,16 @@ class AneBSVD:
         return self._materialize_array(
             self._runner.model.output_array("out"))
 
+    def window_capable(self, height: int, width: int) -> bool:
+        """Whether the phase-specialized window path applies here.
+
+        Beyond ``PHASE_MAX_WIDTH`` the driver checks the schedule-capable
+        wrapper makes and routes windows through the per-step gated path
+        instead (the ordinary function is reliable at every size).
+        """
+        padded = -(-width // ANE_WIDTH_QUANTUM) * ANE_WIDTH_QUANTUM
+        return padded <= PHASE_MAX_WIDTH
+
     def begin_window(self, frames: list[Any]):
         """Start one independently reset window; return its async handle.
 
@@ -1113,6 +1155,11 @@ class AneBSVD:
             raise RuntimeError("reset BSVD ANE before running a schedule window")
         first = frames[0]
         height, width = int(first.shape[1]), int(first.shape[2])
+        if not self.window_capable(height, width):
+            raise RuntimeError(
+                f"{width}x{height} is outside the phase-window envelope "
+                f"(padded width above {PHASE_MAX_WIDTH}); route this window "
+                f"through step() instead")
         self._ensure_scheduled_runner(height, width)
         for frame in frames:
             if (int(frame.shape[1]), int(frame.shape[2])) != (height, width):
@@ -1201,6 +1248,14 @@ class AneBSVD:
                 "reset() first")
         height, width = int(x.shape[1]), int(x.shape[2])
         self._ensure_runner(height, width)
+        if self._state_needs_zero:
+            # A scheduled window left its state behind (reused by design);
+            # the ordinary gated graph reads state through fill, so a
+            # per-step stream starts from zeros.
+            self._runner.model.reset_state()
+            if self._phase_suite is not None:
+                self._phase_suite.set_state(self._runner.model._state)
+            self._state_needs_zero = False
         out = self._join_pending()
         record = self._mirror.step(True)
         write = [0.0 if record.primes[i] else 1.0 for i in range(16)]

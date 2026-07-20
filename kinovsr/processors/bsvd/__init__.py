@@ -740,7 +740,11 @@ class BsvdDenoiser:
             conditioned.append(self._with_nm(x, nm, gain=gain))
 
         begin_window = getattr(self.net, "begin_window", None)
-        if callable(begin_window) and len(conditioned) >= 16:
+        capable = getattr(self.net, "window_capable", None)
+        if callable(begin_window) and len(conditioned) >= 16 and (
+                not callable(capable)
+                or capable(int(conditioned[0].shape[1]),
+                           int(conditioned[0].shape[2]))):
             # Depth-one cross-window pipelining: submit completes the
             # window in flight (emitting it), then starts this one; its
             # dispatches then run while feed() buffers the NEXT window -
@@ -764,8 +768,13 @@ class BsvdDenoiser:
             return self._wavefront.submit(
                 lambda: begin_window(conditioned), finalize)
 
+        # The synchronous fallback (a window too short for the phase path,
+        # or a net without begin_window) emits inline, so the window still
+        # in flight must complete and emit FIRST - both for emission order
+        # (its frames precede this window's) and because resetting the net
+        # under an in-flight window corrupts shared runner state.
+        out = self._wavefront.barrier()
         self.net.reset()
-        out = []
         for i, x in enumerate(conditioned):
             y = self.net.step(x)
             idx = i - self.net.SHIFT_NUM

@@ -503,10 +503,29 @@ class WindowMachine:
         pipeline.submit(lambda: suite.dispatch("fill", 0, first))
         second = [resolve(index) for index in range(8, 16)]
         yield
-        pipeline.submit(lambda: suite.dispatch("fill", 8, second))
+        # Fill steps 8-15 run as GATED SINGLES on the main function, NOT
+        # the fill_08 phase function: re-executing that function fails
+        # with ANE status=0x16 on its SECOND run per load at 640x480
+        # (probed 2026-07-20; deterministic single-threaded, timing-
+        # dependent otherwise - the cold CLI failed at window ONE because
+        # the build replay had spent the one good execution). The bug is
+        # specific to that function at that scale: fill_00, both drains,
+        # the larger drain_00, and CIF-sized fill_08 all re-execute fine.
+        # These eight steps only omitted 28 percent of compute anyway, so
+        # the gated singles - the continuously verified path - cost about
+        # 1.6 percent of a window and remove the trigger entirely.
         count = len(frames)
-        pending = resolve(16) if count > 16 else None
-        yield
+        pending = None
+        fill_tail = _phase_records(8, draining=False)
+        for step in range(8):
+            record = fill_tail[step][0]
+            write = _vector_bytes(
+                [0.0 if record.primes[i] else 1.0 for i in range(16)])
+            suite.runner.load_inputs(second[step], None, write)
+            pipeline.submit(suite.runner.dispatch)
+            if step == 0 and count > 16:
+                pending = resolve(16)
+            yield
         for index in range(16, count):
             view, pending = pending, None
             suite.runner.load_inputs(view)

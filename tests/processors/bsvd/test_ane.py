@@ -249,6 +249,7 @@ class _FakeRunner:
         self.error = error
         self.dispatches = 0
         self.resets = 0
+        self.reuse_flags: list[bool] = []
 
     def load_inputs(self, *_args):
         pass
@@ -258,8 +259,9 @@ class _FakeRunner:
         if self.error is not None:
             raise self.error
 
-    def reset(self):
+    def reset(self, reuse_state: bool = False):
         self.resets += 1
+        self.reuse_flags.append(reuse_state)
 
 
 def _lifecycle_net(monkeypatch) -> A.AneBSVD:
@@ -300,6 +302,46 @@ class TestAneLifecycle:
         net.reset()
         assert runner.resets == 1
         net.close()
+
+    def test_scheduled_reset_reuses_the_state(self, monkeypatch):
+        """Scheduled windows share one MLState across resets: allocating a
+        fresh state per window (265 MB at 640x480) raced its deferred
+        release into ANE status=0x16 failures. A later per-step stream
+        must first zero the reused state, because the ordinary gated
+        graph reads state through fill; continuous resets stay fresh."""
+        net = _lifecycle_net(monkeypatch)
+        runner = _FakeRunner()
+        runner.model = type(
+            "Model", (), {"_state": object(),
+                          "reset_state": lambda self: None})()
+        net._runner = runner
+
+        class Suite:
+            def __init__(self):
+                self.states = []
+                self.pipeline = type("P", (), {"drain": lambda self: None})()
+
+            def set_state(self, state):
+                self.states.append(state)
+
+            def close(self):
+                pass
+
+        net._phase_suite = Suite()
+        net._dirty = True
+        net.reset()
+        assert runner.reuse_flags == [True]
+        assert net._state_needs_zero
+        net.close()
+
+        continuous = _lifecycle_net(monkeypatch)
+        continuous_runner = _FakeRunner()
+        continuous._runner = continuous_runner
+        continuous._dirty = True
+        continuous.reset()
+        assert continuous_runner.reuse_flags == [False]
+        assert not continuous._state_needs_zero
+        continuous.close()
 
     def test_close_stops_worker_and_releases_runner(self, monkeypatch):
         net = _lifecycle_net(monkeypatch)
@@ -411,6 +453,59 @@ class TestDenoiserLifecycle:
         assert denoiser.net.resets == 2
         assert denoiser.net.windows == [list(range(16)),
                                         list(range(50, 66))]
+
+    def test_short_window_fallback_barriers_the_wavefront_first(self):
+        """A window too short for the phase path emits inline through the
+        per-step loop; the async window still in flight must complete and
+        emit BEFORE it - its frames precede this window's - and the net
+        must never be reset under an in-flight window (that inverted
+        emission order in the field and corrupted shared runner state)."""
+        from kinovsr.processors.feed_driver import WindowWavefront
+
+        class Handle:
+            def __init__(self, frames):
+                self.outputs = [frame + 100 for frame in frames]
+
+            def advance(self, block=False):
+                return True
+
+        class Net:
+            SHIFT_NUM = 0
+
+            def __init__(self):
+                self.events = []
+
+            def reset(self):
+                self.events.append("reset")
+
+            def begin_window(self, frames):
+                self.events.append("begin")
+                return Handle(frames)
+
+            def step(self, x):
+                return x + 200
+
+        denoiser = object.__new__(B.BsvdDenoiser)
+        denoiser.net = Net()
+        denoiser._tracker = None
+        denoiser._wavefront = WindowWavefront()
+        denoiser._pulse_gain = lambda _x, **_kwargs: 1.0
+        denoiser._with_nm = lambda x, _nm, gain: x
+        denoiser._emit = lambda value, token: (value, token)
+
+        first = denoiser._run_window(
+            list(range(16)), [f"a{i}" for i in range(16)], 0, 16)
+        assert first == []                    # async window in flight
+
+        short = denoiser._run_window([70, 71], ["b0", "b1"], 0, 2)
+        # The deferred async window's emissions come FIRST, then the
+        # short window's inline emissions.
+        assert short[:16] == [(100 + i, f"a{i}") for i in range(16)]
+        assert short[16:] == [(270, "b0"), (271, "b1")]
+        # finalize's reset (completing the async window) precedes the
+        # sync path's own enter/exit resets; nothing resets while a
+        # window flies.
+        assert denoiser.net.events == ["begin", "reset", "reset", "reset"]
 
 
 # --------------------------------------------------------------------------
