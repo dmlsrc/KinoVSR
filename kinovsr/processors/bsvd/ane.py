@@ -57,6 +57,7 @@ import hashlib
 import json
 import logging
 import shutil
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -460,12 +461,22 @@ class BsvdRunner:
         features, backings = self._bindings()
         return self.model.predict_with(features, backings)
 
-    def step(self, frame_bytes, gate_bytes=None, write_bytes=None):
+    def load_inputs(self, frame_bytes, gate_bytes=None,
+                    write_bytes=None) -> None:
+        """Blit one step's inputs into the bound buffers (host-side only)."""
         self.model.input_view("frame")[:] = frame_bytes
         self.model.input_view("gate")[:] = (
             gate_bytes if gate_bytes is not None else self._ones)
         self.model.input_view("write")[:] = (
             write_bytes if write_bytes is not None else self._ones)
+
+    def dispatch(self):
+        """Predict on the loaded inputs and rotate the rings.
+
+        Pure Core ML plus Python reference swaps - no MLX - so it is safe
+        to run on a worker thread while the main thread owns every MLX
+        operation (the AneBSVD pipelining arrangement).
+        """
         self.predict()
         for i in range(self._skips):
             slot = self._cursor[i]
@@ -473,6 +484,10 @@ class BsvdRunner:
                 self._spares[i], self._rings[i][slot])
             self._cursor[i] = (slot + 1) % len(self._rings[i])
         return self.model.output_array("out")
+
+    def step(self, frame_bytes, gate_bytes=None, write_bytes=None):
+        self.load_inputs(frame_bytes, gate_bytes, write_bytes)
+        return self.dispatch()
 
     def zero_last_push(self, line: int) -> None:
         """Zero the slot the last step pushed into (drain-gated skip lines:
@@ -784,13 +799,25 @@ def _pad_width_reflect(x: Any, target: int) -> Any:
 class AneBSVD:
     """Drop-in for :class:`kinovsr.processors.bsvd.BSVD` on the ANE.
 
-    Same contract: ``step(frame_or_none)`` once per stream item with NHWC
-    (1, H, W, C) inputs padded to multiples of four, ``None`` returned
-    through the 16-step fill, real outputs through the drain on the same
-    steps the product emits them, and ``reset()`` between streams. The
-    engine is built lazily at the first real frame, when the geometry is
-    known; construction failures raise (this backend is explicitly
+    Same contract shape: ``step(frame_or_none)`` once per stream item with
+    NHWC (1, H, W, C) inputs padded to multiples of four, ``None`` through
+    the fill, real outputs through the drain, ``reset()`` between streams.
+    The engine is built lazily at the first real frame, when the geometry
+    is known; construction failures raise (this backend is explicitly
     requested - there is no silent fallback).
+
+    **Dispatches are pipelined one step deep.** ``step(k)`` collects the
+    result of dispatch ``k-1`` and SUBMITS dispatch ``k`` to a worker
+    thread, so the Core ML prediction runs while the caller does the rest
+    of its per-frame work. That both hides the dispatch latency and keeps
+    the ANE busy through the inter-frame gap - critical, because an ANE
+    dispatch issued after >= 10 ms of host idleness pays a 15-23 ms
+    power-state ramp that no host-side warm-up avoids (measured; the
+    synchronous arrangement ran 57 ms/dispatch inside light pipelines
+    against 34 ms hot). The worker runs ONLY ``BsvdRunner.dispatch`` -
+    pure Core ML - and every MLX operation stays on the caller's thread.
+    The pipelining adds one step to the output delay: ``SHIFT_NUM`` is 17
+    (the network's 16 plus one dispatch in flight).
 
     Frames are reflect-padded on the right up to the ANE width quantum
     (multiples of 128 - see the module docstring) and outputs are cropped
@@ -799,7 +826,7 @@ class AneBSVD:
     maps to the same quantum shares one model.
     """
 
-    SHIFT_NUM = 16
+    SHIFT_NUM = 17  # 16-step BiBuffer delay + 1 dispatch in flight
     TAIL_STEPS = 16
 
     def __init__(self, weights_path: str | Path, dtype: Any = mx.float16):
@@ -820,8 +847,15 @@ class AneBSVD:
         self._mirror = _NoneFlowNet()
         self._tail: list[dict] | None = None
         self._tail_cursor = 0
+        self._worker: threading.Thread | None = None
+        self._go = threading.Event()
+        self._done = threading.Event()
+        self._stop = False
+        self._pending: dict | None = None
+        self._worker_error: BaseException | None = None
 
     def reset(self) -> None:
+        self._join_pending(discard=True)
         if self._runner is not None:
             self._runner.reset()
         self._mirror = _NoneFlowNet()
@@ -848,6 +882,52 @@ class AneBSVD:
         self._padded_width = padded
         self._zero_frame = bytes(
             len(self._runner.model.input_view("frame")))
+        self._worker = threading.Thread(
+            target=self._worker_loop, name="bsvd-ane-dispatch", daemon=True)
+        self._worker.start()
+
+    # ------------------------------------------------ dispatch pipelining
+
+    def _worker_loop(self) -> None:
+        while True:
+            self._go.wait()
+            self._go.clear()
+            if self._stop:
+                return
+            try:
+                self._runner.dispatch()
+            except BaseException as exc:  # noqa: BLE001 - carried to caller
+                self._worker_error = exc
+            self._done.set()
+
+    def _submit(self, frame_bytes, gate_bytes, write_bytes, emit: bool,
+                pushes: list | None = None) -> None:
+        self._runner.load_inputs(frame_bytes, gate_bytes, write_bytes)
+        self._pending = {"emit": emit, "pushes": pushes}
+        self._done.clear()
+        self._go.set()
+
+    def _join_pending(self, discard: bool = False):
+        """Wait out the in-flight dispatch; return its emitted output.
+
+        Push gating and output materialization happen here, on the
+        caller's thread, strictly before the next submit reloads the
+        input buffers and the next dispatch rewrites the out backing.
+        """
+        if self._pending is None:
+            return None
+        self._done.wait()
+        pending, self._pending = self._pending, None
+        if self._worker_error is not None:
+            error, self._worker_error = self._worker_error, None
+            raise error
+        if discard:
+            return None
+        if pending["pushes"] is not None:
+            for line, pushed in enumerate(pending["pushes"]):
+                if not pushed:
+                    self._runner.zero_last_push(line)
+        return self._materialize_out() if pending["emit"] else None
 
     @staticmethod
     def _vector_bytes(values: list[float]):
@@ -899,17 +979,15 @@ class AneBSVD:
             if self._tail is None:
                 self._tail = self._assemble_tail()
                 self._tail_cursor = 0
-            if self._tail_cursor >= len(self._tail):
-                return None            # past the 16-step tail
-            entry = self._tail[self._tail_cursor]
-            self._tail_cursor += 1
-            self._runner.step(self._zero_frame,
-                              self._vector_bytes(entry["gate"]),
-                              self._vector_bytes(entry["write"]))
-            for line, pushed in enumerate(entry["pushes"]):
-                if not pushed:
-                    self._runner.zero_last_push(line)
-            return self._materialize_out() if entry["emit"] else None
+            out = self._join_pending()
+            if self._tail_cursor < len(self._tail):
+                entry = self._tail[self._tail_cursor]
+                self._tail_cursor += 1
+                self._submit(self._zero_frame,
+                             self._vector_bytes(entry["gate"]),
+                             self._vector_bytes(entry["write"]),
+                             entry["emit"], entry["pushes"])
+            return out
 
         if self._tail is not None:
             raise RuntimeError(
@@ -917,15 +995,16 @@ class AneBSVD:
                 "reset() first")
         height, width = int(x.shape[1]), int(x.shape[2])
         self._ensure_runner(height, width)
+        out = self._join_pending()
         record = self._mirror.step(True)
         write = [0.0 if record.primes[i] else 1.0 for i in range(16)]
         padded = _pad_width_reflect(x.astype(mx.float16),
                                     self._padded_width)
         nchw = mx.contiguous(mx.transpose(padded, (0, 3, 1, 2)))
         mx.eval(nchw)
-        self._runner.step(memoryview(nchw).cast("B"), None,
-                          self._vector_bytes(write))
-        return self._materialize_out() if record.out_real else None
+        self._submit(memoryview(nchw).cast("B"), None,
+                     self._vector_bytes(write), record.out_real)
+        return out
 
 
 __all__ = ["AneBSVD", "BsvdRunner", "ByteCopyBsvdRunner", "build_runner",

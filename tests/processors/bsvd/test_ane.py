@@ -300,22 +300,31 @@ def ane_net(_module_cache):
 @pytest.mark.requires_weights
 class TestAneParity:
     def _drive_both(self, ane_net, length: int):
+        """Drive both nets; the ANE emissions lag the reference by exactly
+        one step (the in-flight dispatch), with identical content order."""
         reference = B.BSVD(B.default_weights_path("c64"), dtype=mx.float32)
         frames = _real_frames(length, ane_net.input_channels, 96, 128)
         ane_net.reset()
         reference.reset()
-        pairs = []
-        for frame in frames + [None] * 16:
+        ane_outs, ref_outs = [], []
+        for index, frame in enumerate(frames + [None] * 17):
             ane_out = ane_net.step(frame)
             ref_out = reference.step(
                 None if frame is None else frame.astype(mx.float32))
-            assert (ane_out is None) == (ref_out is None)
             if ane_out is not None:
-                delta = mx.abs(ane_out.astype(mx.float32) - ref_out)
-                mx.eval(delta)
-                pairs.append((float(delta.mean()), float(delta.max())))
+                ane_outs.append((index, ane_out))
+            if ref_out is not None:
+                ref_outs.append((index, ref_out))
         ane_net.reset()
-        assert len(pairs) == length
+        assert len(ane_outs) == len(ref_outs) == length
+        assert ([i for i, _ in ane_outs]
+                == [i + 1 for i, _ in ref_outs]), "one-step dispatch lag"
+        pairs = []
+        for (_, ane_out), (_, ref_out) in zip(ane_outs, ref_outs,
+                                              strict=True):
+            delta = mx.abs(ane_out.astype(mx.float32) - ref_out)
+            mx.eval(delta)
+            pairs.append((float(delta.mean()), float(delta.max())))
         return pairs
 
     def test_full_stream_matches_the_product_fp32_net(self, ane_net):
@@ -353,14 +362,17 @@ class TestAneParity:
             pytest.skip(f"BSVD ANE engine unavailable here: {exc}")
         assert net._padded_width == 384
         net.reset()
-        full, interior, band = [], [], []
-        for frame in frames + [None] * 16:
+        ane_outs, ref_outs = [], []
+        for frame in frames + [None] * 17:
             ane_out = net.step(frame)
             ref_out = reference.step(
                 None if frame is None else frame.astype(mx.float32))
-            assert (ane_out is None) == (ref_out is None)
-            if ane_out is None:
-                continue
+            if ane_out is not None:
+                ane_outs.append(ane_out)
+            if ref_out is not None:
+                ref_outs.append(ref_out)
+        full, interior, band = [], [], []
+        for ane_out, ref_out in zip(ane_outs, ref_outs, strict=True):
             assert ane_out.shape == ref_out.shape
             delta = mx.abs(ane_out.astype(mx.float32) - ref_out)
             mx.eval(delta)
