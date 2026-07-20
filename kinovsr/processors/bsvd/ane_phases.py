@@ -14,6 +14,7 @@ gate below requires that handoff to remain exact.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import shutil
@@ -398,6 +399,8 @@ class ScheduledPhaseSuite:
              for _ in range(PHASE_STEPS)]
             for index in range(6)
         ]
+        self._executor: ThreadPoolExecutor | None = None
+        self._future: Any | None = None
 
     def set_state(self, state: Any) -> None:
         for model in self.models.values():
@@ -437,25 +440,84 @@ class ScheduledPhaseSuite:
             self.runner._cursor[index] = (
                 self.runner._cursor[index] + PHASE_STEPS) % len(ring)
 
-    def run(self, frames: list[memoryview], zero_frame: memoryview,
+    def _submit(self, job: Callable[[], Any]) -> None:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="bsvd-ane-window")
+        self._future = self._executor.submit(job)
+
+    def _join(self) -> None:
+        future, self._future = self._future, None
+        if future is not None:
+            future.result()
+
+    def _drain(self) -> None:
+        """Absorb an orphaned in-flight job on the error path."""
+        future, self._future = self._future, None
+        if future is not None:
+            with contextlib.suppress(BaseException):
+                future.result()
+
+    def run(self, frames: list, zero_frame: memoryview,
             snapshot: Callable[[Any], Any]) -> list[Any]:
+        """Run one window; ``frames`` entries are input views or zero-arg
+        callables producing them (lazy host-side prep).
+
+        Dispatches execute on a one-slot worker while the caller's thread
+        preps the next inputs and materializes previous outputs, mirroring
+        the continuous path's pipelined dispatch: the host glue hides
+        under the ANE work and the ANE never idles mid-window. Jobs are
+        pure Core ML plus buffer blits; every MLX operation (prep,
+        snapshot) stays on the caller's thread.
+        """
         if len(frames) < 16:
             raise ValueError("phase specialization needs at least 16 frames")
+
+        def resolve(index: int):
+            entry = frames[index]
+            return entry() if callable(entry) else entry
+
         self.set_state(self.runner.model._state)
-        self.dispatch("fill", 0, frames[:8])
-        self.dispatch("fill", 8, frames[8:16])
-        outputs = []
-        for frame in frames[16:]:
-            outputs.append(snapshot(self.runner.step(frame)))
-        zeros = [zero_frame] * PHASE_STEPS
-        for start in (0, 8):
-            self.dispatch("drain", start, zeros)
-            model = self.models[("drain", start)]
-            outputs.extend(snapshot(model.output_array(f"out_{step}"))
+        try:
+            first = [resolve(index) for index in range(8)]
+            self._submit(lambda: self.dispatch("fill", 0, first))
+            second = [resolve(index) for index in range(8, 16)]
+            self._join()
+            self._submit(lambda: self.dispatch("fill", 8, second))
+            count = len(frames)
+            pending = resolve(16) if count > 16 else None
+            self._join()
+            outputs = []
+            for index in range(16, count):
+                view, pending = pending, None
+                self.runner.load_inputs(view)
+                self._submit(self.runner.dispatch)
+                if index + 1 < count:
+                    pending = resolve(index + 1)
+                self._join()
+                outputs.append(
+                    snapshot(self.runner.model.output_array("out")))
+            zeros = [zero_frame] * PHASE_STEPS
+            self._submit(lambda: self.dispatch("drain", 0, zeros))
+            self._join()
+            self._submit(lambda: self.dispatch("drain", 8, zeros))
+            drained = self.models[("drain", 0)]
+            outputs.extend(snapshot(drained.output_array(f"out_{step}"))
                            for step in range(PHASE_STEPS))
+            self._join()
+            drained = self.models[("drain", 8)]
+            outputs.extend(snapshot(drained.output_array(f"out_{step}"))
+                           for step in range(PHASE_STEPS))
+        except BaseException:
+            self._drain()
+            raise
         return outputs
 
     def close(self) -> None:
+        self._drain()
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
         self.models.clear()
         self._spares.clear()
 

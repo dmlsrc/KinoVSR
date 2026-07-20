@@ -1075,24 +1075,32 @@ class AneBSVD:
         first = frames[0]
         height, width = int(first.shape[1]), int(first.shape[2])
         self._ensure_scheduled_runner(height, width)
-
-        packed = []
         for frame in frames:
             if (int(frame.shape[1]), int(frame.shape[2])) != (height, width):
                 raise RuntimeError(
                     "BSVD ANE schedule window changed resolution")
-            padded = _pad_width_reflect(
-                frame.astype(mx.float16), self._padded_width)
-            nchw = mx.contiguous(mx.transpose(padded, (0, 3, 1, 2)))
-            mx.eval(nchw)
-            packed.append(memoryview(nchw).cast("B"))
+
+        def provider(frame: Any):
+            # Lazy host-side prep: the suite resolves each provider in the
+            # shadow of an in-flight dispatch, so the pad/transpose/eval
+            # work (MLX, this thread) overlaps the ANE instead of running
+            # serially before it.
+            def resolve():
+                padded = _pad_width_reflect(
+                    frame.astype(mx.float16), self._padded_width)
+                nchw = mx.contiguous(mx.transpose(padded, (0, 3, 1, 2)))
+                mx.eval(nchw)
+                return memoryview(nchw).cast("B")
+            return resolve
+
+        self._dirty = True
         outputs = self._phase_suite.run(
-            packed, memoryview(self._zero_frame), self._materialize_array)
+            [provider(frame) for frame in frames],
+            memoryview(self._zero_frame), self._materialize_array)
         if len(outputs) != len(frames):
             raise RuntimeError(
                 f"BSVD ANE phase path returned {len(outputs)} outputs for "
                 f"{len(frames)} frames")
-        self._dirty = True
         self._window_complete = True
         return outputs
 

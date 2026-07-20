@@ -544,6 +544,41 @@ class TestAneParity:
         assert max(band) < 8e-3, f"right band {max(band):.3e}"
         assert max(full) < 2e-3, f"full frame {max(full):.3e}"
 
+    @pytest.mark.usefixtures("_module_cache")
+    def test_scheduled_window_matches_the_product(self):
+        """The phase-specialized window path (fill/drain functions + the
+        pipelined steady middle) must reproduce the product's reset-window
+        semantics: reset, N frames, 16 drains. Emissions are compared in
+        order against the fp32 reference; 21 frames exercises the steady
+        middle across a non-multiple-of-eight window."""
+        weights = B.default_weights_path("c64")
+        if not weights.is_file():
+            pytest.skip(f"bsvd weights not available at {weights}")
+        net = A.AneBSVD(weights, dtype=mx.float16)
+        frames = _real_frames(21, net.input_channels, 96, 128)
+        try:
+            outputs = net.run_window(frames)
+        except Exception as exc:  # noqa: BLE001 - environment, not correctness
+            net.close()
+            pytest.skip(f"BSVD ANE phase suite unavailable here: {exc}")
+        reference = B.BSVD(weights, dtype=mx.float32)
+        reference.reset()
+        expected = []
+        for frame in frames + [None] * 16:
+            out = reference.step(
+                None if frame is None else frame.astype(mx.float32))
+            if out is not None:
+                expected.append(out)
+        assert len(outputs) == len(expected) == 21
+        means = []
+        for got, want in zip(outputs, expected, strict=True):
+            assert got.shape == want.shape
+            delta = mx.abs(got.astype(mx.float32) - want)
+            mx.eval(delta)
+            means.append(float(delta.mean()))
+        net.close()
+        assert max(means) < 8e-4, f"worst frame {max(means):.3e}"
+
     def test_denoiser_backend_parity(self, ane_net):
         ane = B.BsvdDenoiser(strength=0.4, backend="ane")
         mlx_ref = B.BsvdDenoiser(strength=0.4, backend="mlx")
