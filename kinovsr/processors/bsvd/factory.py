@@ -42,6 +42,7 @@ from kinovsr.settings import Settings
 
 _PROFILES = ("c64", "c32")
 _DTYPES = {"float16", "float32"}
+_BACKENDS = {"mlx", "ane"}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -50,6 +51,7 @@ class BsvdStageConfig:
     variant: str
     strength: float
     dtype: str
+    backend: str
     luma_strength: float
     chroma_strength: float
     noise_map: NoiseMapConfig
@@ -84,14 +86,18 @@ class BsvdFactory:
         settings: Settings,
     ) -> BsvdStageConfig:
         reject_unknown_keys(
-            raw, ("weights", "strength", "dtype", *LUMA_CHROMA_KEYS,
-                  *NOISE_MAP_KEYS))
+            raw, ("weights", "strength", "dtype", "backend",
+                  *LUMA_CHROMA_KEYS, *NOISE_MAP_KEYS))
         strength = typed_value(raw, "strength", float, 0.5)
         if not 0.0 <= strength <= 1.0:
             raise ValueError("strength must be in [0, 1]")
         dtype = typed_value(raw, "dtype", str, "float16")
         if dtype not in _DTYPES:
             raise ValueError(f"dtype must be one of {sorted(_DTYPES)}")
+        backend = (typed_value(raw, "backend", str)
+                   or settings.bsvd_backend or "mlx")
+        if backend not in _BACKENDS:
+            raise ValueError(f"backend must be one of {sorted(_BACKENDS)}")
         luma_strength, chroma_strength = parse_luma_chroma(raw)
         return BsvdStageConfig(
             weights_path=typed_value(raw, "weights", str)
@@ -99,6 +105,7 @@ class BsvdFactory:
             variant=profile or "c64",
             strength=strength,
             dtype=dtype,
+            backend=backend,
             luma_strength=luma_strength,
             chroma_strength=chroma_strength,
             noise_map=parse_noise_map(raw),
@@ -117,7 +124,8 @@ class BsvdFactory:
                 config.weights_path, variant=config.variant,
                 strength=config.strength, dtype=dtype,
                 noise_map=tracker, map_refresh=config.noise_map.refresh,
-                pulse=pulse, map_floor=config.noise_map.floor)
+                pulse=pulse, map_floor=config.noise_map.floor,
+                backend=config.backend)
 
         return FeedFlushProcessor(
             make_driver,

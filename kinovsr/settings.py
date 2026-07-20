@@ -147,6 +147,14 @@ class Settings:
     spynet_backend: str = field(
         default="auto", metadata={"env": "{{SPYNET_BACKEND}}"})
 
+    # Which BSVD implementation runs: "mlx" (the reference GPU path,
+    # default - it is the faster standalone) or "ane" (one Core ML dispatch
+    # per step on the Neural Engine; explicitly opt-in, fails loudly when
+    # unavailable). The ANE path pays off in chains where other stages need
+    # the GPU it vacates.
+    bsvd_backend: str = field(
+        default="mlx", metadata={"env": "{{BSVD_BACKEND}}"})
+
     # ---- Legacy per-family weight overrides ---------------------------------
     #
     # Variant token or filesystem path; ``None`` means "use the family

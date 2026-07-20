@@ -32,19 +32,23 @@ call to that level. Every consumer of a backing is evaluated within the same
 :meth:`AneSpyNet.flow` call, and the returned array is freshly materialized,
 so no lazy graph referencing a backing survives the call.
 
-One model set is built per padded geometry and cached on disk (about 1.3 s to
-convert, then loaded from the compiled form). Fixed shapes are a deliberate
-choice, not a CoreML limitation - flexible inputs also stay entirely on the
-Neural Engine. ``EnumeratedShapes`` matches a fixed model at each listed size
-but rejects everything else; a wide ``RangeDim`` loaded with the
-``reshapeFrequency = Infrequent`` optimization hint accepts any size and runs
-within 4-27 percent of a size-specific model, which would trade one build ever
-for a permanent per-frame tax. Since a run holds one geometry for thousands of
-frames, the per-geometry build wins here - see planning doc 20 for the
-measurements and when the flexible arrangement would be preferable.
-Conversion needs ``coremltools``; inference does not. Anything unavailable or
-unsupported returns ``None`` from :func:`engine_for` and the caller stays on
-the pure-MLX path.
+One model set is built per padded geometry and cached on disk (well under a
+second to serialize, then loaded from the compiled form). Fixed shapes are a
+deliberate choice, not a CoreML limitation - flexible inputs also stay
+entirely on the Neural Engine. ``EnumeratedShapes`` matches a fixed model at
+each listed size but rejects everything else; a wide ``RangeDim`` loaded with
+the ``reshapeFrequency = Infrequent`` optimization hint accepts any size and
+runs within 4-27 percent of a size-specific model, which would trade one
+build ever for a permanent per-frame tax. Since a run holds one geometry for
+thousands of frames, the per-geometry build wins here.
+
+Conversion is first-party: each level's graph serializes through
+:mod:`kinovsr.native.anemil` (protobuf against the vendored Core ML schema),
+so neither conversion nor inference needs coremltools, numpy, or torch. The
+emission was verified bit-exact against packages produced by the previous
+coremltools-based converter, and existing cached models remain valid.
+Anything unavailable or unsupported returns ``None`` from :func:`engine_for`
+and the caller stays on the pure-MLX path.
 """
 
 from __future__ import annotations
@@ -108,53 +112,51 @@ def cache_root() -> Path:
 
 # ---------------------------------------------------------------- conversion
 
-def _build_level_program(params: dict, lvl: int, levels: int,
-                         h: int, w: int):
-    """One level's basic module. Every level but the last also folds in the
-    flow accumulate and the 2x upsample the next level needs, so those run on
-    the ANE instead of costing an extra MLX round trip."""
-    import numpy as np  # dev/conversion path only, never on the flow path
-    from coremltools.converters.mil import Builder as mb
-    from coremltools.converters.mil.mil import types
-    import coremltools as ct
+def _emit_level(params: dict, lvl: int, levels: int, h: int, w: int):
+    """One level's basic module, serialized first-party through anemil.
 
+    Every level but the last also folds in the flow accumulate and the 2x
+    upsample the next level needs, so those run on the ANE instead of
+    costing an extra MLX round trip. The emitted graph mirrors the prior
+    coremltools conversion op for op (conv/relu chain, carried-flow slice,
+    add, upsample_bilinear with align_corners, fp16 scalar mul) and was
+    verified bit-exact against packages built by that converter.
+    """
+    from kinovsr.native.anemil import builder
+
+    g = builder.Graph()
+    g.register_input("x", (1, 8, h, w))
     base = f"spynet.basic_module.{lvl}.basic_module"
-    weights, biases = [], []
+
+    t = "x"
     for j in range(5):
-        wt = np.asarray(params[f"{base}.{j}.conv.weight"].astype(mx.float32))
-        weights.append(wt.transpose(0, 3, 1, 2).astype(np.float16))
-        biases.append(np.asarray(
-            params[f"{base}.{j}.conv.bias"].astype(mx.float32)
-        ).astype(np.float16))
-    is_last = lvl == levels - 1
+        # Repo weights are MLX OHWI (O, kH, kW, I); MIL conv wants OIHW.
+        weight = mx.contiguous(mx.transpose(
+            params[f"{base}.{j}.conv.weight"].astype(mx.float32),
+            (0, 3, 1, 2)))
+        bias = params[f"{base}.{j}.conv.bias"].astype(mx.float32)
+        t = g.conv2d(t, weight, bias, tag=f"c{j}", pad=3)
+        if j < 4:
+            t = g.relu(t, g.n(f"r{j}"))
 
-    @mb.program(input_specs=[mb.TensorSpec(shape=(1, 8, h, w),
-                                           dtype=types.fp16)],
-                opset_version=ct.target.iOS18)
-    def program(x):
-        t = x
-        for j in range(5):
-            t = mb.conv(x=t, weight=weights[j], bias=biases[j],
-                        strides=[1, 1], pad_type="custom", pad=[3, 3, 3, 3],
-                        name=f"c{j}")
-            if j < 4:
-                t = mb.relu(x=t, name=f"r{j}")
-        if is_last:
-            return t
-        carried = mb.slice_by_index(x=x, begin=[0, 6, 0, 0], end=[1, 8, h, w],
-                                    name="carried")
-        flow = mb.add(x=t, y=carried, name="accumulate")
-        up = mb.upsample_bilinear(x=flow, scale_factor_height=2,
-                                  scale_factor_width=2, align_corners=True,
-                                  name="upsample")
-        return mb.mul(x=up, y=np.float16(2.0), name="scale")
+    if lvl == levels - 1:
+        output = t
+    else:
+        carried = g.slice_channels("x", 6, 2, "carried")
+        flow = g.binary("add", t, carried, "accumulate")
+        up = g.upsample_bilinear2x(flow, "upsample")
+        two = g.fp16_const(g.n("scale_y"), mx.array(2.0, dtype=mx.float16))
+        output = g.binary("mul", up, two, "scale")
 
-    return program
+    model_bytes = g.finish(
+        inputs=[("x", (1, 8, h, w))], states=[], output_names=[output],
+        short_description=f"KinoVSR SpyNet ANE level {lvl}")
+    return model_bytes, g.blob
 
 
 def _convert_models(params: dict, levels: int, h_up: int, w_up: int,
                     directory: Path) -> None:
-    import coremltools as ct
+    from kinovsr.native.anemil import builder
 
     directory.mkdir(parents=True, exist_ok=True)
     for lvl in range(levels):
@@ -163,18 +165,14 @@ def _convert_models(params: dict, levels: int, h_up: int, w_up: int,
             continue
         h = h_up >> (levels - 1 - lvl)
         w = w_up >> (levels - 1 - lvl)
-        model = ct.convert(
-            _build_level_program(params, lvl, levels, h, w),
-            convert_to="mlprogram",
-            minimum_deployment_target=ct.target.iOS18,
-            compute_units=ct.ComputeUnit.CPU_AND_NE,
-        )
+        model_bytes, blob = _emit_level(params, lvl, levels, h, w)
         # Write beside the target and rename, so a crashed or concurrent
         # conversion cannot leave a half-written package in the cache. The
-        # staging name keeps the .mlpackage suffix that the writer requires.
+        # staging name keeps the .mlpackage suffix for tooling that keys
+        # on the extension.
         staging = directory / f"level{lvl}.partial.mlpackage"
         shutil.rmtree(staging, ignore_errors=True)
-        model.save(str(staging))
+        builder.write_package(staging, model_bytes, blob)
         staging.replace(package)
 
 
@@ -442,17 +440,17 @@ def engine_for(params: dict, shape: tuple) -> AneSpyNet | None:
         return engine
     directory = cache_root() / "spynet-ane" / f"{key[0]}-{w_up}x{h_up}"
     packages = [directory / f"level{i}.mlpackage" for i in range(levels)]
-    # Import coremltools ONLY when something actually has to be converted: it
-    # pulls in its torch integration and costs over a second, which would be
-    # charged to every warm start for no reason.
+    # Load the vendored Core ML schema ONLY when something actually has to
+    # be converted, so a warm start never imports protobuf.
     needs_conversion = not all(p.exists() for p in packages)
     if needs_conversion:
         try:
-            import coremltools  # noqa: F401
-        except ImportError as exc:
+            from kinovsr.native.anemil import schema
+            schema.Model  # noqa: B018 - forces the vendored schema to load
+        except Exception as exc:  # noqa: BLE001 - any failure falls back
             _UNAVAILABLE = (
-                f"coremltools is needed once per geometry to build the ANE "
-                f"models ({exc})")
+                f"the Core ML schema needed to build the ANE models is "
+                f"unavailable ({type(exc).__name__}: {exc})")
             return None
     try:
         if needs_conversion:

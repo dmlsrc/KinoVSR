@@ -31,6 +31,9 @@ classifiers = [
 ]
 dependencies = [
     "mlx>=0.32.0",
+    # Serializes first-party Core ML model conversions (kinovsr.native.anemil);
+    # abi3 wheels, imported lazily and only when a conversion actually runs.
+    "protobuf>=4.25",
     "rich>=15.0",
     "pyobjc-core>=12.2",
     "pyobjc-framework-AVFoundation>=12.2",

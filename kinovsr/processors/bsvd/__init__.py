@@ -391,14 +391,24 @@ class BsvdDenoiser:
         map_refresh: int = 64,
         pulse: Any | None = None,
         map_floor: float = 0.0,
+        backend: str = "mlx",
     ):
+        if backend not in ("mlx", "ane"):
+            raise ValueError(f"unknown BSVD backend {backend!r}; expected 'mlx' or 'ane'")
         wp = Path(weights_path) if weights_path else default_weights_path(variant)
         if not wp.is_file():
             raise FileNotFoundError(
                 f"BSVD weights not found at {wp}. They are not bundled; convert the "
                 "source .pth with kinovsr weights convert or pass --bsvd-weights."
             )
-        self.net = BSVD(wp, dtype=dtype)
+        if backend == "ane":
+            # Explicitly requested; construction and first-step failures
+            # raise rather than silently running a different backend.
+            from .ane import AneBSVD
+
+            self.net: Any = AneBSVD(wp, dtype=dtype)
+        else:
+            self.net = BSVD(wp, dtype=dtype)
         self.sigma = _strength_to_sigma(strength)
         # optional NoiseMapTracker: replaces the constant sigma plane with a
         # per-pixel estimate (sigma units, same scale as the constant).
