@@ -13,7 +13,10 @@ Why the split: the ANE runs this conv workload about 1.8x faster than the GPU
 `resample`/`gather` have no ANE lowering at any layer of the stack, verified
 against the private compiler, so the warps must live elsewhere regardless.
 Keeping them in MLX also leaves the GPU mostly idle during flow, which is what
-makes this composable with the learned stages that need it.
+makes this composable with the learned stages that need it. That refusal is
+re-checkable in seconds after an OS or silicon change with
+``scripts/dev/probe_warp_ane.py``; if a lowering ever appears, revisit the
+split then.
 
 Two invariants that carry the performance, both easy to lose in a refactor:
 

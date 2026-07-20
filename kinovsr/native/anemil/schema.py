@@ -2,8 +2,9 @@
 
 Loads `coreml_spec.fds` (a FileDescriptorSet captured once from Apple's
 public Core ML .proto files; capture provenance and hashes are recorded in
-`coreml_spec.provenance.json`) into a DescriptorPool and materializes
-message classes with message_factory. This deliberately avoids
+`coreml_spec.provenance.json`, and `scripts/dev/make_coreml_fds.py`
+regenerates both) into a DescriptorPool and materializes message classes
+with message_factory. This deliberately avoids
 protoc-generated _pb2 modules: generated code is version-coupled to the
 protobuf runtime (the 4->5->6 major transitions repeatedly broke pinned
 gencode), while a descriptor set is plain data and the dynamic API is the
