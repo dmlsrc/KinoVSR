@@ -104,15 +104,24 @@ def _out_kernel(x: Any, w0: Any, b0: Any, w1: Any, b1: Any) -> Any:
     return mx.conv2d(x, w1, stride=1, padding=1) + b1
 
 
-_cv_relu6_s1_compiled = mx.compile(_cv_relu6_s1_kernel)
-_inc_compiled = mx.compile(_inc_kernel)
-_out_compiled = mx.compile(_out_kernel)
+# Compiled lazily on first use, NOT at import: a module-level mx.compile
+# initializes Metal as an import side effect, and a native fault there
+# (seen once under memory pressure) aborts the whole process during test
+# collection before any test runs. These kernels take weights as
+# arguments, so one compiled trace per kernel serves every checkpoint.
+_KERNEL_COMPILE_CACHE: dict = {}
+
+
+def _kernel(name: str, make: Any) -> Any:
+    from kinovsr.modeling.compile_cache import cached
+
+    return cached(_KERNEL_COMPILE_CACHE, name, lambda: mx.compile(make))
 
 
 def _cv_relu6_s1(x: Any, conv: tuple[Any, Any, int]) -> Any:
     weight, bias, stride = conv
     if stride == 1 and bias is not None:
-        return _cv_relu6_s1_compiled(x, weight, bias)
+        return _kernel("cv_relu6_s1", _cv_relu6_s1_kernel)(x, weight, bias)
     return _relu6(_cv(x, conv))
 
 
@@ -267,7 +276,7 @@ class _DenBlock:
         if _two_conv_ready(self.p["inc0"], self.p["inc3"]):
             w0, b0, _ = self.p["inc0"]
             w1, b1, _ = self.p["inc3"]
-            return _inc_compiled(x, w0, b0, w1, b1)
+            return _kernel("inc", _inc_kernel)(x, w0, b0, w1, b1)
         return _relu6(_cv(_relu6(_cv(x, self.p["inc0"])), self.p["inc3"]))
 
     def _down(self, x: Any | None, conv0: tuple[Any, Any, int], mem: _MemCvBlock) -> Any | None:
@@ -287,7 +296,7 @@ class _DenBlock:
         if _two_conv_ready(self.p["out0"], self.p["out3"]):
             w0, b0, _ = self.p["out0"]
             w1, b1, _ = self.p["out3"]
-            return _out_compiled(x, w0, b0, w1, b1)
+            return _kernel("out", _out_kernel)(x, w0, b0, w1, b1)
         return _cv(_relu6(_cv(x, self.p["out0"])), self.p["out3"])
 
     def __call__(self, x: Any | None) -> Any | None:

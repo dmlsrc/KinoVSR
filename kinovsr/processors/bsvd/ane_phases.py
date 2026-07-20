@@ -15,7 +15,9 @@ gate below requires that handoff to remain exact.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -26,6 +28,8 @@ import mlx.core as mx
 from kinovsr.native.anemil import builder, runtime
 
 from . import ane as base
+
+_log = logging.getLogger("kinovsr.bsvd_ane")
 
 PHASE_STEPS = 8
 PHASE_GRAPH_VERSION = 4
@@ -556,10 +560,16 @@ def _verify_canary_load(suite: ScheduledPhaseSuite, directory: Path,
 def _verify_build(suite: ScheduledPhaseSuite, compiled: Path,
                   directory: Path, input_channels: int,
                   height: int, width: int) -> None:
-    placements = {
-        name: runtime.assert_all_ane(compiled, function_name=name)
-        for name in ("main", *_FUNCTIONS.values(), _CANARY_NAME)
-    }
+    # Placement is gated on the DEFAULT function only. Loading a NAMED
+    # function's MLComputePlan re-runs its own E5RT specialization (~4 s
+    # per function on the serial compiler service, not shared with the
+    # model loads - measured 2026-07-20: six named plans cost 24.3 s,
+    # HALF the cold build, against 0.6 s for the default plan). The phase
+    # functions are gated by something strictly stronger below: the EXACT
+    # replay requires each of them to match this plan-gated main function
+    # bit for bit, a realized-execution oracle no CPU-placed MLState graph
+    # can satisfy, and the canary keeps its CPU-divergence check.
+    placements = {"main": runtime.assert_all_ane(compiled)}
     frames = base._replay_frames(
         input_channels, height, width, PHASE_REPLAY_FRAMES)
     suite.runner.reset()
@@ -605,17 +615,35 @@ def _verify_build(suite: ScheduledPhaseSuite, compiled: Path,
 def build_suite(params: dict, input_channels: int, height: int, width: int,
                 directory: Path) -> ScheduledPhaseSuite:
     """Build/load, place, replay-gate, and return the scheduled phase suite."""
-    package = _convert(params, input_channels, height, width, directory)
-    compiled = runtime.compile_package(package)
-    suite = ScheduledPhaseSuite(compiled)
     verify = directory / f"scheduled8-v{PHASE_GRAPH_VERSION}-verify.json"
     replay = directory / f"scheduled8-v{PHASE_GRAPH_VERSION}-replay.safetensors"
     canary = directory / f"scheduled8-v{PHASE_GRAPH_VERSION}-canary.safetensors"
+    cold = not (verify.is_file() and replay.is_file() and canary.is_file())
+    if cold:
+        # The dominant cold cost is ANE specialization of the six
+        # functions on the serial compiler service; without progress
+        # lines the build reads as hung.
+        _log.info("building BSVD ANE scheduled phases for %dx%d (one-time "
+                  "per geometry, cached under %s)", width, height, directory)
+    start = time.perf_counter()
+    package = _convert(params, input_channels, height, width, directory)
+    compiled = runtime.compile_package(package)
+    if cold:
+        _log.info("scheduled phases emitted and compiled in %.1fs; "
+                  "specializing %d functions for the ANE (the slow part)",
+                  time.perf_counter() - start, len(_FUNCTIONS) + 2)
+    loaded = time.perf_counter()
+    suite = ScheduledPhaseSuite(compiled)
     key = str(package)
-    if not verify.is_file() or not replay.is_file() or not canary.is_file():
+    if cold:
+        _log.info("scheduled phase functions loaded in %.1fs; verifying",
+                  time.perf_counter() - loaded)
+        gate = time.perf_counter()
         _verify_build(
             suite, compiled, directory, input_channels, height, width)
         _VERIFIED.add(key)
+        _log.info("scheduled phases verified in %.1fs (total %.1fs)",
+                  time.perf_counter() - gate, time.perf_counter() - start)
     elif key not in _VERIFIED:
         _verify_canary_load(
             suite, directory, input_channels, height, width)
