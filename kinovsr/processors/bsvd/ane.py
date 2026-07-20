@@ -64,7 +64,6 @@ import hashlib
 import json
 import logging
 import shutil
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -886,18 +885,20 @@ class AneBSVD:
         self._tail: list[dict] | None = None
         self._tail_cursor = 0
         self._window_complete = False
-        self._worker: threading.Thread | None = None
-        self._go = threading.Event()
-        self._done = threading.Event()
-        self._stop = False
+        self._pipeline = runtime.DispatchPipeline("bsvd-ane-dispatch")
+        self._preheat: Any = None
+        self._preheat_pool: Any = None
         self._closed = False
         self._dirty = False
         self._pending: dict | None = None
-        self._worker_error: BaseException | None = None
 
     def reset(self) -> None:
         self._require_open()
         self._join_pending(discard=True)
+        if self._phase_suite is not None:
+            # A window machine abandoned mid-flight leaves its dispatch on
+            # the suite pipeline; settle it before touching shared state.
+            self._phase_suite.pipeline.drain()
         if self._runner is not None and self._dirty:
             self._runner.reset()
             if self._phase_suite is not None:
@@ -912,10 +913,10 @@ class AneBSVD:
         """Release the dispatch worker and the runner's large state buffers.
 
         The pipeline owns this object through an explicit lifecycle, so do
-        not rely on a destructor: the worker's bound method retains ``self``
-        (and therefore the Core ML state plus skip rings) until it is told to
-        exit.  Cleanup remains complete even when an in-flight prediction
-        failed; that error is re-raised after the worker has stopped.
+        not rely on a destructor: the dispatch worker retains ``self`` (and
+        therefore the Core ML state plus skip rings) until it shuts down.
+        Cleanup remains complete even when an in-flight prediction failed;
+        that error is re-raised after the worker has stopped.
         """
         if self._closed:
             return
@@ -923,15 +924,14 @@ class AneBSVD:
         try:
             self._join_pending(discard=True)
         finally:
-            self._stop = True
-            self._go.set()
-            worker = self._worker
-            if worker is not None and worker is not threading.current_thread():
-                worker.join()
+            import contextlib
+
+            with contextlib.suppress(BaseException):
+                self._join_preheat()
+            self._pipeline.close()
             if self._phase_suite is not None:
                 self._phase_suite.close()
             self._phase_suite = None
-            self._worker = None
             self._runner = None
             self.params = {}
             self._geometry = None
@@ -963,26 +963,13 @@ class AneBSVD:
         self._width = width
         self._padded_width = padded
 
-    def _ensure_worker(self) -> None:
-        if self._worker is not None:
-            return
-        self._worker = threading.Thread(
-            target=self._worker_loop, name="bsvd-ane-dispatch", daemon=True)
-        self._worker.start()
+    def _build_continuous(self, height: int) -> None:
+        self._runner, self._directory = build_runner(
+            self.params, self.input_channels, height, self._padded_width)
+        self._zero_frame = bytes(
+            len(self._runner.model.input_view("frame")))
 
-    def _ensure_runner(self, height: int, width: int) -> None:
-        self._configure_geometry(height, width)
-        if self._runner is None:
-            self._runner, self._directory = build_runner(
-                self.params, self.input_channels, height, self._padded_width)
-            self._zero_frame = bytes(
-                len(self._runner.model.input_view("frame")))
-        self._ensure_worker()
-
-    def _ensure_scheduled_runner(self, height: int, width: int) -> None:
-        self._configure_geometry(height, width)
-        if self._phase_suite is not None:
-            return
+    def _build_scheduled(self, height: int) -> None:
         from .ane_phases import build_suite
 
         self._directory = _cache_directory(
@@ -994,27 +981,74 @@ class AneBSVD:
         self._zero_frame = bytes(
             len(self._runner.model.input_view("frame")))
 
-    # ------------------------------------------------ dispatch pipelining
+    def _join_preheat(self) -> None:
+        future, self._preheat = self._preheat, None
+        pool, self._preheat_pool = self._preheat_pool, None
+        if future is not None:
+            future.result()   # surfaces a preheat failure at first use
+        if pool is not None:
+            pool.shutdown(wait=False)
 
-    def _worker_loop(self) -> None:
-        while True:
-            self._go.wait()
-            self._go.clear()
-            if self._stop:
-                return
-            try:
-                self._runner.dispatch()
-            except BaseException as exc:  # noqa: BLE001 - carried to caller
-                self._worker_error = exc
-            self._done.set()
+    def preheat(self, height: int, width: int,
+                scheduled: bool = False) -> None:
+        """Start loading the engine in the background - warm caches only.
+
+        Called at the pipeline's prepare edge, before the first frame:
+        the multi-second Core ML function loads then overlap the source's
+        startup and the first window's decode instead of serializing at
+        the first dispatch. Cold builds stay on the first-use thread,
+        where their float64 fold audit, verification drives, and progress
+        logging belong; a cold cache makes this a no-op.
+        """
+        if self._closed or self._preheat is not None:
+            return
+        if self._runner is not None or self._phase_suite is not None:
+            return
+        try:
+            self._configure_geometry(height, width)
+        except RuntimeError:
+            return   # first real use raises the descriptive error
+        directory = _cache_directory(self.params, height, self._padded_width)
+        if scheduled:
+            from .ane_phases import PHASE_GRAPH_VERSION
+
+            stem = f"scheduled8-v{PHASE_GRAPH_VERSION}"
+            warm = all((directory / name).exists() for name in (
+                f"{stem}.mlpackage", f"{stem}-verify.json",
+                f"{stem}-replay.safetensors", f"{stem}-canary.safetensors"))
+            target = self._build_scheduled
+        else:
+            warm = all((directory / name).exists() for name in (
+                "model.mlpackage", "verify.json", "replay.safetensors"))
+            target = self._build_continuous
+        if not warm:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._preheat_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="bsvd-ane-preheat")
+        self._preheat = self._preheat_pool.submit(target, height)
+
+    def _ensure_runner(self, height: int, width: int) -> None:
+        self._configure_geometry(height, width)
+        self._join_preheat()
+        if self._runner is None:
+            self._build_continuous(height)
+
+    def _ensure_scheduled_runner(self, height: int, width: int) -> None:
+        self._configure_geometry(height, width)
+        self._join_preheat()
+        if self._phase_suite is None:
+            self._build_scheduled(height)
+
+    # ------------------------------------------------ dispatch pipelining
 
     def _submit(self, frame_bytes, gate_bytes, write_bytes, emit: bool,
                 pushes: list | None = None) -> None:
         self._runner.load_inputs(frame_bytes, gate_bytes, write_bytes)
         self._pending = {"emit": emit, "pushes": pushes}
         self._dirty = True
-        self._done.clear()
-        self._go.set()
+        self._pipeline.submit(self._runner.dispatch)
 
     def _join_pending(self, discard: bool = False):
         """Wait out the in-flight dispatch; return its emitted output.
@@ -1022,14 +1056,12 @@ class AneBSVD:
         Push gating and output materialization happen here, on the
         caller's thread, strictly before the next submit reloads the
         input buffers and the next dispatch rewrites the out backing.
+        A failed dispatch re-raises here even when discarding.
         """
         if self._pending is None:
             return None
-        self._done.wait()
         pending, self._pending = self._pending, None
-        if self._worker_error is not None:
-            error, self._worker_error = self._worker_error, None
-            raise error
+        self._pipeline.join()
         if discard:
             return None
         if pending["pushes"] is not None:
@@ -1057,15 +1089,22 @@ class AneBSVD:
         return self._materialize_array(
             self._runner.model.output_array("out"))
 
-    def run_window(self, frames: list[Any]) -> list[Any]:
-        """Run one independently reset window through phase-specialized ANE.
+    def begin_window(self, frames: list[Any]):
+        """Start one independently reset window; return its async handle.
 
-        Schedule windows are already fully buffered by ``BsvdDenoiser``.
-        Unrolling their fixed 16-step fill and drain removes convolutions
-        whose product value is ``None`` and halves the number of dispatches;
-        the steady middle still uses the verified one-step runner.  The
-        returned list is in input-frame order and has exactly ``len(frames)``
-        entries.
+        The handle implements the shared async window protocol (see
+        ``kinovsr.processors.feed_driver.WindowWavefront``): call
+        ``advance(block=False)`` opportunistically to make progress in the
+        shadow of other work, ``advance(block=True)`` to complete, then
+        read ``outputs`` (input-frame order, ``len(frames)`` entries).
+        Every MLX operation runs inside ``advance`` on the caller's
+        thread; only the Core ML dispatches run on the suite's worker.
+        The stream is dirty from this point - ``reset()`` before the next
+        window.
+
+        Unrolled fill/drain functions remove the convolutions whose
+        product value is ``None`` and batch those dispatches eight steps
+        at a time; the steady middle uses the verified one-step runner.
         """
         self._require_open()
         if len(frames) < 16:
@@ -1081,10 +1120,9 @@ class AneBSVD:
                     "BSVD ANE schedule window changed resolution")
 
         def provider(frame: Any):
-            # Lazy host-side prep: the suite resolves each provider in the
-            # shadow of an in-flight dispatch, so the pad/transpose/eval
-            # work (MLX, this thread) overlaps the ANE instead of running
-            # serially before it.
+            # Lazy host-side prep: resolved in the shadow of an in-flight
+            # dispatch, so the pad/transpose/eval work (MLX, caller's
+            # thread) overlaps the ANE instead of running serially first.
             def resolve():
                 padded = _pad_width_reflect(
                     frame.astype(mx.float16), self._padded_width)
@@ -1094,15 +1132,20 @@ class AneBSVD:
             return resolve
 
         self._dirty = True
-        outputs = self._phase_suite.run(
+        self._window_complete = True
+        return self._phase_suite.machine(
             [provider(frame) for frame in frames],
             memoryview(self._zero_frame), self._materialize_array)
-        if len(outputs) != len(frames):
+
+    def run_window(self, frames: list[Any]) -> list[Any]:
+        """Run one reset window to completion (the synchronous form)."""
+        handle = self.begin_window(frames)
+        handle.advance(block=True)
+        if len(handle.outputs) != len(frames):
             raise RuntimeError(
-                f"BSVD ANE phase path returned {len(outputs)} outputs for "
-                f"{len(frames)} frames")
-        self._window_complete = True
-        return outputs
+                f"BSVD ANE phase path returned {len(handle.outputs)} "
+                f"outputs for {len(frames)} frames")
+        return handle.outputs
 
     def _assemble_tail(self) -> list[dict]:
         """Mirror the product's 16 drain steps and derive the schedule.
@@ -1136,8 +1179,6 @@ class AneBSVD:
         if self._window_complete:
             raise RuntimeError(
                 "BSVD ANE schedule window is complete; reset() first")
-        if self._runner is not None:
-            self._ensure_worker()
         if x is None:
             if self._runner is None:
                 return None            # drained before any input frame

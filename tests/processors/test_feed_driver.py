@@ -241,3 +241,133 @@ class TestRunDiagnostics:
     def test_unprepared_processor_reports_nothing(self):
         assert FeedFlushProcessor(lambda: self._Reporting(0)
                                   ).run_diagnostics() == []
+
+
+class _ScriptedHandle:
+    """An async window handle needing `advances_needed` non-blocking pokes,
+    or one blocking call, to complete."""
+
+    def __init__(self, outputs, advances_needed=0):
+        self.outputs = outputs
+        self._remaining = advances_needed
+        self.error = None
+        self.blocking_calls = 0
+        self.nonblocking_calls = 0
+        self.done = False
+
+    def advance(self, block=False):
+        if self.error is not None:
+            raise self.error
+        if block:
+            self.blocking_calls += 1
+            self.done = True
+            return True
+        self.nonblocking_calls += 1
+        if self._remaining > 0:
+            self._remaining -= 1
+            return False
+        self.done = True
+        return True
+
+
+class TestWindowWavefront:
+    """Depth-one cross-window pipelining: the shared async window protocol
+    any accelerator-backed family implements via ``begin_window``."""
+
+    def test_submit_completes_the_previous_window_first(self):
+        from kinovsr.processors.feed_driver import WindowWavefront
+
+        wavefront = WindowWavefront()
+        first = _ScriptedHandle(["w1"])
+        order = []
+
+        out = wavefront.submit(lambda: first,
+                               lambda h: order.append(1) or ["e1"])
+        assert out == []                       # nothing was in flight
+        assert wavefront.in_flight
+        assert first.nonblocking_calls == 1    # kicked, never blocked on
+
+        second = _ScriptedHandle(["w2"])
+        out = wavefront.submit(lambda: second,
+                               lambda h: order.append(2) or ["e2"])
+        assert out == ["e1"]                   # depth-one backpressure
+        assert first.blocking_calls == 1
+        assert order == [1]
+
+        assert wavefront.barrier() == ["e2"]
+        assert order == [1, 2]
+        assert not wavefront.in_flight
+        assert wavefront.barrier() == []       # idempotent when empty
+
+    def test_poll_advances_without_blocking(self):
+        from kinovsr.processors.feed_driver import WindowWavefront
+
+        wavefront = WindowWavefront()
+        handle = _ScriptedHandle(["w"], advances_needed=3)
+        wavefront.submit(lambda: handle, lambda h: list(h.outputs))
+        for _ in range(5):
+            wavefront.poll()
+        assert handle.blocking_calls == 0
+        assert handle.done                     # polls alone completed it
+        assert wavefront.barrier() == ["w"]
+
+    def test_finalize_receives_the_completed_handle(self):
+        from kinovsr.processors.feed_driver import WindowWavefront
+
+        wavefront = WindowWavefront()
+        handle = _ScriptedHandle(["a", "b"])
+        wavefront.submit(lambda: handle,
+                         lambda h: [value.upper() for value in h.outputs])
+        assert wavefront.barrier() == ["A", "B"]
+
+    def test_submit_propagates_the_previous_window_error(self):
+        from kinovsr.processors.feed_driver import WindowWavefront
+
+        wavefront = WindowWavefront()
+        failing = _ScriptedHandle([])
+        wavefront.submit(lambda: failing, lambda h: [])
+        failing.error = ValueError("window failed")
+        with pytest.raises(ValueError, match="window failed"):
+            wavefront.submit(lambda: _ScriptedHandle([]), lambda h: [])
+        assert not wavefront.in_flight         # failed window was consumed
+
+    def test_abandon_suppresses_the_window_error(self):
+        from kinovsr.processors.feed_driver import WindowWavefront
+
+        wavefront = WindowWavefront()
+        handle = _ScriptedHandle(["w"])
+        wavefront.submit(lambda: handle, lambda h: list(h.outputs))
+        handle.error = ValueError("late failure")
+        wavefront.abandon()                    # swallowed: teardown path
+        assert not wavefront.in_flight
+
+
+class TestPreheatHook:
+    def test_prepare_passes_the_input_geometry(self):
+        calls = []
+
+        class Driver:
+            def feed(self, frame, token=None):
+                return []
+
+            def flush(self):
+                return []
+
+            def reset(self):
+                return None
+
+            def preheat(self, height, width):
+                calls.append((height, width))
+
+        spec = StreamSpec(
+            frame=frame_spec_for_matrix(
+                "bt601", full_range=False, geometry=Geometry(64, 48)),
+            timeline=TimelineSpec(
+                time_base=Fraction(1, 24000), cadence=Fraction(25)))
+        proc = FeedFlushProcessor(lambda: Driver())
+        proc.prepare(spec, CTX)
+        assert calls == [(48, 64)]   # (height, width) from Geometry(w, h)
+
+    def test_drivers_without_the_hook_are_untouched(self):
+        proc = FeedFlushProcessor(lambda: _HalveDelayDriver(0))
+        proc.prepare(stream(), CTX)   # must not raise

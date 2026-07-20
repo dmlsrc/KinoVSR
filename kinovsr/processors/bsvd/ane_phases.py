@@ -14,7 +14,6 @@ gate below requires that handoff to remain exact.
 """
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import shutil
@@ -399,8 +398,7 @@ class ScheduledPhaseSuite:
              for _ in range(PHASE_STEPS)]
             for index in range(6)
         ]
-        self._executor: ThreadPoolExecutor | None = None
-        self._future: Any | None = None
+        self.pipeline = runtime.DispatchPipeline("bsvd-ane-window")
 
     def set_state(self, state: Any) -> None:
         for model in self.models.values():
@@ -440,86 +438,120 @@ class ScheduledPhaseSuite:
             self.runner._cursor[index] = (
                 self.runner._cursor[index] + PHASE_STEPS) % len(ring)
 
-    def _submit(self, job: Callable[[], Any]) -> None:
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="bsvd-ane-window")
-        self._future = self._executor.submit(job)
-
-    def _join(self) -> None:
-        future, self._future = self._future, None
-        if future is not None:
-            future.result()
-
-    def _drain(self) -> None:
-        """Absorb an orphaned in-flight job on the error path."""
-        future, self._future = self._future, None
-        if future is not None:
-            with contextlib.suppress(BaseException):
-                future.result()
+    def machine(self, frames: list, zero_frame: memoryview,
+                snapshot: Callable[[Any], Any]) -> WindowMachine:
+        """A cooperative driver for one window; see :class:`WindowMachine`."""
+        return WindowMachine(self, frames, zero_frame, snapshot)
 
     def run(self, frames: list, zero_frame: memoryview,
             snapshot: Callable[[Any], Any]) -> list[Any]:
-        """Run one window; ``frames`` entries are input views or zero-arg
-        callables producing them (lazy host-side prep).
+        """Run one window to completion (the synchronous convenience)."""
+        driver = self.machine(frames, zero_frame, snapshot)
+        driver.advance(block=True)
+        return driver.outputs
 
-        Dispatches execute on a one-slot worker while the caller's thread
-        preps the next inputs and materializes previous outputs, mirroring
-        the continuous path's pipelined dispatch: the host glue hides
-        under the ANE work and the ANE never idles mid-window. Jobs are
-        pure Core ML plus buffer blits; every MLX operation (prep,
-        snapshot) stays on the caller's thread.
-        """
+    def close(self) -> None:
+        self.pipeline.close()
+        self.models.clear()
+        self._spares.clear()
+
+
+class WindowMachine:
+    """Drives one reset-window through the phase suite, one dispatch in
+    flight, advanced cooperatively from the CALLER's thread.
+
+    This is the family-side implementation of the async window protocol
+    (see ``kinovsr.processors.feed_driver.WindowWavefront``):
+    ``advance(block=False)`` makes whatever progress it can without
+    waiting - joining finished dispatches, materializing their outputs,
+    prepping and submitting the next - and returns True once the window
+    is complete and ``outputs`` holds one entry per input frame.
+    ``advance(block=True)`` runs to completion. Every MLX operation
+    (input prep, output materialization) happens inside ``advance`` on
+    the caller's thread; only the Core ML dispatches run on the suite's
+    pipeline worker.
+
+    ``frames`` entries are input views or zero-arg callables producing
+    them, so the host-side prep resolves in the shadow of an in-flight
+    dispatch instead of serially before it.
+    """
+
+    def __init__(self, suite: ScheduledPhaseSuite, frames: list,
+                 zero_frame: memoryview, snapshot: Callable[[Any], Any]):
         if len(frames) < 16:
             raise ValueError("phase specialization needs at least 16 frames")
+        self.outputs: list[Any] = []
+        self._suite = suite
+        self._sequence = self._drive(frames, zero_frame, snapshot)
+        self._done = False
+        self._failed = False
+
+    def _drive(self, frames: list, zero_frame: memoryview,
+               snapshot: Callable[[Any], Any]):
+        # A generator: each `yield` marks a dispatch in flight; `advance`
+        # joins the pipeline before resuming, so everything between two
+        # yields runs with the previous dispatch's results settled.
+        suite = self._suite
+        pipeline = suite.pipeline
 
         def resolve(index: int):
             entry = frames[index]
             return entry() if callable(entry) else entry
 
-        self.set_state(self.runner.model._state)
-        try:
-            first = [resolve(index) for index in range(8)]
-            self._submit(lambda: self.dispatch("fill", 0, first))
-            second = [resolve(index) for index in range(8, 16)]
-            self._join()
-            self._submit(lambda: self.dispatch("fill", 8, second))
-            count = len(frames)
-            pending = resolve(16) if count > 16 else None
-            self._join()
-            outputs = []
-            for index in range(16, count):
-                view, pending = pending, None
-                self.runner.load_inputs(view)
-                self._submit(self.runner.dispatch)
-                if index + 1 < count:
-                    pending = resolve(index + 1)
-                self._join()
-                outputs.append(
-                    snapshot(self.runner.model.output_array("out")))
-            zeros = [zero_frame] * PHASE_STEPS
-            self._submit(lambda: self.dispatch("drain", 0, zeros))
-            self._join()
-            self._submit(lambda: self.dispatch("drain", 8, zeros))
-            drained = self.models[("drain", 0)]
-            outputs.extend(snapshot(drained.output_array(f"out_{step}"))
-                           for step in range(PHASE_STEPS))
-            self._join()
-            drained = self.models[("drain", 8)]
-            outputs.extend(snapshot(drained.output_array(f"out_{step}"))
-                           for step in range(PHASE_STEPS))
-        except BaseException:
-            self._drain()
-            raise
-        return outputs
+        suite.set_state(suite.runner.model._state)
+        first = [resolve(index) for index in range(8)]
+        pipeline.submit(lambda: suite.dispatch("fill", 0, first))
+        second = [resolve(index) for index in range(8, 16)]
+        yield
+        pipeline.submit(lambda: suite.dispatch("fill", 8, second))
+        count = len(frames)
+        pending = resolve(16) if count > 16 else None
+        yield
+        for index in range(16, count):
+            view, pending = pending, None
+            suite.runner.load_inputs(view)
+            pipeline.submit(suite.runner.dispatch)
+            if index + 1 < count:
+                pending = resolve(index + 1)
+            yield
+            self.outputs.append(
+                snapshot(suite.runner.model.output_array("out")))
+        zeros = [zero_frame] * PHASE_STEPS
+        pipeline.submit(lambda: suite.dispatch("drain", 0, zeros))
+        yield
+        pipeline.submit(lambda: suite.dispatch("drain", 8, zeros))
+        drained = suite.models[("drain", 0)]
+        self.outputs.extend(snapshot(drained.output_array(f"out_{step}"))
+                            for step in range(PHASE_STEPS))
+        yield
+        drained = suite.models[("drain", 8)]
+        self.outputs.extend(snapshot(drained.output_array(f"out_{step}"))
+                            for step in range(PHASE_STEPS))
 
-    def close(self) -> None:
-        self._drain()
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
-        self.models.clear()
-        self._spares.clear()
+    def advance(self, block: bool = False) -> bool:
+        """Progress the window; True once complete.
+
+        Non-blocking calls only consume dispatches that have already
+        finished; a blocking call runs the window to completion.
+        """
+        if self._failed:
+            raise RuntimeError("window failed; reset the stream")
+        pipeline = self._suite.pipeline
+        try:
+            while not self._done:
+                if pipeline.in_flight:
+                    if not block and not pipeline.idle():
+                        return False
+                    pipeline.join()
+                try:
+                    next(self._sequence)
+                except StopIteration:
+                    self._done = True
+        except BaseException:
+            self._failed = True
+            pipeline.drain()
+            raise
+        return True
 
 
 def _snapshot(value: Any) -> Any:

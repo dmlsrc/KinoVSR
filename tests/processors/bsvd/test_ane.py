@@ -3,8 +3,6 @@ selection plumbing, and (slow) end-to-end parity against the MLX net."""
 
 from __future__ import annotations
 
-import threading
-
 import mlx.core as mx
 import pytest
 
@@ -307,17 +305,12 @@ class TestAneLifecycle:
         net = _lifecycle_net(monkeypatch)
         runner = _FakeRunner()
         net._runner = runner
-        worker = threading.Thread(
-            target=net._worker_loop, name="test-bsvd-ane-dispatch")
-        net._worker = worker
-        worker.start()
 
         net._submit(b"", b"", b"", emit=False)
         net.close()
 
         assert runner.dispatches == 1
-        assert not worker.is_alive()
-        assert net._worker is None
+        assert not net._pipeline.in_flight
         assert net._runner is None
         net.close()  # lifecycle cleanup is idempotent
         with pytest.raises(RuntimeError, match="closed"):
@@ -325,17 +318,12 @@ class TestAneLifecycle:
 
     def test_close_stops_worker_when_prediction_failed(self, monkeypatch):
         net = _lifecycle_net(monkeypatch)
-        runner = _FakeRunner(RuntimeError("prediction failed"))
-        net._runner = runner
-        worker = threading.Thread(
-            target=net._worker_loop, name="test-bsvd-ane-dispatch-error")
-        net._worker = worker
-        worker.start()
+        net._runner = _FakeRunner(RuntimeError("prediction failed"))
         net._submit(b"", b"", b"", emit=False)
 
         with pytest.raises(RuntimeError, match="prediction failed"):
             net.close()
-        assert not worker.is_alive()
+        assert not net._pipeline.in_flight
         assert net._runner is None
 
 
@@ -348,9 +336,12 @@ class TestDenoiserLifecycle:
             def close(self):
                 self.closes += 1
 
+        from kinovsr.processors.feed_driver import WindowWavefront
+
         net = Net()
         denoiser = object.__new__(B.BsvdDenoiser)
         denoiser.net = net
+        denoiser._wavefront = WindowWavefront()
         denoiser._nm = object()
         denoiser._tokens = [object()]
         denoiser._frames = [object()]
@@ -370,7 +361,20 @@ class TestDenoiserLifecycle:
         assert not denoiser._warm
         assert not denoiser._recent
 
-    def test_schedule_window_uses_backend_batch_path_when_available(self):
+    def test_schedule_window_uses_backend_async_path_when_available(self):
+        """Windows flow through the WindowWavefront one deep: submitting
+        window k+1 completes and emits window k, the net resets only
+        between windows (never mid-flight), and the flush barrier emits
+        the last window."""
+        from kinovsr.processors.feed_driver import WindowWavefront
+
+        class Handle:
+            def __init__(self, frames):
+                self.outputs = [frame + 100 for frame in frames]
+
+            def advance(self, block=False):
+                return True
+
         class Net:
             def __init__(self):
                 self.resets = 0
@@ -379,25 +383,34 @@ class TestDenoiserLifecycle:
             def reset(self):
                 self.resets += 1
 
-            def run_window(self, frames):
+            def begin_window(self, frames):
                 self.windows.append(list(frames))
-                return [frame + 100 for frame in frames]
+                return Handle(frames)
 
         denoiser = object.__new__(B.BsvdDenoiser)
         denoiser.net = Net()
         denoiser._tracker = None
+        denoiser._wavefront = WindowWavefront()
         denoiser._pulse_gain = lambda _x, **_kwargs: 1.0
         denoiser._with_nm = lambda x, _nm, gain: x
         denoiser._emit = lambda value, token: (value, token)
-        frames = list(range(16))
-        tokens = [f"token-{index}" for index in range(16)]
 
-        out = denoiser._run_window(frames, tokens, 3, 7)
+        first = denoiser._run_window(
+            list(range(16)), [f"a{i}" for i in range(16)], 3, 7)
+        assert first == []                    # window 1 is in flight
+        assert denoiser.net.resets == 0       # never reset mid-flight
 
-        assert denoiser.net.windows == [frames]
+        second = denoiser._run_window(
+            list(range(50, 66)), [f"b{i}" for i in range(16)], 0, 2)
+        assert second == [(103, "a3"), (104, "a4"),
+                          (105, "a5"), (106, "a6")]
+        assert denoiser.net.resets == 1
+
+        tail = denoiser._wavefront.barrier()
+        assert tail == [(150, "b0"), (151, "b1")]
         assert denoiser.net.resets == 2
-        assert out == [(103, "token-3"), (104, "token-4"),
-                       (105, "token-5"), (106, "token-6")]
+        assert denoiser.net.windows == [list(range(16)),
+                                        list(range(50, 66))]
 
 
 # --------------------------------------------------------------------------
@@ -578,6 +591,45 @@ class TestAneParity:
             means.append(float(delta.mean()))
         net.close()
         assert max(means) < 8e-4, f"worst frame {max(means):.3e}"
+
+    @pytest.mark.usefixtures("_module_cache")
+    def test_scheduled_denoiser_flows_through_the_wavefront(self):
+        """Two overlapping schedule windows through the real denoiser: the
+        first window's emissions arrive when the second is submitted (the
+        depth-one wavefront), the flush barrier emits the rest, and both
+        backends produce the same frames in the same token order."""
+        weights = B.default_weights_path("c64")
+        if not weights.is_file():
+            pytest.skip(f"bsvd weights not available at {weights}")
+        schedule = [(0, 20, 0, 18), (16, 40, 18, 40)]
+        ane = B.BsvdDenoiser(strength=0.4, backend="ane")
+        mlx_ref = B.BsvdDenoiser(strength=0.4, backend="mlx")
+        ane.set_schedule(schedule)
+        mlx_ref.set_schedule(schedule)
+        # What FeedFlushProcessor.prepare does: warm engine loading starts
+        # before the first frame and must be joined transparently.
+        ane.preheat(96, 128)
+        frames = [f[0].astype(mx.float32)[..., :3]
+                  for f in _real_frames(40, 3, 96, 128)]
+        for frame in frames:
+            mx.eval(frame)
+        try:
+            ane_out, ref_out = [], []
+            for index, frame in enumerate(frames):
+                ane_out += ane.feed(frame, token=index)
+                ref_out += mlx_ref.feed(frame, token=index)
+            ane_out += ane.flush()
+            ref_out += mlx_ref.flush()
+        except Exception as exc:  # noqa: BLE001 - environment, not correctness
+            ane.close()
+            pytest.skip(f"BSVD ANE phase suite unavailable here: {exc}")
+        assert [token for _, token in ane_out] == list(range(40))
+        assert [token for _, token in ref_out] == list(range(40))
+        deltas = [float(mx.abs(a - r).mean().item())
+                  for (a, _), (r, _) in zip(ane_out, ref_out, strict=True)]
+        ane.close()
+        mlx_ref.close()
+        assert max(deltas) < 2e-3, f"worst frame {max(deltas):.3e}"
 
     def test_denoiser_backend_parity(self, ane_net):
         ane = B.BsvdDenoiser(strength=0.4, backend="ane")

@@ -50,6 +50,103 @@ class FeedFlushDriver(Protocol):
     def reset(self) -> None: ...
 
 
+class AsyncWindowHandle(Protocol):
+    """One schedule window in flight on an accelerator, driven cooperatively.
+
+    A family net whose backend can run a whole reset-window off the GPU
+    (today: Core ML on the Neural Engine) returns one of these from
+    ``begin_window(frames)``. The contract every implementation must keep:
+
+    - ``advance(block=False)`` makes whatever progress it can without
+      waiting and returns True once the window is complete;
+      ``advance(block=True)`` runs it to completion. ALL of the family's
+      MLX work (input prep, output materialization) happens inside
+      ``advance`` on the caller's thread - only the accelerator dispatches
+      may run on a worker (``anemil.runtime.DispatchPipeline`` is the
+      shared primitive for that).
+    - ``outputs`` holds one entry per input frame, in input order, once
+      complete.
+    - a raised ``advance`` poisons the handle; the stream needs a reset.
+    """
+
+    def advance(self, block: bool = False) -> bool: ...
+
+    @property
+    def outputs(self) -> list: ...
+
+
+class WindowWavefront:
+    """Depth-one cross-window pipelining for schedule-capable drivers.
+
+    While one window's accelerator dispatches are in flight, the driver
+    keeps buffering input - so upstream keeps decoding - and the
+    previously completed window's emissions have already flowed
+    downstream. The pull scheduler's contract already allows this: a
+    feed/flush driver may emit any input's output arbitrarily late, as
+    long as tokens pair correctly.
+
+    ``submit`` completes the window in flight first (that wait is the
+    depth-one backpressure: at most one window's dispatches plus one
+    window's buffered frames are ever held), starts the next, and returns
+    the finished window's emissions. ``poll`` opportunistically advances
+    without blocking - call it on every feed so completed dispatches are
+    consumed in the shadow of buffering. ``barrier`` completes everything
+    (the flush edge). ``abandon`` quiesces on reset/close paths,
+    suppressing the window's own error so the primary error wins.
+    """
+
+    def __init__(self) -> None:
+        self._handle: AsyncWindowHandle | None = None
+        self._finalize: Any = None
+
+    @property
+    def in_flight(self) -> bool:
+        return self._handle is not None
+
+    def poll(self) -> None:
+        if self._handle is not None:
+            self._handle.advance(block=False)
+
+    def submit(self, begin: Any, finalize: Any) -> list:
+        """Complete the in-flight window, then start the next.
+
+        ``begin`` is a zero-argument callable returning the new window's
+        :class:`AsyncWindowHandle` (it should also submit the first
+        dispatch, so the accelerator is busy before this returns);
+        ``finalize`` maps a completed handle to the window's emission
+        list and MUST leave the net reset for the next window. Returns
+        the completed previous window's emissions.
+        """
+        out = self.barrier()
+        self._handle = begin()
+        self._finalize = finalize
+        self._handle.advance(block=False)
+        return out
+
+    def barrier(self) -> list:
+        """Complete and finalize the in-flight window, if any."""
+        if self._handle is None:
+            return []
+        handle, self._handle = self._handle, None
+        finalize, self._finalize = self._finalize, None
+        try:
+            handle.advance(block=True)
+        except BaseException:
+            self._handle = None
+            raise
+        return finalize(handle)
+
+    def abandon(self) -> None:
+        """Quiesce the in-flight window without emitting (reset/close)."""
+        import contextlib
+
+        handle, self._handle = self._handle, None
+        self._finalize = None
+        if handle is not None:
+            with contextlib.suppress(BaseException):
+                handle.advance(block=True)
+
+
 class PerFrameDriver:
     """feed()/flush() shape over a per-frame engine (``denoise(x) -> x``).
 
@@ -141,6 +238,15 @@ class FeedFlushProcessor:
                 and hasattr(self._driver, "set_schedule")):
             self._driver.set_schedule(
                 [tuple(window) for window in context.windowing])
+        # Accelerator-backed drivers can start loading their engine now,
+        # before the first frame: the input geometry is already known, so
+        # multi-second Core ML function loads overlap the source's startup
+        # and first-window decode instead of serializing at the first
+        # dispatch.
+        preheat = getattr(self._driver, "preheat", None)
+        if callable(preheat):
+            geometry = input_spec.frame.geometry
+            preheat(int(geometry.height), int(geometry.width))
         if self._blend is None and (self._luma_strength != 1.0
                                     or self._chroma_strength != 1.0):
             from kinovsr.media.yuv import luma_chroma_blend
@@ -211,8 +317,10 @@ class FeedFlushProcessor:
 
 __all__ = [
     "LUMA_CHROMA_KEYS",
+    "AsyncWindowHandle",
     "FeedFlushDriver",
     "FeedFlushProcessor",
     "PerFrameDriver",
+    "WindowWavefront",
     "parse_luma_chroma",
 ]

@@ -444,6 +444,11 @@ class BsvdDenoiser:
         # diagnostics: gains across the whole run (survives the end-of-stream reset)
         self._pulse_log: list[float] = []
         self._schedule: list | None = None
+        from kinovsr.processors.feed_driver import WindowWavefront
+
+        # Cross-window pipelining for async-window-capable nets (the ANE
+        # backend); a plain object with no thread until a window flies.
+        self._wavefront = WindowWavefront()
         self._reset_state()
 
     def _reset_conditioning(self, clear_debug: bool = False) -> None:
@@ -472,8 +477,22 @@ class BsvdDenoiser:
         self._steps = 0
 
     def reset(self) -> None:
+        self._wavefront.abandon()
         self._reset_state()
         self._reset_conditioning(clear_debug=True)
+
+    def preheat(self, height: int, width: int) -> None:
+        """Start loading the backend engine for this geometry, if it can.
+
+        Called at the pipeline's prepare edge (after ``set_schedule``);
+        the frame geometry maps to the net's padded working size exactly
+        as ``_prepare`` will pad it. Backends without the hook (the MLX
+        net) ignore this.
+        """
+        hook = getattr(self.net, "preheat", None)
+        if callable(hook):
+            hook(height + (-height) % 4, width + (-width) % 4,
+                 scheduled=self._schedule is not None)
 
     def set_schedule(self, schedule: list | None) -> None:
         """Use GOP-aligned windows instead of one continuous stream.
@@ -497,6 +516,7 @@ class BsvdDenoiser:
         return noise_map_debug_image(self)
 
     def close(self) -> None:
+        self._wavefront.abandon()
         net, self.net = self.net, None
         try:
             close = getattr(net, "close", None)
@@ -617,6 +637,11 @@ class BsvdDenoiser:
 
         x = self._prepare(frame)
         if self._schedule is not None:
+            # Opportunistically advance the window in flight: completed
+            # dispatches are consumed and the next submitted while the
+            # source keeps decoding, so the accelerator never waits for
+            # a full window boundary.
+            self._wavefront.poll()
             self._frames.append(x)
             self._frame_tokens.append(token)
             return self._feed_scheduled(final=False)
@@ -687,14 +712,18 @@ class BsvdDenoiser:
             self._frames = self._frames[drop:]
             self._frame_tokens = self._frame_tokens[drop:]
             self._base += drop
+        if final:
+            # The flush edge: complete the last window still in flight.
+            out.extend(self._wavefront.barrier())
         return out
 
     def _run_window(self, frames: list, tokens: list, emit_start: int, emit_end: int) -> list:
-        self.net.reset()
         nm = None
         if self._tracker is not None:
             # per-window estimate, EMA-blended across windows by the tracker so
             # the conditioning does not pump at gop-aligned window boundaries.
+            # Conditioning needs no net state, so on the async path it runs
+            # while the PREVIOUS window's dispatches are still in flight.
             sig = self._tracker.update([self._crop(f) for f in frames])
             if sig is not None:
                 nm = self._plane_from_map(sig)
@@ -710,14 +739,32 @@ class BsvdDenoiser:
                     tokens[i] if i < len(tokens) else None))
             conditioned.append(self._with_nm(x, nm, gain=gain))
 
-        run_window = getattr(self.net, "run_window", None)
-        if callable(run_window) and len(conditioned) >= 16:
-            window_outputs = run_window(conditioned)
-            out = [self._emit(window_outputs[index], tokens[index])
-                   for index in range(emit_start, emit_end)]
-            self.net.reset()
-            return out
+        begin_window = getattr(self.net, "begin_window", None)
+        if callable(begin_window) and len(conditioned) >= 16:
+            # Depth-one cross-window pipelining: submit completes the
+            # window in flight (emitting it), then starts this one; its
+            # dispatches then run while feed() buffers the NEXT window -
+            # upstream decode, conditioning, and downstream encode all
+            # hide under the accelerator. The net is reset by finalize,
+            # never while its window is still in flight.
+            count = len(conditioned)
+            held_tokens = list(tokens)
 
+            def finalize(handle) -> list:
+                outputs = handle.outputs
+                if len(outputs) != count:
+                    raise RuntimeError(
+                        f"BSVD window returned {len(outputs)} outputs for "
+                        f"{count} frames")
+                emitted = [self._emit(outputs[index], held_tokens[index])
+                           for index in range(emit_start, emit_end)]
+                self.net.reset()
+                return emitted
+
+            return self._wavefront.submit(
+                lambda: begin_window(conditioned), finalize)
+
+        self.net.reset()
         out = []
         for i, x in enumerate(conditioned):
             y = self.net.step(x)
