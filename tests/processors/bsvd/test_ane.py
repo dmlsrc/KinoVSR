@@ -155,6 +155,34 @@ class TestNoneFlowMirror:
 
 
 # --------------------------------------------------------------------------
+# Geometry envelope: width alignment and reflect padding
+# --------------------------------------------------------------------------
+
+class TestGeometry:
+    def test_pad_width_reflect_mirrors_the_right_edge(self):
+        x = mx.arange(2 * 3 * 6 * 1, dtype=mx.float32).reshape(2, 3, 6, 1)
+        padded = A._pad_width_reflect(x, 9)
+        mx.eval(padded)
+        assert padded.shape == (2, 3, 9, 1)
+        assert float(mx.abs(padded[:, :, :6] - x).max()) == 0.0
+        # Reflection excludes the edge column: [.. 3 4 5] -> [.. 3 4 5 4 3 2]
+        want = x[:, :, 2:5, :][:, :, ::-1, :]
+        assert float(mx.abs(padded[:, :, 6:] - want).max()) == 0.0
+        same = A._pad_width_reflect(x, 6)
+        assert same is x
+
+    def test_unaligned_graph_width_is_refused_by_build_runner(self):
+        # Geometry checks run before the params are touched, so no weights
+        # are needed to assert the guard.
+        with pytest.raises(RuntimeError, match="multiple of 128"):
+            A.build_runner(None, 4, 288, 352)
+
+    def test_below_floor_is_refused(self):
+        with pytest.raises(RuntimeError, match="verified ANE floor"):
+            A.build_runner(None, 4, 92, 128)
+
+
+# --------------------------------------------------------------------------
 # Backend selection plumbing
 # --------------------------------------------------------------------------
 
@@ -303,6 +331,46 @@ class TestAneParity:
         pairs = self._drive_both(ane_net, 4)
         means = [mean for mean, _ in pairs]
         assert max(means) < 8e-4, f"worst frame {max(means):.3e}"
+
+    @pytest.mark.usefixtures("_module_cache")
+    def test_cif_geometry_runs_padded_and_matches(self):
+        """352x288 (CIF) is the geometry that fails UNPADDED with the ANE
+        status=0x1d alignment error; through the reflect-pad path it must
+        run and match the fp32 reference. The right band differs by
+        boundary CONTEXT (reflected content vs the frame edge the MLX
+        path sees), so it gets its own bound; the interior must sit at
+        the same ~3e-4 parity as aligned geometries (measured worst
+        3.2e-4 interior, 3.5e-3 band, 9.0e-4 full frame)."""
+        weights = B.default_weights_path("c64")
+        if not weights.is_file():
+            pytest.skip(f"bsvd weights not available at {weights}")
+        net = A.AneBSVD(weights, dtype=mx.float16)
+        reference = B.BSVD(weights, dtype=mx.float32)
+        frames = _real_frames(20, net.input_channels, 288, 352)
+        try:
+            net._ensure_runner(288, 352)
+        except Exception as exc:  # noqa: BLE001 - environment, not correctness
+            pytest.skip(f"BSVD ANE engine unavailable here: {exc}")
+        assert net._padded_width == 384
+        net.reset()
+        full, interior, band = [], [], []
+        for frame in frames + [None] * 16:
+            ane_out = net.step(frame)
+            ref_out = reference.step(
+                None if frame is None else frame.astype(mx.float32))
+            assert (ane_out is None) == (ref_out is None)
+            if ane_out is None:
+                continue
+            assert ane_out.shape == ref_out.shape
+            delta = mx.abs(ane_out.astype(mx.float32) - ref_out)
+            mx.eval(delta)
+            full.append(float(delta.mean()))
+            interior.append(float(delta[:, :, :352 - 64, :].mean()))
+            band.append(float(delta[:, :, 352 - 64:, :].mean()))
+        assert len(full) == 20
+        assert max(interior) < 8e-4, f"interior {max(interior):.3e}"
+        assert max(band) < 8e-3, f"right band {max(band):.3e}"
+        assert max(full) < 2e-3, f"full frame {max(full):.3e}"
 
     def test_denoiser_backend_parity(self, ane_net):
         ane = B.BsvdDenoiser(strength=0.4, backend="ane")

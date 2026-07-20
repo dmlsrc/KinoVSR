@@ -29,9 +29,20 @@ Safety: the Core ML CPU runtime miscomputes this graph's MLState updates
 than slow. Placement is refused unless every operation is ANE-preferred,
 a build-time canary requires CPU and ANE runs to DISAGREE, the rebinding
 runner must match the byte-copy reference bit-exactly, and every load
-replays stored outputs. Geometries below 96 px on a side are refused: a
-32x32 build converts cleanly, reports full ANE placement, then fails at
-the first prediction.
+replays stored outputs.
+
+Geometry envelope (probed 2026-07-19 on the shipped graph): the width the
+graph runs at must be a multiple of 128, which keeps every pyramid
+level's fp16 rows 64-byte aligned - the quarter-resolution level binds at
+W/2 bytes per row. Widths off that grid (352, 320, 704, 32 all probed)
+convert cleanly, report full ANE placement, then fail the FIRST
+prediction with ANEProgramProcessRequestDirect status=0x1d; heights need
+only the multiple-of-four the denoiser already guarantees (96, 100, 144,
+232, 240, 288, 480 all pass at aligned widths). `AneBSVD` therefore
+reflect-pads frames on the right up to the next 128 multiple and crops
+the outputs back - CIF 352x288 runs as 384x288 - so callers see the
+original geometry. Frames below 96 px on a side are refused (the
+verified floor).
 
 Conversion is first-party through :mod:`kinovsr.native.anemil` (protobuf
 against the vendored Core ML schema; no coremltools, numpy, or torch) and
@@ -64,6 +75,11 @@ SKIP_DEPTH = (8, 8, 4)  # skip1, skip2, skip3 push-to-pop latency
 
 GRAPH_VERSION = 1
 MIN_SIDE = 96
+# The graph width must keep every pyramid level's fp16 rows 64-byte
+# aligned (the quarter-res level is W/2 bytes per row): W % 128 == 0.
+# Probed 2026-07-19: widths 128/256/384/640 run; 32/320/352/704 compile,
+# place all-ANE, then fail the first prediction with status=0x1d.
+ANE_WIDTH_QUANTUM = 128
 CPU_DIVERGENCE_FLOOR = 1e-6
 REPLAY_TOLERANCE = 5e-3
 REPLAY_STEPS = 12  # past the depth-8 ring wraparound (first re-read at step 8)
@@ -619,6 +635,12 @@ def build_runner(params: dict, input_channels: int, height: int,
     """
     if height % 4 or width % 4:
         raise RuntimeError(f"{width}x{height} is not a multiple of four")
+    if width % ANE_WIDTH_QUANTUM:
+        raise RuntimeError(
+            f"graph width {width} is not a multiple of "
+            f"{ANE_WIDTH_QUANTUM}; unaligned widths convert and place "
+            f"all-ANE, then fail the first prediction (status=0x1d). "
+            f"AneBSVD pads frames to the quantum - use it, or pad first.")
     if min(height, width) < MIN_SIDE:
         raise RuntimeError(
             f"{width}x{height} is below the verified ANE floor ({MIN_SIDE} "
@@ -749,6 +771,16 @@ class _NoneFlowNet:
 
 # -------------------------------------------------------------- entry point
 
+def _pad_width_reflect(x: Any, target: int) -> Any:
+    """Reflect-pad NHWC ``x`` on the right to ``target`` columns."""
+    width = int(x.shape[2])
+    pad = target - width
+    if pad == 0:
+        return x
+    mirror = x[:, :, width - 1 - pad:width - 1, :][:, :, ::-1, :]
+    return mx.concatenate([x, mirror], axis=2)
+
+
 class AneBSVD:
     """Drop-in for :class:`kinovsr.processors.bsvd.BSVD` on the ANE.
 
@@ -759,6 +791,12 @@ class AneBSVD:
     engine is built lazily at the first real frame, when the geometry is
     known; construction failures raise (this backend is explicitly
     requested - there is no silent fallback).
+
+    Frames are reflect-padded on the right up to the ANE width quantum
+    (multiples of 128 - see the module docstring) and outputs are cropped
+    back, so callers see the original geometry throughout. The cache and
+    the compiled model key on the PADDED size, so every source width that
+    maps to the same quantum shares one model.
     """
 
     SHIFT_NUM = 16
@@ -776,6 +814,8 @@ class AneBSVD:
             weights_path, dtype=mx.float32)
         self._runner: BsvdRunner | None = None
         self._geometry: tuple[int, int] | None = None
+        self._width = 0
+        self._padded_width = 0
         self._zero_frame: bytes | None = None
         self._mirror = _NoneFlowNet()
         self._tail: list[dict] | None = None
@@ -795,9 +835,17 @@ class AneBSVD:
                     f"BSVD ANE stream changed resolution from "
                     f"{self._geometry} to {(height, width)}")
             return
+        if min(height, width) < MIN_SIDE:
+            raise RuntimeError(
+                f"{width}x{height} is below the verified ANE floor "
+                f"({MIN_SIDE} px per side); use --bsvd-backend mlx for "
+                f"smaller frames.")
+        padded = -(-width // ANE_WIDTH_QUANTUM) * ANE_WIDTH_QUANTUM
         self._runner, _directory = build_runner(
-            self.params, self.input_channels, height, width)
+            self.params, self.input_channels, height, padded)
         self._geometry = (height, width)
+        self._width = width
+        self._padded_width = padded
         self._zero_frame = bytes(
             len(self._runner.model.input_view("frame")))
 
@@ -809,9 +857,11 @@ class AneBSVD:
 
     def _materialize_out(self):
         raw = self._runner.model.output_array("out")
-        # Fresh copy, NCHW backing -> NHWC: the backing is rewritten by the
-        # next prediction, so no lazy graph over it may leave this method.
-        out = mx.contiguous(mx.transpose(raw, (0, 2, 3, 1)))
+        # Fresh copy, NCHW backing -> NHWC cropped to the caller's width:
+        # the backing is rewritten by the next prediction, so no lazy
+        # graph over it may leave this method.
+        out = mx.contiguous(
+            mx.transpose(raw, (0, 2, 3, 1))[:, :, :self._width, :])
         mx.eval(out)
         return out
 
@@ -869,7 +919,9 @@ class AneBSVD:
         self._ensure_runner(height, width)
         record = self._mirror.step(True)
         write = [0.0 if record.primes[i] else 1.0 for i in range(16)]
-        nchw = mx.contiguous(mx.transpose(x.astype(mx.float16), (0, 3, 1, 2)))
+        padded = _pad_width_reflect(x.astype(mx.float16),
+                                    self._padded_width)
+        nchw = mx.contiguous(mx.transpose(padded, (0, 3, 1, 2)))
         mx.eval(nchw)
         self._runner.step(memoryview(nchw).cast("B"), None,
                           self._vector_bytes(write))
