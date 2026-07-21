@@ -4,9 +4,13 @@ The opt-in ``--bsvd-backend ane`` implementation: the full per-step
 convolution stack runs as one Core ML dispatch pinned to the ANE, with the
 16 BiBuffer recurrences carried in MLState, the six skip delay lines held
 host-side as copy-free MLX ring buffers (bound per dispatch through
-``ModelRunner.predict_with``), and the ``conv -> pixel_shuffle`` pairs
-folded into exact stride-two transposed convolutions (the native MIL
-``pixel_shuffle`` miscomputes on the ANE after a convolution).
+``ModelRunner.predict_with``), and the upsamplers emitted as the reference
+``conv -> pixel_shuffle`` in <=256-channel shuffle groups.  Native MIL
+``pixel_shuffle`` is shape-dependent on this ANE: 256-channel inputs are
+correct, wider inputs are badly corrupted, and the grouped form is exactly
+equivalent (the channel->pixel mapping is block-diagonal).  The previously
+shipped fold into stride-two transposed convolutions was bit-exact and
+equally fast but broke Espresso's translator at large geometries (below).
 
 Standalone this path is slightly SLOWER than the MLX incumbent (about 91
 vs 78 ms/frame at 640x480 c64); its value is composition - BSVD stops
@@ -31,12 +35,16 @@ at a time and omits the operations and skip outputs whose product value is
 ``None``.  The phase functions, ordinary step, host rings, and MLState are
 one exact-replay-gated multifunction asset.
 
-Safety: the Core ML CPU runtime miscomputes this graph's MLState updates
-(coherent garbage, not noise), so a CPU fallback is silently wrong rather
-than slow. Placement is refused unless every operation is ANE-preferred,
-a build-time canary requires CPU and ANE runs to DISAGREE, the rebinding
-runner must match the byte-copy reference bit-exactly, and every load
-replays stored outputs.
+Safety: the Core ML CPU runtime executes this fp16 ML Program's convolutions
+with substantially less accurate accumulation than the ANE.  The MLState
+read/slice-update/write machinery itself is bit-exact against equivalent
+ordinary tensor I/O, but recurrent feedback amplifies the CPU convolution
+error beyond the product tolerance.  A CPU fallback is therefore silently
+wrong rather than merely slow. Placement is refused unless every operation
+is ANE-preferred (the four value-exact ``island_*`` ops of large geometries
+are the sole allowlisted exception), a build-time differential canary
+fingerprints the CPU and ANE paths, the rebinding runner must match the
+byte-copy reference bit-exactly, and every load replays stored outputs.
 
 Geometry envelope (probed 2026-07-19 on the shipped graph): the width the
 graph runs at must be a multiple of 128, which keeps every pyramid
@@ -50,6 +58,20 @@ reflect-pads frames on the right up to the next 128 multiple and crops
 the outputs back - CIF 352x288 runs as 384x288 - so callers see the
 original geometry. Frames below 96 px on a side are refused (the
 verified floor).
+
+Large geometries (probed 2026-07-21): Espresso's MIL->EIR translator
+crashes (std::bad_cast, surfaced as plan-build error -14) on large
+stateful graphs - with the retired folded conv_transpose upsamplers any
+state update derived from one broke the build above 1920x648, and even
+with the current conv + grouped pixel-shuffle spelling (bit-exact and
+speed-neutral with the folded form) a two-block translation unit breaks
+above 1920x864. The emitted step therefore inserts a value-exact
+float32 island between temp1 and temp2 above ``ISLAND_MIN_PIXELS``,
+which makes Espresso translate the blocks as separate units; the four
+``island_*`` ops legitimately run off-ANE (allowlisted in the placement
+gate) and cost roughly 0.12 s/frame at 1080p. Islandless execution is
+verified through 1920x864 (plus 1280x720 and 1664x900); the island form
+is verified executing 64-frame streams at 1920x1080.
 
 Conversion is first-party through :mod:`kinovsr.native.anemil` (protobuf
 against the vendored Core ML schema; no coremltools, numpy, or torch) and
@@ -80,8 +102,16 @@ BIBUF = (("d0c1", 2), ("d0c2", 2), ("d1c1", 4), ("d1c2", 4),
          ("u2c1", 4), ("u2c2", 4), ("u1c1", 2), ("u1c2", 2))
 SKIP_DEPTH = (8, 8, 4)  # skip1, skip2, skip3 push-to-pop latency
 
-GRAPH_VERSION = 1
+GRAPH_VERSION = 2
 MIN_SIDE = 96
+# Above this many graph pixels the emitted step inserts a float32
+# translation island between temp1 and temp2 (see _emit_graph). The
+# islandless graph is verified through 1920x864 = 1,658,880 px; the
+# first measured islandless failure is 1920x960 = 1,843,200 px, and the
+# island form is verified loading at 1920x960/1008 and executing at
+# 1920x1080. The island is always CORRECT (value-exact); the threshold
+# only avoids its ~20% dispatch cost at small geometries.
+ISLAND_MIN_PIXELS = 1920 * 864 + 1
 # The graph width must keep every pyramid level's fp16 rows 64-byte
 # aligned (the quarter-res level is W/2 bytes per row): W % 128 == 0.
 # Probed 2026-07-19: widths 128/256/384/640 run; 32/320/352/704 compile,
@@ -177,7 +207,7 @@ def _assert_true_float64() -> None:
             f"the upsample fold audit.")
 
 
-def _fold_weights(weight, bias, r: int = 2):
+def _fold_weights(weight, bias, r: int = 2):  # phase chunks only
     """[Cout*r*r, Cin, k, k] + bias -> [Cin+1, Cout, k*r, k*r], any dtype.
 
     Sub-pixel convolution and transposed convolution are equivalent; the
@@ -248,7 +278,11 @@ def _oihw(weight):
 
 
 def _audit_fold(params: dict, height: int, width: int) -> float:
-    """Prove every upsample fold exact in float64 before converting."""
+    """Prove every upsample fold exact in float64 before converting.
+
+    The ordinary step now emits the reference conv + pixel-shuffle
+    directly; only the phase fill/drain chunks still fold, so this
+    audit runs on the scheduled-phase build path."""
     _assert_true_float64()
     worst = 0.0
     geometry = {"u2": (height // 4, width // 4), "u1": (height // 2, width // 2)}
@@ -276,9 +310,10 @@ def _audit_fold(params: dict, height: int, width: int) -> float:
 def _emit_graph(params: dict, input_channels: int, height: int, width: int,
                 blob=None):
     """Emit one BSVD step and return its graph plus function signature."""
-    from kinovsr.native.anemil import builder
+    from kinovsr.native.anemil import builder, schema
 
     state_shapes, skip_shapes = _shapes(params, input_channels, height, width)
+    island = height * width >= ISLAND_MIN_PIXELS
     g = builder.Graph(blob)
 
     g.register_input("frame", (1, input_channels, height, width))
@@ -288,6 +323,8 @@ def _emit_graph(params: dict, input_channels: int, height: int, width: int,
         g.register_input(f"skip_{i}", dims)
     for i, dims in enumerate(state_shapes):
         g.register_input(f"st{i}", dims)
+    if island:
+        g.register_input("island_bias", (1, 1, 1, 1))
 
     def conv(x, block, key, relu6=False, name=None):
         weight, bias, stride = params[block][key]
@@ -297,14 +334,54 @@ def _emit_graph(params: dict, input_channels: int, height: int, width: int,
                         relu6=relu6, relu6_name=name)
 
     def upsample(x, block, key):
-        weight, bias, _stride = params[block][key]
-        folded = _fold_weights(_oihw(weight), bias.astype(mx.float32))
-        divisor = 4 if key == "u2" else 2
-        rows, cols = height // divisor, width // divisor
-        ones = g.fp16_const(g.n(f"{block}_{key}_ones"),
-                            mx.ones((1, 1, rows, cols), dtype=mx.float16))
-        ext = g.concat_channels([x, ones], tag=f"{block}_{key}_ext")
-        return g.conv_transpose2d(ext, folded, tag=f"{block}_{key}_up")
+        """The reference conv + 2x pixel-shuffle, shuffled in <=256
+        channel groups (block-diagonal, exactly equivalent; the wider
+        native shuffle is numerically wrong on the ANE). This unfolded
+        spelling is bit-exact with the retired folded conv_transpose
+        form and dodges the Espresso MIL->EIR std::bad_cast that killed
+        plan builds above 1920x648 whenever a state update derived from
+        a conv_transpose (probed 2026-07-21)."""
+        y = conv(x, block, key)
+        channels = int(g.shape[y][1])
+        if channels <= 256:
+            return g.pixel_shuffle2x(y, tag=f"{block}_{key}_ps")
+        half = channels // 2
+        parts = [g.pixel_shuffle2x(
+                     g.slice_channels(y, start, half,
+                                      f"{block}_{key}_grp{j}"),
+                     tag=f"{block}_{key}_ps{j}")
+                 for j, start in enumerate((0, half))]
+        return g.concat_channels(parts, tag=f"{block}_{key}_cat")
+
+    def translation_island(x):
+        """cast fp32 -> add a runtime zero bias -> cast fp16 on the
+        temp1 -> temp2 handoff. Value-exact (widening cast, +0.0, exact
+        narrowing) and placed off-ANE, which makes Espresso translate
+        the two blocks as separate MIL->EIR units - each fits at
+        geometries where the whole graph's translation crashes with
+        std::bad_cast (any update_state in a two-block unit above
+        ~1.66M px). The bias is a model input so nothing can constant-
+        fold the add away; ModelRunner's fixed bindings feed it zeros
+        with no runner changes."""
+        dims = g.shape[x]
+        x32 = g.op("cast",
+                   {"x": x,
+                    "dtype": g.const_str(g.n("island_cast32_dtype"),
+                                         "fp32")},
+                   g.n("island_cast32"), dims, dtype=schema.FLOAT32)
+        bias32 = g.op("cast",
+                      {"x": "island_bias",
+                       "dtype": g.const_str(g.n("island_bias_dtype"),
+                                            "fp32")},
+                      g.n("island_bias32"), (1, 1, 1, 1),
+                      dtype=schema.FLOAT32)
+        sum32 = g.op("add", {"x": x32, "y": bias32},
+                     g.n("island_add"), dims, dtype=schema.FLOAT32)
+        return g.op("cast",
+                    {"x": sum32,
+                     "dtype": g.const_str(g.n("island_cast16_dtype"),
+                                          "fp16")},
+                    g.n("island_cast16"), dims)
 
     gates = [g.slice_channels("gate", i, 1, f"gate{i}") for i in range(16)]
     writes = [g.slice_channels("write", i, 1, f"write{i}") for i in range(16)]
@@ -398,11 +475,16 @@ def _emit_graph(params: dict, input_channels: int, height: int, width: int,
         for index, reads, new_state in pending:
             g.update_state(f"st{index}", reads, new_state)
 
+        if island and block_index == 0:
+            x = translation_island(x)
+
     output_names = ["out"] + [f"skip_out_{i}" for i in range(len(pushed))]
     inputs = ([("frame", (1, input_channels, height, width)),
                ("gate", (1, 16, 1, 1)), ("write", (1, 16, 1, 1))]
               + [(f"skip_{i}", skip_shapes[i])
                  for i in range(len(skip_shapes))])
+    if island:
+        inputs.append(("island_bias", (1, 1, 1, 1)))
     states = [(f"st{i}", state_shapes[i]) for i in range(len(state_shapes))]
     return g, inputs, states, output_names
 
@@ -650,8 +732,9 @@ def _verify_build(compiled: Path, directory: Path, input_channels: int,
     if separation < CPU_DIVERGENCE_FLOOR:
         raise RuntimeError(
             f"CPU_AND_NE and CPU_ONLY agree to {separation:.3e}, so the "
-            f"requested ANE run is executing on the CPU, where this graph's "
-            f"state updates are miscomputed.")
+            f"differential canary cannot distinguish the requested ANE run "
+            f"from the CPU path. Core ML CPU fp16 convolution accumulation "
+            f"exceeds this recurrent graph's numerical tolerance.")
     byte_copy = ByteCopyBsvdRunner(compiled, "ane")
     on_reference = _drive(byte_copy, frames)
     del byte_copy
@@ -725,13 +808,15 @@ def build_runner(params: dict, input_channels: int, height: int,
     if not complete:
         _log.info("building BSVD ANE model for %dx%d (one-time per "
                   "geometry, cached under %s)", width, height, directory)
-        worst = _audit_fold(params, height, width)
-        if worst > 1e-9:
-            raise RuntimeError(
-                f"upsample fold audit failed in float64: {worst:.3e}")
         package = _convert(params, input_channels, height, width, directory)
         compiled = runtime.compile_package(package)
-        placement = runtime.assert_all_ane(compiled)
+        # Geometries above ISLAND_MIN_PIXELS legitimately place the four
+        # value-exact island_* ops off the ANE; everything else must be
+        # ANE-preferred as before.
+        placement = runtime.assert_all_ane(
+            compiled, allow_prefixes=(("island_",)
+                                      if height * width >= ISLAND_MIN_PIXELS
+                                      else ()))
         _verify_build(compiled, directory, input_channels, height, width,
                       placement)
         _VERIFIED.add(str(directory))

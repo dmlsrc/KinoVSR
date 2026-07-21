@@ -122,8 +122,12 @@ class Graph:
         return operation
 
     def op(self, op_type: str, inputs: dict, out_name: str | None,
-           out_dims=None, name: str | None = None) -> str | None:
-        """Raw escape hatch: named bindings in, one fp16 output (or none)."""
+           out_dims=None, name: str | None = None,
+           dtype: int | None = None) -> str | None:
+        """Raw escape hatch: named bindings in, one output (or none).
+
+        The output is fp16 unless `dtype` names another schema dtype -
+        the float32 translation-island casts are the one current user."""
         operation = self._operation(op_type, name or out_name)
         for key, ref in inputs.items():
             refs = ref if isinstance(ref, (list, tuple)) else [ref]
@@ -133,7 +137,9 @@ class Graph:
         if out_name is not None:
             named = operation.outputs.add()
             named.name = out_name
-            _set_tensor_type(named.type.tensorType, schema.FLOAT16, out_dims)
+            _set_tensor_type(named.type.tensorType,
+                             schema.FLOAT16 if dtype is None else dtype,
+                             out_dims)
             self.shape[out_name] = tuple(int(d) for d in out_dims)
         return out_name
 
@@ -225,6 +231,27 @@ class Graph:
         """x op y with the output taking x's shape (y broadcasts into x)."""
         return self.op(op_type, {"x": x, "y": y}, name or self.n(tag),
                        self.shape[x])
+
+    def pixel_shuffle2x(self, x: str, tag: str) -> str:
+        """Native 2x pixel shuffle: (1, C, H, W) -> (1, C/4, 2H, 2W).
+
+        The single-op native shuffle miscomputes on the ANE when the
+        INPUT has more than 256 channels (measured 2026-07-20: 512->128
+        is badly wrong, 256->64 is bit-exact), so callers must slice
+        wider tensors into <=256-channel groups and concat the shuffled
+        groups - the channel->pixel mapping is block-diagonal, so the
+        grouped form is exactly equivalent.
+        """
+        xs = self.shape[x]
+        if xs[1] > 256:
+            raise ValueError(
+                f"pixel_shuffle2x input has {xs[1]} channels; the native "
+                f"op is numerically wrong on the ANE above 256 - slice "
+                f"into groups and concat instead")
+        opname = self.n(tag)
+        factor = self.const_i32_scalar(f"{opname}_factor_0", 2)
+        return self.op("pixel_shuffle", {"x": x, "upscale_factor": factor},
+                       opname, (xs[0], xs[1] // 4, xs[2] * 2, xs[3] * 2))
 
     def concat_channels(self, values, tag: str, name: str | None = None) -> str:
         opname = name or self.n(tag)

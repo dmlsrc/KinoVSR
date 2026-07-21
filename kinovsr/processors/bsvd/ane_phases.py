@@ -33,7 +33,7 @@ from . import ane as base
 _log = logging.getLogger("kinovsr.bsvd_ane")
 
 PHASE_STEPS = 8
-PHASE_GRAPH_VERSION = 5
+PHASE_GRAPH_VERSION = 6
 PHASE_REPLAY_FRAMES = 20
 _FUNCTIONS = {
     ("fill", 0): "fill_00",
@@ -627,6 +627,14 @@ def build_suite(params: dict, input_channels: int, height: int, width: int,
         _log.info("building BSVD ANE scheduled phases for %dx%d (one-time "
                   "per geometry, cached under %s)", width, height, directory)
     start = time.perf_counter()
+    if cold:
+        # The fill/drain chunks still emit the folded conv_transpose
+        # upsamplers (the ordinary step moved to conv + pixel_shuffle);
+        # prove the fold exact in float64 before converting.
+        worst = base._audit_fold(params, height, width)
+        if worst > 1e-9:
+            raise RuntimeError(
+                f"upsample fold audit failed in float64: {worst:.3e}")
     package = _convert(params, input_channels, height, width, directory)
     compiled = runtime.compile_package(package)
     if cold:

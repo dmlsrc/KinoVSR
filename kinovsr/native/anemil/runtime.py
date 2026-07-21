@@ -63,9 +63,10 @@ def compile_package(package: Path) -> Path:
     return compiled_dir
 
 
-def placement(compiled: Path, timeout: float = 300.0,
-              function_name: str | None = None) -> dict:
-    """Preferred compute device counts, by device class name."""
+def _plan_operations(compiled: Path, timeout: float,
+                     function_name: str | None):
+    """Yield (operation, preferred-device class name) over the selected
+    function of a compiled ML program's MLComputePlan."""
     import CoreML
     from Foundation import NSURL
 
@@ -92,30 +93,60 @@ def placement(compiled: Path, timeout: float = 300.0,
         raise RuntimeError("compiled model is not an ML program")
     selected = function_name or "main"
     main = program.functions()[selected]
-    preferred: dict[str, int] = {}
     for operation in main.block().operations():
         usage = plan.computeDeviceUsageForMLProgramOperation_(operation)
         if usage is None:
             continue
-        device = type(usage.preferredComputeDevice()).__name__
+        yield operation, type(usage.preferredComputeDevice()).__name__
+
+
+def _operation_outputs(operation) -> list[str]:
+    """Output value names of an MLModelStructureProgramOperation."""
+    return [str(named.name()) for named in operation.outputs()]
+
+
+def placement(compiled: Path, timeout: float = 300.0,
+              function_name: str | None = None) -> dict:
+    """Preferred compute device counts, by device class name."""
+    preferred: dict[str, int] = {}
+    for _operation, device in _plan_operations(
+            compiled, timeout, function_name):
         preferred[device] = preferred.get(device, 0) + 1
     return preferred
 
 
 def assert_all_ane(compiled: Path,
-                   function_name: str | None = None) -> dict:
+                   function_name: str | None = None,
+                   allow_prefixes: tuple[str, ...] = ()) -> dict:
     """Refuse a model that would run any operation off the ANE.
 
-    Placement is a preference, not a realized trace; pair this with a
-    runtime oracle (replay or differential canary) per processor.
+    `allow_prefixes` exempts operations whose every output name starts
+    with one of the prefixes - the deliberate float32 translation-island
+    ops ("island_") are value-exact on any device, unlike the fp16
+    convolutions this gate exists to keep off the CPU. Placement is a
+    preference, not a realized trace; pair this with a runtime oracle
+    (replay or differential canary) per processor.
     """
-    preferred = placement(compiled, function_name=function_name)
-    stray = {k: v for k, v in preferred.items() if "NeuralEngine" not in k}
+    preferred: dict[str, int] = {}
+    stray: dict[str, int] = {}
+    stray_names: list[str] = []
+    for operation, device in _plan_operations(compiled, 300.0,
+                                              function_name):
+        preferred[device] = preferred.get(device, 0) + 1
+        if "NeuralEngine" in device:
+            continue
+        outputs = _operation_outputs(operation)
+        if allow_prefixes and outputs and all(
+                name.startswith(allow_prefixes) for name in outputs):
+            continue
+        stray[device] = stray.get(device, 0) + 1
+        stray_names.extend(outputs[:2])
     if stray:
         raise RuntimeError(
-            f"{stray} operations are not ANE-preferred; refusing. On graphs "
-            f"with MLState the Core ML CPU runtime miscomputes the updates, "
-            f"so a partial fallback is silently wrong rather than slow.")
+            f"{stray} operations are not ANE-preferred (first: "
+            f"{stray_names[:4]}); refusing because a partial fallback can "
+            f"violate the requesting processor's performance or numerical "
+            f"contract.")
     return preferred
 
 
