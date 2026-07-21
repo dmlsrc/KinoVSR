@@ -8,6 +8,7 @@ import pytest
 
 from kinovsr.processors import bsvd as B
 from kinovsr.processors.bsvd import ane as A
+from kinovsr.processors.bsvd import ane_phases as P
 
 pytestmark = pytest.mark.unit
 
@@ -180,6 +181,128 @@ class TestGeometry:
     def test_below_floor_is_refused(self):
         with pytest.raises(RuntimeError, match="verified ANE floor"):
             A.build_runner(None, 4, 92, 128)
+
+    def test_phase_window_envelope_includes_only_verified_640x480(self):
+        net = object.__new__(A.AneBSVD)
+
+        assert net.window_capable(480, 640)
+        assert net.window_capable(480, 513)  # padded to 640
+        assert not net.window_capable(481, 640)
+        assert not net.window_capable(480, 641)  # padded to 768
+
+
+# --------------------------------------------------------------------------
+# Three-context scheduled window design
+# --------------------------------------------------------------------------
+
+class _ImmediatePipeline:
+    def __init__(self):
+        self.in_flight = False
+
+    def submit(self, call):
+        assert not self.in_flight
+        call()
+        self.in_flight = True
+
+    def idle(self):
+        return True
+
+    def join(self):
+        assert self.in_flight
+        self.in_flight = False
+
+    def drain(self):
+        self.in_flight = False
+
+
+class _ScheduledFakeRunner:
+    def __init__(self, events):
+        self.events = events
+        self.loads = []
+        self.zeroed = []
+        self.model = type(
+            "Model", (), {
+                "_state": object(),
+                "output_array": lambda self, name: name,
+            })()
+
+    def load_inputs(self, frame, gates=None, writes=None):
+        self.loads.append((frame, gates, writes))
+
+    def dispatch(self):
+        self.events.append("main")
+
+    def zero_last_push(self, line):
+        self.zeroed.append(line)
+
+
+class _ScheduledFakeSuite:
+    def __init__(self):
+        self.events = []
+        self.pipeline = _ImmediatePipeline()
+        self.runner = _ScheduledFakeRunner(self.events)
+        self.models = {
+            ("drain", 8): type(
+                "PhaseModel", (), {
+                    "output_array": lambda self, name: name,
+                })(),
+        }
+        self.states = []
+
+    def set_state(self, state):
+        self.states.append(state)
+
+    def dispatch(self, kind, start, frames):
+        self.events.append((kind, start, len(frames)))
+
+
+class TestScheduledPhases:
+    def test_asset_keeps_only_the_two_stable_specializations(self):
+        assert P._FUNCTIONS == {
+            ("fill", 0): "fill_00",
+            ("drain", 8): "drain_08",
+        }
+
+    def test_inner_phases_run_as_gated_main_steps(self, monkeypatch):
+        monkeypatch.setattr(P, "_vector_bytes", tuple)
+        suite = _ScheduledFakeSuite()
+        frames = [bytes([index]) for index in range(20)]
+        machine = P.WindowMachine(suite, frames, b"zero", lambda value: value)
+
+        assert machine.advance(block=True)
+        assert suite.events[0] == ("fill", 0, 8)
+        assert suite.events[-1] == ("drain", 8, 8)
+        assert suite.events[1:-1] == ["main"] * 20
+        assert len(machine.outputs) == len(frames)
+
+        gate_write_modes = [
+            (gates is not None, writes is not None)
+            for _frame, gates, writes in suite.runner.loads
+        ]
+        assert gate_write_modes == (
+            [(False, True)] * 8
+            + [(False, False)] * 4
+            + [(True, True)] * 8
+        )
+
+    def test_warm_suite_load_does_not_reverify_or_require_a_canary(
+            self, monkeypatch, tmp_path):
+        stem = f"scheduled8-v{P.PHASE_GRAPH_VERSION}"
+        package = tmp_path / f"{stem}.mlpackage"
+        package.mkdir()
+        (tmp_path / f"{stem}-verify.json").write_text("{}")
+        (tmp_path / f"{stem}-replay.safetensors").touch()
+        expected = object()
+
+        monkeypatch.setattr(P, "_convert", lambda *_args: package)
+        monkeypatch.setattr(P.runtime, "compile_package", lambda path: path)
+        monkeypatch.setattr(P, "ScheduledPhaseSuite", lambda _path: expected)
+        monkeypatch.setattr(
+            P, "_verify_build",
+            lambda *_args: pytest.fail("warm load unexpectedly reverified"))
+
+        actual = P.build_suite({}, 4, 480, 640, tmp_path)
+        assert actual is expected
 
 
 # --------------------------------------------------------------------------

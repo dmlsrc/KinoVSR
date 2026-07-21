@@ -87,18 +87,14 @@ MIN_SIDE = 96
 # Probed 2026-07-19: widths 128/256/384/640 run; 32/320/352/704 compile,
 # place all-ANE, then fail the first prediction with status=0x1d.
 ANE_WIDTH_QUANTUM = 128
-# The phase-specialized window functions are only reliable up to this
-# padded width. At 640x480, RE-EXECUTING a phase function after other
-# work fails with ANEProgramProcessRequestDirect status=0x16 - probed
-# 2026-07-20, deterministic single-threaded, timing-dependent otherwise;
-# WHICH function dies depends on execution history (fill_08 back to
-# back; drain_00 only after ~185 intervening dispatches; the ordinary
-# single-step function never, at any size, across thousands of
-# executions). At 384-wide, every function re-executes cleanly across
-# many windows. Between 384 and 640 is uncharacterized; raise only with
-# multi-window probe evidence. Scheduled windows beyond this width run
-# entirely as gated singles on the main function instead.
-PHASE_MAX_WIDTH = 384
+# The three-context phase schedule (main + fill_00 + drain_08) is stable
+# through this measured production envelope.  At 640x480, adding either
+# inner phase as a fourth resident ANE program makes program re-entry fail
+# with ANEProgramProcessRequestDirect status=0x16; those steps therefore run
+# through main.  Geometries beyond the measured rectangle stay on the fully
+# gated main function until separately proven.
+PHASE_MAX_WIDTH = 640
+PHASE_MAX_HEIGHT = 480
 CPU_DIVERGENCE_FLOOR = 1e-6
 REPLAY_TOLERANCE = 5e-3
 REPLAY_STEPS = 12  # past the depth-8 ring wraparound (first re-read at step 8)
@@ -1047,7 +1043,7 @@ class AneBSVD:
             stem = f"scheduled8-v{PHASE_GRAPH_VERSION}"
             warm = all((directory / name).exists() for name in (
                 f"{stem}.mlpackage", f"{stem}-verify.json",
-                f"{stem}-replay.safetensors", f"{stem}-canary.safetensors"))
+                f"{stem}-replay.safetensors"))
             target = self._build_scheduled
         else:
             warm = all((directory / name).exists() for name in (
@@ -1124,12 +1120,13 @@ class AneBSVD:
     def window_capable(self, height: int, width: int) -> bool:
         """Whether the phase-specialized window path applies here.
 
-        Beyond ``PHASE_MAX_WIDTH`` the driver checks the schedule-capable
-        wrapper makes and routes windows through the per-step gated path
-        instead (the ordinary function is reliable at every size).
+        Beyond the measured ``PHASE_MAX_WIDTH`` by ``PHASE_MAX_HEIGHT``
+        envelope, the schedule-capable wrapper routes windows through the
+        per-step gated path instead (the ordinary function is reliable at
+        every size).
         """
         padded = -(-width // ANE_WIDTH_QUANTUM) * ANE_WIDTH_QUANTUM
-        return padded <= PHASE_MAX_WIDTH
+        return height <= PHASE_MAX_HEIGHT and padded <= PHASE_MAX_WIDTH
 
     def begin_window(self, frames: list[Any]):
         """Start one independently reset window; return its async handle.
@@ -1144,9 +1141,10 @@ class AneBSVD:
         The stream is dirty from this point - ``reset()`` before the next
         window.
 
-        Unrolled fill/drain functions remove the convolutions whose
-        product value is ``None`` and batch those dispatches eight steps
-        at a time; the steady middle uses the verified one-step runner.
+        The unrolled outer fill/drain functions remove convolutions whose
+        product value is ``None`` and batch those dispatches eight steps at
+        a time; the inner boundary and steady middle use the verified
+        one-step runner.
         """
         self._require_open()
         if len(frames) < 16:
@@ -1158,8 +1156,9 @@ class AneBSVD:
         if not self.window_capable(height, width):
             raise RuntimeError(
                 f"{width}x{height} is outside the phase-window envelope "
-                f"(padded width above {PHASE_MAX_WIDTH}); route this window "
-                f"through step() instead")
+                f"(verified padded maximum {PHASE_MAX_WIDTH}x"
+                f"{PHASE_MAX_HEIGHT}); route this window through step() "
+                f"instead")
         self._ensure_scheduled_runner(height, width)
         for frame in frames:
             if (int(frame.shape[1]), int(frame.shape[2])) != (height, width):

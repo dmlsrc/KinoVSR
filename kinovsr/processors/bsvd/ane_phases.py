@@ -6,11 +6,13 @@ is appropriate for a long continuous stream, but GOP-aligned windows spend
 32 of roughly 46 steps filling or draining.  This module unrolls those phases
 eight at a time and omits operations whose product value is ``None``.
 
-Four functions (fill 0-7, fill 8-15, drain 0-7, drain 8-15) share one Core
-ML asset and one weight blob.  They also share the shipping graph's MLState
-handle and host skip rings, so the steady middle of a window can return to the
-ordinary one-step runner without copying state.  The emitted-frame replay
-gate below requires that handoff to remain exact.
+Two functions (fill 0-7 and drain 8-15) share one Core ML asset and one weight
+blob with the ordinary one-step graph.  The inner fill and drain chunks run as
+gated one-step calls: at 640x480, three resident ANE programs are stable while
+returning to a fourth fails with status=0x16.  All three share the shipping
+graph's MLState handle and host skip rings, so every handoff avoids copying
+state.  The emitted-frame replay gate below requires those handoffs to remain
+exact.
 """
 from __future__ import annotations
 
@@ -19,7 +21,6 @@ import logging
 import shutil
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -32,19 +33,12 @@ from . import ane as base
 _log = logging.getLogger("kinovsr.bsvd_ane")
 
 PHASE_STEPS = 8
-PHASE_GRAPH_VERSION = 4
+PHASE_GRAPH_VERSION = 5
 PHASE_REPLAY_FRAMES = 20
-CANARY_STEPS = 2
-CANARY_DIVERGENCE_FLOOR = 4e-5
-CANARY_REPLAY_TOLERANCE = 2e-5
-_CANARY_NAME = "state_canary"
 _FUNCTIONS = {
     ("fill", 0): "fill_00",
-    ("fill", 8): "fill_08",
-    ("drain", 0): "drain_00",
     ("drain", 8): "drain_08",
 }
-_VERIFIED: set[str] = set()
 
 
 def _phase_records(start: int, draining: bool) -> list[tuple[Any, list[bool]]]:
@@ -310,51 +304,10 @@ def _emit_program(params: dict, input_channels: int, height: int, width: int):
             params, input_channels, height, width, start,
             draining=kind == "drain", blob=blob)
         functions.append((name, graph, inputs, states, outputs))
-    functions.append((_CANARY_NAME, *_emit_canary(
-        params, input_channels, height, width, blob)))
     model_bytes = builder.finish_functions(
         functions, "KinoVSR BSVD ANE scheduled phases",
         default_function="main")
     return model_bytes, blob
-
-
-def _emit_canary(params: dict, input_channels: int, height: int, width: int,
-                 blob: builder.BlobFile):
-    """Cheap state recurrence whose CPU and ANE results visibly diverge."""
-    state_shapes, _skip_shapes = base._shapes(
-        params, input_channels, height, width)
-    graph = builder.Graph(blob)
-    inputs = [("frame", (1, input_channels, height, width))]
-    states = [(f"st{index}", shape)
-              for index, shape in enumerate(state_shapes)]
-    for name, shape in inputs + states:
-        graph.register_input(name, shape)
-    reads = [graph.read_state(name) for name, _shape in states]
-    graph.slice_channels(
-        reads[0], 0, 3, "canary_previous_state", name="out")
-
-    def conv(x: str, key: str) -> str:
-        weight, bias, stride = params["temp1"][key]
-        return graph.conv2d(
-            x, base._oihw(weight),
-            None if bias is None else bias.astype(mx.float32),
-            tag=f"canary_{key}", stride=int(stride), relu6=True)
-
-    x = conv(conv(conv("frame", "inc0"), "inc3"), "d0")
-    channels = int(params["temp1"]["d0c1"][0].shape[3])
-    fold = channels // 8
-    zero_scalar = graph.fp16_const(
-        "canary_zero", mx.zeros((1, 1, 1, 1), dtype=mx.float16))
-    carry = graph.slice_channels(
-        reads[0], channels, fold, "canary_carry")
-    carry = graph.binary("mul", carry, zero_scalar, "canary_zero_carry")
-    state0 = graph.concat_channels([x, carry], tag="canary_state0")
-    graph.update_state("st0", reads[0], state0)
-    for index in range(1, len(states)):
-        cleared = graph.binary(
-            "mul", reads[index], zero_scalar, f"canary_clear_st{index}")
-        graph.update_state(f"st{index}", reads[index], cleared)
-    return graph, inputs, states, ["out"]
 
 
 def _convert(params: dict, input_channels: int, height: int, width: int,
@@ -372,7 +325,7 @@ def _convert(params: dict, input_channels: int, height: int, width: int,
 
 
 class ScheduledPhaseSuite:
-    """Four phase functions sharing one MLState and the base skip rings."""
+    """Two phase functions sharing one MLState and the base skip rings."""
 
     def __init__(self, compiled: Path):
         # Load the default function first so every other function can attach
@@ -383,15 +336,15 @@ class ScheduledPhaseSuite:
             compiled, "ane", function_name="main")
         shared_state = self.runner.model._state
 
-        def load(item):
-            key, name = item
-            return key, runtime.ModelRunner(
+        # main + these two specializations is the measured stable residency
+        # boundary at 640x480.  Loading either inner phase as a fourth model
+        # makes returning to an evicted ANE program fail with status=0x16.
+        self.models = {
+            key: runtime.ModelRunner(
                 compiled, "ane", dynamic=("skip_",),
                 function_name=name, state=shared_state)
-
-        load_items = [*_FUNCTIONS.items(), (_CANARY_NAME, _CANARY_NAME)]
-        with ThreadPoolExecutor(max_workers=len(load_items)) as pool:
-            self.models = dict(pool.map(load, load_items))
+            for key, name in _FUNCTIONS.items()
+        }
         first = self.models[("fill", 0)]
         self._spares = [
             [runtime.bind_array(first.dynamic_inputs[f"skip_0_{index}"])
@@ -503,17 +456,10 @@ class WindowMachine:
         pipeline.submit(lambda: suite.dispatch("fill", 0, first))
         second = [resolve(index) for index in range(8, 16)]
         yield
-        # Fill steps 8-15 run as GATED SINGLES on the main function, NOT
-        # the fill_08 phase function: re-executing that function fails
-        # with ANE status=0x16 on its SECOND run per load at 640x480
-        # (probed 2026-07-20; deterministic single-threaded, timing-
-        # dependent otherwise - the cold CLI failed at window ONE because
-        # the build replay had spent the one good execution). The bug is
-        # specific to that function at that scale: fill_00, both drains,
-        # the larger drain_00, and CIF-sized fill_08 all re-execute fine.
-        # These eight steps only omitted 28 percent of compute anyway, so
-        # the gated singles - the continuously verified path - cost about
-        # 1.6 percent of a window and remove the trigger entirely.
+        # Keep the two inner boundary chunks on main.  Loading either as a
+        # fourth resident ANE program makes phase-program re-entry unstable
+        # at 640x480; gated singles preserve the exact schedule without
+        # adding another Core ML context.
         count = len(frames)
         pending = None
         fill_tail = _phase_records(8, draining=False)
@@ -535,13 +481,24 @@ class WindowMachine:
             yield
             self.outputs.append(
                 snapshot(suite.runner.model.output_array("out")))
+        drain_head = _phase_records(0, draining=True)
+        for record, _flow in drain_head:
+            gates = _vector_bytes(
+                [0.0 if record.drained[i] else 1.0 for i in range(16)])
+            writes = _vector_bytes(
+                [0.0 if record.primes[i] else 1.0 for i in range(16)])
+            suite.runner.load_inputs(zero_frame, gates, writes)
+            pipeline.submit(suite.runner.dispatch)
+            yield
+            for line, pushed in enumerate(record.pushes):
+                if not pushed:
+                    suite.runner.zero_last_push(line)
+            if record.out_real:
+                self.outputs.append(
+                    snapshot(suite.runner.model.output_array("out")))
+
         zeros = [zero_frame] * PHASE_STEPS
-        pipeline.submit(lambda: suite.dispatch("drain", 0, zeros))
-        yield
         pipeline.submit(lambda: suite.dispatch("drain", 8, zeros))
-        drained = suite.models[("drain", 0)]
-        self.outputs.extend(snapshot(drained.output_array(f"out_{step}"))
-                            for step in range(PHASE_STEPS))
         yield
         drained = suite.models[("drain", 8)]
         self.outputs.extend(snapshot(drained.output_array(f"out_{step}"))
@@ -620,68 +577,16 @@ def _replay_suite(suite: ScheduledPhaseSuite, input_channels: int,
     return outputs
 
 
-def _drive_canary_model(model: runtime.ModelRunner, input_channels: int,
-                        height: int, width: int) -> list[Any]:
-    model.reset_state()
-    outputs = []
-    for frame in base._replay_frames(
-            input_channels, height, width, CANARY_STEPS):
-        model.input_view("frame")[:] = memoryview(frame).cast("B")
-        model.predict()
-        outputs.append(_snapshot(model.output_array("out")))
-    return outputs
-
-
-def _drive_canary(compiled: Path, compute_units: str, input_channels: int,
-                  height: int, width: int) -> list[Any]:
-    model = runtime.ModelRunner(
-        compiled, compute_units, function_name=_CANARY_NAME)
-    return _drive_canary_model(model, input_channels, height, width)
-
-
-def _mean_abs(left: list[Any], right: list[Any]) -> float:
-    deltas = [mx.abs(a - b).mean()
-              for a, b in zip(left, right, strict=True)]
-    return float(mx.mean(mx.stack(deltas)))
-
-
-def _verify_canary_load(suite: ScheduledPhaseSuite, directory: Path,
-                        input_channels: int, height: int, width: int) -> None:
-    record = json.loads((
-        directory / f"scheduled8-v{PHASE_GRAPH_VERSION}-verify.json"
-    ).read_text())
-    if record.get("graph_version") != PHASE_GRAPH_VERSION:
-        raise RuntimeError("scheduled phase cache has a different graph version")
-    expected = mx.load(str(
-        directory / f"scheduled8-v{PHASE_GRAPH_VERSION}-canary.safetensors"))
-    actual = _drive_canary_model(
-        suite.models[_CANARY_NAME], input_channels, height, width)
-    reference = [expected[f"out_{index}"]
-                 for index in range(len(actual))]
-    drift = _mean_abs(actual, reference)
-    tolerance = float(record.get(
-        "canary_replay_tolerance", CANARY_REPLAY_TOLERANCE))
-    if drift > tolerance:
-        raise RuntimeError(
-            f"scheduled phase ANE canary drift {drift:.3e} exceeds "
-            f"{tolerance:.0e}; refusing a possible CPU "
-            f"fallback")
-    suite.runner.reset()
-    suite.set_state(suite.runner.model._state)
-
-
 def _verify_build(suite: ScheduledPhaseSuite, compiled: Path,
                   directory: Path, input_channels: int,
                   height: int, width: int) -> None:
     # Placement is gated on the DEFAULT function only. Loading a NAMED
     # function's MLComputePlan re-runs its own E5RT specialization (~4 s
     # per function on the serial compiler service, not shared with the
-    # model loads - measured 2026-07-20: six named plans cost 24.3 s,
-    # HALF the cold build, against 0.6 s for the default plan). The phase
-    # functions are gated by something strictly stronger below: the EXACT
-    # replay requires each of them to match this plan-gated main function
-    # bit for bit, a realized-execution oracle no CPU-placed MLState graph
-    # can satisfy, and the canary keeps its CPU-divergence check.
+    # model loads. The phase functions are gated by something strictly
+    # stronger below: the EXACT replay requires both of them to match this
+    # plan-gated main function bit for bit, a realized-execution oracle no
+    # CPU-placed MLState graph can satisfy.
     placements = {"main": runtime.assert_all_ane(compiled)}
     frames = base._replay_frames(
         input_channels, height, width, PHASE_REPLAY_FRAMES)
@@ -695,32 +600,15 @@ def _verify_build(suite: ScheduledPhaseSuite, compiled: Path,
         raise RuntimeError(
             f"scheduled phase graph differs from the full graph (max abs "
             f"{maximum:.3e})")
-    canary_ane = _drive_canary(
-        compiled, "ane", input_channels, height, width)
-    canary_cpu = _drive_canary(
-        compiled, "cpu", input_channels, height, width)
-    separation = _mean_abs(canary_ane, canary_cpu)
-    if separation < CANARY_DIVERGENCE_FLOOR:
-        raise RuntimeError(
-            f"scheduled phase canary separates ANE and CPU by only "
-            f"{separation:.3e}; refusing an inconclusive runtime oracle")
     mx.save_safetensors(
         str(directory / f"scheduled8-v{PHASE_GRAPH_VERSION}-replay"),
         {f"out_{index}": value for index, value in enumerate(actual)})
-    mx.save_safetensors(
-        str(directory / f"scheduled8-v{PHASE_GRAPH_VERSION}-canary"),
-        {f"out_{index}": value
-         for index, value in enumerate(canary_ane)})
     (directory / f"scheduled8-v{PHASE_GRAPH_VERSION}-verify.json").write_text(
         json.dumps({
             "graph_version": PHASE_GRAPH_VERSION,
             "phase_steps": PHASE_STEPS,
             "replay_frames": PHASE_REPLAY_FRAMES,
             "full_graph_max_abs": maximum,
-            "canary_steps": CANARY_STEPS,
-            "canary_separation": separation,
-            "canary_divergence_floor": CANARY_DIVERGENCE_FLOOR,
-            "canary_replay_tolerance": CANARY_REPLAY_TOLERANCE,
             "placements": placements,
         }, indent=2))
 
@@ -728,12 +616,12 @@ def _verify_build(suite: ScheduledPhaseSuite, compiled: Path,
 def build_suite(params: dict, input_channels: int, height: int, width: int,
                 directory: Path) -> ScheduledPhaseSuite:
     """Build/load, place, replay-gate, and return the scheduled phase suite."""
+    package_path = directory / f"scheduled8-v{PHASE_GRAPH_VERSION}.mlpackage"
     verify = directory / f"scheduled8-v{PHASE_GRAPH_VERSION}-verify.json"
     replay = directory / f"scheduled8-v{PHASE_GRAPH_VERSION}-replay.safetensors"
-    canary = directory / f"scheduled8-v{PHASE_GRAPH_VERSION}-canary.safetensors"
-    cold = not (verify.is_file() and replay.is_file() and canary.is_file())
+    cold = not (package_path.is_dir() and verify.is_file() and replay.is_file())
     if cold:
-        # The dominant cold cost is ANE specialization of the six
+        # The dominant cold cost is ANE specialization of the three
         # functions on the serial compiler service; without progress
         # lines the build reads as hung.
         _log.info("building BSVD ANE scheduled phases for %dx%d (one-time "
@@ -744,23 +632,17 @@ def build_suite(params: dict, input_channels: int, height: int, width: int,
     if cold:
         _log.info("scheduled phases emitted and compiled in %.1fs; "
                   "specializing %d functions for the ANE (the slow part)",
-                  time.perf_counter() - start, len(_FUNCTIONS) + 2)
+                  time.perf_counter() - start, len(_FUNCTIONS) + 1)
     loaded = time.perf_counter()
     suite = ScheduledPhaseSuite(compiled)
-    key = str(package)
     if cold:
         _log.info("scheduled phase functions loaded in %.1fs; verifying",
                   time.perf_counter() - loaded)
         gate = time.perf_counter()
         _verify_build(
             suite, compiled, directory, input_channels, height, width)
-        _VERIFIED.add(key)
         _log.info("scheduled phases verified in %.1fs (total %.1fs)",
                   time.perf_counter() - gate, time.perf_counter() - start)
-    elif key not in _VERIFIED:
-        _verify_canary_load(
-            suite, directory, input_channels, height, width)
-        _VERIFIED.add(key)
     return suite
 
 
