@@ -121,10 +121,15 @@ ANE_WIDTH_QUANTUM = 128
 # through this measured production envelope.  At 640x480, adding either
 # inner phase as a fourth resident ANE program makes program re-entry fail
 # with ANEProgramProcessRequestDirect status=0x16; those steps therefore run
-# through main.  Geometries beyond the measured rectangle stay on the fully
-# gated main function until separately proven.
-PHASE_MAX_WIDTH = 640
-PHASE_MAX_HEIGHT = 480
+# through main.  With the v7 shuffle-spelled chunks the re-entry boundary
+# was re-probed 2026-07-21 (cold gate plus six bit-exact reset windows per
+# geometry): 640x480, 768x576, and 1024x576 pass with a steady ~1.45x
+# window speedup over gated main; 1152x576 and 1024x648 (663K px, both
+# equal-area) fail with 0x16 on the first re-entry, so the working-set
+# boundary sits just above 590K px.  Geometries beyond the rectangle stay
+# on the fully gated main function.
+PHASE_MAX_WIDTH = 1024
+PHASE_MAX_HEIGHT = 576
 CPU_DIVERGENCE_FLOOR = 1e-6
 REPLAY_TOLERANCE = 5e-3
 REPLAY_STEPS = 12  # past the depth-8 ring wraparound (first re-read at step 8)
@@ -175,134 +180,9 @@ def _shapes(params: dict, input_channels: int, height: int, width: int):
     return states, skips
 
 
-# --------------------------------------------------- float64 fold audit (MLX)
-
-def _assert_true_float64() -> None:
-    """Refuse the fold audit unless MLX CPU float64 is real double precision
-    for the operation classes the audit uses (arithmetic, matmul, reductions,
-    scatter, movement - transcendentals are NOT trusted and not used)."""
-    tiny = 2.0 ** -40
-    with mx.stream(mx.cpu):
-        one_tiny = mx.array([1.0 + tiny], dtype=mx.float64)
-        checks = {
-            "add_sub": float((one_tiny + tiny - one_tiny)[0]) == tiny,
-            "mul": abs(float((one_tiny * one_tiny - 1.0)[0]) - 2.0 ** -39)
-                   < 2.0 ** -75,
-            "sum": float(mx.sum(mx.array([1.0, tiny, -1.0],
-                                         dtype=mx.float64))) == tiny,
-            "matmul": float((mx.array([[1.0, tiny]], dtype=mx.float64)
-                             @ mx.array([[1.0], [1.0]], dtype=mx.float64)
-                             - 1.0)[0, 0]) == tiny,
-            "scatter_add": float(mx.zeros((6,), dtype=mx.float64)
-                                 .at[0:5:2].add(mx.array([tiny] * 3,
-                                                         dtype=mx.float64))[2]
-                                 ) == tiny,
-            "movement": float(mx.pad(mx.transpose(one_tiny.reshape(1, 1)),
-                                     ((0, 0), (1, 0)))[0, 1]) == 1.0 + tiny,
-        }
-    failed = [name for name, ok in checks.items() if not ok]
-    if failed:
-        raise RuntimeError(
-            f"MLX CPU float64 is not double-precision for {failed}; refusing "
-            f"the upsample fold audit.")
-
-
-def _fold_weights(weight, bias, r: int = 2):  # phase chunks only
-    """[Cout*r*r, Cin, k, k] + bias -> [Cin+1, Cout, k*r, k*r], any dtype.
-
-    Sub-pixel convolution and transposed convolution are equivalent; the
-    appended input channel is fed a constant one and carries the per-phase
-    bias, which a per-channel transposed-convolution bias cannot express.
-    """
-    c4 = int(weight.shape[0])
-    cin, k = int(weight.shape[1]), int(weight.shape[2])
-    cout = c4 // (r * r)
-    if k != 3 or r != 2:
-        raise ValueError("fold is written for k=3, r=2")
-    w6 = weight.reshape(cout, r, r, cin, k, k)[:, :, :, :, ::-1, ::-1]
-    main = mx.transpose(w6, (3, 0, 4, 1, 5, 2)).reshape(
-        cin, cout, k * r, k * r)
-    plane = mx.pad(bias.reshape(cout, r, r), ((0, 0), (2, 2), (2, 2)))[None]
-    return mx.concatenate([main, plane.astype(weight.dtype)], axis=0)
-
-
-def _conv2d_f64(x, weight, bias):
-    channels, h, w = int(x.shape[1]), int(x.shape[2]), int(x.shape[3])
-    padded = mx.pad(x, ((0, 0), (0, 0), (1, 1), (1, 1)))
-    out = mx.zeros((1, int(weight.shape[0]), h, w), dtype=x.dtype)
-    for kh in range(3):
-        for kw in range(3):
-            window = padded[:, :, kh:kh + h, kw:kw + w].reshape(
-                channels, h * w)
-            out = out + (weight[:, :, kh, kw] @ window).reshape(1, -1, h, w)
-    return out + bias.reshape(1, -1, 1, 1)
-
-
-def _pixel_shuffle_f64(y, r: int = 2):
-    n, c4, h, w = [int(s) for s in y.shape]
-    c = c4 // (r * r)
-    return mx.transpose(y.reshape(n, c, r, r, h, w),
-                        (0, 1, 4, 2, 5, 3)).reshape(n, c, h * r, w * r)
-
-
-def _conv_transpose_f64(x, weight, stride: int = 2, pad: int = 2):
-    ci, h, w = int(x.shape[1]), int(x.shape[2]), int(x.shape[3])
-    k = int(weight.shape[2])
-    oh = (h - 1) * stride - 2 * pad + k
-    ow = (w - 1) * stride - 2 * pad + k
-    out = mx.zeros((1, int(weight.shape[1]), oh, ow), dtype=x.dtype)
-    for kh in range(k):
-        for kw in range(k):
-            oy0, ox0 = kh - pad, kw - pad
-            iy_lo = max(0, -(oy0 // stride))
-            iy_hi = min(h - 1, (oh - 1 - oy0) // stride)
-            ix_lo = max(0, -(ox0 // stride))
-            ix_hi = min(w - 1, (ow - 1 - ox0) // stride)
-            if iy_lo > iy_hi or ix_lo > ix_hi:
-                continue
-            piece = x[:, :, iy_lo:iy_hi + 1, ix_lo:ix_hi + 1]
-            rows, cols = int(piece.shape[2]), int(piece.shape[3])
-            piece = (mx.transpose(weight[:, :, kh, kw])
-                     @ piece.reshape(ci, rows * cols)).reshape(
-                         1, -1, rows, cols)
-            out = out.at[:, :,
-                         oy0 + stride * iy_lo: oy0 + stride * iy_hi + 1: stride,
-                         ox0 + stride * ix_lo: ox0 + stride * ix_hi + 1: stride
-                         ].add(piece)
-    return out
-
-
 def _oihw(weight):
     """MLX OHWI conv weight (the product layout) -> contiguous fp32 OIHW."""
     return mx.contiguous(mx.transpose(weight, (0, 3, 1, 2)).astype(mx.float32))
-
-
-def _audit_fold(params: dict, height: int, width: int) -> float:
-    """Prove every upsample fold exact in float64 before converting.
-
-    The ordinary step now emits the reference conv + pixel-shuffle
-    directly; only the phase fill/drain chunks still fold, so this
-    audit runs on the scheduled-phase build path."""
-    _assert_true_float64()
-    worst = 0.0
-    geometry = {"u2": (height // 4, width // 4), "u1": (height // 2, width // 2)}
-    with mx.stream(mx.cpu):
-        for index, block in enumerate(BLOCKS):
-            for key, (rows, columns) in geometry.items():
-                weight = _oihw(params[block][key][0]).astype(mx.float64)
-                bias = params[block][key][1].astype(mx.float64)
-                source = (mx.random.uniform(
-                    shape=(1, int(weight.shape[1]), rows, columns),
-                    key=mx.random.key(20260719 + index)) * 2.0 - 1.0
-                ).astype(mx.float64)
-                want = _pixel_shuffle_f64(_conv2d_f64(source, weight, bias))
-                folded = _fold_weights(weight, bias)
-                extended = mx.concatenate(
-                    [source, mx.ones((1, 1, rows, columns),
-                                     dtype=mx.float64)], axis=1)
-                got = _conv_transpose_f64(extended, folded)
-                worst = max(worst, float(mx.abs(want - got).max()))
-    return worst
 
 
 # ----------------------------------------------------------------- emission
@@ -446,7 +326,6 @@ def _emit_graph(params: dict, input_channels: int, height: int, width: int,
                       gates[base + 4], writes[base + 4])
         x2 = bibuffer(x2, base + 5, block, "u2c2",
                       gates[base + 5], writes[base + 5])
-        # The u2 conv itself is folded into the transposed convolution.
         x2 = upsample(x2, block, "u2")
 
         merged = g.binary("add", x2, skip3_pop, f"{block}_skip3_add")

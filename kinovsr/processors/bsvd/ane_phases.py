@@ -33,7 +33,7 @@ from . import ane as base
 _log = logging.getLogger("kinovsr.bsvd_ane")
 
 PHASE_STEPS = 8
-PHASE_GRAPH_VERSION = 6
+PHASE_GRAPH_VERSION = 7
 PHASE_REPLAY_FRAMES = 20
 _FUNCTIONS = {
     ("fill", 0): "fill_00",
@@ -112,18 +112,22 @@ def _emit_chunk(params: dict, input_channels: int, height: int, width: int,
             relu6_name=name)
 
     def upsample(x: str, block: str, key: str) -> str:
-        weight, bias, _stride = params[block][key]
-        folded = base._fold_weights(
-            base._oihw(weight), bias.astype(mx.float32))
-        divisor = 4 if key == "u2" else 2
-        rows, columns = height // divisor, width // divisor
-        ones = graph.fp16_const(
-            graph.n(f"{block}_{key}_ones"),
-            mx.ones((1, 1, rows, columns), dtype=mx.float16))
-        extended = graph.concat_channels(
-            [x, ones], tag=f"{block}_{key}_ext")
-        return graph.conv_transpose2d(
-            extended, folded, tag=f"{block}_{key}_up")
+        """The reference conv + grouped 2x pixel shuffle, matching the
+        ordinary step's spelling (bit-exact with the retired folded
+        conv_transpose form, and it dodges the Espresso MIL->EIR
+        std::bad_cast that kept the eight-step chunks from compiling
+        above the small-geometry envelope - see ane.py)."""
+        y = conv(x, block, key, relu6=False)
+        channels = int(graph.shape[y][1])
+        if channels <= 256:
+            return graph.pixel_shuffle2x(y, tag=f"{block}_{key}_ps")
+        half = channels // 2
+        parts = [graph.pixel_shuffle2x(
+                     graph.slice_channels(y, start_ch, half,
+                                          f"{block}_{key}_grp{j}"),
+                     tag=f"{block}_{key}_ps{j}")
+                 for j, start_ch in enumerate((0, half))]
+        return graph.concat_channels(parts, tag=f"{block}_{key}_cat")
 
     output_names: list[str] = []
     pushed_history: list[dict[int, str]] = []
@@ -627,14 +631,6 @@ def build_suite(params: dict, input_channels: int, height: int, width: int,
         _log.info("building BSVD ANE scheduled phases for %dx%d (one-time "
                   "per geometry, cached under %s)", width, height, directory)
     start = time.perf_counter()
-    if cold:
-        # The fill/drain chunks still emit the folded conv_transpose
-        # upsamplers (the ordinary step moved to conv + pixel_shuffle);
-        # prove the fold exact in float64 before converting.
-        worst = base._audit_fold(params, height, width)
-        if worst > 1e-9:
-            raise RuntimeError(
-                f"upsample fold audit failed in float64: {worst:.3e}")
     package = _convert(params, input_channels, height, width, directory)
     compiled = runtime.compile_package(package)
     if cold:

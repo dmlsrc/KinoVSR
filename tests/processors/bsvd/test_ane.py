@@ -182,13 +182,17 @@ class TestGeometry:
         with pytest.raises(RuntimeError, match="verified ANE floor"):
             A.build_runner(None, 4, 92, 128)
 
-    def test_phase_window_envelope_includes_only_verified_640x480(self):
+    def test_phase_window_envelope_is_the_verified_1024x576_rectangle(self):
         net = object.__new__(A.AneBSVD)
 
         assert net.window_capable(480, 640)
-        assert net.window_capable(480, 513)  # padded to 640
-        assert not net.window_capable(481, 640)
-        assert not net.window_capable(480, 641)  # padded to 768
+        assert net.window_capable(576, 768)
+        assert net.window_capable(576, 1024)
+        assert net.window_capable(576, 897)  # padded to 1024
+        assert net.window_capable(540, 960)  # qHD, padded to 1024
+        assert not net.window_capable(648, 1024)  # 0x16 on re-entry
+        assert not net.window_capable(576, 1025)  # padded to 1152: 0x16
+        assert not net.window_capable(577, 1024)
 
 
 # --------------------------------------------------------------------------
