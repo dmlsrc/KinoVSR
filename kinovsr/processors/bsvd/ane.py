@@ -73,6 +73,16 @@ gate) and cost roughly 0.12 s/frame at 1080p. Islandless execution is
 verified through 1920x864 (plus 1280x720 and 1664x900); the island form
 is verified executing 64-frame streams at 1920x1080.
 
+Island-geometry accuracy (measured 2026-07-23): the island OPS are
+value-exact, but the islanded stateful graph as Core ML executes it at
+1920x1080 lands ~1.5e-2 mean from the product fp32 net on settled
+frames - two orders past this backend's usual ~3e-4 - and its build
+gates never saw that because the replay oracle is self-referential.
+Large geometries therefore route to the direct AppleNeuralEngine chain
+(:mod:`.ane_direct`, ~3.5e-4 and faster); this islanded path remains
+the small-geometry engine and the fallback when the private route is
+unavailable.
+
 Conversion is first-party through :mod:`kinovsr.native.anemil` (protobuf
 against the vendored Core ML schema; no coremltools, numpy, or torch) and
 is cached per weights + geometry under the KinoVSR cache directory. The
@@ -164,15 +174,16 @@ def _weights_key(params: dict) -> str:
     return digest.hexdigest()[:16]
 
 
-def _shapes(params: dict, input_channels: int, height: int, width: int):
+def _shapes(params: dict, input_channels: int, height: int, width: int,
+            blocks: tuple = BLOCKS):
     states = []
-    for block in BLOCKS:
+    for block in blocks:
         for key, divisor in BIBUF:
             channels = int(params[block][key][0].shape[3])
             states.append((1, channels + channels // 8,
                            height // divisor, width // divisor))
     skips = []
-    for block in BLOCKS:
+    for block in blocks:
         skips.append((1, 3, height, width))
         skips.append((1, int(params[block]["inc3"][0].shape[0]), height, width))
         skips.append((1, int(params[block]["d0c1"][0].shape[3]),
@@ -188,12 +199,24 @@ def _oihw(weight):
 # ----------------------------------------------------------------- emission
 
 def _emit_graph(params: dict, input_channels: int, height: int, width: int,
-                blob=None):
-    """Emit one BSVD step and return its graph plus function signature."""
+                blob=None, *, blocks: tuple = BLOCKS,
+                explicit_state: bool = False):
+    """Emit one BSVD step and return its graph plus function signature.
+
+    The default emission is the shipped stateful graph (MLState
+    recurrence, fp32 island above ``ISLAND_MIN_PIXELS``) and is
+    byte-stable across the ``blocks``/``explicit_state`` parameters.
+    ``explicit_state=True`` emits the same step with the recurrence as
+    ordinary tensors - ``st{i}`` stay inputs, each unit's would-be state
+    update becomes an output - and no island; combined with a single
+    entry in ``blocks`` this yields the per-block halves the direct
+    AppleNeuralEngine backend chains (see ``ane_direct``).
+    """
     from kinovsr.native.anemil import builder, schema
 
-    state_shapes, skip_shapes = _shapes(params, input_channels, height, width)
-    island = height * width >= ISLAND_MIN_PIXELS
+    state_shapes, skip_shapes = _shapes(params, input_channels, height, width,
+                                        blocks=blocks)
+    island = (not explicit_state) and height * width >= ISLAND_MIN_PIXELS
     g = builder.Graph(blob)
 
     g.register_input("frame", (1, input_channels, height, width))
@@ -268,9 +291,13 @@ def _emit_graph(params: dict, input_channels: int, height: int, width: int,
 
     x = "frame"
     pushed = []
-    for block_index, block in enumerate(BLOCKS):
+    state_output_names: list[str] = []
+    for block_index, block in enumerate(blocks):
         base = block_index * 8
-        block_reads = [g.read_state(f"st{base + i}") for i in range(8)]
+        if explicit_state:
+            block_reads = [f"st{base + i}" for i in range(8)]
+        else:
+            block_reads = [g.read_state(f"st{base + i}") for i in range(8)]
         pending: list[tuple[int, str, str]] = []
 
         def bibuffer(x, index, block, key, gate_i, write_i, name=None, *,
@@ -339,7 +366,7 @@ def _emit_graph(params: dict, input_channels: int, height: int, width: int,
         prediction = conv(conv(y, block, "out0", relu6=True), block, "out3")
 
         out_channels = int(params[block]["out3"][0].shape[0])
-        final = block_index == len(BLOCKS) - 1
+        final = block_index == len(blocks) - 1
         if out_channels == 3:
             x = g.binary("sub", skip1_pop, prediction, f"{block}_minus",
                          name="out" if final else None)
@@ -352,7 +379,10 @@ def _emit_graph(params: dict, input_channels: int, height: int, width: int,
                                   name="out" if final else None)
 
         for index, reads, new_state in pending:
-            g.update_state(f"st{index}", reads, new_state)
+            if explicit_state:
+                state_output_names.append(new_state)
+            else:
+                g.update_state(f"st{index}", reads, new_state)
 
         if island and block_index == 0:
             x = translation_island(x)
@@ -364,6 +394,10 @@ def _emit_graph(params: dict, input_channels: int, height: int, width: int,
                  for i in range(len(skip_shapes))])
     if island:
         inputs.append(("island_bias", (1, 1, 1, 1)))
+    if explicit_state:
+        inputs += [(f"st{i}", state_shapes[i])
+                   for i in range(len(state_shapes))]
+        return g, inputs, [], output_names + state_output_names
     states = [(f"st{i}", state_shapes[i]) for i in range(len(state_shapes))]
     return g, inputs, states, output_names
 
@@ -924,6 +958,9 @@ class AneBSVD:
             if self._phase_suite is not None:
                 self._phase_suite.close()
             self._phase_suite = None
+            closer = getattr(self._runner, "close", None)
+            if callable(closer):
+                closer()
             self._runner = None
             self.params = {}
             self._geometry = None
@@ -956,8 +993,18 @@ class AneBSVD:
         self._padded_width = padded
 
     def _build_continuous(self, height: int) -> None:
-        self._runner, self._directory = build_runner(
-            self.params, self.input_channels, height, self._padded_width)
+        from . import ane_direct
+
+        if ane_direct.should_use(height, self._padded_width):
+            # Large geometries: the direct two-half chain replaces the
+            # islanded single graph (same numbers, no island tax; see
+            # ane_direct). Same runner contract, so everything downstream
+            # of this build is engine-agnostic.
+            self._runner, self._directory = ane_direct.build_direct_runner(
+                self.params, self.input_channels, height, self._padded_width)
+        else:
+            self._runner, self._directory = build_runner(
+                self.params, self.input_channels, height, self._padded_width)
         self._zero_frame = bytes(
             len(self._runner.model.input_view("frame")))
 
@@ -1010,8 +1057,15 @@ class AneBSVD:
                 f"{stem}-replay.safetensors"))
             target = self._build_scheduled
         else:
-            warm = all((directory / name).exists() for name in (
-                "model.mlpackage", "verify.json", "replay.safetensors"))
+            from . import ane_direct
+
+            names = ["model.mlpackage", "verify.json", "replay.safetensors"]
+            if ane_direct.should_use(height, self._padded_width):
+                # Cold direct builds (device compiles plus the one-time
+                # exactness gate) stay on the first-use thread with the
+                # other cold paths; preheat only warm ones.
+                names += ane_direct.warm_names()
+            warm = all((directory / name).exists() for name in names)
             target = self._build_continuous
         if not warm:
             return
