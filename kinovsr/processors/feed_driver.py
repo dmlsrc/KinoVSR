@@ -223,6 +223,16 @@ class FeedFlushProcessor:
         self._chroma_strength = float(chroma_strength)
         # A blend closure bound at prepare when the split is active, else None.
         self._blend: Any = None
+        # The driver's optional pump() hook, bound at prepare. Emissions
+        # flow downstream one at a time through the pull scheduler, and a
+        # schedule-capable driver may have a whole accelerator window in
+        # flight behind them; pumping between consumptions keeps those
+        # dispatches advancing while later stages (VT upscale, encode)
+        # run on this thread. Without it a burst of window outputs
+        # serializes the chain: the accelerator idles while downstream
+        # works through the burst, then downstream idles while the next
+        # window runs (measured additive at 640x480, 2026-07-23).
+        self._pump: Any = None
         # The family's final report, stashed at close (see run_diagnostics).
         self._final_diagnostics: list[str] = []
         self._final_debug_images: dict[str, Any] = {}
@@ -247,6 +257,8 @@ class FeedFlushProcessor:
         if callable(preheat):
             geometry = input_spec.frame.geometry
             preheat(int(geometry.height), int(geometry.width))
+        pump = getattr(self._driver, "pump", None)
+        self._pump = pump if callable(pump) else None
         if self._blend is None and (self._luma_strength != 1.0
                                     or self._chroma_strength != 1.0):
             from kinovsr.media.yuv import luma_chroma_blend
@@ -266,6 +278,10 @@ class FeedFlushProcessor:
             if self._blend is not None:
                 out = self._blend(token.payload, out)
             yield token.with_payload(out)
+            if self._pump is not None:
+                # Downstream just consumed one emission; let the driver's
+                # in-flight window progress before handing over the next.
+                self._pump()
 
     def reset(self, boundary: Boundary,
               context: PipelineContext) -> None:
@@ -279,6 +295,8 @@ class FeedFlushProcessor:
             if self._blend is not None:
                 out = self._blend(token.payload, out)
             yield token.with_payload(out)
+            if self._pump is not None:
+                self._pump()
 
     def run_diagnostics(self) -> list[str]:
         """End-of-run diagnostic lines from the wrapped driver, when the

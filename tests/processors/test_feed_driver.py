@@ -88,6 +88,72 @@ def run(proc: FeedFlushProcessor, spec: StreamSpec, units: list) -> list:
     return out
 
 
+class _BurstPumpDriver:
+    """Emits a three-frame burst per feed and counts pump() calls - the
+    stand-in for a windowed accelerator driver with dispatches in flight
+    behind its emissions."""
+
+    def __init__(self) -> None:
+        self.pumps = 0
+        self.pumps_seen_at_yield: list[int] = []
+
+    def feed(self, frame, token=None) -> list:
+        return [(frame, token)] * 3
+
+    def flush(self) -> list:
+        return []
+
+    def reset(self) -> None:
+        pass
+
+    def pump(self) -> None:
+        self.pumps += 1
+
+
+class TestPump:
+    def test_pump_fires_between_lazy_consumptions(self):
+        """The adapter must let the driver advance in-flight work each
+        time downstream consumes one emission - not once per batch."""
+        driver = _BurstPumpDriver()
+        proc = FeedFlushProcessor(lambda: driver)
+        proc.prepare(stream(), CTX)
+        emissions = proc.process(gray_unit(0.4, 0), CTX)
+        assert driver.pumps == 0
+        next(emissions)
+        assert driver.pumps == 0, "pump follows a consumption, not a yield"
+        next(emissions)
+        assert driver.pumps == 1
+        next(emissions)
+        assert driver.pumps == 2
+        assert list(emissions) == []
+        assert driver.pumps == 3
+
+    def test_drivers_without_pump_bind_none(self):
+        proc = FeedFlushProcessor(lambda: _HalveDelayDriver(0))
+        proc.prepare(stream(), CTX)
+        assert proc._pump is None
+
+    def test_bsvd_pump_polls_only_when_scheduled(self):
+        from types import SimpleNamespace
+
+        from kinovsr.processors.bsvd import BsvdDenoiser
+
+        class _Wavefront:
+            polls = 0
+
+            def poll(self):
+                self.polls += 1
+
+        wavefront = _Wavefront()
+        stub = SimpleNamespace(_schedule=[(0, 4, 0, 4)],
+                               _wavefront=wavefront)
+        BsvdDenoiser.pump(stub)
+        assert wavefront.polls == 1
+        stub._schedule = None
+        BsvdDenoiser.pump(stub)
+        assert wavefront.polls == 1, "continuous streams must not poll"
+
+
 class TestNoSplit:
     def test_strengths_of_one_bind_no_blend(self):
         proc = FeedFlushProcessor(lambda: _HalveDelayDriver(0))

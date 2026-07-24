@@ -494,6 +494,18 @@ class BsvdDenoiser:
             hook(height + (-height) % 4, width + (-width) % 4,
                  scheduled=self._schedule is not None)
 
+    def pump(self) -> None:
+        """Advance the in-flight schedule window without blocking.
+
+        The pipeline adapter calls this between downstream consumptions
+        of our emissions, so a window's remaining accelerator dispatches
+        keep flowing while later stages process the previous window's
+        outputs on the driver thread. Continuous streams have no window
+        in flight and this is a no-op.
+        """
+        if self._schedule is not None:
+            self._wavefront.poll()
+
     def set_schedule(self, schedule: list | None) -> None:
         """Use GOP-aligned windows instead of one continuous stream.
 
