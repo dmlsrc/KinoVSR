@@ -267,6 +267,25 @@ class TestScheduledPhases:
             ("drain", 8): "drain_08",
         }
 
+    def test_schedule_vectors_are_byte_identical_to_the_mlx_spelling(self):
+        """The 16-lane gate/write vectors are struct-packed rather than
+        built through mx.array. mx.float16 IS IEEE 754 binary16 and the
+        schedule's values are exactly 0.0/1.0, so the bytes must match
+        the MLX spelling this replaced EXACTLY - the graph reads them as
+        raw bytes, so a near-miss would be a silently wrong gate."""
+        for values in ([0.0] * 16, [1.0] * 16, [0.0, 1.0] * 8,
+                       [1.0 if index % 3 else 0.0 for index in range(16)]):
+            vector = mx.array(values, dtype=mx.float16).reshape(1, 16, 1, 1)
+            mx.eval(vector)
+            expected = bytes(memoryview(mx.contiguous(vector)).cast("B"))
+            assert len(expected) == 32
+            assert bytes(A._vector_bytes(values)) == expected
+
+    def test_phase_and_step_paths_share_one_vector_spelling(self):
+        """One byte layout for both the window path and the ordinary
+        step, so the two can never drift apart."""
+        assert P._vector_bytes is A._vector_bytes
+
     def test_inner_phases_run_as_gated_main_steps(self, monkeypatch):
         monkeypatch.setattr(P, "_vector_bytes", tuple)
         suite = _ScheduledFakeSuite()

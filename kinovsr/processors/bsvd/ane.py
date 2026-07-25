@@ -96,6 +96,7 @@ import hashlib
 import json
 import logging
 import shutil
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,24 @@ import mlx.core as mx
 from kinovsr.native.anemil import runtime
 
 _log = logging.getLogger("kinovsr.bsvd_ane")
+
+
+def _vector_bytes(values: list[float]) -> bytes:
+    """Pack one 16-lane gate/write schedule vector as fp16 bytes.
+
+    These go straight into a bound byte view (``load_inputs`` blits them
+    into ``input_view("gate")``), so the graph only ever wanted 32 bytes
+    in the right layout - building them through ``mx.array`` + ``mx.eval``
+    allocated and evaluated a GPU-backed array per dispatch just to read
+    its bytes back out. ``mx.float16`` IS IEEE 754 binary16, which is what
+    struct's ``e`` emits, and the schedule's values are exactly 0.0 and
+    1.0, so this is byte-identical to the MLX spelling it replaced rather
+    than merely close (asserted by test).
+
+    Keeping the dispatch schedule free of MLX also leaves the door open
+    for a dispatch loop that does not run on the MLX lane.
+    """
+    return struct.pack("<16e", *values)
 
 BLOCKS = ("temp1", "temp2")
 # The eight BiBufferConvs of a DenBlock in execution order, with the
@@ -1116,12 +1135,6 @@ class AneBSVD:
                     self._runner.zero_last_push(line)
         return self._materialize_out() if pending["emit"] else None
 
-    @staticmethod
-    def _vector_bytes(values: list[float]):
-        vector = mx.array(values, dtype=mx.float16).reshape(1, 16, 1, 1)
-        mx.eval(vector)
-        return memoryview(mx.contiguous(vector)).cast("B")
-
     def _materialize_array(self, raw):
         # Fresh copy, NCHW backing -> NHWC cropped to the caller's width:
         # the backing is rewritten by the next prediction, so no lazy
@@ -1254,8 +1267,8 @@ class AneBSVD:
                 entry = self._tail[self._tail_cursor]
                 self._tail_cursor += 1
                 self._submit(self._zero_frame,
-                             self._vector_bytes(entry["gate"]),
-                             self._vector_bytes(entry["write"]),
+                             _vector_bytes(entry["gate"]),
+                             _vector_bytes(entry["write"]),
                              entry["emit"], entry["pushes"])
             return out
 
@@ -1281,7 +1294,7 @@ class AneBSVD:
         nchw = mx.contiguous(mx.transpose(padded, (0, 3, 1, 2)))
         mx.eval(nchw)
         self._submit(memoryview(nchw).cast("B"), None,
-                     self._vector_bytes(write), record.out_real)
+                     _vector_bytes(write), record.out_real)
         return out
 
 

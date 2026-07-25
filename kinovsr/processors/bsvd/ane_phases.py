@@ -21,6 +21,7 @@ import logging
 import shutil
 import time
 from collections.abc import Callable
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +42,21 @@ _FUNCTIONS = {
 }
 
 
-def _phase_records(start: int, draining: bool) -> list[tuple[Any, list[bool]]]:
+# One spelling of the 16-lane gate/write byte layout, shared with the
+# ordinary step path; see ane._vector_bytes for why it is not MLX.
+_vector_bytes = base._vector_bytes
+
+
+@cache
+def _phase_records(start: int,
+                   draining: bool) -> tuple[tuple[Any, list[bool]], ...]:
+    """Replay the mirror to the requested phase; the boolean topology only.
+
+    Cached and returned as a tuple: the replay is deterministic, every
+    window derives the same records for a given phase, and no caller
+    mutates them. This also takes the replay out of ``dispatch``, which
+    otherwise re-derives it on every eight-step chunk.
+    """
     mirror = base._NoneFlowNet()
     # Sixteen real steps fully prime the boolean topology.  Additional
     # steady steps do not change it; drain to the requested phase afterward.
@@ -57,7 +72,7 @@ def _phase_records(start: int, draining: bool) -> list[tuple[Any, list[bool]]]:
         second = mirror.blocks[1](first, record)
         record.out_real = second
         records.append((record, [not draining, first, second]))
-    return records
+    return tuple(records)
 
 
 def _emit_chunk(params: dict, input_channels: int, height: int, width: int,
@@ -538,12 +553,6 @@ def _snapshot(value: Any) -> Any:
     copied = value.astype(mx.float32)
     mx.eval(copied)
     return copied
-
-
-def _vector_bytes(values: list[float]) -> memoryview:
-    vector = mx.array(values, dtype=mx.float16).reshape(1, 16, 1, 1)
-    mx.eval(vector)
-    return memoryview(mx.contiguous(vector)).cast("B")
 
 
 def _drive_reference(runner: base.BsvdRunner, frames: list[Any]) -> list[Any]:
