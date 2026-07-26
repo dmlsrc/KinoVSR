@@ -14,6 +14,48 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
+def test_vision_vsr_uses_high_backward_flow_and_zero_forward(monkeypatch):
+    from kinovsr.native import vision_flow, vsr
+
+    calls = []
+
+    def generate(from_buffer, to_buffer, *, accuracy):
+        calls.append((from_buffer, to_buffer, accuracy))
+        return "vision-backward"
+
+    class Frame:
+        def __init__(self, buffer):
+            self._buffer = buffer
+
+        def buffer(self):
+            return self._buffer
+
+    monkeypatch.setattr(vision_flow, "generate_vision_flow", generate)
+    monkeypatch.setattr(vsr, "autorelease_pool", nullcontext)
+
+    session = object.__new__(vsr.VsrSession)
+    session._flow_backend = "vision"
+    session._flow_zero_pair = ("zero-forward", "zero-backward")
+    session._flow_pairs = (
+        ("old-forward-0", "old-backward-0"),
+        ("old-forward-1", "old-backward-1"),
+    )
+
+    session._run_explicit_flow(
+        Frame("previous"),
+        Frame("current"),
+        slot=1,
+        submission_mode="ignored",
+        frame_index=7,
+    )
+
+    assert calls == [("current", "previous", "high")]
+    assert session._flow_pairs == (
+        ("old-forward-0", "old-backward-0"),
+        ("zero-forward", "vision-backward"),
+    )
+
+
 def test_explicit_flow_finish_waits_processes_and_clears_pending(
         monkeypatch):
     from kinovsr.native import vsr

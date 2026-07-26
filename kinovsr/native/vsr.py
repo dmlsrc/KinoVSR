@@ -733,12 +733,12 @@ class VsrSession:
         )
 
     def _start_vision_flow(self) -> None:
-        """Prepare zero-copy Vision flow for balanced VSR.
+        """Prepare zero-copy, current-to-previous Vision flow for balanced VSR.
 
         Vision emits source-geometry TwoComponent16Half IOSurfaces, including
-        for portrait input. VSR accepts those buffers directly, so only the
-        first-frame zero field needs allocation here; later slots retain
-        Vision's returned buffers.
+        for portrait input. VSR accepts those buffers directly. The measured
+        consumer ignores forward flow, so every slot reuses an immutable zero
+        forward surface and retains only Vision's current-to-previous result.
         """
         from .vision_flow import FLOW_16H
 
@@ -760,8 +760,9 @@ class VsrSession:
             thread_name_prefix="vsr-vision-flow",
         )
         _log.info(
-            "VSR explicit flow ready (Vision revision 1 Medium, "
-            "source-geometry %sx%s, zero-copy, one-frame overlap)",
+            "VSR explicit flow ready (Vision revision 1 High, "
+            "current-to-previous only, source-geometry %sx%s, zero-copy, "
+            "one-frame overlap)",
             self.in_w,
             self.in_h,
         )
@@ -788,14 +789,21 @@ class VsrSession:
         frame_index: int,
     ) -> None:
         if self._flow_backend == "vision":
-            from .vision_flow import generate_bidirectional_vision_flow
+            from .vision_flow import generate_vision_flow
 
             del submission_mode
             with autorelease_pool():
-                pair = generate_bidirectional_vision_flow(
-                    previous_frame.buffer(),
+                zero_pair = self._flow_zero_pair
+                if zero_pair is None:
+                    raise RuntimeError(
+                        "Vision zero-flow buffers are unavailable"
+                    )
+                backward = generate_vision_flow(
                     current_frame.buffer(),
+                    previous_frame.buffer(),
+                    accuracy="high",
                 )
+                pair = (zero_pair[0], backward)
                 pairs = self._flow_pairs
                 if pairs is None:
                     raise RuntimeError(

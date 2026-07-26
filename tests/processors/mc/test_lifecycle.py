@@ -238,3 +238,33 @@ def test_gate_openness_accumulates_resident_no_per_frame_sync():
 
     src = inspect.getsource(McTemporalDenoiser._weight)
     assert "float(" not in src and ".item()" not in src
+
+
+def test_vision_occlusion_keeps_bidirectional_flow():
+    import mlx.core as mx
+
+    from kinovsr.processors.mc import McTemporalDenoiser
+
+    class Engine:
+        def __init__(self):
+            self.calls = []
+
+        def compute(self, from_frame, to_frame):
+            self.calls.append((from_frame, to_frame))
+            return mx.zeros((*from_frame.shape[:2], 2))
+
+    current = mx.zeros((4, 6, 3))
+    reference = mx.ones((4, 6, 3))
+    engine = McTemporalDenoiser.__new__(McTemporalDenoiser)
+    engine.flow_source = "vision"
+    engine.occlusion = True
+    engine._vision = Engine()
+
+    flows = engine._compute_flows(current, [reference])
+
+    assert len(flows) == 1
+    assert flows[0][0].shape == flows[0][1].shape == (4, 6, 2)
+    assert engine._vision.calls == [
+        (current, reference),
+        (reference, current),
+    ]

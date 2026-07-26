@@ -196,7 +196,7 @@ UPSCALE_SLOT_OPTIONS = [
         group='Spatial Upscalers',
         default='vt',
         choices=('vt', 'vision'),
-        help="Explicit optical-flow backend for --upscale balanced. vt (default) = public VideoToolbox Quality flow; deterministic and overlapped with SR, but its estimator silently fails below a measured 128-pixel destination boundary, where balanced falls back to Image mode. vision = Vision revision 1 Medium forward/backward flow, passed to VT SR as source-geometry fp16 IOSurfaces without MLX readback or copies. It can run temporal VT SR below 128, but explicitly selecting it bypasses the small-input Image fallback; compare quality on that workload before using it."),
+        help="Explicit optical-flow backend for --upscale balanced. vt (default) = public VideoToolbox Quality flow; deterministic and overlapped with SR, but its estimator silently fails below a measured 128-pixel destination boundary, where balanced falls back to Image mode. vision = Vision revision 1 High current-to-previous flow with an immutable zero forward field, passed to VT SR as source-geometry fp16 IOSurfaces without MLX readback or copies. The one-direction policy is local to VT SR; consumers that need bidirectional Vision flow retain it. Vision can run temporal VT SR below 128, but explicitly selecting it bypasses the small-input Image fallback; compare quality on that workload before using it."),
 ]
 
 RUNTIME_OPTIONS = [

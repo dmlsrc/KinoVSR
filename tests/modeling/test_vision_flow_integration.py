@@ -89,6 +89,8 @@ def test_mc_denoiser_runs_on_vision_flow():
 
 @pytest.mark.integration
 def test_sr_flow_mode_vision_computes_both_directions():
+    # Learned recurrent propagation consumes both directions. The VT SR
+    # one-direction optimization must never leak through this shared service.
     from kinovsr.modeling.vsr_blocks import _compute_flows
     from kinovsr.modeling.vt_flow import VtFlowServices
 

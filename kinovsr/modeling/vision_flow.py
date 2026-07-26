@@ -68,6 +68,7 @@ class VisionFlowEngine:
                 self._from_buf,
                 self._to_buf,
                 pixel_format=FLOW_32F,
+                accuracy="medium",
             )
             Quartz.CVPixelBufferLockBaseAddress(fb, 1)
             try:

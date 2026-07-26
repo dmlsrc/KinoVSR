@@ -141,6 +141,16 @@ def test_vision_balanced_vsr_runs_source_geometry_without_image_fallback(
         forward = session._flow_pairs[0][0]
         assert Quartz.CVPixelBufferGetWidth(forward) == width
         assert Quartz.CVPixelBufferGetHeight(forward) == height
+        zero_pair = session._flow_zero_pair
+        assert zero_pair is not None
+        assert all(
+            pair[0] is zero_pair[0]
+            for pair in session._flow_pairs
+        )
+        assert all(
+            pair[1] is not zero_pair[1]
+            for pair in session._flow_pairs
+        )
     finally:
         session.close()
 

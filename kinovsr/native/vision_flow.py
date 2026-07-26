@@ -1,9 +1,10 @@
 """Validated Vision optical-flow buffers for native and MLX consumers.
 
-Vision revision 1 at Medium accuracy is the measured native flow variant used
-elsewhere in KinoVSR. This adapter asks Vision for IOSurface-backed
-TwoComponent16Half buffers so VideoToolbox can consume them directly: no MLX
-readback, format conversion, or buffer copy sits between the two frameworks.
+Callers select the measured policy for their consumer. Shared MLX flow keeps
+revision 1 Medium, while VideoToolbox SR uses revision 1 High. This adapter can
+ask Vision for IOSurface-backed TwoComponent16Half buffers so VideoToolbox
+consumes them directly: no MLX readback, format conversion, or buffer copy sits
+between the two frameworks.
 """
 
 from __future__ import annotations
@@ -20,6 +21,11 @@ FLOW_16H = 0x32433068
 # kCVPixelFormatType_TwoComponent32Float ("2C0f"). MLX consumers request this
 # format to preserve precision through their direct readback.
 FLOW_32F = 0x32433066
+
+_ACCURACY = {
+    "medium": Vision.VNGenerateOpticalFlowRequestComputationAccuracyMedium,
+    "high": Vision.VNGenerateOpticalFlowRequestComputationAccuracyHigh,
+}
 
 
 def _validate_flow_buffer(
@@ -51,12 +57,21 @@ def generate_vision_flow(
     to_buffer: Any,
     *,
     pixel_format: int = FLOW_16H,
+    accuracy: str = "medium",
 ) -> Any:
     """Return source-geometry flow from ``from_buffer`` to ``to_buffer``.
 
     The returned CVPixelBuffer is retained by its PyObjC wrapper and can be
     handed directly to ``VTFrameProcessorOpticalFlow``.
     """
+    try:
+        computation_accuracy = _ACCURACY[accuracy]
+    except KeyError:
+        raise ValueError(
+            "Vision flow accuracy must be one of "
+            f"{sorted(_ACCURACY)}, got {accuracy!r}"
+        ) from None
+
     width = int(Quartz.CVPixelBufferGetWidth(from_buffer))
     height = int(Quartz.CVPixelBufferGetHeight(from_buffer))
     target_width = int(Quartz.CVPixelBufferGetWidth(to_buffer))
@@ -70,9 +85,7 @@ def generate_vision_flow(
     request = Vision.VNGenerateOpticalFlowRequest.alloc(
     ).initWithTargetedCVPixelBuffer_options_(to_buffer, {})
     request.setRevision_(Vision.VNGenerateOpticalFlowRequestRevision1)
-    request.setComputationAccuracy_(
-        Vision.VNGenerateOpticalFlowRequestComputationAccuracyMedium
-    )
+    request.setComputationAccuracy_(computation_accuracy)
     request.setOutputPixelFormat_(pixel_format)
     handler = Vision.VNImageRequestHandler.alloc(
     ).initWithCVPixelBuffer_options_(from_buffer, {})
@@ -97,11 +110,21 @@ def generate_vision_flow(
 def generate_bidirectional_vision_flow(
     previous_buffer: Any,
     current_buffer: Any,
+    *,
+    accuracy: str = "medium",
 ) -> tuple[Any, Any]:
     """Return previous->current and current->previous Vision flow buffers."""
     return (
-        generate_vision_flow(previous_buffer, current_buffer),
-        generate_vision_flow(current_buffer, previous_buffer),
+        generate_vision_flow(
+            previous_buffer,
+            current_buffer,
+            accuracy=accuracy,
+        ),
+        generate_vision_flow(
+            current_buffer,
+            previous_buffer,
+            accuracy=accuracy,
+        ),
     )
 
 
