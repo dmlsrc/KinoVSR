@@ -193,3 +193,95 @@ def test_small_balanced_fallback_is_bit_exact_with_image_mode():
         return outputs
 
     assert run("balanced", True) == run("image", False)
+
+
+@pytest.mark.integration
+def test_balanced_flow_stays_near_zero_on_a_repeated_frame():
+    """A repeated frame must keep producing the same near-zero field.
+
+    The true field for a repeated frame is exactly zero, so this pins the
+    end-to-end invariant that a static input produces a small, non-growing
+    field. It caught a real runaway: with an oversized destination and
+    Sequential submission the mean magnitude grew 0.07 -> 313 px over eleven
+    identical pairs on real video.
+
+    Scope, so this is not read as more than it is: at 640x480 the advertised
+    destination is 160x120, below the 128 px writer floor, so this exercises the
+    forced full-source fallback. The runaway does NOT reproduce here with
+    synthetic texture, and it does not reproduce at an advertised destination at
+    all, so this test does not by itself discriminate Random from Sequential.
+    It guards the invariant, not the mode.
+    """
+    import numpy as np
+
+    from kinovsr.native.frameworks import Quartz
+    from kinovsr.native.vsr import VsrSession
+
+    width, height, count = 640, 480, 8
+    # Aperiodic but trackable: white noise gives the matcher nothing to lock
+    # onto and produces a degenerate field, while modular/periodic patterns
+    # admit exact false matches. Incommensurate sinusoids plus blobs avoid both.
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    texture = (
+        0.5
+        + 0.18 * np.sin(xx / 11.3 + yy / 29.7)
+        + 0.14 * np.sin(xx / 4.7 - yy / 7.1)
+        + 0.10 * np.sin((xx + yy) / 17.9)
+    )
+    rng = np.random.default_rng(11)
+    for _ in range(24):
+        cy, cx = rng.uniform(0, height), rng.uniform(0, width)
+        texture += 0.25 * np.exp(
+            -(((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * 19.0**2))
+        )
+    texture = np.clip(texture, 0.0, 1.0)
+    rgb = mx.array(np.repeat(texture[..., None], 3, axis=2)).astype(mx.float16)
+    frame = mx.concatenate(
+        [rgb, mx.ones((height, width, 1), dtype=mx.float16)], axis=-1
+    )
+    mx.eval(frame)
+
+    def flow_mean(buffer):
+        # Read the buffer's own geometry: the flow destination is the
+        # configuration's advertised shape, not the source shape.
+        flow_w = int(Quartz.CVPixelBufferGetWidth(buffer))
+        flow_h = int(Quartz.CVPixelBufferGetHeight(buffer))
+        row_bytes = int(Quartz.CVPixelBufferGetBytesPerRow(buffer))
+        Quartz.CVPixelBufferLockBaseAddress(buffer, 1)
+        try:
+            view = Quartz.CVPixelBufferGetBaseAddress(buffer).as_buffer(
+                flow_h * row_bytes
+            )
+            field = (
+                np.frombuffer(view, dtype=np.float16)
+                .reshape(flow_h, row_bytes // 2)[:, : flow_w * 2]
+                .reshape(flow_h, flow_w, 2)
+                .astype(np.float32)
+            )
+        finally:
+            Quartz.CVPixelBufferUnlockBaseAddress(buffer, 1)
+        return float(np.linalg.norm(field, axis=-1).mean())
+
+    session = VsrSession(width, height, mode="balanced", fps=30.0,
+                         explicit_flow=True)
+    observed = []
+    original = session._run_explicit_flow
+
+    def record(previous_frame, current_frame, slot, submission_mode, index):
+        original(previous_frame, current_frame, slot, submission_mode, index)
+        observed.append(flow_mean(session._flow_pairs[slot][1]))
+
+    session._run_explicit_flow = record
+    try:
+        for index in range(count):
+            session.submit_upscale_to_buffer(frame, index)
+        while session.finish_pending_upscale() is not None:
+            pass
+    finally:
+        session.close()
+
+    assert len(observed) == count - 1
+    # Every pair is the same pair, so every field must match the first one and
+    # stay small. A compounding chain fails the ratio long before the bound.
+    assert max(observed) < 1.0, observed
+    assert max(observed) <= 4.0 * max(observed[0], 1e-4), observed

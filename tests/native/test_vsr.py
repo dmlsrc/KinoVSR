@@ -15,6 +15,37 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
+def test_every_flow_submission_uses_random_mode(monkeypatch):
+    """VTOpticalFlow's Sequential cache compounds instead of refining.
+
+    Under Sequential the field diverges geometrically - measured to 313 px on
+    byte-identical frames and 5334 px on real ones, where the true field is at
+    most about one pixel. Pin Random on every submission, including submissions
+    that continue an uninterrupted run, so a future edit cannot reintroduce the
+    Sequential chain.
+    """
+    from kinovsr.native import vsr
+
+    class Executor:
+        def __init__(self):
+            self.modes = []
+
+        def submit(self, _fn, _prev, _cur, _slot, submission_mode, _index):
+            self.modes.append(submission_mode)
+            return "future"
+
+    executor = Executor()
+    session = object.__new__(vsr.VsrSession)
+    session._flow_executor = executor
+
+    for index in range(4):
+        session._start_flow_future("prev", "cur", index % 2, index)
+
+    random_mode = vsr.vt.VTOpticalFlowParametersSubmissionModeRandom
+    assert executor.modes == [random_mode] * 4
+    assert not hasattr(session, "_flow_needs_random")
+
+
 def test_vision_vsr_uses_high_backward_flow_and_zero_forward(monkeypatch):
     from kinovsr.native import vision_flow, vsr
 
@@ -128,7 +159,6 @@ def test_explicit_flow_reset_requires_drain_and_rearms_random_modes():
     session._flow_pending_frame = None
     session._prev_src_frame = object()
     session._prev_dst_frame = object()
-    session._flow_needs_random = False
     session._vsr_needs_random = False
     session._flow_backend = "vt"
     session._flow_pairs = (("forward-0", "backward-0"),)
@@ -139,7 +169,6 @@ def test_explicit_flow_reset_requires_drain_and_rearms_random_modes():
 
     assert session._prev_src_frame is None
     assert session._prev_dst_frame is None
-    assert session._flow_needs_random
     assert session._vsr_needs_random
     assert zeroed == [("forward-0", "backward-0")]
 

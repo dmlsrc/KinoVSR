@@ -22,9 +22,9 @@ from kinovsr.settings import default_settings
 
 from .frameworks import Quartz, autorelease_pool, vt
 from .optical_flow import (
-    flow_destination_geometry,
     mark_flow_pair_pending,
     require_flow_pair_written,
+    select_flow_destination_geometry,
     source_sized_flow_is_reliable,
 )
 
@@ -324,7 +324,7 @@ class VsrSession:
         self._flow_pending_frame: Any = None
         self._flow_pending_index: int | None = None
         self._flow_pending_slot: int | None = None
-        self._flow_needs_random = True
+        # No flow-side counterpart: the flow processor always submits Random.
         self._vsr_needs_random = True
 
         if mode == "fast":
@@ -451,7 +451,6 @@ class VsrSession:
             )
         self._prev_src_frame = None
         self._prev_dst_frame = None
-        self._flow_needs_random = True
         self._vsr_needs_random = True
         if self._flow_pairs is not None:
             # A precomputed-flow VSR submission requires a non-null flow object
@@ -717,7 +716,9 @@ class VsrSession:
         self._flow_processor = processor
 
         attrs = dict(config.destinationPixelBufferAttributes() or {})
-        flow_w, flow_h = flow_destination_geometry(self.in_w, self.in_h)
+        flow_w, flow_h, used_advertised = select_flow_destination_geometry(
+            attrs, self.in_w, self.in_h
+        )
         pairs = []
         for _ in range(EXPLICIT_FLOW_PAIR_COUNT):
             pairs.append(
@@ -733,8 +734,9 @@ class VsrSession:
             thread_name_prefix="vsr-explicit-flow",
         )
         _log.info(
-            "VSR explicit flow ready (Quality, full-resolution %sx%s, "
+            "VSR explicit flow ready (Quality, %s destination %sx%s, "
             "one-frame overlap)",
+            "advertised" if used_advertised else "full-resolution",
             flow_w,
             flow_h,
         )
@@ -862,12 +864,17 @@ class VsrSession:
         executor = self._flow_executor
         if executor is None:
             raise RuntimeError("explicit optical-flow executor is unavailable")
-        submission_mode = (
-            vt.VTOpticalFlowParametersSubmissionModeRandom
-            if self._flow_needs_random
-            else vt.VTOpticalFlowParametersSubmissionModeSequential
-        )
-        self._flow_needs_random = False
+        # VTOpticalFlow's Sequential cache compounds its own estimate rather
+        # than refining it, but only when the destination is larger than the
+        # configuration advertises. At a forced full-source destination the mean
+        # magnitude on byte-identical frames grew 0.07 -> 313 px over eleven
+        # submissions (5334 px on real frames by the ninth); at the advertised
+        # destination it converges instead, 0.0156 -> 0.0208 px over 23 pairs.
+        # Clearing the destination first changes nothing, so the runaway state
+        # is internal to the processor. Random is measured free (2.38 s versus
+        # 2.42 s over twelve frames) and keeps the field correct on the sub-128
+        # fallback below, which is the one path that must still oversize.
+        submission_mode = vt.VTOpticalFlowParametersSubmissionModeRandom
         return executor.submit(
             self._run_explicit_flow,
             previous_frame,

@@ -41,6 +41,46 @@ def flow_destination_geometry(width: int, height: int) -> tuple[int, int]:
     )
 
 
+def select_flow_destination_geometry(
+    advertised: Any,
+    width: int,
+    height: int,
+) -> tuple[int, int, bool]:
+    """Pick the flow destination, preferring the configuration's own shape.
+
+    Returns ``(w, h, used_advertised)``.
+
+    Flow vectors are expressed in destination-buffer coordinates, so the
+    destination shape is not a free choice: it scales the field the SR scaler
+    consumes.  Measured on an 854x480 clip, where the advertised destination is
+    240x135, forcing the full source size instead raised edge temporal
+    instability from 4.89 to 8.57 while leaving spatial detail unchanged
+    (gradient energy 8.20 versus 8.23), so the forced shape was over-warping
+    rather than adding information.  Accuracy is equal either way: a known
+    +3 source-pixel shift reads +0.811 into 240x135 against an expected +0.843,
+    and +2.857 into 854x480 against an expected +3.000 - the same ~0.95 ratio.
+
+    The full-source fallback still matters.  ``VT_FLOW_MIN_DESTINATION_DIMENSION``
+    records that VT returns success without writing a destination below 128 in
+    either dimension, and a configuration can advertise exactly that (a 640x480
+    source advertises 160x120).  Prefer the advertised shape only when it clears
+    the boundary; otherwise keep the rotation-normalized full-size workaround.
+    """
+    fallback_w, fallback_h = flow_destination_geometry(width, height)
+    attrs = dict(advertised or {})
+    try:
+        adv_w = int(attrs.get(Quartz.kCVPixelBufferWidthKey, 0) or 0)
+        adv_h = int(attrs.get(Quartz.kCVPixelBufferHeightKey, 0) or 0)
+    except (TypeError, ValueError):
+        return fallback_w, fallback_h, False
+    if (
+        adv_w >= VT_FLOW_MIN_DESTINATION_DIMENSION
+        and adv_h >= VT_FLOW_MIN_DESTINATION_DIMENSION
+    ):
+        return adv_w, adv_h, True
+    return fallback_w, fallback_h, False
+
+
 def source_sized_flow_is_reliable(width: int, height: int) -> bool:
     """Whether a source-sized destination clears VT's writer boundary."""
     return (
