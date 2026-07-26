@@ -150,6 +150,13 @@ TEMPORAL_SRC_POOL_ALLOCATION_LIMIT = 3
 STATELESS_SRC_POOL_ALLOCATION_LIMIT = 1
 EXPLICIT_FLOW_PAIR_COUNT = 2
 
+# Evidence boundary, not a broad quality claim: Vision High and the
+# backward-only policy were selected on one 150-frame 640x480 clip. On macOS
+# 26.5.2, balanced VSR decoded byte-identically with full bidirectional High
+# flow and with an all-zero forward field. Reverify after an OS update because
+# a future VSR implementation may begin consuming the forward field.
+VISION_VSR_ACCURACY = "high"
+
 
 def _validate_combination(width: int, height: int, scale: int, mode: str) -> None:
     """Check the (input size, scale, mode) combo is something VT supports.
@@ -736,9 +743,11 @@ class VsrSession:
         """Prepare zero-copy, current-to-previous Vision flow for balanced VSR.
 
         Vision emits source-geometry TwoComponent16Half IOSurfaces, including
-        for portrait input. VSR accepts those buffers directly. The measured
-        consumer ignores forward flow, so every slot reuses an immutable zero
-        forward surface and retains only Vision's current-to-previous result.
+        for portrait input. VSR accepts those buffers directly. On macOS
+        26.5.2, decoded output was identical with a zero forward field, so
+        every slot reuses one immutable zero surface and retains only Vision's
+        current-to-previous result. This is an OS-dependent measured behavior,
+        not a public API guarantee.
         """
         from .vision_flow import FLOW_16H
 
@@ -760,9 +769,10 @@ class VsrSession:
             thread_name_prefix="vsr-vision-flow",
         )
         _log.info(
-            "VSR explicit flow ready (Vision revision 1 High, "
+            "VSR explicit flow ready (Vision revision 1 %s, "
             "current-to-previous only, source-geometry %sx%s, zero-copy, "
             "one-frame overlap)",
+            VISION_VSR_ACCURACY.title(),
             self.in_w,
             self.in_h,
         )
@@ -801,7 +811,7 @@ class VsrSession:
                 backward = generate_vision_flow(
                     current_frame.buffer(),
                     previous_frame.buffer(),
-                    accuracy="high",
+                    accuracy=VISION_VSR_ACCURACY,
                 )
                 pair = (zero_pair[0], backward)
                 pairs = self._flow_pairs

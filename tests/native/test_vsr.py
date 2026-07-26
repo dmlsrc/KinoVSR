@@ -1,6 +1,7 @@
 """Native VideoToolbox VSR process-global behavior."""
 
 import json
+import logging
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ pytestmark = pytest.mark.unit
 def test_vision_vsr_uses_high_backward_flow_and_zero_forward(monkeypatch):
     from kinovsr.native import vision_flow, vsr
 
+    assert vsr.VISION_VSR_ACCURACY == "high"
     calls = []
 
     def generate(from_buffer, to_buffer, *, accuracy):
@@ -49,11 +51,39 @@ def test_vision_vsr_uses_high_backward_flow_and_zero_forward(monkeypatch):
         frame_index=7,
     )
 
-    assert calls == [("current", "previous", "high")]
+    assert calls == [("current", "previous", vsr.VISION_VSR_ACCURACY)]
     assert session._flow_pairs == (
         ("old-forward-0", "old-backward-0"),
         ("zero-forward", "vision-backward"),
     )
+
+
+def test_vision_vsr_log_uses_the_request_accuracy_constant(
+        monkeypatch, caplog):
+    from kinovsr.native import vsr
+
+    buffers = iter((object(), object()))
+    monkeypatch.setattr(
+        vsr._pb,
+        "make_pixel_buffer_from_attrs",
+        lambda *_args, **_kwargs: next(buffers),
+    )
+    monkeypatch.setattr(
+        vsr.VsrSession,
+        "_zero_flow_pair",
+        lambda _self, _pair: None,
+    )
+    monkeypatch.setattr(vsr, "VISION_VSR_ACCURACY", "medium")
+
+    session = object.__new__(vsr.VsrSession)
+    session.in_w = 640
+    session.in_h = 480
+    try:
+        with caplog.at_level(logging.INFO, logger=vsr.__name__):
+            session._start_vision_flow()
+        assert "Vision revision 1 Medium" in caplog.text
+    finally:
+        session._flow_executor.shutdown()
 
 
 def test_explicit_flow_finish_waits_processes_and_clears_pending(

@@ -70,6 +70,11 @@ class TestCanonicalVocabulary:
                           "--verbose", "--mc-flow ", "--vt-sr-flow"):
             assert canonical in text, canonical
 
+    def test_vision_flow_help_exposes_narrow_os_validation(self, parser):
+        text = " ".join(parser.format_help().split())
+        assert "one 150-frame 640x480 clip on macOS 26.5.2" in text
+        assert "future OS may consume the zero field and reduce quality" in text
+
     @pytest.mark.parametrize("flag", RETIRED_FLAGS)
     def test_retired_flags_are_rejected(self, parser, capsys, flag):
         with pytest.raises(SystemExit) as exc:
