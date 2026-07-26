@@ -20,6 +20,7 @@ from kinovsr.settings import (
 ALL_ENV_VARS = [
     "KINOVSR_VERBOSE", "KINOVSR_QUIET",
     "SHARED_TEMP_DIR", "TMPDIR", "KINOVSR_MLX_CACHE_LIMIT_GB",
+    "KINOVSR_BSVD_DIRECT",
     "BASICVSRPP_WEIGHTS", "BASICVSRPP_RESTORE_WEIGHTS", "BSVD_WEIGHTS",
     "ESC_WEIGHTS", "FASTDVD_WEIGHTS", "FBCNN_WEIGHTS", "NAFNET_WEIGHTS",
     "PVDD_WEIGHTS", "REALBASICVSR_WEIGHTS", "REALESRGAN_WEIGHTS",
@@ -53,9 +54,11 @@ def test_bare_settings_reads_no_environment(monkeypatch):
 def test_from_env_reads_declared_variables(monkeypatch):
     monkeypatch.setenv("NAFNET_WEIGHTS", "gopro32")
     monkeypatch.setenv("TOFLOW_GRAPH", "/some/graph.json")
+    monkeypatch.setenv("KINOVSR_BSVD_DIRECT", "require")
     s = Settings.from_env()
     assert s.nafnet_weights == "gopro32"
     assert s.toflow_graph == "/some/graph.json"
+    assert s.bsvd_direct == "require"
     assert s.bsvd_weights is None
 
 
@@ -155,6 +158,13 @@ def test_cli_flags_override_env(monkeypatch):
     args = _parse(["--nafnet-weights", "sidd32"])
     s = settings_from_args(args, Settings.from_env())
     assert s.nafnet_weights == "sidd32"
+
+
+def test_bsvd_direct_cli_overrides_env(monkeypatch):
+    monkeypatch.setenv("KINOVSR_BSVD_DIRECT", "off")
+    args = _parse(["--bsvd-direct", "force"])
+    s = settings_from_args(args, Settings.from_env())
+    assert s.bsvd_direct == "force"
 
 
 def test_cli_unset_flags_keep_base(monkeypatch):

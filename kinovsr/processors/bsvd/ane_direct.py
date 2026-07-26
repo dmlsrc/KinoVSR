@@ -29,16 +29,16 @@ device compiles, and the first dispatch's own error status stands in
 for a load canary. There is no per-load replay on this route.
 
 Selection: :func:`should_use` engages the route where the island would
-otherwise be required, i.e. padded area >= ``ISLAND_MIN_PIXELS``.
-``KINOVSR_BSVD_DIRECT`` overrides per command: ``auto`` (default),
-``off`` (always Core ML), ``require`` (error if unavailable), and
-``force`` (use it at any geometry - probe/testing aid).
+otherwise be required, i.e. padded area >= ``ISLAND_MIN_PIXELS``. The
+``bsvd_direct`` setting selects ``auto`` (default), ``off`` (always Core
+ML), ``require`` (error if unavailable), or ``force`` (use it at any
+geometry - probe/testing aid). It can be set through ``--bsvd-direct``,
+the ``[settings]`` table, or ``KINOVSR_BSVD_DIRECT``.
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import struct
 from pathlib import Path
@@ -46,6 +46,7 @@ from pathlib import Path
 import mlx.core as mx
 
 from kinovsr.native.anemil import direct, runtime
+from kinovsr.settings import default_settings
 
 from . import ane
 
@@ -61,10 +62,10 @@ _HALF_ONE = struct.pack("<e", 1.0)
 
 
 def _mode() -> str:
-    value = os.environ.get("KINOVSR_BSVD_DIRECT", "auto").strip().lower()
+    value = (default_settings().bsvd_direct or "auto").strip().lower()
     if value not in ("auto", "off", "require", "force"):
         raise RuntimeError(
-            f"KINOVSR_BSVD_DIRECT={value!r}; expected auto, off, require, "
+            f"bsvd_direct={value!r}; expected auto, off, require, "
             f"or force")
     return value
 

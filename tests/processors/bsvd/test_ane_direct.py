@@ -9,6 +9,7 @@ import pytest
 from kinovsr.processors import bsvd as B
 from kinovsr.processors.bsvd import ane as A
 from kinovsr.processors.bsvd import ane_direct as D
+from kinovsr.settings import Settings
 
 pytestmark = pytest.mark.unit
 
@@ -89,7 +90,8 @@ class TestSelection:
     SMALL = (480, 640)
 
     def _mode(self, monkeypatch, value):
-        monkeypatch.setenv("KINOVSR_BSVD_DIRECT", value)
+        monkeypatch.setattr(
+            D, "default_settings", lambda: Settings(bsvd_direct=value))
 
     def test_off_never_engages(self, monkeypatch):
         self._mode(monkeypatch, "off")
@@ -126,7 +128,7 @@ class TestSelection:
 
     def test_unknown_mode_is_rejected(self, monkeypatch):
         self._mode(monkeypatch, "sometimes")
-        with pytest.raises(RuntimeError, match="KINOVSR_BSVD_DIRECT"):
+        with pytest.raises(RuntimeError, match="bsvd_direct"):
             D.should_use(*self.LARGE)
 
 

@@ -155,6 +155,14 @@ class Settings:
     bsvd_backend: str = field(
         default="mlx", metadata={"env": "{{BSVD_BACKEND}}"})
 
+    # Which implementation serves large BSVD ANE graphs: "auto" selects the
+    # direct private route where the Core ML graph would need its fp32 island,
+    # "off" keeps Core ML, "require" refuses fallback when direct dispatch is
+    # unavailable, and "force" enables direct dispatch at every geometry for
+    # probes and testing.
+    bsvd_direct: str = field(
+        default="auto", metadata={"env": "{{KINOVSR_BSVD_DIRECT}}"})
+
     # ---- Legacy per-family weight overrides ---------------------------------
     #
     # Variant token or filesystem path; ``None`` means "use the family
