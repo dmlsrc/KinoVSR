@@ -58,7 +58,9 @@ def test_explicit_flow_reset_requires_drain_and_rearms_random_modes():
     session._prev_dst_frame = object()
     session._flow_needs_random = False
     session._vsr_needs_random = False
+    session._flow_backend = "vt"
     session._flow_pairs = (("forward-0", "backward-0"),)
+    session._flow_zero_pair = None
     session._zero_flow_pair = zeroed.append
 
     session.reset_temporal_context()
@@ -97,6 +99,7 @@ def test_explicit_flow_close_waits_before_ending_both_sessions():
     session._flow_pending_index = 1
     session._flow_pending_slot = 0
     session._flow_pairs = (("forward", "backward"),)
+    session._flow_zero_pair = None
     session._flow_config = object()
     session.config = object()
     session._xfer = None

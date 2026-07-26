@@ -286,12 +286,29 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
 
     # ---- upscale + frame-rate conversion ---------------------------------
     if options.upscale in _VT_MODES:
-        add("upscale", {"processor": "videotoolbox",
-                        "capability": "upscale",
-                        "profile": options.upscale}, slot="upscale")
+        table = {
+            "processor": "videotoolbox",
+            "capability": "upscale",
+            "profile": options.upscale,
+        }
+        if options.vt_sr_flow != "vt":
+            if options.upscale != "balanced":
+                raise ConfigError(
+                    "--vt-sr-flow is only valid with --upscale balanced"
+                )
+            table["flow"] = options.vt_sr_flow
+        add("upscale", table, slot="upscale")
     elif options.upscale != "none":
+        if options.vt_sr_flow != "vt":
+            raise ConfigError(
+                "--vt-sr-flow is only valid with --upscale balanced"
+            )
         table = {"processor": options.upscale, "capability": "upscale"}
         add("upscale", table, slot="upscale")
+    elif options.vt_sr_flow != "vt":
+        raise ConfigError(
+            "--vt-sr-flow is only valid with --upscale balanced"
+        )
 
     if options.target_fps:
         add("fps", {"processor": "videotoolbox",

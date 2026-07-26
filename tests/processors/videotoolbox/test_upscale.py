@@ -58,8 +58,23 @@ def cv_stream(layout, w=W, h=H) -> StreamSpec:
 class TestParseAndSpec:
     def test_profile_is_the_mode_default_balanced(self):
         assert parse({}).mode == "balanced"
+        assert parse({}).flow == "vt"
         assert parse({}, profile="fast").mode == "fast"
         assert parse({}, profile="image").mode == "image"
+
+    def test_balanced_accepts_vision_flow(self):
+        config = parse({"flow": "vision"}, profile="balanced")
+        assert config.mode == "balanced"
+        assert config.flow == "vision"
+
+    def test_bad_flow_rejected(self):
+        with pytest.raises(ValueError, match="flow must be one of"):
+            parse({"flow": "internal"}, profile="balanced")
+
+    @pytest.mark.parametrize("mode", ["fast", "image"])
+    def test_flow_is_balanced_only(self, mode):
+        with pytest.raises(ValueError, match="only valid.*balanced"):
+            parse({"flow": "vision"}, profile=mode)
 
     def test_bad_profile_rejected(self):
         with pytest.raises(ValueError, match="profile must be one of"):
@@ -211,7 +226,7 @@ class TestBalancedFlowPipeline:
             self.closed = True
 
     @staticmethod
-    def _prepared(monkeypatch):
+    def _prepared(monkeypatch, *, flow="vt"):
         from kinovsr.native import vsr
         from kinovsr.processors import videotoolbox
         from kinovsr.processors.videotoolbox import (
@@ -226,7 +241,9 @@ class TestBalancedFlowPipeline:
             "apply_output_pool",
             lambda *_args: None,
         )
-        processor = VtUpscaleProcessor(VtUpscaleConfig(mode="balanced"))
+        processor = VtUpscaleProcessor(
+            VtUpscaleConfig(mode="balanced", flow=flow)
+        )
         processor.prepare(cv_stream(Layout.CV_RGBA_HALF), CONTEXT)
         return processor, TestBalancedFlowPipeline.Session.instances[-1]
 
@@ -239,6 +256,7 @@ class TestBalancedFlowPipeline:
         ]
 
         assert session.kwargs["explicit_flow"] is True
+        assert session.kwargs["flow_backend"] == "vt"
         assert [out.payload for out in processor.process(units[0], CONTEXT)] == [
             "out-0"
         ]
@@ -265,6 +283,14 @@ class TestBalancedFlowPipeline:
         processor.close(CONTEXT)
         assert session.closed
 
+    def test_vision_backend_reaches_the_native_session(self, monkeypatch):
+        processor, session = self._prepared(monkeypatch, flow="vision")
+        try:
+            assert session.kwargs["explicit_flow"] is True
+            assert session.kwargs["flow_backend"] == "vision"
+        finally:
+            processor.close(CONTEXT)
+
     def test_reset_rejects_an_undrained_delayed_frame(self, monkeypatch):
         processor, _session = self._prepared(monkeypatch)
         first = FrameUnit(payload="in-0", pts=0, duration=1000)
@@ -283,16 +309,21 @@ class TestBalancedFlowPipeline:
 @pytest.mark.integration
 class TestUpscale:
     @staticmethod
-    def run(mode, units, cut_at=None):
+    def run(mode, units, cut_at=None, *, flow=None):
         from kinovsr.pipeline import resolve_pipeline, run_plan
 
         if cut_at is not None:
             units = list(units)
             units[cut_at] = units[cut_at].with_boundary(
                 Boundary(BoundaryKind.HARD_CUT, source_index=cut_at))
-        config = {"pipeline": ["up"],
-                  "up": {"processor": "videotoolbox", "capability": "upscale",
-                         "profile": mode}}
+        up = {
+            "processor": "videotoolbox",
+            "capability": "upscale",
+            "profile": mode,
+        }
+        if flow is not None:
+            up["flow"] = flow
+        config = {"pipeline": ["up"], "up": up}
         plan = resolve_pipeline(config, input_spec=mlx_stream(), settings=SETTINGS)
         try:
             return list(run_plan(plan, units, CONTEXT)), plan
@@ -318,6 +349,12 @@ class TestUpscale:
         # which must run cleanly and lose no frames.
         out, _ = self.run("balanced", mlx_units(5), cut_at=2)
         assert len(out) == 5
+
+    def test_balanced_vision_flow_backend_runs_through_pipeline(self):
+        units = mlx_units(4)
+        out, _ = self.run("balanced", units, flow="vision")
+        assert len(out) == len(units)
+        assert [unit.pts for unit in out] == [unit.pts for unit in units]
 
     @pytest.mark.parametrize("mode,layout,scale", [
         ("fast", Layout.CV_NV12, 2),

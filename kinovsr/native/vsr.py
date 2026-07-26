@@ -238,11 +238,10 @@ class VsrSession:
                   scale=4. RGBAHalf source. Uses prev source + prev output to
                   inform the per-frame upscale.  Default for video; slightly
                   crisper motion edges at the cost of slightly more
-                  frame-to-frame variation than image mode. When explicit
-                  public flow is requested below its reliable 128x128 writer
-                  boundary, the session uses deterministic Image input instead
-                  of silently feeding invalid flow or reverting to the
-                  nondeterministic internal Video-flow path.
+                  frame-to-frame variation than image mode. Explicit public VT
+                  flow uses deterministic Image input below its reliable
+                  128x128 writer boundary. Vision flow has no such boundary and
+                  supplies its source-geometry IOSurface buffers directly.
       "image"     VTSuperResolutionScalerConfiguration InputType=Image. scale=4.
                   RGBAHalf source. Per-frame deterministic upscale, no
                   prev-frame feedback.  Apple documents this as for stills,
@@ -262,11 +261,21 @@ class VsrSession:
         fps: float = 24.0,
         *,
         explicit_flow: bool = False,
+        flow_backend: str = "vt",
     ):
         if mode not in ("fast", "balanced", "image"):
             raise ValueError(f"VsrSession only supports VideoToolbox modes, got {mode!r}")
+        if flow_backend not in ("vt", "vision"):
+            raise ValueError(
+                "VSR flow backend must be one of ['vt', 'vision'], "
+                f"got {flow_backend!r}"
+            )
         if explicit_flow and mode != "balanced":
             raise ValueError("explicit optical flow is only valid for balanced VSR")
+        if flow_backend != "vt" and not explicit_flow:
+            raise ValueError(
+                "a non-default VSR flow backend requires explicit_flow=True"
+            )
         scale = scale_for_mode(mode)
         _validate_combination(in_w, in_h, scale, mode)
         self.in_w, self.in_h = in_w, in_h
@@ -274,7 +283,11 @@ class VsrSession:
         self.out_w, self.out_h = in_w * scale, in_h * scale
         self.mode = mode
         self.fps = float(fps)
-        explicit_geometry_ok = source_sized_flow_is_reliable(in_w, in_h)
+        self._flow_backend = flow_backend
+        explicit_geometry_ok = (
+            flow_backend == "vision"
+            or source_sized_flow_is_reliable(in_w, in_h)
+        )
         self._image_fallback = bool(
             explicit_flow
             and mode == "balanced"
@@ -298,6 +311,7 @@ class VsrSession:
         self._flow_config: Any = None
         self._flow_processor: Any = None
         self._flow_pairs: tuple[tuple[Any, Any], ...] | None = None
+        self._flow_zero_pair: tuple[Any, Any] | None = None
         self._flow_executor: ThreadPoolExecutor | None = None
         self._flow_future: Future[None] | None = None
         self._flow_pending_frame: Any = None
@@ -436,7 +450,15 @@ class VsrSession:
             # A precomputed-flow VSR submission requires a non-null flow object
             # even when there is no previous frame. Keep slot zero genuinely
             # empty after a cut rather than reusing the preceding shot's field.
-            self._zero_flow_pair(self._flow_pairs[0])
+            if self._flow_backend == "vision":
+                zero_pair = self._flow_zero_pair
+                if zero_pair is None:
+                    raise RuntimeError("Vision zero-flow buffers are unavailable")
+                pairs = list(self._flow_pairs)
+                pairs[0] = zero_pair
+                self._flow_pairs = tuple(pairs)
+            else:
+                self._zero_flow_pair(self._flow_pairs[0])
 
     def flush_pools(self) -> None:
         """Release excess cached buffers in every session-owned pool.
@@ -475,6 +497,7 @@ class VsrSession:
                     self._flow_pending_index = None
                     self._flow_pending_slot = None
                     self._flow_pairs = None
+                    self._flow_zero_pair = None
                     self._flow_config = None
                     self.config = None
                     xfer, self._xfer = self._xfer, None
@@ -522,9 +545,9 @@ class VsrSession:
         """Submit an MLX/numpy frame, possibly returning one delayed output.
 
         Ordinary sessions are synchronous. An ``explicit_flow=True`` balanced
-        session overlaps public Quality optical flow for frame N+1 with VSR for
-        frame N, so its second and later submissions have one frame of bounded
-        latency. Call :meth:`finish_pending_upscale` at a drain or cut.
+        session overlaps the selected optical-flow backend for frame N+1 with
+        VSR for frame N, so its second and later submissions have one frame of
+        bounded latency. Call :meth:`finish_pending_upscale` at a drain or cut.
         """
         src_pb = self._make_src_buffer()
         _pb.upload_frame_to_buffer(frame, src_pb)
@@ -647,7 +670,14 @@ class VsrSession:
         cls._zero_flow_buffer(pair[1])
 
     def _start_explicit_flow(self) -> None:
-        """Start the public Quality-flow processor used by balanced VSR.
+        """Start the selected explicit-flow backend used by balanced VSR."""
+        if self._flow_backend == "vision":
+            self._start_vision_flow()
+            return
+        self._start_vt_flow()
+
+    def _start_vt_flow(self) -> None:
+        """Start the public Quality VT-flow processor used by balanced VSR.
 
         VT advertises quarter-resolution destination attributes, but on the
         current macOS implementation those buffers complete successfully while
@@ -702,13 +732,52 @@ class VsrSession:
             flow_h,
         )
 
+    def _start_vision_flow(self) -> None:
+        """Prepare zero-copy Vision flow for balanced VSR.
+
+        Vision emits source-geometry TwoComponent16Half IOSurfaces, including
+        for portrait input. VSR accepts those buffers directly, so only the
+        first-frame zero field needs allocation here; later slots retain
+        Vision's returned buffers.
+        """
+        from .vision_flow import FLOW_16H
+
+        attrs = {
+            "PixelFormatType": FLOW_16H,
+            "IOSurfaceProperties": {},
+        }
+        zero_pair = (
+            _pb.make_pixel_buffer_from_attrs(self.in_w, self.in_h, attrs),
+            _pb.make_pixel_buffer_from_attrs(self.in_w, self.in_h, attrs),
+        )
+        self._zero_flow_pair(zero_pair)
+        self._flow_zero_pair = zero_pair
+        self._flow_pairs = tuple(
+            zero_pair for _ in range(EXPLICIT_FLOW_PAIR_COUNT)
+        )
+        self._flow_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="vsr-vision-flow",
+        )
+        _log.info(
+            "VSR explicit flow ready (Vision revision 1 Medium, "
+            "source-geometry %sx%s, zero-copy, one-frame overlap)",
+            self.in_w,
+            self.in_h,
+        )
+
     def _flow_object(self, slot: int) -> Any:
         pairs = self._flow_pairs
         if pairs is None:
             raise RuntimeError("explicit optical-flow buffers are unavailable")
         forward, backward = pairs[slot]
-        return vt.VTFrameProcessorOpticalFlow.alloc(
+        optical_flow = vt.VTFrameProcessorOpticalFlow.alloc(
         ).initWithForwardFlow_backwardFlow_(forward, backward)
+        if optical_flow is None:
+            raise RuntimeError(
+                "VTFrameProcessorOpticalFlow rejected explicit flow buffers"
+            )
+        return optical_flow
 
     def _run_explicit_flow(
         self,
@@ -718,6 +787,25 @@ class VsrSession:
         submission_mode: int,
         frame_index: int,
     ) -> None:
+        if self._flow_backend == "vision":
+            from .vision_flow import generate_bidirectional_vision_flow
+
+            del submission_mode
+            with autorelease_pool():
+                pair = generate_bidirectional_vision_flow(
+                    previous_frame.buffer(),
+                    current_frame.buffer(),
+                )
+                pairs = self._flow_pairs
+                if pairs is None:
+                    raise RuntimeError(
+                        "explicit optical-flow buffers are unavailable"
+                    )
+                updated = list(pairs)
+                updated[slot] = pair
+                self._flow_pairs = tuple(updated)
+            return
+
         processor = self._flow_processor
         if processor is None:
             raise RuntimeError("explicit optical-flow processor is unavailable")

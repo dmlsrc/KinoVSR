@@ -54,6 +54,7 @@ class TestCanonicalVocabulary:
     def test_canonical_defaults(self, parser):
         args = parser.parse_args(BASE)
         assert args.upscale == "none"
+        assert args.vt_sr_flow == "vt"
         assert args.fastdvdnet_profile == "clipped"
         assert args.overwrite is False
 
@@ -66,7 +67,7 @@ class TestCanonicalVocabulary:
         for canonical in ("--upscale", "--fastdvdnet-profile",
                           "--stdf-weights", "--fbcnn-weights",
                           "--realesrgan-denoise-strength", "--base-config",
-                          "--verbose", "--mc-flow "):
+                          "--verbose", "--mc-flow ", "--vt-sr-flow"):
             assert canonical in text, canonical
 
     @pytest.mark.parametrize("flag", RETIRED_FLAGS)
@@ -345,6 +346,9 @@ class TestPipelineOwnedFlags:
 
     def test_upscale_selector_is_flagged(self):
         assert "upscale" in self._flags(upscale="balanced")
+
+    def test_vt_sr_flow_is_flagged(self):
+        assert "vt_sr_flow" in self._flags(vt_sr_flow="vision")
 
     def test_geometry_flags_are_flagged(self):
         # C8: crop/anamorphic/sanitize flags were silently ignored alongside

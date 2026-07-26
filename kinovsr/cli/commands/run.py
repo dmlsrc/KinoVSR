@@ -85,6 +85,7 @@ _PIPELINE_OPTIONS = (
     ("target_fps", None),
     ("temporal_mode", "normal"),
     ("conform_cfr", None),
+    ("vt_sr_flow", "vt"),
 )
 _UNSET = (None, False, "off", "")
 

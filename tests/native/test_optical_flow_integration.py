@@ -85,6 +85,67 @@ def test_portrait_balanced_vsr_uses_rotation_normalized_flow_geometry():
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("width,height", [(64, 48), (128, 192)])
+def test_vision_balanced_vsr_runs_source_geometry_without_image_fallback(
+    width,
+    height,
+):
+    from kinovsr.media import pixel_buffers as pb
+    from kinovsr.native.frameworks import Quartz
+    from kinovsr.native.vsr import VsrSession
+
+    rgb = mx.random.uniform(
+        low=0.05,
+        high=0.95,
+        shape=(height, width, 3),
+        key=mx.random.key(width * 1000 + height),
+    ).astype(mx.float16)
+    rgba = mx.concatenate(
+        [rgb, mx.ones((height, width, 1), mx.float16)],
+        axis=-1,
+    )
+    frames = [mx.roll(rgba, shift, axis=1) for shift in (0, 1, 2)]
+    mx.eval(*frames)
+
+    session = VsrSession(
+        width,
+        height,
+        mode="balanced",
+        fps=30.0,
+        explicit_flow=True,
+        flow_backend="vision",
+    )
+    output_count = 0
+    try:
+        assert session._explicit_flow is True
+        assert session._image_fallback is False
+        assert session._temporal_video is True
+        assert session._flow_processor is None
+        assert session._flow_pairs is not None
+
+        for index, frame in enumerate(frames):
+            output = session.submit_upscale_to_buffer(frame, index)
+            if output is not None:
+                array = pb.read_rgbahalf_rgb(output)
+                mx.eval(array)
+                output_count += 1
+                del output
+        output = session.finish_pending_upscale()
+        if output is not None:
+            array = pb.read_rgbahalf_rgb(output)
+            mx.eval(array)
+            output_count += 1
+            del output
+
+        assert output_count == len(frames)
+        forward = session._flow_pairs[0][0]
+        assert Quartz.CVPixelBufferGetWidth(forward) == width
+        assert Quartz.CVPixelBufferGetHeight(forward) == height
+    finally:
+        session.close()
+
+
+@pytest.mark.integration
 def test_small_balanced_fallback_is_bit_exact_with_image_mode():
     from kinovsr.media import pixel_buffers as pb
     from kinovsr.native.vsr import VsrSession

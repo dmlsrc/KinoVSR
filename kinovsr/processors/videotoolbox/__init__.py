@@ -297,6 +297,7 @@ class VtInterpolateProcessor:
 @dataclasses.dataclass(frozen=True, slots=True)
 class VtUpscaleConfig:
     mode: str  # "fast" | "balanced" | "image"
+    flow: str = "vt"  # balanced only: "vt" | "vision"
 
 
 def _upscale_produces(spec: StreamSpec, config: object) -> StreamSpec:
@@ -379,15 +380,13 @@ class VtUpscaleProcessor:
             self._session = VsrSession(
                 g.width, g.height, mode=self._config.mode,
                 fps=float(rate_hint),
-                # Balanced VSR's private internal flow is timing-sensitive:
-                # identical inputs can produce different tail frames when
-                # Python scheduling changes. Public Quality flow is stable,
-                # measurably better against a moving-reference target, and is
-                # overlapped one frame ahead so it does not cost throughput.
-                # native.vsr falls back to deterministic Image input when
-                # either source dimension is below public flow's reliable
-                # writer boundary.
+                # Balanced VSR's private internal flow is timing-sensitive.
+                # Both explicit backends are overlapped one frame ahead.
+                # Public VT Quality flow is the default; Vision is an opt-in
+                # zero-copy alternative that also works below VT's measured
+                # 128-pixel destination-writer boundary.
                 explicit_flow=self._config.mode == "balanced",
+                flow_backend=self._config.flow,
             )
             apply_output_pool(
                 self._session, output_pool_binding, self._session.out_w, self._session.out_h
@@ -514,13 +513,23 @@ class VideoToolboxFactory:
         settings: Settings,
     ) -> VtInterpolateConfig | VtUpscaleConfig:
         if capability is Capability.UPSCALE:
-            reject_unknown_keys(raw, ())
+            reject_unknown_keys(raw, ("flow",))
             mode = profile or "balanced"
             if mode not in _UPSCALE_PROFILES:
                 raise ValueError(
                     f"videotoolbox upscale profile must be one of {list(_UPSCALE_PROFILES)}"
                 )
-            return VtUpscaleConfig(mode=mode)
+            flow = str(raw.get("flow", "vt"))
+            if flow not in ("vt", "vision"):
+                raise ValueError(
+                    "videotoolbox upscale flow must be one of ['vt', 'vision']"
+                )
+            if mode != "balanced" and "flow" in raw:
+                raise ValueError(
+                    "videotoolbox upscale flow is only valid for "
+                    "the balanced profile"
+                )
+            return VtUpscaleConfig(mode=mode, flow=flow)
         reject_unknown_keys(raw, ("target_fps",))
         if "target_fps" not in raw:
             raise ValueError("target_fps is required for interpolation")

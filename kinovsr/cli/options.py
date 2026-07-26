@@ -52,7 +52,7 @@ SHARED_KEYS = frozenset({
     "trim",               # warm-up frames trimmed at window joins
     "passes",             # in-stage iteration count
     "ensemble",           # 8-way geometric self-ensemble
-    "flow",               # optical-flow engine: spynet | zero | vt
+    "flow",               # optical-flow engine: spynet | zero | vt | vision
     "flow_weights",       # stock SpyNet checkpoint path
     "flow_scale",         # flow-pyramid resolution: full | half | quarter
     "flow_consistency",   # forward-backward consistency masking strength

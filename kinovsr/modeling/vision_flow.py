@@ -23,14 +23,10 @@ from __future__ import annotations
 from typing import Any
 
 import mlx.core as mx
-import Vision
 
 from kinovsr.media import pixel_buffers as _pb
 from kinovsr.native.frameworks import Quartz, autorelease_pool
-
-# kCVPixelFormatType_TwoComponent32Float ('2C0f'): request the fp32 flow
-# plane explicitly so the read below never guesses.
-_FLOW_32F = 0x32433066
+from kinovsr.native.vision_flow import FLOW_32F, generate_vision_flow
 
 
 class VisionFlowEngine:
@@ -68,32 +64,11 @@ class VisionFlowEngine:
         with autorelease_pool():
             self._upload(from_rgb, self._from_buf)
             self._upload(to_rgb, self._to_buf)
-            req = Vision.VNGenerateOpticalFlowRequest.alloc(
-                ).initWithTargetedCVPixelBuffer_options_(self._to_buf, {})
-            req.setRevision_(Vision.VNGenerateOpticalFlowRequestRevision1)
-            req.setComputationAccuracy_(
-                Vision.VNGenerateOpticalFlowRequestComputationAccuracyMedium)
-            req.setOutputPixelFormat_(_FLOW_32F)
-            handler = Vision.VNImageRequestHandler.alloc(
-                ).initWithCVPixelBuffer_options_(self._from_buf, {})
-            ok, err = handler.performRequests_error_([req], None)
-            if not ok:
-                raise RuntimeError(f"Vision optical flow failed: {err}")
-            results = req.results()
-            if not results:
-                raise RuntimeError("Vision optical flow returned no observation")
-            fb = results[0].pixelBuffer()
-            fw = int(Quartz.CVPixelBufferGetWidth(fb))
-            fh = int(Quartz.CVPixelBufferGetHeight(fb))
-            if (fw, fh) != (self.w, self.h):
-                raise RuntimeError(
-                    f"Vision optical flow returned {fw}x{fh} for a "
-                    f"{self.w}x{self.h} request")
-            fmt = int(Quartz.CVPixelBufferGetPixelFormatType(fb))
-            if fmt != _FLOW_32F:
-                raise RuntimeError(
-                    f"Vision optical flow returned pixel format {fmt:#x}, "
-                    f"expected TwoComponent32Float")
+            fb = generate_vision_flow(
+                self._from_buf,
+                self._to_buf,
+                pixel_format=FLOW_32F,
+            )
             Quartz.CVPixelBufferLockBaseAddress(fb, 1)
             try:
                 bpr = Quartz.CVPixelBufferGetBytesPerRow(fb)
