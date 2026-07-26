@@ -1,12 +1,8 @@
-"""ffmpeg (software-codec) encode backend for KinoVSR outputs.
+"""ffmpeg encode backend for KinoVSR outputs.
 
-This is one of two encode backends. The other is the VideoToolbox /
-AVAssetWriter backend in `kinovsr.native.encode`
-(`encode_video_videotoolbox`), which hardware-encodes the `default` tier.
-The `default` tier auto-routes to VideoToolbox; this ffmpeg backend handles
-the tiers VideoToolbox does not: `web` (libx264 - software x264 produces
-higher-quality H.264 than the hardware h264_videotoolbox encoder), `hq`
-(libx265 4:4:4), and the ProRes `export` / `reference` tiers.
+The `default` tier uses ffmpeg's VideoToolbox encoder. The remaining tiers
+select software codecs: `web` uses libx264, `hq` uses libx265 4:4:4, and
+`export` / `reference` use ProRes.
 
 Five tiers cover the practical use cases. Pick by *destination*, not by
 encoder flags - the flags are an implementation detail.

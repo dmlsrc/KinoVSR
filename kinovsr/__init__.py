@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .media.audio import AudioTrack
-    from .native.encode import encode_video_videotoolbox
     from .native.frameworks import autorelease_pool
     from .native.temporal import VtfrcSession
     from .native.vsr import VsrSession
@@ -51,8 +50,6 @@ _EXPORTS = {
     "VsrSession": ("kinovsr.native.vsr", "VsrSession"),
     "VtfrcSession": ("kinovsr.native.temporal", "VtfrcSession"),
     "autorelease_pool": ("kinovsr.native.frameworks", "autorelease_pool"),
-    "encode_video_videotoolbox": ("kinovsr.native.encode",
-                                  "encode_video_videotoolbox"),
 }
 
 __all__ = sorted(_EXPORTS)

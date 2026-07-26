@@ -3,9 +3,8 @@
 This note records the PERF-08 correction and its acceptance protocol. The
 problem was not an unbounded product pool: Core Image rendering work in the
 typed pipeline had no common accounting or cleanup owner, so framework caches
-could accumulate for the entire process lifetime. The legacy native encoder
-performed local cleanup every 64 input frames, but host sessions and file runs
-did not.
+could accumulate for the entire process lifetime. Earlier cleanup was local to
+one encode path, while host sessions and file runs had none.
 
 ## Corrected Contract
 
@@ -30,8 +29,7 @@ covers:
   exhaustion, explicit cancellation, and abandonment;
 - exported `run_plan`, with the same lifecycle guarantees;
 - `run_file`, including automatic geometry probing and post-chain comparison
-  or diagnostic work; and
-- the legacy `encode_video_videotoolbox` utility on success and failure.
+  or diagnostic work.
 
 The janitor keeps plain counters (active renders, dirty completed renders,
 owner leases) under one lock with an untimed condition. A clear runs outside

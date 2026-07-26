@@ -6,7 +6,7 @@ theme, the verbosity level, and per-subsystem filtering stay coordinated on
 one console.
 
 Each module gets its own logger via ``logging.getLogger(__name__)``. The
-logger *name* (``kinovsr.native.encode``, ``kinovsr.pipeline``, ...) is the
+logger *name* (``kinovsr.native.writer``, ``kinovsr.pipeline``, ...) is the
 subsystem, so output can be leveled or silenced per subsystem::
 
     logging.getLogger("kinovsr.native").setLevel(logging.WARNING)
