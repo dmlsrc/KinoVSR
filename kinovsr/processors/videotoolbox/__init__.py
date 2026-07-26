@@ -343,6 +343,7 @@ class VtUpscaleProcessor:
         self._mx: Any = None
         self._index = 0
         self._cv_input = False
+        self._pending: FrameUnit | None = None
         self._output_pool_binding: tuple[Any, int, int, int] | None = None
 
     def _bind_output_pool(
@@ -377,7 +378,13 @@ class VtUpscaleProcessor:
         try:
             self._session = VsrSession(
                 g.width, g.height, mode=self._config.mode,
-                fps=float(rate_hint)
+                fps=float(rate_hint),
+                # Balanced VSR's private internal flow is timing-sensitive:
+                # identical inputs can produce different tail frames when
+                # Python scheduling changes. Public Quality flow is stable,
+                # measurably better against a moving-reference target, and is
+                # overlapped one frame ahead so it does not cost throughput.
+                explicit_flow=self._config.mode == "balanced",
             )
             apply_output_pool(
                 self._session, output_pool_binding, self._session.out_w, self._session.out_h
@@ -391,29 +398,64 @@ class VtUpscaleProcessor:
 
     def process(self, unit: FrameUnit, context: PipelineContext) -> Iterable[FrameUnit]:
         if self._cv_input:
-            out = self._session.upscale_buffer_to_buffer(unit.payload, self._index)
-            self._index += 1
+            out = self._session.submit_upscale_buffer_to_buffer(
+                unit.payload,
+                self._index,
+            )
+        else:
+            mx = self._mx
+            rgb = unit.payload
+            rgba = mx.concatenate(
+                [
+                    rgb.astype(mx.float16),
+                    mx.ones((*rgb.shape[:2], 1), mx.float16),
+                ],
+                axis=-1,
+            )
+            out = self._session.submit_upscale_to_buffer(rgba, self._index)
+        self._index += 1
+        if out is None:
+            if self._pending is not None:
+                raise RuntimeError(
+                    "VideoToolbox VSR accepted a second delayed frame"
+                )
+            self._pending = unit
+            return
+        if self._pending is None:
             yield unit.with_payload(out)
             return
-        mx = self._mx
-        rgb = unit.payload
-        rgba = mx.concatenate(
-            [rgb.astype(mx.float16), mx.ones((*rgb.shape[:2], 1), mx.float16)], axis=-1
-        )
-        out = self._session.upscale_to_buffer(rgba, self._index)
-        self._index += 1
-        yield unit.with_payload(out)
+        pending, self._pending = self._pending, unit
+        yield pending.with_payload(out)
 
     def reset(self, boundary: Boundary, context: PipelineContext) -> None:
         if self._session is not None:
+            if self._pending is not None:
+                raise RuntimeError(
+                    "VideoToolbox VSR must be flushed before a hard-cut reset"
+                )
             self._session.reset_temporal_context()
 
     def flush(self, context: PipelineContext) -> Iterable[FrameUnit]:
-        return ()
+        if self._session is None:
+            return
+        out = self._session.finish_pending_upscale()
+        if out is None:
+            if self._pending is not None:
+                raise RuntimeError(
+                    "VideoToolbox VSR lost its delayed output while flushing"
+                )
+            return
+        pending, self._pending = self._pending, None
+        if pending is None:
+            raise RuntimeError(
+                "VideoToolbox VSR produced an output with no pending frame"
+            )
+        yield pending.with_payload(out)
 
     def close(self, context: PipelineContext) -> None:
         session, self._session = self._session, None
         self._output_pool_binding = None
+        self._pending = None
         if session is not None:
             session.close()
 

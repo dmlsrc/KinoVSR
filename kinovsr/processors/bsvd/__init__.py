@@ -11,6 +11,7 @@ first conv's input channels from the weights.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -383,9 +384,11 @@ class BSVD:
 class BsvdDenoiser:
     """Streaming BSVD denoiser for harness preprocess chains.
 
-    feed(frame, token) and flush() return lists of (denoised_frame, token). The
-    network has a 16-step bidirectional-buffer delay; the first 16 intermediate
-    outputs are discarded, then outputs are paired with the oldest input token.
+    feed(frame, token) and flush() return iterables of
+    (denoised_frame, token). The network has a 16-step bidirectional-buffer
+    delay; the first 16 intermediate outputs are discarded, then outputs are
+    paired with the oldest input token. Flush stays lazy so downstream work
+    can consume each tail frame before the next recurrent accelerator step.
     """
 
     MAP_WARMUP = 9   # frames buffered before estimating a spatial noise map
@@ -644,7 +647,7 @@ class BsvdDenoiser:
         self._emitted += 1
         return [self._emit(out, tok)]
 
-    def feed(self, frame: Any, token: Any = None) -> list:
+    def feed(self, frame: Any, token: Any = None) -> Iterable:
         from kinovsr.analysis.noise.track import source_since_sync
 
         x = self._prepare(frame)
@@ -679,31 +682,31 @@ class BsvdDenoiser:
                 self._since_refresh = 0
         return self._step(x, token=token, real=True, gain=gain)
 
-    def flush(self) -> list:
+    def flush(self) -> Iterable:
         if self._schedule is not None:
-            out = self._feed_scheduled(final=True)
+            yield from self._feed_scheduled(final=True)
             self._reset_state()
             self._reset_conditioning(clear_debug=False)
-            return out
-        out = []
+            return
         if self._warm:
             # short stream ended before the map warmup filled: estimate from
             # whatever arrived (the tracker falls back to constant below 2 frames)
             self._estimate_from([f for f, _, _ in self._warm])
-            out += self._drain_warm()
+            yield from self._drain_warm()
         guard = self.net.SHIFT_NUM + self._received + 2
         while self._emitted < self._received:
             before = self._emitted
-            out += self._step(None)
+            yield from self._step(None)
             guard -= 1
             if guard <= 0 and self._emitted == before:
                 raise RuntimeError("BSVD flush did not produce enough delayed frames")
         self._reset_state()
         self._reset_conditioning(clear_debug=False)
-        return out
 
-    def _feed_scheduled(self, final: bool) -> list:
-        out: list = []
+    def _feed_scheduled(self, final: bool) -> Iterable:
+        # A feed-side poll may have materialized outputs since the previous
+        # call. Emit them before changing the schedule.
+        yield from self._wavefront.available()
         total = self._base + len(self._frames)
         while self._sched_i < len(self._schedule):
             p0, p1, e0, e1 = self._schedule[self._sched_i]
@@ -715,7 +718,9 @@ class BsvdDenoiser:
                 rel_pe = pe - self._base
                 local_frames = self._frames[rel_p0:rel_pe]
                 local_tokens = self._frame_tokens[rel_p0:rel_pe]
-                out.extend(self._run_window(local_frames, local_tokens, e0 - p0, ee - p0))
+                yield from self._run_window(
+                    local_frames, local_tokens, e0 - p0, ee - p0
+                )
             self._sched_i += 1
         keep_from = (self._schedule[self._sched_i][0] if self._sched_i < len(self._schedule)
                      else self._base + len(self._frames))
@@ -725,11 +730,17 @@ class BsvdDenoiser:
             self._frame_tokens = self._frame_tokens[drop:]
             self._base += drop
         if final:
-            # The flush edge: complete the last window still in flight.
-            out.extend(self._wavefront.barrier())
-        return out
+            # Keep the accelerator and downstream temporal stages overlapped:
+            # yield each materialized output before advancing the final window.
+            yield from self._wavefront.drain()
 
-    def _run_window(self, frames: list, tokens: list, emit_start: int, emit_end: int) -> list:
+    def _run_window(
+        self,
+        frames: list,
+        tokens: list,
+        emit_start: int,
+        emit_end: int,
+    ) -> Iterable:
         nm = None
         if self._tracker is not None:
             # per-window estimate, EMA-blended across windows by the tracker so
@@ -765,27 +776,44 @@ class BsvdDenoiser:
             # never while its window is still in flight.
             count = len(conditioned)
             held_tokens = list(tokens)
+            next_output = 0
 
-            def finalize(handle) -> list:
+            def collect(handle, complete: bool) -> Iterable:
+                nonlocal next_output
                 outputs = handle.outputs
-                if len(outputs) != count:
+                if complete and len(outputs) != count:
                     raise RuntimeError(
                         f"BSVD window returned {len(outputs)} outputs for "
                         f"{count} frames")
-                emitted = [self._emit(outputs[index], held_tokens[index])
-                           for index in range(emit_start, emit_end)]
-                self.net.reset()
-                return emitted
+                ready = min(len(outputs), count)
+                selected_start = max(next_output, emit_start)
+                selected_end = min(ready, emit_end)
+                selected = tuple(
+                    (outputs[index], held_tokens[index])
+                    for index in range(selected_start, selected_end)
+                )
+                next_output = ready
+                if complete:
+                    # Window outputs are detached materialized arrays, so the
+                    # recurrent state may reset before public crop/cast work.
+                    self.net.reset()
+                return (
+                    self._emit(output, token)
+                    for output, token in selected
+                )
 
-            return self._wavefront.submit(
-                lambda: begin_window(conditioned), finalize)
+            yield from self._wavefront.submit(
+                lambda: begin_window(conditioned), collect
+            )
+            yield from self._wavefront.available()
+            return
 
         # The synchronous fallback (a window too short for the phase path,
         # or a net without begin_window) emits inline, so the window still
         # in flight must complete and emit FIRST - both for emission order
         # (its frames precede this window's) and because resetting the net
         # under an in-flight window corrupts shared runner state.
-        out = self._wavefront.barrier()
+        yield from self._wavefront.drain()
         self.net.reset()
         for i, x in enumerate(conditioned):
             y = self.net.step(x)
@@ -793,16 +821,15 @@ class BsvdDenoiser:
             if emit_start <= idx < emit_end:
                 if y is None:
                     raise RuntimeError("BSVD scheduled window emitted an empty frame")
-                out.append(self._emit(y, tokens[idx]))
+                yield self._emit(y, tokens[idx])
         for i in range(self.net.SHIFT_NUM):
             y = self.net.step(None)
             idx = len(frames) + i - self.net.SHIFT_NUM
             if emit_start <= idx < emit_end:
                 if y is None:
                     raise RuntimeError("BSVD scheduled window emitted an empty frame")
-                out.append(self._emit(y, tokens[idx]))
+                yield self._emit(y, tokens[idx])
         self.net.reset()
-        return out
 
 
 __all__ = ["BSVD", "BsvdDenoiser", "default_weights_path", "load_bsvd"]

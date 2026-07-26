@@ -1,7 +1,7 @@
 """Adapter from the family driver shape to the Processor protocol.
 
 The learned families already speak a common streaming dialect:
-``feed(frame, token) -> [(out, token), ...]``, ``flush() -> [...]``,
+``feed(frame, token) -> Iterable[(out, token)]``, ``flush() -> Iterable[...]``,
 ``reset()``, and optionally ``close()``. The token rides through the
 family's internal delay untouched, which is exactly the timestamp
 bookkeeping a typed pipeline needs: this adapter passes the whole input
@@ -43,9 +43,9 @@ def parse_luma_chroma(raw: Mapping[str, Any]) -> tuple[float, float]:
 class FeedFlushDriver(Protocol):
     """What the wrapped family object must provide."""
 
-    def feed(self, frame: Any, token: Any = None) -> list: ...
+    def feed(self, frame: Any, token: Any = None) -> Iterable: ...
 
-    def flush(self) -> list: ...
+    def flush(self) -> Iterable: ...
 
     def reset(self) -> None: ...
 
@@ -64,6 +64,10 @@ class AsyncWindowHandle(Protocol):
       ``advance`` on the caller's thread - only the accelerator dispatches
       may run on a worker (``anemil.runtime.DispatchPipeline`` is the
       shared primitive for that).
+    - ``advance_until_output(block=True)``, when present, stops after the
+      next output is materialized (or the window completes). It lets a final
+      window drain through downstream stages without first completing the
+      entire accelerator batch.
     - ``outputs`` holds one entry per input frame, in input order, once
       complete.
     - a raised ``advance`` poisons the handle; the stream needs a reset.
@@ -88,16 +92,17 @@ class WindowWavefront:
     ``submit`` completes the window in flight first (that wait is the
     depth-one backpressure: at most one window's dispatches plus one
     window's buffered frames are ever held), starts the next, and returns
-    the finished window's emissions. ``poll`` opportunistically advances
-    without blocking - call it on every feed so completed dispatches are
-    consumed in the shadow of buffering. ``barrier`` completes everything
-    (the flush edge). ``abandon`` quiesces on reset/close paths,
-    suppressing the window's own error so the primary error wins.
+    the finished window's remaining emissions. ``poll`` opportunistically
+    advances without blocking; ``available`` emits outputs materialized so
+    far. ``drain`` advances only to the next output before yielding it
+    downstream. ``barrier`` eagerly completes everything before a new
+    window. ``abandon`` quiesces on reset/close paths.
     """
 
     def __init__(self) -> None:
         self._handle: AsyncWindowHandle | None = None
-        self._finalize: Any = None
+        self._collect: Any = None
+        self._done = False
 
     @property
     def in_flight(self) -> bool:
@@ -105,43 +110,77 @@ class WindowWavefront:
 
     def poll(self) -> None:
         if self._handle is not None:
-            self._handle.advance(block=False)
+            self._done = self._handle.advance(block=False)
 
-    def submit(self, begin: Any, finalize: Any) -> list:
+    def submit(self, begin: Any, collect: Any) -> Iterable:
         """Complete the in-flight window, then start the next.
 
         ``begin`` is a zero-argument callable returning the new window's
         :class:`AsyncWindowHandle` (it should also submit the first
         dispatch, so the accelerator is busy before this returns);
-        ``finalize`` maps a completed handle to the window's emission
-        list and MUST leave the net reset for the next window. Returns
-        the completed previous window's emissions.
+        ``collect(handle, complete)`` detaches newly available outputs and,
+        at completion, validates them and resets shared network state.
         """
         out = self.barrier()
         self._handle = begin()
-        self._finalize = finalize
-        self._handle.advance(block=False)
+        self._collect = collect
+        self._done = self._handle.advance(block=False)
         return out
 
-    def barrier(self) -> list:
+    def available(self) -> Iterable:
+        """Collect outputs materialized by nonblocking progress so far."""
+        if self._handle is None:
+            return []
+        if self._done:
+            return self._finish()
+        return self._collect(self._handle, False)
+
+    def drain(self) -> Iterable:
+        """Yield each available output before advancing to the next one."""
+        while self._handle is not None:
+            available = iter(self.available())
+            try:
+                first = next(available)
+            except StopIteration:
+                pass
+            else:
+                yield first
+                yield from available
+                continue
+            if self._handle is None:
+                return
+            advance = getattr(self._handle, "advance_until_output", None)
+            if callable(advance):
+                self._done = advance(block=True)
+            else:
+                self._done = self._handle.advance(block=True)
+
+    def barrier(self) -> Iterable:
         """Complete and finalize the in-flight window, if any."""
         if self._handle is None:
             return []
-        handle, self._handle = self._handle, None
-        finalize, self._finalize = self._finalize, None
         try:
-            handle.advance(block=True)
+            self._done = self._handle.advance(block=True)
         except BaseException:
             self._handle = None
+            self._collect = None
+            self._done = False
             raise
-        return finalize(handle)
+        return self._finish()
+
+    def _finish(self) -> Iterable:
+        handle, self._handle = self._handle, None
+        collect, self._collect = self._collect, None
+        self._done = False
+        return collect(handle, True)
 
     def abandon(self) -> None:
         """Quiesce the in-flight window without emitting (reset/close)."""
         import contextlib
 
         handle, self._handle = self._handle, None
-        self._finalize = None
+        self._collect = None
+        self._done = False
         if handle is not None:
             with contextlib.suppress(BaseException):
                 handle.advance(block=True)

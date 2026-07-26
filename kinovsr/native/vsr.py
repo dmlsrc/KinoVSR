@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from typing import Any
 
@@ -141,6 +142,7 @@ HQ_MAX_INPUT_H = 1080
 DST_POOL_ALLOCATION_LIMIT = 2
 TEMPORAL_SRC_POOL_ALLOCATION_LIMIT = 3
 STATELESS_SRC_POOL_ALLOCATION_LIMIT = 1
+EXPLICIT_FLOW_PAIR_COUNT = 2
 
 
 def _validate_combination(width: int, height: int, scale: int, mode: str) -> None:
@@ -242,9 +244,19 @@ class VsrSession:
     `reset_temporal_context()` - useful for input that may contain edits.
     """
 
-    def __init__(self, in_w: int, in_h: int, mode: str, fps: float = 24.0):
+    def __init__(
+        self,
+        in_w: int,
+        in_h: int,
+        mode: str,
+        fps: float = 24.0,
+        *,
+        explicit_flow: bool = False,
+    ):
         if mode not in ("fast", "balanced", "image"):
             raise ValueError(f"VsrSession only supports VideoToolbox modes, got {mode!r}")
+        if explicit_flow and mode != "balanced":
+            raise ValueError("explicit optical flow is only valid for balanced VSR")
         scale = scale_for_mode(mode)
         _validate_combination(in_w, in_h, scale, mode)
         self.in_w, self.in_h = in_w, in_h
@@ -252,6 +264,17 @@ class VsrSession:
         self.out_w, self.out_h = in_w * scale, in_h * scale
         self.mode = mode
         self.fps = float(fps)
+        self._explicit_flow = bool(explicit_flow)
+        self._flow_config: Any = None
+        self._flow_processor: Any = None
+        self._flow_pairs: tuple[tuple[Any, Any], ...] | None = None
+        self._flow_executor: ThreadPoolExecutor | None = None
+        self._flow_future: Future[None] | None = None
+        self._flow_pending_frame: Any = None
+        self._flow_pending_index: int | None = None
+        self._flow_pending_slot: int | None = None
+        self._flow_needs_random = True
+        self._vsr_needs_random = True
 
         if mode == "fast":
             self.config = vt.VTLowLatencySuperResolutionScalerConfiguration.alloc(
@@ -266,7 +289,7 @@ class VsrSession:
             )
             cls = vt.VTSuperResolutionScalerConfiguration
             self.config = cls.alloc().initWithFrameWidth_frameHeight_scaleFactor_inputType_usePrecomputedFlow_qualityPrioritization_revision_(
-                in_w, in_h, scale, input_type, False,
+                in_w, in_h, scale, input_type, self._explicit_flow,
                 vt.VTSuperResolutionScalerConfigurationQualityPrioritizationNormal,
                 cls.defaultRevision(),
             )
@@ -350,6 +373,13 @@ class VsrSession:
                 "VSR destination CVPixelBufferPool creation failed; "
                 "bounded output allocation is required"
             )
+        if self._explicit_flow:
+            try:
+                self._start_explicit_flow()
+            except BaseException:
+                with suppress(BaseException):
+                    self.close()
+                raise
 
     def use_dst_pool(self, pool: Any) -> None:
         """Wire the writer's adaptor pixelBufferPool() as VSR's dst source -
@@ -364,8 +394,19 @@ class VsrSession:
 
     def reset_temporal_context(self) -> None:
         """Drop the previous-frame chain. Call at scene cuts on --video input."""
+        if self._flow_pending_frame is not None:
+            raise RuntimeError(
+                "finish_pending_upscale() must drain explicit flow before reset"
+            )
         self._prev_src_frame = None
         self._prev_dst_frame = None
+        self._flow_needs_random = True
+        self._vsr_needs_random = True
+        if self._flow_pairs is not None:
+            # A precomputed-flow VSR submission requires a non-null flow object
+            # even when there is no previous frame. Keep slot zero genuinely
+            # empty after a cut rather than reusing the preceding shot's field.
+            self._zero_flow_pair(self._flow_pairs[0])
 
     def flush_pools(self) -> None:
         """Release excess cached buffers in every session-owned pool.
@@ -381,21 +422,40 @@ class VsrSession:
 
     def close(self) -> None:
         processor, self.processor = self.processor, None
+        flow_processor = getattr(self, "_flow_processor", None)
+        flow_executor = getattr(self, "_flow_executor", None)
+        self._flow_processor = None
+        self._flow_executor = None
         try:
-            if processor is not None:
-                processor.endSession()
+            if flow_executor is not None:
+                flow_executor.shutdown(wait=True)
         finally:
-            self.reset_temporal_context()
-            self.config = None
-            xfer, self._xfer = self._xfer, None
             try:
-                if xfer is not None:
-                    vt.VTPixelTransferSessionInvalidate(xfer)
+                if flow_processor is not None:
+                    flow_processor.endSession()
             finally:
-                self.flush_pools()
-                self._src_pool = None
-                self._dst_pool = None
-                self._owns_dst_pool = False
+                try:
+                    if processor is not None:
+                        processor.endSession()
+                finally:
+                    self._prev_src_frame = None
+                    self._prev_dst_frame = None
+                    self._flow_future = None
+                    self._flow_pending_frame = None
+                    self._flow_pending_index = None
+                    self._flow_pending_slot = None
+                    self._flow_pairs = None
+                    self._flow_config = None
+                    self.config = None
+                    xfer, self._xfer = self._xfer, None
+                    try:
+                        if xfer is not None:
+                            vt.VTPixelTransferSessionInvalidate(xfer)
+                    finally:
+                        self.flush_pools()
+                        self._src_pool = None
+                        self._dst_pool = None
+                        self._owns_dst_pool = False
 
     # ------------------------------------------------------------------------
     # Internal: buffer factories
@@ -423,6 +483,63 @@ class VsrSession:
     # ------------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------------
+
+    def submit_upscale_to_buffer(
+        self,
+        frame: Any,
+        frame_index: int,
+    ) -> Any | None:
+        """Submit an MLX/numpy frame, possibly returning one delayed output.
+
+        Ordinary sessions are synchronous. An ``explicit_flow=True`` balanced
+        session overlaps public Quality optical flow for frame N+1 with VSR for
+        frame N, so its second and later submissions have one frame of bounded
+        latency. Call :meth:`finish_pending_upscale` at a drain or cut.
+        """
+        src_pb = self._make_src_buffer()
+        _pb.upload_frame_to_buffer(frame, src_pb)
+        if self._explicit_flow:
+            return self._submit_explicit(src_pb, frame_index)
+        return self._process(src_pb, frame_index)
+
+    def submit_upscale_buffer_to_buffer(
+        self,
+        src_pb: Any,
+        frame_index: int,
+    ) -> Any | None:
+        """Submit a native source buffer with the same latency contract."""
+        clean = self._clean_src_buffer(src_pb)
+        if self._explicit_flow:
+            return self._submit_explicit(clean, frame_index)
+        return self._process(clean, frame_index)
+
+    def finish_pending_upscale(self) -> Any | None:
+        """Finish and return the final delayed explicit-flow output, if any."""
+        if not self._explicit_flow or self._flow_pending_frame is None:
+            return None
+        future = self._flow_future
+        if future is None:
+            raise RuntimeError("explicit-flow pending frame has no flow future")
+        future.result()
+        slot = self._flow_pending_slot
+        frame_index = self._flow_pending_index
+        if slot is None or frame_index is None:
+            raise RuntimeError("explicit-flow pending state is incomplete")
+        # Match the ordinary submit path's native lifetime. Without this
+        # scoped pool, the temporary VTFrameProcessorFrame around the drained
+        # output survives the hard-cut reset and can pin a bounded destination
+        # surface until the process-wide autorelease pool eventually drains.
+        with autorelease_pool():
+            output = self._process_precomputed_frame(
+                self._flow_pending_frame,
+                frame_index,
+                slot,
+            )
+        self._flow_future = None
+        self._flow_pending_frame = None
+        self._flow_pending_index = None
+        self._flow_pending_slot = None
+        return output
 
     def upscale_to_buffer(self, frame: Any, frame_index: int) -> Any:
         """Upscale one frame from an MLX/numpy array. Returns the dst
@@ -481,6 +598,225 @@ class VsrSession:
         Quartz.CVBufferRemoveAttachment(clean, Quartz.kCVImageBufferTransferFunctionKey)
         return clean
 
+    @staticmethod
+    def _zero_flow_buffer(buffer: Any) -> None:
+        Quartz.CVPixelBufferLockBaseAddress(buffer, 0)
+        try:
+            row_bytes = int(Quartz.CVPixelBufferGetBytesPerRow(buffer))
+            height = int(Quartz.CVPixelBufferGetHeight(buffer))
+            view = Quartz.CVPixelBufferGetBaseAddress(buffer).as_buffer(
+                row_bytes * height
+            )
+            view[:] = bytes(len(view))
+        finally:
+            Quartz.CVPixelBufferUnlockBaseAddress(buffer, 0)
+
+    @classmethod
+    def _zero_flow_pair(cls, pair: tuple[Any, Any]) -> None:
+        cls._zero_flow_buffer(pair[0])
+        cls._zero_flow_buffer(pair[1])
+
+    def _start_explicit_flow(self) -> None:
+        """Start the public Quality-flow processor used by balanced VSR.
+
+        VT advertises quarter-resolution destination attributes, but on the
+        current macOS implementation those buffers complete successfully while
+        remaining zero. Full-input-resolution buffers receive the real vector
+        field and are accepted by precomputed-flow VSR. Keep that measured
+        geometry explicit here; silently returning to the advertised shape is
+        a quality regression.
+        """
+        cls = vt.VTOpticalFlowConfiguration
+        if not cls.isSupported():
+            raise RuntimeError("VTOpticalFlow is not supported on this device")
+        config = cls.alloc(
+        ).initWithFrameWidth_frameHeight_qualityPrioritization_revision_(
+            self.in_w,
+            self.in_h,
+            vt.VTOpticalFlowConfigurationQualityPrioritizationQuality,
+            cls.defaultRevision(),
+        )
+        if config is None:
+            raise RuntimeError(
+                f"VTOpticalFlow config init returned nil for "
+                f"{self.in_w}x{self.in_h}"
+            )
+        processor = vt.VTFrameProcessor.alloc().init()
+        with _suppress_native_stderr():
+            ok, err = processor.startSessionWithConfiguration_error_(config, None)
+        if not ok:
+            raise RuntimeError(f"VTOpticalFlow startSession failed: {err}")
+        self._flow_config = config
+        self._flow_processor = processor
+
+        attrs = dict(config.destinationPixelBufferAttributes() or {})
+        pairs = []
+        for _ in range(EXPLICIT_FLOW_PAIR_COUNT):
+            pairs.append((
+                _pb.make_pixel_buffer_from_attrs(self.in_w, self.in_h, attrs),
+                _pb.make_pixel_buffer_from_attrs(self.in_w, self.in_h, attrs),
+            ))
+        self._flow_pairs = tuple(pairs)
+        self._zero_flow_pair(self._flow_pairs[0])
+        self._flow_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="vsr-explicit-flow",
+        )
+        _log.info(
+            "VSR explicit flow ready (Quality, full-resolution %sx%s, "
+            "one-frame overlap)",
+            self.in_w,
+            self.in_h,
+        )
+
+    def _flow_object(self, slot: int) -> Any:
+        pairs = self._flow_pairs
+        if pairs is None:
+            raise RuntimeError("explicit optical-flow buffers are unavailable")
+        forward, backward = pairs[slot]
+        return vt.VTFrameProcessorOpticalFlow.alloc(
+        ).initWithForwardFlow_backwardFlow_(forward, backward)
+
+    def _run_explicit_flow(
+        self,
+        previous_frame: Any,
+        current_frame: Any,
+        slot: int,
+        submission_mode: int,
+        frame_index: int,
+    ) -> None:
+        processor = self._flow_processor
+        if processor is None:
+            raise RuntimeError("explicit optical-flow processor is unavailable")
+        with autorelease_pool():
+            optical_flow = self._flow_object(slot)
+            params = vt.VTOpticalFlowParameters.alloc(
+            ).initWithSourceFrame_nextFrame_submissionMode_destinationOpticalFlow_(
+                previous_frame,
+                current_frame,
+                submission_mode,
+                optical_flow,
+            )
+            ok, err = processor.processWithParameters_error_(params, None)
+            if not ok:
+                raise RuntimeError(
+                    f"VTOpticalFlow process failed at frame "
+                    f"{frame_index}: {err}"
+                )
+
+    def _start_flow_future(
+        self,
+        previous_frame: Any,
+        current_frame: Any,
+        slot: int,
+        frame_index: int,
+    ) -> Future[None]:
+        executor = self._flow_executor
+        if executor is None:
+            raise RuntimeError("explicit optical-flow executor is unavailable")
+        submission_mode = (
+            vt.VTOpticalFlowParametersSubmissionModeRandom
+            if self._flow_needs_random
+            else vt.VTOpticalFlowParametersSubmissionModeSequential
+        )
+        self._flow_needs_random = False
+        return executor.submit(
+            self._run_explicit_flow,
+            previous_frame,
+            current_frame,
+            slot,
+            submission_mode,
+            frame_index,
+        )
+
+    def _process_precomputed_frame(
+        self,
+        source_frame: Any,
+        frame_index: int,
+        flow_slot: int,
+    ) -> Any:
+        dst_pb = self._make_dst_buffer()
+        pts = _pb.frame_pts(frame_index, self.fps)
+        dst_frame = vt.VTFrameProcessorFrame.alloc(
+        ).initWithBuffer_presentationTimeStamp_(dst_pb, pts)
+        submission_mode = (
+            vt.VTSuperResolutionScalerParametersSubmissionModeRandom
+            if self._vsr_needs_random
+            else vt.VTSuperResolutionScalerParametersSubmissionModeSequential
+        )
+        params = vt.VTSuperResolutionScalerParameters.alloc(
+        ).initWithSourceFrame_previousFrame_previousOutputFrame_opticalFlow_submissionMode_destinationFrame_(
+            source_frame,
+            self._prev_src_frame,
+            self._prev_dst_frame,
+            self._flow_object(flow_slot),
+            submission_mode,
+            dst_frame,
+        )
+        ok, err = self.processor.processWithParameters_error_(params, None)
+        if not ok:
+            raise RuntimeError(
+                f"precomputed-flow VSR failed at frame {frame_index}: {err}"
+            )
+        self._vsr_needs_random = False
+        self._prev_src_frame = source_frame
+        self._prev_dst_frame = dst_frame
+        return dst_pb
+
+    def _submit_explicit(self, src_pb: Any, frame_index: int) -> Any | None:
+        with autorelease_pool():
+            pts = _pb.frame_pts(frame_index, self.fps)
+            source_frame = vt.VTFrameProcessorFrame.alloc(
+            ).initWithBuffer_presentationTimeStamp_(src_pb, pts)
+            if self._prev_src_frame is None:
+                return self._process_precomputed_frame(
+                    source_frame,
+                    frame_index,
+                    0,
+                )
+
+            if self._flow_pending_frame is None:
+                slot = 0
+                self._flow_future = self._start_flow_future(
+                    self._prev_src_frame,
+                    source_frame,
+                    slot,
+                    frame_index,
+                )
+                self._flow_pending_frame = source_frame
+                self._flow_pending_index = frame_index
+                self._flow_pending_slot = slot
+                return None
+
+            future = self._flow_future
+            if future is None:
+                raise RuntimeError(
+                    "explicit-flow pending frame has no flow future"
+                )
+            future.result()
+            completed_frame = self._flow_pending_frame
+            completed_index = self._flow_pending_index
+            completed_slot = self._flow_pending_slot
+            if completed_index is None or completed_slot is None:
+                raise RuntimeError("explicit-flow pending state is incomplete")
+
+            next_slot = 1 - completed_slot
+            next_future = self._start_flow_future(
+                completed_frame,
+                source_frame,
+                next_slot,
+                frame_index,
+            )
+            self._flow_future = next_future
+            self._flow_pending_frame = source_frame
+            self._flow_pending_index = frame_index
+            self._flow_pending_slot = next_slot
+            return self._process_precomputed_frame(
+                completed_frame,
+                completed_index,
+                completed_slot,
+            )
+
     def _process(self, src_pb: Any, frame_index: int) -> Any:
         """Run VSR on a ready source CVPixelBuffer; return the dst buffer.
 
@@ -491,6 +827,11 @@ class VsrSession:
         so an externally-supplied src buffer stays valid across the one
         iteration balanced mode references it.
         """
+        if self._explicit_flow:
+            raise RuntimeError(
+                "explicit-flow sessions require submit_upscale_to_buffer() "
+                "or submit_upscale_buffer_to_buffer()"
+            )
         with autorelease_pool():
             dst_pb = self._make_dst_buffer()
             pts = _pb.frame_pts(frame_index, self.fps)

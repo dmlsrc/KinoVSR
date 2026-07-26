@@ -5,12 +5,113 @@ import subprocess
 import sys
 import tempfile
 import threading
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 pytestmark = pytest.mark.unit
+
+
+def test_explicit_flow_finish_waits_processes_and_clears_pending(
+        monkeypatch):
+    from kinovsr.native import vsr
+
+    events = []
+
+    class Future:
+        def result(self):
+            events.append("flow")
+
+    session = object.__new__(vsr.VsrSession)
+    session._explicit_flow = True
+    session._flow_future = Future()
+    session._flow_pending_frame = "frame"
+    session._flow_pending_index = 7
+    session._flow_pending_slot = 1
+    session._process_precomputed_frame = (
+        lambda frame, index, slot:
+        events.append(("vsr", frame, index, slot)) or "output"
+    )
+    monkeypatch.setattr(vsr, "autorelease_pool", nullcontext)
+
+    assert session.finish_pending_upscale() == "output"
+    assert events == ["flow", ("vsr", "frame", 7, 1)]
+    assert session._flow_future is None
+    assert session._flow_pending_frame is None
+    assert session._flow_pending_index is None
+    assert session._flow_pending_slot is None
+
+
+def test_explicit_flow_reset_requires_drain_and_rearms_random_modes():
+    from kinovsr.native import vsr
+
+    session = object.__new__(vsr.VsrSession)
+    session._flow_pending_frame = object()
+    with pytest.raises(RuntimeError, match="finish_pending_upscale"):
+        session.reset_temporal_context()
+
+    zeroed = []
+    session._flow_pending_frame = None
+    session._prev_src_frame = object()
+    session._prev_dst_frame = object()
+    session._flow_needs_random = False
+    session._vsr_needs_random = False
+    session._flow_pairs = (("forward-0", "backward-0"),)
+    session._zero_flow_pair = zeroed.append
+
+    session.reset_temporal_context()
+
+    assert session._prev_src_frame is None
+    assert session._prev_dst_frame is None
+    assert session._flow_needs_random
+    assert session._vsr_needs_random
+    assert zeroed == [("forward-0", "backward-0")]
+
+
+def test_explicit_flow_close_waits_before_ending_both_sessions():
+    from kinovsr.native import vsr
+
+    events = []
+
+    class Executor:
+        def shutdown(self, *, wait):
+            events.append(("executor", wait))
+
+    class Processor:
+        def __init__(self, name):
+            self.name = name
+
+        def endSession(self):
+            events.append(self.name)
+
+    session = object.__new__(vsr.VsrSession)
+    session.processor = Processor("vsr")
+    session._flow_processor = Processor("flow")
+    session._flow_executor = Executor()
+    session._prev_src_frame = object()
+    session._prev_dst_frame = object()
+    session._flow_future = object()
+    session._flow_pending_frame = object()
+    session._flow_pending_index = 1
+    session._flow_pending_slot = 0
+    session._flow_pairs = (("forward", "backward"),)
+    session._flow_config = object()
+    session.config = object()
+    session._xfer = None
+    session._src_pool = None
+    session._dst_pool = None
+    session._owns_dst_pool = True
+    session.flush_pools = lambda: events.append("pools")
+
+    session.close()
+
+    assert events == [("executor", True), "flow", "vsr", "pools"]
+    assert session.processor is None
+    assert session._flow_processor is None
+    assert session._flow_executor is None
+    assert session._flow_pairs is None
 
 
 def test_verbose_native_stderr_path_performs_no_descriptor_operations(

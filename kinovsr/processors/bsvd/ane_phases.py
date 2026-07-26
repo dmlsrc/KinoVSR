@@ -441,7 +441,8 @@ class WindowMachine:
     ``advance(block=True)`` runs to completion. Every MLX operation
     (input prep, output materialization) happens inside ``advance`` on
     the caller's thread; only the Core ML dispatches run on the suite's
-    pipeline worker.
+    pipeline worker. ``advance_until_output(block=True)`` provides a
+    finer-grained drain edge for downstream streaming.
 
     ``frames`` entries are input views or zero-arg callables producing
     them, so the host-side prep resolves in the shadow of an in-flight
@@ -523,17 +524,16 @@ class WindowMachine:
         self.outputs.extend(snapshot(drained.output_array(f"out_{step}"))
                             for step in range(PHASE_STEPS))
 
-    def advance(self, block: bool = False) -> bool:
-        """Progress the window; True once complete.
-
-        Non-blocking calls only consume dispatches that have already
-        finished; a blocking call runs the window to completion.
-        """
+    def _advance(self, block: bool, stop_on_output: bool) -> bool:
         if self._failed:
             raise RuntimeError("window failed; reset the stream")
         pipeline = self._suite.pipeline
+        output_count = len(self.outputs)
         try:
-            while not self._done:
+            while (
+                not self._done
+                and (not stop_on_output or len(self.outputs) == output_count)
+            ):
                 if pipeline.in_flight:
                     if not block and not pipeline.idle():
                         return False
@@ -546,7 +546,19 @@ class WindowMachine:
             self._failed = True
             pipeline.drain()
             raise
-        return True
+        return self._done
+
+    def advance(self, block: bool = False) -> bool:
+        """Progress the window; True once complete.
+
+        Non-blocking calls only consume dispatches that have already
+        finished; a blocking call runs the window to completion.
+        """
+        return self._advance(block, stop_on_output=False)
+
+    def advance_until_output(self, block: bool = True) -> bool:
+        """Progress until one more output is ready or the window completes."""
+        return self._advance(block, stop_on_output=True)
 
 
 def _snapshot(value: Any) -> Any:

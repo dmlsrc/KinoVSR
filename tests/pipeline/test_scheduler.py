@@ -1,5 +1,6 @@
 """Scheduler behavior: lifecycle order, boundaries, flush, cleanup."""
 
+import weakref
 from fractions import Fraction
 
 import pytest
@@ -330,6 +331,51 @@ class TestBoundaries:
                      if any(b.kind is BoundaryKind.HARD_CUT
                             for b in u.boundaries)]
         assert cut_units == [3]
+
+    def test_emitted_native_payloads_are_released_before_cut_reset(self):
+        """Loop variables must not pin two bounded-pool outputs at a cut."""
+
+        class Payload:
+            pass
+
+        class NativeLike(Recorder):
+            def __init__(self):
+                super().__init__("native")
+                self.last_process = None
+                self.last_flush = None
+                self.did_midstream_flush = False
+
+            def process(self, unit, context):
+                payload = Payload()
+                self.last_process = weakref.ref(payload)
+                yield unit.with_payload(payload)
+
+            def flush(self, context):
+                if self.did_midstream_flush:
+                    return
+                self.did_midstream_flush = True
+                payload = Payload()
+                self.last_flush = weakref.ref(payload)
+                yield FrameUnit(payload=payload, pts=99, duration=1)
+
+            def reset(self, boundary, context):
+                if boundary.kind is BoundaryKind.HARD_CUT:
+                    assert self.last_process() is None
+                    assert self.last_flush() is None
+                super().reset(boundary, context)
+
+        processor = NativeLike()
+        feed = self.cut_at(units(2), 1)
+        stream = run_chain(chain(processor), feed, CONTEXT)
+
+        ordinary = next(stream)
+        del ordinary
+        drained = next(stream)
+        del drained
+        # Resuming now exhausts the drain, releases its loop variable, and
+        # reaches reset() before producing the cut frame.
+        next(stream)
+        stream.close()
 
     def test_deep_delay_survives_cuts_on_shots_shorter_than_its_window(self):
         # A stage's REAL delay can exceed any declared radius (deflicker

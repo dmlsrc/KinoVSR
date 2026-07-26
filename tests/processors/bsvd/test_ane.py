@@ -308,6 +308,21 @@ class TestScheduledPhases:
             + [(True, True)] * 8
         )
 
+    def test_blocking_progress_can_stop_at_each_materialized_output(
+            self, monkeypatch):
+        monkeypatch.setattr(P, "_vector_bytes", tuple)
+        suite = _ScheduledFakeSuite()
+        frames = [bytes([index]) for index in range(20)]
+        machine = P.WindowMachine(suite, frames, b"zero", lambda value: value)
+
+        assert not machine.advance_until_output(block=True)
+        assert len(machine.outputs) == 1
+        assert not machine.advance_until_output(block=True)
+        assert len(machine.outputs) == 2
+        while not machine.advance_until_output(block=True):
+            pass
+        assert len(machine.outputs) == len(frames)
+
     def test_warm_suite_load_does_not_reverify_or_require_a_canary(
             self, monkeypatch, tmp_path):
         stem = f"scheduled8-v{P.PHASE_GRAPH_VERSION}"
@@ -549,6 +564,44 @@ class TestDenoiserLifecycle:
         assert not denoiser._warm
         assert not denoiser._recent
 
+    def test_continuous_flush_yields_before_advancing_the_next_tail_step(self):
+        """Drain work must stay interleaved with downstream consumption."""
+
+        class Net:
+            SHIFT_NUM = 0
+
+        denoiser = object.__new__(B.BsvdDenoiser)
+        denoiser.net = Net()
+        denoiser._schedule = None
+        denoiser._warm = []
+        denoiser._received = 2
+        denoiser._emitted = 0
+        events = []
+
+        def step(_frame):
+            index = denoiser._emitted
+            events.append(f"step-{index}")
+            denoiser._emitted += 1
+            return [(f"out-{index}", f"token-{index}")]
+
+        denoiser._step = step
+        denoiser._reset_state = lambda: events.append("reset-state")
+        denoiser._reset_conditioning = (
+            lambda *, clear_debug: events.append(
+                f"reset-conditioning-{clear_debug}"
+            )
+        )
+
+        drain = denoiser.flush()
+        assert events == []
+        assert next(drain) == ("out-0", "token-0")
+        assert events == ["step-0"]
+        events.append("downstream")
+        assert next(drain) == ("out-1", "token-1")
+        assert events == ["step-0", "downstream", "step-1"]
+        assert list(drain) == []
+        assert events[-2:] == ["reset-state", "reset-conditioning-False"]
+
     def test_schedule_window_uses_backend_async_path_when_available(self):
         """Windows flow through the WindowWavefront one deep: submitting
         window k+1 completes and emits window k, the net resets only
@@ -558,10 +611,14 @@ class TestDenoiserLifecycle:
 
         class Handle:
             def __init__(self, frames):
-                self.outputs = [frame + 100 for frame in frames]
+                self._results = [frame + 100 for frame in frames]
+                self.outputs = []
 
             def advance(self, block=False):
-                return True
+                if block:
+                    self.outputs = list(self._results)
+                    return True
+                return False
 
         class Net:
             def __init__(self):
@@ -583,18 +640,18 @@ class TestDenoiserLifecycle:
         denoiser._with_nm = lambda x, _nm, gain: x
         denoiser._emit = lambda value, token: (value, token)
 
-        first = denoiser._run_window(
-            list(range(16)), [f"a{i}" for i in range(16)], 3, 7)
+        first = list(denoiser._run_window(
+            list(range(16)), [f"a{i}" for i in range(16)], 3, 7))
         assert first == []                    # window 1 is in flight
         assert denoiser.net.resets == 0       # never reset mid-flight
 
-        second = denoiser._run_window(
-            list(range(50, 66)), [f"b{i}" for i in range(16)], 0, 2)
+        second = list(denoiser._run_window(
+            list(range(50, 66)), [f"b{i}" for i in range(16)], 0, 2))
         assert second == [(103, "a3"), (104, "a4"),
                           (105, "a5"), (106, "a6")]
         assert denoiser.net.resets == 1
 
-        tail = denoiser._wavefront.barrier()
+        tail = list(denoiser._wavefront.barrier())
         assert tail == [(150, "b0"), (151, "b1")]
         assert denoiser.net.resets == 2
         assert denoiser.net.windows == [list(range(16)),
@@ -610,10 +667,14 @@ class TestDenoiserLifecycle:
 
         class Handle:
             def __init__(self, frames):
-                self.outputs = [frame + 100 for frame in frames]
+                self._results = [frame + 100 for frame in frames]
+                self.outputs = []
 
             def advance(self, block=False):
-                return True
+                if block:
+                    self.outputs = list(self._results)
+                    return True
+                return False
 
         class Net:
             SHIFT_NUM = 0
@@ -639,11 +700,17 @@ class TestDenoiserLifecycle:
         denoiser._with_nm = lambda x, _nm, gain: x
         denoiser._emit = lambda value, token: (value, token)
 
-        first = denoiser._run_window(
-            list(range(16)), [f"a{i}" for i in range(16)], 0, 16)
+        first = list(denoiser._run_window(
+            list(range(16)), [f"a{i}" for i in range(16)], 0, 16))
         assert first == []                    # async window in flight
 
-        short = denoiser._run_window([70, 71], ["b0", "b1"], 0, 2)
+        short_iter = denoiser._run_window([70, 71], ["b0", "b1"], 0, 2)
+        first_deferred = next(short_iter)
+        assert first_deferred == (100, "a0")
+        # The prior window reaches downstream before the short fallback starts
+        # stepping.
+        assert denoiser.net.events == ["begin", "reset"]
+        short = [first_deferred, *short_iter]
         # The deferred async window's emissions come FIRST, then the
         # short window's inline emissions.
         assert short[:16] == [(100 + i, f"a{i}") for i in range(16)]
@@ -857,10 +924,10 @@ class TestAneParity:
         try:
             ane_out, ref_out = [], []
             for index, frame in enumerate(frames):
-                ane_out += ane.feed(frame, token=index)
-                ref_out += mlx_ref.feed(frame, token=index)
-            ane_out += ane.flush()
-            ref_out += mlx_ref.flush()
+                ane_out.extend(ane.feed(frame, token=index))
+                ref_out.extend(mlx_ref.feed(frame, token=index))
+            ane_out.extend(ane.flush())
+            ref_out.extend(mlx_ref.flush())
         except Exception as exc:  # noqa: BLE001 - environment, not correctness
             ane.close()
             pytest.skip(f"BSVD ANE phase suite unavailable here: {exc}")
@@ -883,8 +950,8 @@ class TestAneParity:
         for index, frame in enumerate(frames):
             ane_out += ane.feed(frame, token=index)
             ref_out += mlx_ref.feed(frame, token=index)
-        ane_out += ane.flush()
-        ref_out += mlx_ref.flush()
+        ane_out.extend(ane.flush())
+        ref_out.extend(mlx_ref.flush())
         assert [token for _, token in ane_out] == list(range(8))
         assert [token for _, token in ref_out] == list(range(8))
         deltas = [float(mx.abs(a - r).mean().item())

@@ -94,6 +94,11 @@ def _stage_stream(
                     # Drain the pre-boundary tail with pre-boundary state.
                     for tail in processor.flush(context):
                         yield attach(tail)
+                        # Do not keep a native payload alive in the loop
+                        # variable while reset() and the next segment run.
+                        # Bounded CVPixelBuffer pools otherwise see both the
+                        # last ordinary output and the drained tail in flight.
+                        del tail
                 for boundary in unit.boundaries:
                     processor.reset(boundary, context)
             except Exception as exc:
@@ -109,6 +114,10 @@ def _stage_stream(
             outputs = processor.process(unit, context)
             for produced in outputs:
                 yield attach(produced)
+                # Release stage-local ownership as soon as downstream asks
+                # for another unit. Stateful native stages retain exactly the
+                # references they need themselves.
+                del produced
         except Exception as exc:
             wrapped = _wrap_stage_error(stage, exc)
             if wrapped is exc:
@@ -118,6 +127,7 @@ def _stage_stream(
     try:
         for tail in processor.flush(context):
             yield attach(tail)
+            del tail
     except Exception as exc:
         wrapped = _wrap_stage_error(stage, exc)
         if wrapped is exc:

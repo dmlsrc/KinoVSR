@@ -348,20 +348,22 @@ class TestWindowWavefront:
         order = []
 
         out = wavefront.submit(lambda: first,
-                               lambda h: order.append(1) or ["e1"])
+                               lambda h, complete:
+                               order.append((1, complete)) or ["e1"])
         assert out == []                       # nothing was in flight
         assert wavefront.in_flight
         assert first.nonblocking_calls == 1    # kicked, never blocked on
 
         second = _ScriptedHandle(["w2"])
         out = wavefront.submit(lambda: second,
-                               lambda h: order.append(2) or ["e2"])
+                               lambda h, complete:
+                               order.append((2, complete)) or ["e2"])
         assert out == ["e1"]                   # depth-one backpressure
         assert first.blocking_calls == 1
-        assert order == [1]
+        assert order == [(1, True)]
 
         assert wavefront.barrier() == ["e2"]
-        assert order == [1, 2]
+        assert order == [(1, True), (2, True)]
         assert not wavefront.in_flight
         assert wavefront.barrier() == []       # idempotent when empty
 
@@ -370,7 +372,10 @@ class TestWindowWavefront:
 
         wavefront = WindowWavefront()
         handle = _ScriptedHandle(["w"], advances_needed=3)
-        wavefront.submit(lambda: handle, lambda h: list(h.outputs))
+        wavefront.submit(
+            lambda: handle,
+            lambda h, _complete: list(h.outputs),
+        )
         for _ in range(5):
             wavefront.poll()
         assert handle.blocking_calls == 0
@@ -382,19 +387,66 @@ class TestWindowWavefront:
 
         wavefront = WindowWavefront()
         handle = _ScriptedHandle(["a", "b"])
-        wavefront.submit(lambda: handle,
-                         lambda h: [value.upper() for value in h.outputs])
+        wavefront.submit(
+            lambda: handle,
+            lambda h, _complete: [
+                value.upper() for value in h.outputs
+            ],
+        )
         assert wavefront.barrier() == ["A", "B"]
+
+    def test_drain_interleaves_handle_outputs_with_downstream(self):
+        from kinovsr.processors.feed_driver import WindowWavefront
+
+        class IncrementalHandle:
+            def __init__(self):
+                self.outputs = []
+                self.next_value = 0
+
+            def advance(self, block=False):
+                return False
+
+            def advance_until_output(self, block=True):
+                assert block
+                self.outputs.append(f"w{self.next_value}")
+                self.next_value += 1
+                return self.next_value == 3
+
+        wavefront = WindowWavefront()
+        handle = IncrementalHandle()
+        cursor = 0
+        events = []
+
+        def collect(current, complete):
+            nonlocal cursor
+            ready = tuple(current.outputs[cursor:])
+            cursor = len(current.outputs)
+            if complete:
+                events.append("finish")
+            return ready
+
+        wavefront.submit(lambda: handle, collect)
+        drain = wavefront.drain()
+        assert next(drain) == "w0"
+        events.append("downstream")
+        assert next(drain) == "w1"
+        assert events == ["downstream"]
+        assert list(drain) == ["w2"]
+        assert events == ["downstream", "finish"]
+        assert not wavefront.in_flight
 
     def test_submit_propagates_the_previous_window_error(self):
         from kinovsr.processors.feed_driver import WindowWavefront
 
         wavefront = WindowWavefront()
         failing = _ScriptedHandle([])
-        wavefront.submit(lambda: failing, lambda h: [])
+        wavefront.submit(lambda: failing, lambda h, _complete: [])
         failing.error = ValueError("window failed")
         with pytest.raises(ValueError, match="window failed"):
-            wavefront.submit(lambda: _ScriptedHandle([]), lambda h: [])
+            wavefront.submit(
+                lambda: _ScriptedHandle([]),
+                lambda h, _complete: [],
+            )
         assert not wavefront.in_flight         # failed window was consumed
 
     def test_abandon_suppresses_the_window_error(self):
@@ -402,7 +454,10 @@ class TestWindowWavefront:
 
         wavefront = WindowWavefront()
         handle = _ScriptedHandle(["w"])
-        wavefront.submit(lambda: handle, lambda h: list(h.outputs))
+        wavefront.submit(
+            lambda: handle,
+            lambda h, _complete: list(h.outputs),
+        )
         handle.error = ValueError("late failure")
         wavefront.abandon()                    # swallowed: teardown path
         assert not wavefront.in_flight

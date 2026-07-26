@@ -179,6 +179,107 @@ def mlx_units(n, w=W, h=H):
     ]
 
 
+@pytest.mark.unit
+class TestBalancedFlowPipeline:
+    class Session:
+        instances = []
+
+        def __init__(self, *_args, **kwargs):
+            self.kwargs = kwargs
+            self.out_w = W * 4
+            self.out_h = H * 4
+            self.dst_attrs = {"PixelFormatType": 123}
+            self.submissions = []
+            self.outputs = iter(("out-0", None, "out-1"))
+            self.finish_output = "out-2"
+            self.reset_count = 0
+            self.closed = False
+            self.__class__.instances.append(self)
+
+        def submit_upscale_buffer_to_buffer(self, payload, index):
+            self.submissions.append((payload, index))
+            return next(self.outputs)
+
+        def finish_pending_upscale(self):
+            output, self.finish_output = self.finish_output, None
+            return output
+
+        def reset_temporal_context(self):
+            self.reset_count += 1
+
+        def close(self):
+            self.closed = True
+
+    @staticmethod
+    def _prepared(monkeypatch):
+        from kinovsr.native import vsr
+        from kinovsr.processors import videotoolbox
+        from kinovsr.processors.videotoolbox import (
+            VtUpscaleConfig,
+            VtUpscaleProcessor,
+        )
+
+        TestBalancedFlowPipeline.Session.instances.clear()
+        monkeypatch.setattr(vsr, "VsrSession", TestBalancedFlowPipeline.Session)
+        monkeypatch.setattr(
+            videotoolbox,
+            "apply_output_pool",
+            lambda *_args: None,
+        )
+        processor = VtUpscaleProcessor(VtUpscaleConfig(mode="balanced"))
+        processor.prepare(cv_stream(Layout.CV_RGBA_HALF), CONTEXT)
+        return processor, TestBalancedFlowPipeline.Session.instances[-1]
+
+    def test_balanced_uses_explicit_flow_and_preserves_delayed_unit_order(
+            self, monkeypatch):
+        processor, session = self._prepared(monkeypatch)
+        units = [
+            FrameUnit(payload=f"in-{index}", pts=index * 1000, duration=1000)
+            for index in range(3)
+        ]
+
+        assert session.kwargs["explicit_flow"] is True
+        assert [out.payload for out in processor.process(units[0], CONTEXT)] == [
+            "out-0"
+        ]
+        assert list(processor.process(units[1], CONTEXT)) == []
+        delayed = list(processor.process(units[2], CONTEXT))
+        assert [(out.payload, out.pts) for out in delayed] == [
+            ("out-1", 1000)
+        ]
+        tail = list(processor.flush(CONTEXT))
+        assert [(out.payload, out.pts) for out in tail] == [
+            ("out-2", 2000)
+        ]
+        assert session.submissions == [
+            ("in-0", 0),
+            ("in-1", 1),
+            ("in-2", 2),
+        ]
+
+        processor.reset(
+            Boundary(BoundaryKind.HARD_CUT, source_index=3),
+            CONTEXT,
+        )
+        assert session.reset_count == 1
+        processor.close(CONTEXT)
+        assert session.closed
+
+    def test_reset_rejects_an_undrained_delayed_frame(self, monkeypatch):
+        processor, _session = self._prepared(monkeypatch)
+        first = FrameUnit(payload="in-0", pts=0, duration=1000)
+        second = FrameUnit(payload="in-1", pts=1000, duration=1000)
+        assert list(processor.process(first, CONTEXT))
+        assert list(processor.process(second, CONTEXT)) == []
+
+        with pytest.raises(RuntimeError, match="flushed before"):
+            processor.reset(
+                Boundary(BoundaryKind.HARD_CUT, source_index=2),
+                CONTEXT,
+            )
+        processor.close(CONTEXT)
+
+
 @pytest.mark.integration
 class TestUpscale:
     @staticmethod
