@@ -32,13 +32,24 @@ def test_advertised_shape_is_used_when_it_clears_the_writer_floor():
     )
 
 
-def test_advertised_shape_below_the_floor_falls_back_to_full_size():
-    """A 640x480 source advertises 160x120; height 120 is never written."""
+def test_advertised_shape_below_the_floor_is_repaired_minimally():
+    """A 640x480 source advertises 160x120; height 120 is never written.
+
+    Raise only the offending dimension. Replacing the whole advertisement with
+    the source size measured far worse: on a 640x360 clip, edge temporal
+    instability was 4.28 at the repaired 160x128 against 7.96 at a forced
+    640x360, where non-temporal Image mode scores 4.62.
+    """
     from kinovsr.native.optical_flow import select_flow_destination_geometry
 
     assert select_flow_destination_geometry(_attrs(160, 120), 640, 480) == (
-        640,
-        480,
+        160,
+        128,
+        False,
+    )
+    assert select_flow_destination_geometry(_attrs(160, 90), 640, 360) == (
+        160,
+        128,
         False,
     )
 
@@ -54,15 +65,26 @@ def test_missing_or_unusable_advertisement_falls_back():
         )
 
 
-def test_portrait_fallback_stays_rotation_normalized():
-    """Portrait sources write flow in landscape coordinates."""
+def test_portrait_repair_keeps_the_advertised_orientation():
+    """A portrait source still advertises a landscape flow shape.
+
+    The advertisement already carries VT's rotation-normalized orientation, so
+    repairing it needs no axis swap; only the source-sized last resort does.
+    """
     from kinovsr.native.optical_flow import select_flow_destination_geometry
 
     assert select_flow_destination_geometry(_attrs(160, 120), 480, 640) == (
-        640,
-        480,
+        160,
+        128,
         False,
     )
+
+
+def test_source_sized_last_resort_is_rotation_normalized():
+    """With no usable advertisement, fall back to landscape source geometry."""
+    from kinovsr.native.optical_flow import select_flow_destination_geometry
+
+    assert select_flow_destination_geometry(None, 480, 640) == (640, 480, False)
 
 
 def test_tiny_source_fallback_is_raised_to_the_floor():

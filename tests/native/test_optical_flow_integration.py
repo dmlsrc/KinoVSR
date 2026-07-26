@@ -62,7 +62,17 @@ def test_small_balanced_vsr_uses_deterministic_image_fallback():
 
 
 @pytest.mark.integration
-def test_portrait_balanced_vsr_uses_rotation_normalized_flow_geometry():
+def test_portrait_balanced_vsr_repairs_the_advertised_flow_geometry():
+    """A 128x192 source advertises 80x60, so both dimensions need raising.
+
+    The advertisement is already landscape, carrying VT's rotation-normalized
+    orientation, so repairing it needs no axis swap. Measured on a 360x640
+    portrait clip, whose advertisement is 160x90, the repaired 160x128 scored
+    edge temporal instability 11.33 with gradient energy 6.64, against 13.95 and
+    6.59 for the previous rotation-normalized full-source 640x360 - better on
+    both axes. Non-temporal Image mode scored 11.36 with only 6.16 gradient
+    energy, so the repair matches Image's stability while keeping more detail.
+    """
     from kinovsr.native.frameworks import Quartz
     from kinovsr.native.vsr import VsrSession
 
@@ -78,7 +88,7 @@ def test_portrait_balanced_vsr_uses_rotation_normalized_flow_geometry():
         assert session._image_fallback is False
         assert session._flow_pairs is not None
         forward = session._flow_pairs[0][0]
-        assert Quartz.CVPixelBufferGetWidth(forward) == 192
+        assert Quartz.CVPixelBufferGetWidth(forward) == 128
         assert Quartz.CVPixelBufferGetHeight(forward) == 128
     finally:
         session.close()

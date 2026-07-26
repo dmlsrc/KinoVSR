@@ -60,11 +60,21 @@ def select_flow_destination_geometry(
     +3 source-pixel shift reads +0.811 into 240x135 against an expected +0.843,
     and +2.857 into 854x480 against an expected +3.000 - the same ~0.95 ratio.
 
-    The full-source fallback still matters.  ``VT_FLOW_MIN_DESTINATION_DIMENSION``
-    records that VT returns success without writing a destination below 128 in
-    either dimension, and a configuration can advertise exactly that (a 640x480
-    source advertises 160x120).  Prefer the advertised shape only when it clears
-    the boundary; otherwise keep the rotation-normalized full-size workaround.
+    ``VT_FLOW_MIN_DESTINATION_DIMENSION`` records that VT returns success without
+    writing a destination below 128 in either dimension, and a configuration can
+    advertise exactly that: 640x360 advertises 160x90 and 640x480 advertises
+    160x120.  When that happens, REPAIR the advertisement minimally by raising
+    only the offending dimension rather than replacing it with the full source
+    size.  Measured on a 640x360 clip whose advertisement is unusable, edge
+    temporal instability was 4.28 at the repaired 160x128, against 4.75 at an
+    aspect-preserving 228x128, 4.85 at the canonical 240x135, 4.62 for
+    non-temporal Image mode, and 7.96 at the forced full 640x360 - so the
+    minimal repair is both the best measured option and the only one that beats
+    Image.  Spatial detail is within about 2% of Image across all three coarse
+    shapes, so this is not a blur win.
+
+    The source-sized shape remains the last resort for a configuration that
+    advertises nothing usable at all.
     """
     fallback_w, fallback_h = flow_destination_geometry(width, height)
     attrs = dict(advertised or {})
@@ -73,12 +83,18 @@ def select_flow_destination_geometry(
         adv_h = int(attrs.get(Quartz.kCVPixelBufferHeightKey, 0) or 0)
     except (TypeError, ValueError):
         return fallback_w, fallback_h, False
+    if adv_w < 1 or adv_h < 1:
+        return fallback_w, fallback_h, False
     if (
         adv_w >= VT_FLOW_MIN_DESTINATION_DIMENSION
         and adv_h >= VT_FLOW_MIN_DESTINATION_DIMENSION
     ):
         return adv_w, adv_h, True
-    return fallback_w, fallback_h, False
+    return (
+        max(adv_w, VT_FLOW_MIN_DESTINATION_DIMENSION),
+        max(adv_h, VT_FLOW_MIN_DESTINATION_DIMENSION),
+        False,
+    )
 
 
 def source_sized_flow_is_reliable(width: int, height: int) -> bool:
