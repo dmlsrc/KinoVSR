@@ -19,9 +19,14 @@ import mlx.core as mx
 
 from kinovsr.config.helpers import reject_unknown_keys, typed_value
 from kinovsr.media import pixel_buffers as _pb
-from kinovsr.modeling.vsr_blocks import compiled_spynet_flow
+from kinovsr.modeling.vsr_blocks import compiled_spynet_flow, resize
 from kinovsr.modeling.vt_flow import _append_cleanup_context
 from kinovsr.native.frameworks import Foundation, Quartz, autorelease_pool, vt
+from kinovsr.native.optical_flow import (
+    flow_destination_geometry,
+    mark_flow_pair_pending,
+    require_flow_pair_written,
+)
 from kinovsr.native.vsr import _suppress_native_stderr
 from kinovsr.processors.capabilities import (
     Capability,
@@ -230,6 +235,7 @@ class McTemporalDenoiser:
         self._warp_grid = _grid(self.h, self.w)
         self._src_attrs: Any = None
         self._dst_attrs: Any = None
+        self._flow_w, self._flow_h = self.w, self.h
         self._workers: list[dict[str, Any]] = []
         self._curr_buf: Any = None
         self._pool: ThreadPoolExecutor | None = None
@@ -295,6 +301,7 @@ class McTemporalDenoiser:
         # the call, so N parallel sessions overlap (~1.6x for 2) rather than
         # serialize - the only real lever for the window's cost.
         try:
+            self._flow_w, self._flow_h = flow_destination_geometry(self.w, self.h)
             for _ in range(max(1, self.window)):
                 self._workers.append(self._make_worker(cls))
             # Every flow reads the same current frame, so upload it once.
@@ -333,8 +340,12 @@ class McTemporalDenoiser:
             return {
                 "proc": proc,
                 "ref": _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._src_attrs),
-                "fwd": _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._dst_attrs),
-                "bwd": _pb.make_pixel_buffer_from_attrs(self.w, self.h, self._dst_attrs),
+                "fwd": _pb.make_pixel_buffer_from_attrs(
+                    self._flow_w, self._flow_h, self._dst_attrs
+                ),
+                "bwd": _pb.make_pixel_buffer_from_attrs(
+                    self._flow_w, self._flow_h, self._dst_attrs
+                ),
             }
         except BaseException as active:
             try:
@@ -540,21 +551,49 @@ class McTemporalDenoiser:
         _pb.write_fp16_rgba(rgba, buf)
 
     def _read_flow(self, pb: Any) -> Any:
+        flow_w = int(Quartz.CVPixelBufferGetWidth(pb))
+        flow_h = int(Quartz.CVPixelBufferGetHeight(pb))
         Quartz.CVPixelBufferLockBaseAddress(pb, 1)
         try:
             bpr = Quartz.CVPixelBufferGetBytesPerRow(pb)
             base = Quartz.CVPixelBufferGetBaseAddress(pb)
-            raw = mx.array(memoryview(base.as_buffer(self.h * bpr)))
+            raw = mx.array(memoryview(base.as_buffer(flow_h * bpr)))
             flow = (
                 raw.view(mx.float16)
-                .reshape(self.h, bpr // 2)[:, : self.w * 2]
+                .reshape(flow_h, bpr // 2)[:, : flow_w * 2]
                 .reshape(
-                    self.h,
-                    self.w,
+                    flow_h,
+                    flow_w,
                     2,
                 )
                 .astype(mx.float32)
             )
+            if self.h > self.w:
+                # VT rotation-normalizes portrait flow: raw coordinates are
+                # (u, v) = (+source_y, -source_x), and the spatial field is
+                # rotated the same way. Rotate it back, restore source vector
+                # axes/units, then resize only if the 128-pixel writer floor
+                # enlarged either normalized dimension.
+                flow = mx.transpose(flow[::-1], (1, 0, 2))
+                flow = mx.stack(
+                    [
+                        -flow[..., 1] * (self.w / flow_h),
+                        flow[..., 0] * (self.h / flow_w),
+                    ],
+                    axis=-1,
+                )
+            else:
+                flow = flow * mx.array(
+                    [self.w / flow_w, self.h / flow_h],
+                    dtype=mx.float32,
+                )
+            if int(flow.shape[1]) != self.w or int(flow.shape[0]) != self.h:
+                flow = resize(
+                    flow[None],
+                    self.h,
+                    self.w,
+                    False,
+                )[0]
             mx.eval(flow)
         finally:
             Quartz.CVPixelBufferUnlockBaseAddress(pb, 1)
@@ -596,6 +635,7 @@ class McTemporalDenoiser:
         for j, ref in enumerate(refs):
             wk = self._workers[j]
             self._upload(ref, wk["ref"])
+            mark_flow_pair_pending((wk["fwd"], wk["bwd"]))
             sf = vt.VTFrameProcessorFrame.alloc().initWithBuffer_presentationTimeStamp_(
                 wk["ref"],
                 _pb.frame_pts(0, 24.0),
@@ -632,6 +672,12 @@ class McTemporalDenoiser:
         for e in errs:
             if e is not None:
                 raise RuntimeError(f"VTOpticalFlow process failed: {e}")
+        for j in range(len(refs)):
+            wk = self._workers[j]
+            require_flow_pair_written(
+                (wk["fwd"], wk["bwd"]),
+                context=(f"mc reference {j} at source {self.w}x{self.h}"),
+            )
 
         out = []
         for j in range(len(refs)):

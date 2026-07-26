@@ -384,6 +384,9 @@ class VtUpscaleProcessor:
                 # Python scheduling changes. Public Quality flow is stable,
                 # measurably better against a moving-reference target, and is
                 # overlapped one frame ahead so it does not cost throughput.
+                # native.vsr falls back to deterministic Image input when
+                # either source dimension is below public flow's reliable
+                # writer boundary.
                 explicit_flow=self._config.mode == "balanced",
             )
             apply_output_pool(

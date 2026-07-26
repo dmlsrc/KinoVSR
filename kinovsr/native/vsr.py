@@ -21,6 +21,12 @@ from kinovsr.media import pixel_buffers as _pb
 from kinovsr.settings import default_settings
 
 from .frameworks import Quartz, autorelease_pool, vt
+from .optical_flow import (
+    flow_destination_geometry,
+    mark_flow_pair_pending,
+    require_flow_pair_written,
+    source_sized_flow_is_reliable,
+)
 
 _log = logging.getLogger(__name__)
 _NATIVE_STDERR_LOCK = threading.RLock()
@@ -232,7 +238,11 @@ class VsrSession:
                   scale=4. RGBAHalf source. Uses prev source + prev output to
                   inform the per-frame upscale.  Default for video; slightly
                   crisper motion edges at the cost of slightly more
-                  frame-to-frame variation than image mode.
+                  frame-to-frame variation than image mode. When explicit
+                  public flow is requested below its reliable 128x128 writer
+                  boundary, the session uses deterministic Image input instead
+                  of silently feeding invalid flow or reverting to the
+                  nondeterministic internal Video-flow path.
       "image"     VTSuperResolutionScalerConfiguration InputType=Image. scale=4.
                   RGBAHalf source. Per-frame deterministic upscale, no
                   prev-frame feedback.  Apple documents this as for stills,
@@ -264,7 +274,27 @@ class VsrSession:
         self.out_w, self.out_h = in_w * scale, in_h * scale
         self.mode = mode
         self.fps = float(fps)
-        self._explicit_flow = bool(explicit_flow)
+        explicit_geometry_ok = source_sized_flow_is_reliable(in_w, in_h)
+        self._image_fallback = bool(
+            explicit_flow
+            and mode == "balanced"
+            and not explicit_geometry_ok
+        )
+        self._temporal_video = mode == "balanced" and not self._image_fallback
+        self._explicit_flow = bool(
+            explicit_flow
+            and self._temporal_video
+            and explicit_geometry_ok
+        )
+        if self._image_fallback:
+            _log.info(
+                "VSR balanced request at %sx%s uses deterministic Image input: "
+                "VT can silently leave source-sized fields below 128 pixels "
+                "untouched, and the internal Video-flow path is "
+                "nondeterministic",
+                in_w,
+                in_h,
+            )
         self._flow_config: Any = None
         self._flow_processor: Any = None
         self._flow_pairs: tuple[tuple[Any, Any], ...] | None = None
@@ -284,7 +314,7 @@ class VsrSession:
         else:
             input_type = (
                 vt.VTSuperResolutionScalerConfigurationInputTypeVideo
-                if mode == "balanced"
+                if self._temporal_video
                 else vt.VTSuperResolutionScalerConfigurationInputTypeImage
             )
             cls = vt.VTSuperResolutionScalerConfiguration
@@ -336,7 +366,7 @@ class VsrSession:
         # previous, and VT's older sequential reference during handoff.
         self._src_pool_allocation_limit = (
             TEMPORAL_SRC_POOL_ALLOCATION_LIMIT
-            if mode == "balanced"
+            if self._temporal_video
             else STATELESS_SRC_POOL_ALLOCATION_LIMIT
         )
         self._src_pool = _pb.make_bounded_pool_from_attrs(
@@ -621,10 +651,10 @@ class VsrSession:
 
         VT advertises quarter-resolution destination attributes, but on the
         current macOS implementation those buffers complete successfully while
-        remaining zero. Full-input-resolution buffers receive the real vector
-        field and are accepted by precomputed-flow VSR. Keep that measured
-        geometry explicit here; silently returning to the advertised shape is
-        a quality regression.
+        remaining zero. Full-resolution buffers in VT's rotation-normalized
+        geometry receive the real vector field and are accepted by
+        precomputed-flow VSR. Keep that measured geometry explicit here;
+        silently returning to the advertised shape is a quality regression.
         """
         cls = vt.VTOpticalFlowConfiguration
         if not cls.isSupported():
@@ -650,12 +680,15 @@ class VsrSession:
         self._flow_processor = processor
 
         attrs = dict(config.destinationPixelBufferAttributes() or {})
+        flow_w, flow_h = flow_destination_geometry(self.in_w, self.in_h)
         pairs = []
         for _ in range(EXPLICIT_FLOW_PAIR_COUNT):
-            pairs.append((
-                _pb.make_pixel_buffer_from_attrs(self.in_w, self.in_h, attrs),
-                _pb.make_pixel_buffer_from_attrs(self.in_w, self.in_h, attrs),
-            ))
+            pairs.append(
+                (
+                    _pb.make_pixel_buffer_from_attrs(flow_w, flow_h, attrs),
+                    _pb.make_pixel_buffer_from_attrs(flow_w, flow_h, attrs),
+                )
+            )
         self._flow_pairs = tuple(pairs)
         self._zero_flow_pair(self._flow_pairs[0])
         self._flow_executor = ThreadPoolExecutor(
@@ -665,8 +698,8 @@ class VsrSession:
         _log.info(
             "VSR explicit flow ready (Quality, full-resolution %sx%s, "
             "one-frame overlap)",
-            self.in_w,
-            self.in_h,
+            flow_w,
+            flow_h,
         )
 
     def _flow_object(self, slot: int) -> Any:
@@ -689,6 +722,11 @@ class VsrSession:
         if processor is None:
             raise RuntimeError("explicit optical-flow processor is unavailable")
         with autorelease_pool():
+            pairs = self._flow_pairs
+            if pairs is None:
+                raise RuntimeError("explicit optical-flow buffers are unavailable")
+            pair = pairs[slot]
+            mark_flow_pair_pending(pair)
             optical_flow = self._flow_object(slot)
             params = vt.VTOpticalFlowParameters.alloc(
             ).initWithSourceFrame_nextFrame_submissionMode_destinationOpticalFlow_(
@@ -703,6 +741,10 @@ class VsrSession:
                     f"VTOpticalFlow process failed at frame "
                     f"{frame_index}: {err}"
                 )
+            require_flow_pair_written(
+                pair,
+                context=f"balanced VSR frame {frame_index}",
+            )
 
     def _start_flow_future(
         self,
@@ -844,7 +886,7 @@ class VsrSession:
                 params = vt.VTLowLatencySuperResolutionScalerParameters.alloc(
                 ).initWithSourceFrame_destinationFrame_(src_frame, dst_frame)
             else:
-                use_temporal = self.mode == "balanced"
+                use_temporal = self._temporal_video
                 params = vt.VTSuperResolutionScalerParameters.alloc(
                 ).initWithSourceFrame_previousFrame_previousOutputFrame_opticalFlow_submissionMode_destinationFrame_(
                     src_frame,
@@ -860,7 +902,7 @@ class VsrSession:
                 raise RuntimeError(
                     f"VSR processWithParameters failed at frame {frame_index}: {err}"
                 )
-            if self.mode == "balanced":
+            if self._temporal_video:
                 self._prev_src_frame = src_frame
                 self._prev_dst_frame = dst_frame
             else:
