@@ -40,7 +40,7 @@ def test_mc_flow_scales_and_rotation_normalizes_to_source(width, height):
 
 
 @pytest.mark.integration
-def test_small_balanced_vsr_uses_deterministic_image_fallback():
+def test_small_explicit_vt_vsr_uses_deterministic_image_fallback():
     from kinovsr.native.vsr import VsrSession
 
     session = VsrSession(
@@ -49,6 +49,7 @@ def test_small_balanced_vsr_uses_deterministic_image_fallback():
         mode="balanced",
         fps=30.0,
         explicit_flow=True,
+        flow_backend="vt",
     )
     try:
         assert session._explicit_flow is False
@@ -57,6 +58,152 @@ def test_small_balanced_vsr_uses_deterministic_image_fallback():
         assert session._flow_processor is None
         assert session._flow_pairs is None
         assert session._src_pool_allocation_limit == 1
+    finally:
+        session.close()
+
+
+@pytest.mark.integration
+def test_small_internal_balanced_vsr_keeps_temporal_video_mode():
+    from kinovsr.native.vsr import VsrSession
+
+    session = VsrSession(
+        64,
+        48,
+        mode="balanced",
+        fps=30.0,
+        explicit_flow=False,
+        flow_backend="internal",
+    )
+    try:
+        assert session._explicit_flow is False
+        assert session._image_fallback is False
+        assert session._temporal_video is True
+        assert session._flow_processor is None
+        assert session._flow_pairs is None
+        assert session._src_pool_allocation_limit > 1
+    finally:
+        session.close()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "width,height,expected_flow",
+    [
+        (854, 480, (240, 135)),
+        (640, 480, (160, 128)),
+        (640, 360, (160, 128)),
+        (320, 240, (128, 128)),
+        (128, 128, (128, 128)),
+    ],
+)
+def test_sequential_flow_estimator_stays_bounded_on_repaired_destinations(
+    width,
+    height,
+    expected_flow,
+):
+    """A minimally enlarged destination must not revive estimator divergence.
+
+    The old forced-full destination grew beyond 313 pixels on byte-identical
+    frames in eleven Sequential submissions. Exercise both the 854x480
+    advertised control and destinations raised to the 128-pixel writer floor
+    for long enough to expose that failure mode.
+
+    This deliberately pins only the public flow estimator's numerical state.
+    A sane field is not sufficient evidence of correct VSR behavior: VT SR can
+    turn a geometrically incompatible field into breathing/wavy output, so the
+    rendered path requires separate video-level validation.
+    """
+    import numpy as np
+
+    from kinovsr.media import pixel_buffers as pb
+    from kinovsr.native.frameworks import Quartz, vt
+    from kinovsr.native.vsr import VsrSession
+
+    def center_mean_magnitude(buffer):
+        flow_width = int(Quartz.CVPixelBufferGetWidth(buffer))
+        flow_height = int(Quartz.CVPixelBufferGetHeight(buffer))
+        row_bytes = int(Quartz.CVPixelBufferGetBytesPerRow(buffer))
+        Quartz.CVPixelBufferLockBaseAddress(buffer, 1)
+        try:
+            view = Quartz.CVPixelBufferGetBaseAddress(buffer).as_buffer(
+                flow_height * row_bytes
+            )
+            field = (
+                np.frombuffer(view, dtype=np.float16)
+                .reshape(flow_height, row_bytes // 2)[:, : flow_width * 2]
+                .reshape(flow_height, flow_width, 2)
+                .astype(np.float32)
+            )
+        finally:
+            Quartz.CVPixelBufferUnlockBaseAddress(buffer, 1)
+        center = field[
+            flow_height // 4 : flow_height - flow_height // 4,
+            flow_width // 4 : flow_width - flow_width // 4,
+        ]
+        return float(np.sqrt(np.sum(center * center, axis=-1)).mean())
+
+    session = VsrSession(
+        width,
+        height,
+        mode="balanced",
+        fps=30.0,
+        explicit_flow=True,
+        flow_backend="vt",
+    )
+    try:
+        rgb = mx.random.uniform(
+            low=0.05,
+            high=0.95,
+            shape=(height, width, 3),
+            key=mx.random.key(width * 1000 + height),
+        ).astype(mx.float16)
+        frame = mx.concatenate(
+            [rgb, mx.ones((height, width, 1), dtype=mx.float16)],
+            axis=-1,
+        )
+        mx.eval(frame)
+        sources = [
+            session._upload_src_buffer(frame),
+            session._upload_src_buffer(frame),
+        ]
+
+        def wrap(buffer, index):
+            return vt.VTFrameProcessorFrame.alloc(
+            ).initWithBuffer_presentationTimeStamp_(
+                buffer,
+                pb.frame_pts(index, session.fps),
+            )
+
+        previous = wrap(sources[0], 0)
+        trace = []
+        for index in range(1, 65):
+            current = wrap(sources[index % 2], index)
+            mode = (
+                vt.VTOpticalFlowParametersSubmissionModeRandom
+                if index == 1
+                else vt.VTOpticalFlowParametersSubmissionModeSequential
+            )
+            slot = (index - 1) % 2
+            session._run_explicit_flow(
+                previous,
+                current,
+                slot,
+                mode,
+                index,
+            )
+            pair = session._flow_pairs[slot]
+            trace.append(
+                max(
+                    center_mean_magnitude(pair[0]),
+                    center_mean_magnitude(pair[1]),
+                )
+            )
+            previous = current
+
+        flow_width = int(Quartz.CVPixelBufferGetWidth(session._flow_pairs[0][0]))
+        flow_height = int(Quartz.CVPixelBufferGetHeight(session._flow_pairs[0][0]))
+        assert (flow_width, flow_height) == expected_flow
+        assert max(trace) < 2.0, trace
     finally:
         session.close()
 
@@ -217,10 +364,9 @@ def test_balanced_flow_stays_near_zero_on_a_repeated_frame():
 
     Scope, so this is not read as more than it is: at 640x480 the advertised
     destination is 160x120, below the 128 px writer floor, so this exercises the
-    forced full-source fallback. The runaway does NOT reproduce here with
-    synthetic texture, and it does not reproduce at an advertised destination at
-    all, so this test does not by itself discriminate Random from Sequential.
-    It guards the invariant, not the mode.
+    minimally repaired 160x128 field through VSR. The runaway does not reproduce
+    here with synthetic texture, so this test guards the estimator invariant and
+    end-to-end execution, not rendered quality on moving real content.
     """
     import numpy as np
 

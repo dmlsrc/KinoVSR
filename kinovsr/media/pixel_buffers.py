@@ -549,6 +549,76 @@ def _apply_frame_spec_attachments(pb: Any, frame_spec: Any) -> None:
     )
 
 
+def copy_pixel_buffer_into(source: Any, destination: Any) -> Any:
+    """Copy pixels and propagating attachments into an existing buffer.
+
+    Source and destination must have identical active geometry and pixel
+    format. Keeping allocation separate lets hot native paths reuse a bounded
+    pool while still receiving a genuinely distinct IOSurface.
+    """
+    source_shape = (
+        Quartz.CVPixelBufferGetWidth(source),
+        Quartz.CVPixelBufferGetHeight(source),
+        Quartz.CVPixelBufferGetPixelFormatType(source),
+    )
+    destination_shape = (
+        Quartz.CVPixelBufferGetWidth(destination),
+        Quartz.CVPixelBufferGetHeight(destination),
+        Quartz.CVPixelBufferGetPixelFormatType(destination),
+    )
+    if source_shape != destination_shape:
+        raise ValueError(
+            "CVPixelBuffer copy requires matching width, height, and format; "
+            f"got {source_shape!r} -> {destination_shape!r}"
+        )
+    if (
+        Quartz.CVPixelBufferIsPlanar(source)
+        != Quartz.CVPixelBufferIsPlanar(destination)
+    ):
+        raise ValueError("CVPixelBuffer copy requires matching plane layouts")
+
+    h = source_shape[1]
+    Quartz.CVPixelBufferLockBaseAddress(source, 1)       # read-only source
+    Quartz.CVPixelBufferLockBaseAddress(destination, 0)  # writable destination
+    try:
+        if Quartz.CVPixelBufferIsPlanar(source):
+            source_planes = Quartz.CVPixelBufferGetPlaneCount(source)
+            destination_planes = Quartz.CVPixelBufferGetPlaneCount(destination)
+            if source_planes != destination_planes:
+                raise ValueError(
+                    "CVPixelBuffer copy requires matching plane counts"
+                )
+            for i in range(source_planes):
+                source_height = Quartz.CVPixelBufferGetHeightOfPlane(source, i)
+                destination_height = Quartz.CVPixelBufferGetHeightOfPlane(
+                    destination, i
+                )
+                if source_height != destination_height:
+                    raise ValueError(
+                        "CVPixelBuffer copy requires matching plane heights"
+                    )
+                _copy_plane_bytes(
+                    Quartz.CVPixelBufferGetBaseAddressOfPlane(source, i),
+                    Quartz.CVPixelBufferGetBytesPerRowOfPlane(source, i),
+                    Quartz.CVPixelBufferGetBaseAddressOfPlane(destination, i),
+                    Quartz.CVPixelBufferGetBytesPerRowOfPlane(destination, i),
+                    source_height,
+                )
+        else:
+            _copy_plane_bytes(
+                Quartz.CVPixelBufferGetBaseAddress(source),
+                Quartz.CVPixelBufferGetBytesPerRow(source),
+                Quartz.CVPixelBufferGetBaseAddress(destination),
+                Quartz.CVPixelBufferGetBytesPerRow(destination),
+                h,
+            )
+    finally:
+        Quartz.CVPixelBufferUnlockBaseAddress(destination, 0)
+        Quartz.CVPixelBufferUnlockBaseAddress(source, 1)
+    Quartz.CVBufferPropagateAttachments(source, destination)
+    return destination
+
+
 def copy_pixel_buffer(pb: Any, *, frame_spec: Any = None) -> Any:
     """Deep-copy a CVPixelBuffer into a fresh IOSurface-backed buffer.
 
@@ -564,31 +634,7 @@ def copy_pixel_buffer(pb: Any, *, frame_spec: Any = None) -> Any:
         "PixelFormatType": fmt, "Width": w, "Height": h,
         "IOSurfaceProperties": {}, "MetalCompatibility": True,
     })
-    Quartz.CVPixelBufferLockBaseAddress(pb, 1)   # read-only source
-    Quartz.CVPixelBufferLockBaseAddress(dst, 0)  # writable destination
-    try:
-        if Quartz.CVPixelBufferIsPlanar(pb):
-            for i in range(Quartz.CVPixelBufferGetPlaneCount(pb)):
-                _copy_plane_bytes(
-                    Quartz.CVPixelBufferGetBaseAddressOfPlane(pb, i),
-                    Quartz.CVPixelBufferGetBytesPerRowOfPlane(pb, i),
-                    Quartz.CVPixelBufferGetBaseAddressOfPlane(dst, i),
-                    Quartz.CVPixelBufferGetBytesPerRowOfPlane(dst, i),
-                    Quartz.CVPixelBufferGetHeightOfPlane(pb, i))
-        else:
-            _copy_plane_bytes(
-                Quartz.CVPixelBufferGetBaseAddress(pb),
-                Quartz.CVPixelBufferGetBytesPerRow(pb),
-                Quartz.CVPixelBufferGetBaseAddress(dst),
-                Quartz.CVPixelBufferGetBytesPerRow(dst), h)
-    finally:
-        Quartz.CVPixelBufferUnlockBaseAddress(dst, 0)
-        Quartz.CVPixelBufferUnlockBaseAddress(pb, 1)
-    # Preserve native metadata that the producing buffer explicitly marked for
-    # downstream ownership. Processor-produced values already present on ``pb``
-    # therefore win; non-propagating/private attachments intentionally stay with
-    # the borrowed source buffer.
-    Quartz.CVBufferPropagateAttachments(pb, dst)
+    copy_pixel_buffer_into(pb, dst)
     if frame_spec is not None:
         _apply_frame_spec_attachments(dst, frame_spec)
     return dst

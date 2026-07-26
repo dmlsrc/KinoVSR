@@ -43,16 +43,18 @@ class TestDefaultsAndOrder:
     def test_upscale_none_omits_the_stage(self):
         assert asm("--upscale", "none")["pipeline"] == []
 
-    def test_vision_flow_routes_to_balanced_vt_sr(self):
+    @pytest.mark.parametrize("flow", ["vision", "internal"])
+    def test_alternate_flow_routes_to_balanced_vt_sr(self, flow):
         config = asm(
-            "--upscale", "balanced", "--vt-sr-flow", "vision"
+            "--upscale", "balanced", "--vt-sr-flow", flow
         )
-        assert config["upscale"]["flow"] == "vision"
+        assert config["upscale"]["flow"] == flow
 
+    @pytest.mark.parametrize("flow", ["vision", "internal"])
     @pytest.mark.parametrize("mode", ["none", "fast", "image", "metalfx"])
-    def test_vt_sr_flow_rejects_nonbalanced_upscalers(self, mode):
+    def test_vt_sr_flow_rejects_nonbalanced_upscalers(self, mode, flow):
         with pytest.raises(ConfigError, match="only valid.*balanced"):
-            asm("--upscale", mode, "--vt-sr-flow", "vision")
+            asm("--upscale", mode, "--vt-sr-flow", flow)
 
     def test_default_slot_order(self):
         config = asm("--restore", "decompress_track1", "--deflicker", "on",

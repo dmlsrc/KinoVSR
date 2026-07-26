@@ -62,19 +62,20 @@ class TestParseAndSpec:
         assert parse({}, profile="fast").mode == "fast"
         assert parse({}, profile="image").mode == "image"
 
-    def test_balanced_accepts_vision_flow(self):
-        config = parse({"flow": "vision"}, profile="balanced")
+    @pytest.mark.parametrize("flow", ["vision", "internal"])
+    def test_balanced_accepts_alternate_flow(self, flow):
+        config = parse({"flow": flow}, profile="balanced")
         assert config.mode == "balanced"
-        assert config.flow == "vision"
+        assert config.flow == flow
 
     def test_bad_flow_rejected(self):
         with pytest.raises(ValueError, match="flow must be one of"):
-            parse({"flow": "internal"}, profile="balanced")
+            parse({"flow": "bogus"}, profile="balanced")
 
     @pytest.mark.parametrize("mode", ["fast", "image"])
     def test_flow_is_balanced_only(self, mode):
         with pytest.raises(ValueError, match="only valid.*balanced"):
-            parse({"flow": "vision"}, profile=mode)
+            parse({"flow": "internal"}, profile=mode)
 
     def test_bad_profile_rejected(self):
         with pytest.raises(ValueError, match="profile must be one of"):
@@ -205,8 +206,12 @@ class TestBalancedFlowPipeline:
             self.out_h = H * 4
             self.dst_attrs = {"PixelFormatType": 123}
             self.submissions = []
-            self.outputs = iter(("out-0", None, "out-1"))
-            self.finish_output = "out-2"
+            if kwargs["explicit_flow"]:
+                self.outputs = iter(("out-0", None, "out-1"))
+                self.finish_output = "out-2"
+            else:
+                self.outputs = iter(("out-0", "out-1", "out-2"))
+                self.finish_output = None
             self.reset_count = 0
             self.closed = False
             self.__class__.instances.append(self)
@@ -226,7 +231,7 @@ class TestBalancedFlowPipeline:
             self.closed = True
 
     @staticmethod
-    def _prepared(monkeypatch, *, flow="vt"):
+    def _prepared(monkeypatch, *, flow="vt", matrix="bt709"):
         from kinovsr.native import vsr
         from kinovsr.processors import videotoolbox
         from kinovsr.processors.videotoolbox import (
@@ -244,10 +249,37 @@ class TestBalancedFlowPipeline:
         processor = VtUpscaleProcessor(
             VtUpscaleConfig(mode="balanced", flow=flow)
         )
-        processor.prepare(cv_stream(Layout.CV_RGBA_HALF), CONTEXT)
+        input_spec = StreamSpec(
+            frame=frame_spec_for_matrix(
+                matrix,
+                full_range=False,
+                geometry=Geometry(W, H),
+                layout=Layout.CV_RGBA_HALF,
+            ),
+            timeline=TimelineSpec(time_base=TB, cadence=Fraction(24)),
+        )
+        processor.prepare(input_spec, CONTEXT)
         return processor, TestBalancedFlowPipeline.Session.instances[-1]
 
-    def test_balanced_uses_explicit_flow_and_preserves_delayed_unit_order(
+    @pytest.mark.parametrize("matrix", ["bt601", "bt709", "bt2020"])
+    def test_balanced_passes_resolved_source_matrix_to_native_session(
+            self, monkeypatch, matrix):
+        from kinovsr.media.color import resolve_frame_spec
+
+        processor, session = self._prepared(monkeypatch, matrix=matrix)
+        try:
+            expected = resolve_frame_spec(
+                frame_spec_for_matrix(
+                    matrix,
+                    full_range=False,
+                    geometry=Geometry(W, H),
+                )
+            )[2]
+            assert session.kwargs["source_matrix"] == expected
+        finally:
+            processor.close(CONTEXT)
+
+    def test_balanced_vt_uses_precomputed_flow_and_preserves_delayed_order(
             self, monkeypatch):
         processor, session = self._prepared(monkeypatch)
         units = [
@@ -282,6 +314,24 @@ class TestBalancedFlowPipeline:
         assert session.reset_count == 1
         processor.close(CONTEXT)
         assert session.closed
+
+    def test_internal_backend_is_synchronous(self, monkeypatch):
+        processor, session = self._prepared(monkeypatch, flow="internal")
+        units = [
+            FrameUnit(payload=f"in-{index}", pts=index * 1000, duration=1000)
+            for index in range(3)
+        ]
+        try:
+            assert session.kwargs["explicit_flow"] is False
+            assert session.kwargs["flow_backend"] == "internal"
+            assert [
+                out.payload
+                for unit in units
+                for out in processor.process(unit, CONTEXT)
+            ] == ["out-0", "out-1", "out-2"]
+            assert list(processor.flush(CONTEXT)) == []
+        finally:
+            processor.close(CONTEXT)
 
     def test_vision_backend_reaches_the_native_session(self, monkeypatch):
         processor, session = self._prepared(monkeypatch, flow="vision")
@@ -350,9 +400,10 @@ class TestUpscale:
         out, _ = self.run("balanced", mlx_units(5), cut_at=2)
         assert len(out) == 5
 
-    def test_balanced_vision_flow_backend_runs_through_pipeline(self):
+    @pytest.mark.parametrize("flow", ["vision", "internal"])
+    def test_balanced_alternate_flow_backend_runs_through_pipeline(self, flow):
         units = mlx_units(4)
-        out, _ = self.run("balanced", units, flow="vision")
+        out, _ = self.run("balanced", units, flow=flow)
         assert len(out) == len(units)
         assert [unit.pts for unit in out] == [unit.pts for unit in units]
 

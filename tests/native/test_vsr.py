@@ -15,35 +15,161 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
-def test_every_flow_submission_uses_random_mode(monkeypatch):
-    """VTOpticalFlow's Sequential cache compounds instead of refining.
+def test_uploaded_source_gets_matrix_attachment_after_pixel_upload(monkeypatch):
+    from kinovsr.native import vsr
 
-    Under Sequential the field diverges geometrically - measured to 313 px on
-    byte-identical frames and 5334 px on real ones, where the true field is at
-    most about one pixel. Pin Random on every submission, including submissions
-    that continue an uninterrupted run, so a future edit cannot reintroduce the
-    Sequential chain.
-    """
+    events = []
+    session = object.__new__(vsr.VsrSession)
+    session._make_src_buffer = lambda: "source-buffer"
+    session._tag_source_matrix = (
+        lambda buffer: events.append(("matrix", buffer))
+    )
+    monkeypatch.setattr(
+        vsr._pb,
+        "upload_frame_to_buffer",
+        lambda frame, buffer: events.append(("upload", frame, buffer)),
+    )
+
+    assert session._upload_src_buffer("frame") == "source-buffer"
+    assert events == [
+        ("upload", "frame", "source-buffer"),
+        ("matrix", "source-buffer"),
+    ]
+
+
+def test_source_matrix_attachment_only_sets_matrix(monkeypatch):
+    from kinovsr.native import vsr
+    from kinovsr.native.frameworks import Quartz
+
+    calls = []
+    monkeypatch.setattr(
+        Quartz,
+        "CVBufferSetAttachment",
+        lambda *args: calls.append(args),
+    )
+    session = object.__new__(vsr.VsrSession)
+    session._source_matrix = Quartz.kCVImageBufferYCbCrMatrix_ITU_R_709_2
+    buffer = object()
+
+    session._tag_source_matrix(buffer)
+
+    assert calls == [
+        (
+            buffer,
+            Quartz.kCVImageBufferYCbCrMatrixKey,
+            Quartz.kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+            Quartz.kCVAttachmentMode_ShouldPropagate,
+        )
+    ]
+
+
+def test_flow_submission_isolates_source_and_uses_sequential_after_reset():
     from kinovsr.native import vsr
 
     class Executor:
         def __init__(self):
-            self.modes = []
+            self.calls = []
 
-        def submit(self, _fn, _prev, _cur, _slot, submission_mode, _index):
-            self.modes.append(submission_mode)
+        def submit(self, fn, prev, cur, slot, submission_mode, index):
+            self.calls.append(
+                (fn, prev, cur, slot, submission_mode, index)
+            )
             return "future"
 
     executor = Executor()
     session = object.__new__(vsr.VsrSession)
     session._flow_executor = executor
+    session._flow_needs_random = True
+    session._isolate_flow_source_frame = lambda frame: f"isolated-{frame}"
 
     for index in range(4):
-        session._start_flow_future("prev", "cur", index % 2, index)
+        session._start_flow_future(
+            f"prev-{index}",
+            f"cur-{index}",
+            index % 2,
+            index,
+        )
 
     random_mode = vsr.vt.VTOpticalFlowParametersSubmissionModeRandom
-    assert executor.modes == [random_mode] * 4
-    assert not hasattr(session, "_flow_needs_random")
+    sequential_mode = vsr.vt.VTOpticalFlowParametersSubmissionModeSequential
+    assert [call[1] for call in executor.calls] == [
+        "isolated-prev-0",
+        "isolated-prev-1",
+        "isolated-prev-2",
+        "isolated-prev-3",
+    ]
+    assert [call[2] for call in executor.calls] == [
+        "cur-0",
+        "cur-1",
+        "cur-2",
+        "cur-3",
+    ]
+    assert [call[4] for call in executor.calls] == [
+        random_mode,
+        sequential_mode,
+        sequential_mode,
+        sequential_mode,
+    ]
+
+
+def test_flow_source_isolation_copies_into_bounded_pool(monkeypatch):
+    from kinovsr.native import vsr
+
+    events = []
+
+    class SourceFrame:
+        def buffer(self):
+            return "shared-source"
+
+        def presentationTimeStamp(self):
+            return "pts"
+
+    class FrameInit:
+        def initWithBuffer_presentationTimeStamp_(self, buffer, pts):
+            return ("flow-frame", buffer, pts)
+
+    class FrameClass:
+        @staticmethod
+        def alloc():
+            return FrameInit()
+
+    monkeypatch.setattr(
+        vsr._pb,
+        "pool_create_buffer_bounded",
+        lambda pool, limit: (
+            events.append(("acquire", pool, limit))
+            or "isolated-source"
+        ),
+    )
+    monkeypatch.setattr(
+        vsr._pb,
+        "copy_pixel_buffer_into",
+        lambda source, destination: events.append(
+            ("copy", source, destination)
+        ),
+    )
+    monkeypatch.setattr(
+        vsr,
+        "vt",
+        SimpleNamespace(VTFrameProcessorFrame=FrameClass),
+    )
+
+    session = object.__new__(vsr.VsrSession)
+    session._flow_src_pool = "flow-source-pool"
+
+    assert session._isolate_flow_source_frame(SourceFrame()) == (
+        "flow-frame",
+        "isolated-source",
+        "pts",
+    )
+    assert events == [
+        (
+            "acquire",
+            "flow-source-pool",
+            vsr.EXPLICIT_FLOW_SOURCE_POOL_LIMIT,
+        ),
+        ("copy", "shared-source", "isolated-source"),
+    ]
 
 
 def test_vision_vsr_uses_high_backward_flow_and_zero_forward(monkeypatch):
@@ -159,6 +285,7 @@ def test_explicit_flow_reset_requires_drain_and_rearms_random_modes():
     session._flow_pending_frame = None
     session._prev_src_frame = object()
     session._prev_dst_frame = object()
+    session._flow_needs_random = False
     session._vsr_needs_random = False
     session._flow_backend = "vt"
     session._flow_pairs = (("forward-0", "backward-0"),)
@@ -169,6 +296,7 @@ def test_explicit_flow_reset_requires_drain_and_rearms_random_modes():
 
     assert session._prev_src_frame is None
     assert session._prev_dst_frame is None
+    assert session._flow_needs_random
     assert session._vsr_needs_random
     assert zeroed == [("forward-0", "backward-0")]
 
@@ -202,6 +330,7 @@ def test_explicit_flow_close_waits_before_ending_both_sessions():
     session._flow_pairs = (("forward", "backward"),)
     session._flow_zero_pair = None
     session._flow_config = object()
+    session._flow_src_pool = None
     session.config = object()
     session._xfer = None
     session._src_pool = None

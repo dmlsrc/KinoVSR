@@ -300,7 +300,7 @@ class VtInterpolateProcessor:
 @dataclasses.dataclass(frozen=True, slots=True)
 class VtUpscaleConfig:
     mode: str  # "fast" | "balanced" | "image"
-    flow: str = "vt"  # balanced only: "vt" | "vision"
+    flow: str = "vt"  # balanced only: "vt" | "vision" | "internal"
 
 
 def _upscale_produces(spec: StreamSpec, config: object) -> StreamSpec:
@@ -362,6 +362,7 @@ class VtUpscaleProcessor:
     def prepare(self, input_spec: StreamSpec, context: PipelineContext) -> None:
         import mlx.core as mx
 
+        from kinovsr.media.color import resolve_frame_spec
         from kinovsr.native.vsr import VsrSession
 
         self._mx = mx
@@ -383,13 +384,24 @@ class VtUpscaleProcessor:
             self._session = VsrSession(
                 g.width, g.height, mode=self._config.mode,
                 fps=float(rate_hint),
-                # Balanced VSR's private internal flow is timing-sensitive.
-                # Both explicit backends are overlapped one frame ahead.
-                # Public VT Quality flow is the default; Vision is an opt-in
-                # zero-copy alternative that also works below VT's measured
-                # 128-pixel destination-writer boundary.
-                explicit_flow=self._config.mode == "balanced",
+                # Default VT Balanced keeps public precomputed flow. Explicit
+                # backends receive a flow-only source snapshot so their
+                # one-frame overlap never aliases the IOSurface VSR consumes.
+                # "internal" opts into the scaler's private flow path.
+                explicit_flow=(
+                    self._config.mode == "balanced"
+                    and self._config.flow != "internal"
+                ),
                 flow_backend=self._config.flow,
+                # The Video input model consults this attachment even on
+                # RGBAHalf. In particular, an untagged source otherwise
+                # shifts saturated reds substantially. Keep Image/Fast
+                # behavior unchanged.
+                source_matrix=(
+                    resolve_frame_spec(input_spec.frame)[2]
+                    if self._config.mode == "balanced"
+                    else None
+                ),
             )
             apply_output_pool(
                 self._session, output_pool_binding, self._session.out_w, self._session.out_h
@@ -523,9 +535,10 @@ class VideoToolboxFactory:
                     f"videotoolbox upscale profile must be one of {list(_UPSCALE_PROFILES)}"
                 )
             flow = str(raw.get("flow", "vt"))
-            if flow not in ("vt", "vision"):
+            if flow not in ("vt", "vision", "internal"):
                 raise ValueError(
-                    "videotoolbox upscale flow must be one of ['vt', 'vision']"
+                    "videotoolbox upscale flow must be one of "
+                    "['vt', 'vision', 'internal']"
                 )
             if mode != "balanced" and "flow" in raw:
                 raise ValueError(

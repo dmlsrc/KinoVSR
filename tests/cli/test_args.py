@@ -58,6 +58,12 @@ class TestCanonicalVocabulary:
         assert args.fastdvdnet_profile == "clipped"
         assert args.overwrite is False
 
+    def test_internal_vt_sr_flow_is_a_canonical_choice(self, parser):
+        args = parser.parse_args(
+            [*BASE, "--upscale", "balanced", "--vt-sr-flow", "internal"]
+        )
+        assert args.vt_sr_flow == "internal"
+
     def test_overwrite_is_explicit(self, parser):
         args = parser.parse_args([*BASE, "--overwrite"])
         assert args.overwrite is True

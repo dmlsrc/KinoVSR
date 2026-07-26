@@ -149,6 +149,7 @@ DST_POOL_ALLOCATION_LIMIT = 2
 TEMPORAL_SRC_POOL_ALLOCATION_LIMIT = 3
 STATELESS_SRC_POOL_ALLOCATION_LIMIT = 1
 EXPLICIT_FLOW_PAIR_COUNT = 2
+EXPLICIT_FLOW_SOURCE_POOL_LIMIT = 2
 
 # Evidence boundary, not a broad quality claim: Vision High and the
 # backward-only policy were selected on one 150-frame 640x480 clip. On macOS
@@ -245,10 +246,10 @@ class VsrSession:
                   scale=4. RGBAHalf source. Uses prev source + prev output to
                   inform the per-frame upscale.  Default for video; slightly
                   crisper motion edges at the cost of slightly more
-                  frame-to-frame variation than image mode. Explicit public VT
-                  flow uses deterministic Image input below its reliable
-                  128x128 writer boundary. Vision flow has no such boundary and
-                  supplies its source-geometry IOSurface buffers directly.
+                  frame-to-frame variation than image mode. Public precomputed
+                  VT flow is the product default; the scaler's internal flow
+                  remains selectable. Small explicit-VT inputs use deterministic
+                  Image mode; explicit Vision flow has no such boundary.
       "image"     VTSuperResolutionScalerConfiguration InputType=Image. scale=4.
                   RGBAHalf source. Per-frame deterministic upscale, no
                   prev-frame feedback.  Apple documents this as for stills,
@@ -269,19 +270,24 @@ class VsrSession:
         *,
         explicit_flow: bool = False,
         flow_backend: str = "vt",
+        source_matrix: Any = None,
     ):
         if mode not in ("fast", "balanced", "image"):
             raise ValueError(f"VsrSession only supports VideoToolbox modes, got {mode!r}")
-        if flow_backend not in ("vt", "vision"):
+        if flow_backend not in ("vt", "vision", "internal"):
             raise ValueError(
-                "VSR flow backend must be one of ['vt', 'vision'], "
+                "VSR flow backend must be one of ['vt', 'vision', 'internal'], "
                 f"got {flow_backend!r}"
             )
         if explicit_flow and mode != "balanced":
             raise ValueError("explicit optical flow is only valid for balanced VSR")
-        if flow_backend != "vt" and not explicit_flow:
+        if flow_backend == "vision" and not explicit_flow:
             raise ValueError(
-                "a non-default VSR flow backend requires explicit_flow=True"
+                "the Vision VSR flow backend requires explicit_flow=True"
+            )
+        if flow_backend == "internal" and explicit_flow:
+            raise ValueError(
+                "the internal VSR flow backend requires explicit_flow=False"
             )
         scale = scale_for_mode(mode)
         _validate_combination(in_w, in_h, scale, mode)
@@ -290,14 +296,16 @@ class VsrSession:
         self.out_w, self.out_h = in_w * scale, in_h * scale
         self.mode = mode
         self.fps = float(fps)
+        self._source_matrix = source_matrix
         self._flow_backend = flow_backend
         explicit_geometry_ok = (
-            flow_backend == "vision"
+            flow_backend in ("vision", "internal")
             or source_sized_flow_is_reliable(in_w, in_h)
         )
         self._image_fallback = bool(
             explicit_flow
             and mode == "balanced"
+            and flow_backend == "vt"
             and not explicit_geometry_ok
         )
         self._temporal_video = mode == "balanced" and not self._image_fallback
@@ -320,11 +328,12 @@ class VsrSession:
         self._flow_pairs: tuple[tuple[Any, Any], ...] | None = None
         self._flow_zero_pair: tuple[Any, Any] | None = None
         self._flow_executor: ThreadPoolExecutor | None = None
+        self._flow_src_pool: Any = None
         self._flow_future: Future[None] | None = None
         self._flow_pending_frame: Any = None
         self._flow_pending_index: int | None = None
         self._flow_pending_slot: int | None = None
-        # No flow-side counterpart: the flow processor always submits Random.
+        self._flow_needs_random = True
         self._vsr_needs_random = True
 
         if mode == "fast":
@@ -451,6 +460,7 @@ class VsrSession:
             )
         self._prev_src_frame = None
         self._prev_dst_frame = None
+        self._flow_needs_random = True
         self._vsr_needs_random = True
         if self._flow_pairs is not None:
             # A precomputed-flow VSR submission requires a non-null flow object
@@ -475,6 +485,9 @@ class VsrSession:
         needs after an early decode or processing burst.
         """
         _pb.flush_pool(self._src_pool)
+        flow_src_pool = getattr(self, "_flow_src_pool", None)
+        if flow_src_pool is not None:
+            _pb.flush_pool(flow_src_pool)
         if self._owns_dst_pool:
             _pb.flush_pool(self._dst_pool)
 
@@ -513,6 +526,7 @@ class VsrSession:
                     finally:
                         self.flush_pools()
                         self._src_pool = None
+                        self._flow_src_pool = None
                         self._dst_pool = None
                         self._owns_dst_pool = False
 
@@ -555,8 +569,7 @@ class VsrSession:
         VSR for frame N, so its second and later submissions have one frame of
         bounded latency. Call :meth:`finish_pending_upscale` at a drain or cut.
         """
-        src_pb = self._make_src_buffer()
-        _pb.upload_frame_to_buffer(frame, src_pb)
+        src_pb = self._upload_src_buffer(frame)
         if self._explicit_flow:
             return self._submit_explicit(src_pb, frame_index)
         return self._process(src_pb, frame_index)
@@ -610,8 +623,7 @@ class VsrSession:
         as a CVPixelBuffer in the source format - e.g. straight from a native
         decoder - use `upscale_buffer_to_buffer` to skip the upload entirely.
         """
-        src_pb = self._make_src_buffer()
-        _pb.upload_frame_to_buffer(frame, src_pb)
+        src_pb = self._upload_src_buffer(frame)
         return self._process(src_pb, frame_index)
 
     def upscale_buffer_to_buffer(self, src_pb: Any, frame_index: int) -> Any:
@@ -624,11 +636,28 @@ class VsrSession:
         whose coded size is padded to a macroblock multiple (a 544x408 clip is
         coded at 544x416) - that the VSR processor rejects with -19730, even
         though the identical pixels in a VSR pool buffer upscale fine.
-        Colorimetry is owned by the decode (see video_reader) and the encoder
-        tag, not normalized here.
+        The resolved source matrix is normalized here for balanced VSR; output
+        colorimetry remains owned by the encoder tag.
         """
         clean = self._clean_src_buffer(src_pb)
         return self._process(clean, frame_index)
+
+    def _tag_source_matrix(self, src_pb: Any) -> None:
+        """Apply the resolved matrix attachment required by balanced VSR."""
+        if self._source_matrix is None:
+            return
+        Quartz.CVBufferSetAttachment(
+            src_pb,
+            Quartz.kCVImageBufferYCbCrMatrixKey,
+            self._source_matrix,
+            Quartz.kCVAttachmentMode_ShouldPropagate,
+        )
+
+    def _upload_src_buffer(self, frame: Any) -> Any:
+        src_pb = self._make_src_buffer()
+        _pb.upload_frame_to_buffer(frame, src_pb)
+        self._tag_source_matrix(src_pb)
+        return src_pb
 
     def _clean_src_buffer(self, src_pb: Any) -> Any:
         """Copy `src_pb` into a clean VSR-source pool buffer via a lazily-created
@@ -638,12 +667,13 @@ class VsrSession:
         Then strip the TransferFunction attachment the transfer propagated from the
         source. The VSR scaler HONORS that tag: it linearizes the input through the
         (709) EOTF but never re-encodes, darkening the output by ~2x (measured:
-        709-EOTF(0.39)=0.166, a hard black crush on tagged SD clips). The MLX upload
-        path (upscale_to_buffer) feeds an untagged buffer and is unaffected, which
-        is why fastdvdnet stays correct -- this makes the native buffer-to-buffer path
-        match it. Only the gamma tag is removed: the YCbCr matrix / range are left
-        intact for the NV12 (fast) path's YUV interpretation, and output
-        colorimetry comes from the encoder tag, not these scaler-input attachments.
+        709-EOTF(0.39)=0.166, a hard black crush on tagged SD clips).
+
+        The balanced Video model separately honors the YCbCr matrix attachment even
+        on RGBAHalf input. Apply the pipeline's resolved source matrix after the
+        transfer so tagged and untagged sources use the same modeled interpretation.
+        Fast/Image pass no matrix override and retain their existing behavior.
+        Output colorimetry comes from the encoder tag, not these input attachments.
         """
         if self._xfer is None:
             err, xfer = vt.VTPixelTransferSessionCreate(None, None)
@@ -655,6 +685,7 @@ class VsrSession:
         if err != 0:
             raise RuntimeError(f"VTPixelTransferSessionTransferImage failed: {err}")
         Quartz.CVBufferRemoveAttachment(clean, Quartz.kCVImageBufferTransferFunctionKey)
+        self._tag_source_matrix(clean)
         return clean
 
     @staticmethod
@@ -679,18 +710,25 @@ class VsrSession:
         """Start the selected explicit-flow backend used by balanced VSR."""
         if self._flow_backend == "vision":
             self._start_vision_flow()
-            return
-        self._start_vt_flow()
+        else:
+            self._start_vt_flow()
+        self._flow_src_pool = _pb.make_bounded_pool_from_attrs(
+            self.src_attrs,
+            EXPLICIT_FLOW_SOURCE_POOL_LIMIT,
+        )
+        if self._flow_src_pool is None:
+            raise RuntimeError(
+                "explicit-flow source-isolation pool creation failed"
+            )
 
     def _start_vt_flow(self) -> None:
         """Start the public Quality VT-flow processor used by balanced VSR.
 
         VT advertises quarter-resolution destination attributes, but on the
         current macOS implementation those buffers complete successfully while
-        remaining zero. Full-resolution buffers in VT's rotation-normalized
-        geometry receive the real vector field and are accepted by
-        precomputed-flow VSR. Keep that measured geometry explicit here;
-        silently returning to the advertised shape is a quality regression.
+        remaining zero whenever either dimension is below 128. Prefer the
+        advertised geometry when writable and otherwise raise only the
+        offending dimension to the measured writer floor.
         """
         cls = vt.VTOpticalFlowConfiguration
         if not cls.isSupported():
@@ -736,7 +774,7 @@ class VsrSession:
         _log.info(
             "VSR explicit flow ready (Quality, %s destination %sx%s, "
             "one-frame overlap)",
-            "advertised" if used_advertised else "full-resolution",
+            "advertised" if used_advertised else "adjusted",
             flow_w,
             flow_h,
         )
@@ -745,11 +783,13 @@ class VsrSession:
         """Prepare zero-copy, current-to-previous Vision flow for balanced VSR.
 
         Vision emits source-geometry TwoComponent16Half IOSurfaces, including
-        for portrait input. VSR accepts those buffers directly. On macOS
-        26.5.2, decoded output was identical with a zero forward field, so
-        every slot reuses one immutable zero surface and retains only Vision's
-        current-to-previous result. This is an OS-dependent measured behavior,
-        not a public API guarantee.
+        for portrait input, and VSR accepts those buffers directly. Acceptance
+        is not a quality guarantee: source-geometry Vision fields have produced
+        the same breathing/wavy VSR output class as source-geometry public VT
+        flow on small clips. On macOS 26.5.2, decoded output was identical with
+        a zero forward field, so every slot reuses one immutable zero surface
+        and retains only Vision's current-to-previous result. This is an
+        OS-dependent measured behavior, not a public API guarantee.
         """
         from .vision_flow import FLOW_16H
 
@@ -791,6 +831,33 @@ class VsrSession:
                 "VTFrameProcessorOpticalFlow rejected explicit flow buffers"
             )
         return optical_flow
+
+    def _isolate_flow_source_frame(self, source_frame: Any) -> Any:
+        """Snapshot one source into flow-only storage before overlap.
+
+        During the one-frame pipeline, VSR consumes frame N while the selected
+        explicit backend computes N -> N+1. Passing frame N's IOSurface to both
+        native sessions concurrently can intermittently corrupt the VSR result
+        even though neither Python call writes it. A bounded copy keeps the
+        pixels and public attachments identical while giving flow a distinct
+        IOSurface and lifetime.
+        """
+        pool = self._flow_src_pool
+        if pool is None:
+            raise RuntimeError("explicit-flow source-isolation pool is unavailable")
+        isolated = _pb.pool_create_buffer_bounded(
+            pool,
+            EXPLICIT_FLOW_SOURCE_POOL_LIMIT,
+        )
+        _pb.copy_pixel_buffer_into(source_frame.buffer(), isolated)
+        frame = vt.VTFrameProcessorFrame.alloc(
+        ).initWithBuffer_presentationTimeStamp_(
+            isolated,
+            source_frame.presentationTimeStamp(),
+        )
+        if frame is None:
+            raise RuntimeError("isolated explicit-flow source frame init returned nil")
+        return frame
 
     def _run_explicit_flow(
         self,
@@ -864,20 +931,16 @@ class VsrSession:
         executor = self._flow_executor
         if executor is None:
             raise RuntimeError("explicit optical-flow executor is unavailable")
-        # VTOpticalFlow's Sequential cache compounds its own estimate rather
-        # than refining it, but only when the destination is larger than the
-        # configuration advertises. At a forced full-source destination the mean
-        # magnitude on byte-identical frames grew 0.07 -> 313 px over eleven
-        # submissions (5334 px on real frames by the ninth); at the advertised
-        # destination it converges instead, 0.0156 -> 0.0208 px over 23 pairs.
-        # Clearing the destination first changes nothing, so the runaway state
-        # is internal to the processor. Random is measured free (2.38 s versus
-        # 2.42 s over twelve frames) and keeps the field correct on the sub-128
-        # fallback below, which is the one path that must still oversize.
-        submission_mode = vt.VTOpticalFlowParametersSubmissionModeRandom
+        isolated_previous = self._isolate_flow_source_frame(previous_frame)
+        submission_mode = (
+            vt.VTOpticalFlowParametersSubmissionModeRandom
+            if self._flow_needs_random
+            else vt.VTOpticalFlowParametersSubmissionModeSequential
+        )
+        self._flow_needs_random = False
         return executor.submit(
             self._run_explicit_flow,
-            previous_frame,
+            isolated_previous,
             current_frame,
             slot,
             submission_mode,
