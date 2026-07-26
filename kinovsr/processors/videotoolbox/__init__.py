@@ -257,8 +257,11 @@ class VtInterpolateProcessor:
     def reset(self, boundary: Boundary, context: PipelineContext) -> None:
         # The scheduler drained the pre-boundary tail via flush(), which
         # clears the buffered pair inside the session; the target grid
-        # deliberately keeps counting so PTS stays monotonic.
-        pass
+        # deliberately keeps counting so PTS stays monotonic. Reset only the
+        # native reference cache: the next pair must be Random rather than
+        # Sequential so VideoToolbox cannot reuse pre-boundary motion state.
+        if self._session is not None:
+            self._session.reset_temporal_context()
 
     def flush(self, context: PipelineContext) -> Iterable[FrameUnit]:
         if self._session is None:

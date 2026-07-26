@@ -80,6 +80,27 @@ class TestParseAndSpec:
         assert get_factory("videotoolbox") is FACTORY
 
 
+def test_reset_marks_native_frc_references_discontinuous():
+    from kinovsr.processors.videotoolbox import VtInterpolateProcessor
+
+    class Session:
+        reset_calls = 0
+
+        def reset_temporal_context(self):
+            self.reset_calls += 1
+
+    processor = VtInterpolateProcessor(parse({"target_fps": 60}))
+    session = Session()
+    processor._session = session
+
+    processor.reset(
+        Boundary(BoundaryKind.HARD_CUT, source_index=4),
+        CONTEXT,
+    )
+
+    assert session.reset_calls == 1
+
+
 def source_units(n):
     from kinovsr.media import pixel_buffers as _pb
 

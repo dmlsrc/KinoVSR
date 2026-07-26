@@ -16,6 +16,7 @@ def _bare_session(source=Fraction(25), target=Fraction(40)):
     session.source_cadence = source
     session.target_cadence = target
     session._next_target_index = None
+    session._submission_needs_random = False
     return session
 
 
@@ -97,3 +98,37 @@ def test_duplicate_source_times_are_refused_not_dropped():
     session._prev_time = Fraction(0)
     with pytest.raises(RuntimeError, match="strictly increasing"):
         list(session.feed_at(object(), Fraction(0)))
+
+
+def test_reset_requires_a_drained_pair_and_marks_next_submission_random():
+    session = _bare_session()
+    session._prev_src_pb = object()
+    with pytest.raises(RuntimeError, match=r"drain\(\)"):
+        session.reset_temporal_context()
+
+    session._prev_src_pb = None
+    session.reset_temporal_context()
+    assert session._submission_needs_random is True
+
+
+def test_pair_without_targets_marks_next_submission_random():
+    session = _bare_session(Fraction(24), Fraction(12))
+    session._prev_src_pb = object()
+    session._prev_time = Fraction(1, 24)
+    session._next_target_index = 1
+    next_buffer = object()
+
+    assert list(session.feed_at(next_buffer, Fraction(2, 24))) == []
+    assert session._prev_src_pb is next_buffer
+    assert session._submission_needs_random is True
+
+
+def test_empty_drain_marks_reused_session_random():
+    session = _bare_session(Fraction(24), Fraction(12))
+    session._prev_src_pb = object()
+    session._prev_time = Fraction(1, 24)
+    session._next_target_index = 1
+
+    assert list(session.drain()) == []
+    assert session._prev_src_pb is None
+    assert session._submission_needs_random is True

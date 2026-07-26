@@ -147,6 +147,10 @@ class VtfrcSession:
         self._prev_src_pb: Any = None
         self._prev_time: Fraction | None = None
         self._next_target_index: int | None = None
+        # Apple requires Random after a jump or skip so the processor clears
+        # its internal interpolation cache. The first request has no preceding
+        # references; later contiguous pairs clear this flag after succeeding.
+        self._submission_needs_random = True
 
     def use_dst_pool(self, pool: Any) -> None:
         """Wire AVWriter's adaptor pool for zero-copy output."""
@@ -170,6 +174,7 @@ class VtfrcSession:
         finally:
             self._prev_src_pb = None
             self._next_target_index = None
+            self._submission_needs_random = True
             self.config = None
             self.flush_pools()
             self._dst_pool = None
@@ -244,6 +249,19 @@ class VtfrcSession:
     # Public API
     # ------------------------------------------------------------------------
 
+    def reset_temporal_context(self) -> None:
+        """Mark the next submitted pair as unrelated to prior references.
+
+        The caller must drain the preceding segment first so no buffered pair
+        is discarded. The next request then uses Random exactly once; later
+        contiguous pairs return to Sequential.
+        """
+        if self._prev_src_pb is not None:
+            raise RuntimeError(
+                "drain() must clear the buffered FRC pair before reset"
+            )
+        self._submission_needs_random = True
+
     def _process_destination_batches(
         self,
         source_pb: Any,
@@ -281,7 +299,11 @@ class VtfrcSession:
                     for index, buffer in zip(batch_indices, dest_buffers, strict=True)
                 ]
                 submission_mode = (
-                    vt.VTFrameRateConversionParametersSubmissionModeSequential
+                    (
+                        vt.VTFrameRateConversionParametersSubmissionModeRandom
+                        if self._submission_needs_random
+                        else vt.VTFrameRateConversionParametersSubmissionModeSequential
+                    )
                     if offset == 0
                     else vt.VTFrameRateConversionParametersSubmissionModeSequentialReferencesUnchanged
                 )
@@ -297,6 +319,8 @@ class VtfrcSession:
                 del params, dest_frames
             if not ok:
                 raise RuntimeError(f"{error_label}: {err}")
+            if offset == 0:
+                self._submission_needs_random = False
 
             while dest_buffers:
                 yield dest_buffers.pop(0)
@@ -341,6 +365,9 @@ class VtfrcSession:
         target_indices = self._targets_between(self._prev_time, src_time)
         if not target_indices:
             # Identity / downsample case: no output frame falls in this gap.
+            # The next submitted pair will have skipped references relative
+            # to the processor's cache and must clear it with Random.
+            self._submission_needs_random = True
             self._prev_src_pb = src_pb
             self._prev_time = src_time
             return
@@ -382,11 +409,13 @@ class VtfrcSession:
                      else 1 / self.source_cadence)
         if hold_span <= 0:
             self._prev_src_pb = None
+            self._submission_needs_random = True
             return
         end_time = self._prev_time + hold_span
         target_indices = self._targets_between(self._prev_time, end_time)
         if not target_indices:
             self._prev_src_pb = None
+            self._submission_needs_random = True
             return
         phases = self._phases_between(
             target_indices, self._prev_time, end_time)
@@ -402,3 +431,4 @@ class VtfrcSession:
         )
         self._next_target_index = target_indices[-1] + 1
         self._prev_src_pb = None
+        self._submission_needs_random = True

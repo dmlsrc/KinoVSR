@@ -9,7 +9,10 @@ import pytest
 
 
 @pytest.mark.unit
-def test_destination_fanout_is_submitted_in_fixed_batches(monkeypatch):
+@pytest.mark.parametrize("needs_random", [False, True])
+def test_destination_fanout_is_submitted_in_fixed_batches(
+    monkeypatch, needs_random
+):
     from kinovsr.native import temporal
 
     class Frame:
@@ -51,6 +54,7 @@ def test_destination_fanout_is_submitted_in_fixed_batches(monkeypatch):
     session.target_cadence = Fraction(240)
     session.processor = Processor()
     session._make_dst_buffer = object
+    session._submission_needs_random = needs_random
 
     outputs = list(
         session._process_destination_batches(
@@ -65,11 +69,14 @@ def test_destination_fanout_is_submitted_in_fixed_batches(monkeypatch):
     )
 
     sequential = temporal.vt.VTFrameRateConversionParametersSubmissionModeSequential
+    random = temporal.vt.VTFrameRateConversionParametersSubmissionModeRandom
     unchanged = (
         temporal.vt.VTFrameRateConversionParametersSubmissionModeSequentialReferencesUnchanged
     )
     assert len(outputs) == 10
-    assert calls == [(4, sequential), (4, unchanged), (2, unchanged)]
+    first = random if needs_random else sequential
+    assert calls == [(4, first), (4, unchanged), (2, unchanged)]
+    assert session._submission_needs_random is False
 
 
 def _source_buffer(seed: int):
@@ -121,16 +128,20 @@ def _active_digest(buffer) -> str:
     return hashlib.sha256(active).hexdigest()
 
 
-def _consume_pair(session, first, second) -> list[str]:
-    assert list(session.feed(first, 0)) == []
+def _output_digests(outputs) -> list[str]:
     digests = []
-    for output in session.feed(second, 1):
-        digests.append(_active_digest(output))
-        del output
-    for output in session.drain():
+    for output in outputs:
         digests.append(_active_digest(output))
         del output
     return digests
+
+
+def _consume_pair(session, first, second) -> list[str]:
+    assert list(session.feed(first, 0)) == []
+    return [
+        *_output_digests(session.feed(second, 1)),
+        *_output_digests(session.drain()),
+    ]
 
 
 @pytest.mark.integration
@@ -165,6 +176,52 @@ def test_batched_ntsc_fanout_is_bit_exact_to_one_call(monkeypatch, mode):
             batched.close()
 
     assert len(actual) == 14
+    assert actual == expected
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("mode", ["normal", "high"])
+def test_post_cut_random_submission_matches_fresh_session(mode):
+    from kinovsr.native import temporal
+
+    before_first = _source_buffer(1)
+    before_last = _source_buffer(2)
+    after_first = _source_buffer(31)
+    after_second = _source_buffer(32)
+    reused = fresh = None
+    try:
+        reused = temporal.VtfrcSession(
+            128,
+            96,
+            24,
+            48,
+            mode=mode,
+        )
+        assert _output_digests(reused.feed(before_first, 0)) == []
+        _output_digests(reused.feed(before_last, 1))
+        _output_digests(reused.drain())
+        reused.reset_temporal_context()
+        assert _output_digests(reused.feed(after_first, 2)) == []
+        actual = _output_digests(reused.feed(after_second, 3))
+
+        fresh = temporal.VtfrcSession(
+            128,
+            96,
+            24,
+            48,
+            mode=mode,
+        )
+        assert _output_digests(fresh.feed(after_first, 2)) == []
+        expected = _output_digests(fresh.feed(after_second, 3))
+    except (RuntimeError, SystemExit) as exc:
+        pytest.skip(str(exc))
+    finally:
+        if reused is not None:
+            reused.close()
+        if fresh is not None:
+            fresh.close()
+
+    assert len(actual) == 2
     assert actual == expected
 
 
