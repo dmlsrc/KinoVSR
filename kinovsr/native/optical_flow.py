@@ -41,6 +41,32 @@ def flow_destination_geometry(width: int, height: int) -> tuple[int, int]:
     )
 
 
+def advertised_flow_destination_geometry(
+    advertised: Any,
+) -> tuple[int, int]:
+    """Return the unmodified destination geometry advertised by VT.
+
+    This is the coordinate contract consumed by VT SR, not necessarily a
+    writable destination for the public VT optical-flow producer. In
+    particular, do not apply ``VT_FLOW_MIN_DESTINATION_DIMENSION`` here:
+    Vision writes its own full-resolution field and a Metal conversion writes
+    this destination, so the public VT producer's measured 128-pixel floor is
+    irrelevant.
+    """
+    attrs = dict(advertised or {})
+    try:
+        width = int(attrs.get(Quartz.kCVPixelBufferWidthKey, 0) or 0)
+        height = int(attrs.get(Quartz.kCVPixelBufferHeightKey, 0) or 0)
+    except (TypeError, ValueError):
+        width = height = 0
+    if width < 1 or height < 1:
+        raise RuntimeError(
+            "VT optical-flow configuration advertised invalid destination "
+            f"geometry {width}x{height}"
+        )
+    return width, height
+
+
 def select_flow_destination_geometry(
     advertised: Any,
     width: int,

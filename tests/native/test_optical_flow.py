@@ -73,6 +73,29 @@ def test_flow_destination_geometry_enforces_writer_floor_and_orientation(
     assert flow_destination_geometry(width, height) == expected
 
 
+def test_advertised_geometry_preserves_vt_sr_consumer_grid_without_writer_floor():
+    from kinovsr.native.frameworks import Quartz
+    from kinovsr.native.optical_flow import (
+        advertised_flow_destination_geometry,
+    )
+
+    attrs = {
+        Quartz.kCVPixelBufferWidthKey: 80,
+        Quartz.kCVPixelBufferHeightKey: 45,
+    }
+
+    assert advertised_flow_destination_geometry(attrs) == (80, 45)
+
+
+def test_invalid_advertised_geometry_is_rejected():
+    from kinovsr.native.optical_flow import (
+        advertised_flow_destination_geometry,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid destination geometry"):
+        advertised_flow_destination_geometry({"Width": 0, "Height": "bad"})
+
+
 def test_pending_marker_distinguishes_zero_flow_from_no_write(monkeypatch):
     optical_flow = _fake_quartz(monkeypatch)
     pair = (_Buffer(), _Buffer())

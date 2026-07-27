@@ -22,6 +22,7 @@ from kinovsr.settings import default_settings
 
 from .frameworks import Quartz, autorelease_pool, vt
 from .optical_flow import (
+    advertised_flow_destination_geometry,
     mark_flow_pair_pending,
     require_flow_pair_written,
     select_flow_destination_geometry,
@@ -327,6 +328,8 @@ class VsrSession:
         self._flow_processor: Any = None
         self._flow_pairs: tuple[tuple[Any, Any], ...] | None = None
         self._flow_zero_pair: tuple[Any, Any] | None = None
+        self._vision_flow_converter: Any = None
+        self._vision_flow_destinations: tuple[Any, ...] | None = None
         self._flow_executor: ThreadPoolExecutor | None = None
         self._flow_src_pool: Any = None
         self._flow_future: Future[None] | None = None
@@ -495,6 +498,11 @@ class VsrSession:
         processor, self.processor = self.processor, None
         flow_processor = getattr(self, "_flow_processor", None)
         flow_executor = getattr(self, "_flow_executor", None)
+        vision_flow_converter = getattr(
+            self,
+            "_vision_flow_converter",
+            None,
+        )
         self._flow_processor = None
         self._flow_executor = None
         try:
@@ -502,33 +510,39 @@ class VsrSession:
                 flow_executor.shutdown(wait=True)
         finally:
             try:
-                if flow_processor is not None:
-                    flow_processor.endSession()
+                self._vision_flow_converter = None
+                if vision_flow_converter is not None:
+                    vision_flow_converter.close()
             finally:
                 try:
-                    if processor is not None:
-                        processor.endSession()
+                    if flow_processor is not None:
+                        flow_processor.endSession()
                 finally:
-                    self._prev_src_frame = None
-                    self._prev_dst_frame = None
-                    self._flow_future = None
-                    self._flow_pending_frame = None
-                    self._flow_pending_index = None
-                    self._flow_pending_slot = None
-                    self._flow_pairs = None
-                    self._flow_zero_pair = None
-                    self._flow_config = None
-                    self.config = None
-                    xfer, self._xfer = self._xfer, None
                     try:
-                        if xfer is not None:
-                            vt.VTPixelTransferSessionInvalidate(xfer)
+                        if processor is not None:
+                            processor.endSession()
                     finally:
-                        self.flush_pools()
-                        self._src_pool = None
-                        self._flow_src_pool = None
-                        self._dst_pool = None
-                        self._owns_dst_pool = False
+                        self._prev_src_frame = None
+                        self._prev_dst_frame = None
+                        self._flow_future = None
+                        self._flow_pending_frame = None
+                        self._flow_pending_index = None
+                        self._flow_pending_slot = None
+                        self._flow_pairs = None
+                        self._flow_zero_pair = None
+                        self._vision_flow_destinations = None
+                        self._flow_config = None
+                        self.config = None
+                        xfer, self._xfer = self._xfer, None
+                        try:
+                            if xfer is not None:
+                                vt.VTPixelTransferSessionInvalidate(xfer)
+                        finally:
+                            self.flush_pools()
+                            self._src_pool = None
+                            self._flow_src_pool = None
+                            self._dst_pool = None
+                            self._owns_dst_pool = False
 
     # ------------------------------------------------------------------------
     # Internal: buffer factories
@@ -780,31 +794,64 @@ class VsrSession:
         )
 
     def _start_vision_flow(self) -> None:
-        """Prepare zero-copy, current-to-previous Vision flow for balanced VSR.
+        """Prepare full-estimate Vision flow in VT SR's advertised geometry.
 
-        Vision emits source-geometry TwoComponent16Half IOSurfaces, including
-        for portrait input, and VSR accepts those buffers directly. Acceptance
-        is not a quality guarantee: source-geometry Vision fields have produced
-        the same breathing/wavy VSR output class as source-geometry public VT
-        flow on small clips. On macOS 26.5.2, decoded output was identical with
-        a zero forward field, so every slot reuses one immutable zero surface
-        and retains only Vision's current-to-previous result. This is an
+        Vision emits a source-sized field in source-pixel units. VT SR accepts
+        that IOSurface but interprets it in its smaller advertised coordinate
+        system, which over-warps the result. Keep Vision's better-conditioned
+        full-resolution estimate, then resample it and scale its vectors into
+        the raw VT grid on Metal. Portrait fields are also rotated
+        counterclockwise into VT's landscape coordinates.
+
+        On macOS 26.5.2, decoded output was identical with a zero forward field,
+        so every slot reuses one immutable zero surface and retains only
+        Vision's converted current-to-previous result. This remains an
         OS-dependent measured behavior, not a public API guarantee.
         """
-        from .vision_flow import FLOW_16H
+        from .vision_flow import FLOW_16H, VisionFlowToVtConverter
 
-        attrs = {
-            "PixelFormatType": FLOW_16H,
-            "IOSurfaceProperties": {},
-        }
+        cls = vt.VTOpticalFlowConfiguration
+        config = cls.alloc(
+        ).initWithFrameWidth_frameHeight_qualityPrioritization_revision_(
+            self.in_w,
+            self.in_h,
+            vt.VTOpticalFlowConfigurationQualityPrioritizationQuality,
+            cls.defaultRevision(),
+        )
+        if config is None:
+            raise RuntimeError(
+                "VT flow geometry configuration returned nil for Vision "
+                f"{self.in_w}x{self.in_h}"
+            )
+        attrs = dict(config.destinationPixelBufferAttributes() or {})
+        flow_w, flow_h = advertised_flow_destination_geometry(attrs)
+        if _pb.resolve_pixel_format(attrs) != FLOW_16H:
+            raise RuntimeError(
+                "VT flow geometry configuration did not advertise "
+                "TwoComponent16Half"
+            )
+        attrs[Quartz.kCVPixelBufferMetalCompatibilityKey] = True
         zero_pair = (
-            _pb.make_pixel_buffer_from_attrs(self.in_w, self.in_h, attrs),
-            _pb.make_pixel_buffer_from_attrs(self.in_w, self.in_h, attrs),
+            _pb.make_pixel_buffer_from_attrs(flow_w, flow_h, attrs),
+            _pb.make_pixel_buffer_from_attrs(flow_w, flow_h, attrs),
+        )
+        destinations = tuple(
+            _pb.make_pixel_buffer_from_attrs(flow_w, flow_h, attrs)
+            for _ in range(EXPLICIT_FLOW_PAIR_COUNT)
         )
         self._zero_flow_pair(zero_pair)
+        self._flow_config = config
         self._flow_zero_pair = zero_pair
+        self._vision_flow_destinations = destinations
         self._flow_pairs = tuple(
             zero_pair for _ in range(EXPLICIT_FLOW_PAIR_COUNT)
+        )
+        self._vision_flow_converter = VisionFlowToVtConverter(
+            self.in_w,
+            self.in_h,
+            flow_w,
+            flow_h,
+            rotate_counterclockwise=self.in_h > self.in_w,
         )
         self._flow_executor = ThreadPoolExecutor(
             max_workers=1,
@@ -812,11 +859,14 @@ class VsrSession:
         )
         _log.info(
             "VSR explicit flow ready (Vision revision 1 %s, "
-            "current-to-previous only, source-geometry %sx%s, zero-copy, "
-            "one-frame overlap)",
+            "current-to-previous only, full estimate %sx%s -> VT grid %sx%s "
+            "on Metal%s, one-frame overlap)",
             VISION_VSR_ACCURACY.title(),
             self.in_w,
             self.in_h,
+            flow_w,
+            flow_h,
+            ", portrait CCW" if self.in_h > self.in_w else "",
         )
 
     def _flow_object(self, slot: int) -> Any:
@@ -882,7 +932,15 @@ class VsrSession:
                     previous_frame.buffer(),
                     accuracy=VISION_VSR_ACCURACY,
                 )
-                pair = (zero_pair[0], backward)
+                converter = self._vision_flow_converter
+                destinations = self._vision_flow_destinations
+                if converter is None or destinations is None:
+                    raise RuntimeError(
+                        "Vision flow conversion resources are unavailable"
+                    )
+                converted = destinations[slot]
+                converter.convert(backward, converted)
+                pair = (zero_pair[0], converted)
                 pairs = self._flow_pairs
                 if pairs is None:
                     raise RuntimeError(

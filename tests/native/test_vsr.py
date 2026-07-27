@@ -177,10 +177,15 @@ def test_vision_vsr_uses_high_backward_flow_and_zero_forward(monkeypatch):
 
     assert vsr.VISION_VSR_ACCURACY == "high"
     calls = []
+    conversions = []
 
     def generate(from_buffer, to_buffer, *, accuracy):
         calls.append((from_buffer, to_buffer, accuracy))
         return "vision-backward"
+
+    class Converter:
+        def convert(self, source, destination):
+            conversions.append((source, destination))
 
     class Frame:
         def __init__(self, buffer):
@@ -199,6 +204,11 @@ def test_vision_vsr_uses_high_backward_flow_and_zero_forward(monkeypatch):
         ("old-forward-0", "old-backward-0"),
         ("old-forward-1", "old-backward-1"),
     )
+    session._vision_flow_converter = Converter()
+    session._vision_flow_destinations = (
+        "converted-backward-0",
+        "converted-backward-1",
+    )
 
     session._run_explicit_flow(
         Frame("previous"),
@@ -209,17 +219,26 @@ def test_vision_vsr_uses_high_backward_flow_and_zero_forward(monkeypatch):
     )
 
     assert calls == [("current", "previous", vsr.VISION_VSR_ACCURACY)]
+    assert conversions == [
+        ("vision-backward", "converted-backward-1"),
+    ]
     assert session._flow_pairs == (
         ("old-forward-0", "old-backward-0"),
-        ("zero-forward", "vision-backward"),
+        ("zero-forward", "converted-backward-1"),
     )
 
 
 def test_vision_vsr_log_uses_the_request_accuracy_constant(
         monkeypatch, caplog):
-    from kinovsr.native import vsr
+    from kinovsr.native import vision_flow, vsr
 
-    buffers = iter((object(), object()))
+    buffers = iter(object() for _ in range(4))
+    converter_calls = []
+
+    class Converter:
+        def __init__(self, *args, **kwargs):
+            converter_calls.append((args, kwargs))
+
     monkeypatch.setattr(
         vsr._pb,
         "make_pixel_buffer_from_attrs",
@@ -230,6 +249,7 @@ def test_vision_vsr_log_uses_the_request_accuracy_constant(
         "_zero_flow_pair",
         lambda _self, _pair: None,
     )
+    monkeypatch.setattr(vision_flow, "VisionFlowToVtConverter", Converter)
     monkeypatch.setattr(vsr, "VISION_VSR_ACCURACY", "medium")
 
     session = object.__new__(vsr.VsrSession)
@@ -239,6 +259,13 @@ def test_vision_vsr_log_uses_the_request_accuracy_constant(
         with caplog.at_level(logging.INFO, logger=vsr.__name__):
             session._start_vision_flow()
         assert "Vision revision 1 Medium" in caplog.text
+        assert "full estimate 640x480 -> VT grid 160x120" in caplog.text
+        assert converter_calls == [
+            (
+                (640, 480, 160, 120),
+                {"rotate_counterclockwise": False},
+            )
+        ]
     finally:
         session._flow_executor.shutdown()
 
@@ -317,6 +344,10 @@ def test_explicit_flow_close_waits_before_ending_both_sessions():
         def endSession(self):
             events.append(self.name)
 
+    class Converter:
+        def close(self):
+            events.append("converter")
+
     session = object.__new__(vsr.VsrSession)
     session.processor = Processor("vsr")
     session._flow_processor = Processor("flow")
@@ -329,6 +360,8 @@ def test_explicit_flow_close_waits_before_ending_both_sessions():
     session._flow_pending_slot = 0
     session._flow_pairs = (("forward", "backward"),)
     session._flow_zero_pair = None
+    session._vision_flow_converter = Converter()
+    session._vision_flow_destinations = ("converted",)
     session._flow_config = object()
     session._flow_src_pool = None
     session.config = object()
@@ -340,11 +373,19 @@ def test_explicit_flow_close_waits_before_ending_both_sessions():
 
     session.close()
 
-    assert events == [("executor", True), "flow", "vsr", "pools"]
+    assert events == [
+        ("executor", True),
+        "converter",
+        "flow",
+        "vsr",
+        "pools",
+    ]
     assert session.processor is None
     assert session._flow_processor is None
     assert session._flow_executor is None
     assert session._flow_pairs is None
+    assert session._vision_flow_converter is None
+    assert session._vision_flow_destinations is None
 
 
 def test_verbose_native_stderr_path_performs_no_descriptor_operations(
