@@ -43,6 +43,7 @@ dependencies = [
     "pyobjc-framework-libdispatch>=12.2",
     "pyobjc-framework-Metal>=12.2",
     "pyobjc-framework-MetalFX>=12.2",
+    "pyobjc-framework-MetalPerformanceShaders>=12.2",
     "pyobjc-framework-Quartz>=12.2",
     "pyobjc-framework-VideoToolbox>=12.2",
     "pyobjc-framework-Vision>=12.2",

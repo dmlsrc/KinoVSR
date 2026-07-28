@@ -405,8 +405,10 @@ class BsvdDenoiser:
         map_floor: float = 0.0,
         backend: str = "mlx",
     ):
-        if backend not in ("mlx", "ane"):
-            raise ValueError(f"unknown BSVD backend {backend!r}; expected 'mlx' or 'ane'")
+        if backend not in ("mlx", "ane", "mpsgraph"):
+            raise ValueError(
+                f"unknown BSVD backend {backend!r}; expected 'mlx', 'ane', "
+                f"or 'mpsgraph'")
         wp = Path(weights_path) if weights_path else default_weights_path(variant)
         if not wp.is_file():
             raise FileNotFoundError(
@@ -419,6 +421,10 @@ class BsvdDenoiser:
             from .ane import AneBSVD
 
             self.net: Any = AneBSVD(wp, dtype=dtype)
+        elif backend == "mpsgraph":
+            from .mps import MpsGraphBSVD
+
+            self.net = MpsGraphBSVD(wp, dtype=dtype)
         else:
             self.net = BSVD(wp, dtype=dtype)
         self.sigma = _strength_to_sigma(strength)

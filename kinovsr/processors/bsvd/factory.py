@@ -42,7 +42,7 @@ from kinovsr.settings import Settings
 
 _PROFILES = ("c64", "c32")
 _DTYPES = {"float16", "float32"}
-_BACKENDS = {"mlx", "ane"}
+_BACKENDS = {"mlx", "ane", "mpsgraph"}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
