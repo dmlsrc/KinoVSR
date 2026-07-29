@@ -4,6 +4,26 @@ from __future__ import annotations
 
 from typing import Any
 
+QOS_CLASS_USER_INITIATED = 0x19
+
+
+def _set_thread_qos(qos_class: int) -> None:
+    """Assign an explicit Darwin QoS class to an accelerator worker."""
+    import ctypes
+    import os
+
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    setter = libc.pthread_set_qos_class_self_np
+    setter.argtypes = [ctypes.c_uint, ctypes.c_int]
+    setter.restype = ctypes.c_int
+    status = int(setter(int(qos_class), 0))
+    if status:
+        raise OSError(
+            status,
+            f"could not set accelerator thread QoS: "
+            f"{os.strerror(status)}",
+        )
+
 
 class DispatchPipeline:
     """One accelerator dispatch in flight on a dedicated worker thread.
@@ -19,8 +39,14 @@ class DispatchPipeline:
     concurrency a synchronous pull pipeline can put to use.
     """
 
-    def __init__(self, name: str = "ane-dispatch"):
+    def __init__(
+        self,
+        name: str = "ane-dispatch",
+        *,
+        qos_class: int | None = None,
+    ):
         self._name = name
+        self._qos_class = qos_class
         self._executor: Any = None
         self._future: Any = None
 
@@ -38,8 +64,17 @@ class DispatchPipeline:
         if self._executor is None:
             from concurrent.futures import ThreadPoolExecutor
 
+            executor_options = {}
+            if self._qos_class is not None:
+                executor_options = {
+                    "initializer": _set_thread_qos,
+                    "initargs": (self._qos_class,),
+                }
             self._executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix=self._name)
+                max_workers=1,
+                thread_name_prefix=self._name,
+                **executor_options,
+            )
         self._future = self._executor.submit(job)
 
     def join(self) -> None:
@@ -65,4 +100,4 @@ class DispatchPipeline:
             self._executor = None
 
 
-__all__ = ["DispatchPipeline"]
+__all__ = ["DispatchPipeline", "QOS_CLASS_USER_INITIATED"]

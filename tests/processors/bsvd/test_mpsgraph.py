@@ -9,6 +9,7 @@ import pytest
 from kinovsr.processors import bsvd as B
 from kinovsr.processors.bsvd import cli_options, factory
 from kinovsr.processors.bsvd.mps import MpsGraphBSVD
+from kinovsr.processors.bsvd.mps_phases import ScheduledMpsPhaseSuite
 
 pytestmark = pytest.mark.unit
 
@@ -37,6 +38,27 @@ class TestBackendSelection:
         frame = mx.zeros((1, 94, 128, net.input_channels), dtype=mx.float16)
         with pytest.raises(ValueError, match="divisible by four"):
             net.step(frame)
+
+    @pytest.mark.parametrize("count", [16, 17, 18, 19, 20, 23, 24, 63])
+    def test_four_step_window_actions_cover_fill_and_drain_exactly(
+        self, count
+    ):
+        actions = ScheduledMpsPhaseSuite._actions(list(range(count)))
+        assert all(
+            len(action.frames) == len(action.records) == 4
+            for action in actions
+        )
+        assert sum(
+            record.out_real
+            for action in actions
+            for record in action.records
+        ) == count
+        flattened = [
+            frame for action in actions for frame in action.frames]
+        assert flattened[:count] == list(range(count))
+        assert all(frame is None for frame in flattened[count:])
+        assert len(flattened) >= count + 16
+        assert len(flattened) < count + 20
 
 
 # --------------------------------------------------------------------------

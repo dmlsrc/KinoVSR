@@ -9,6 +9,7 @@ import time
 import pytest
 
 from kinovsr.native.anemil.runtime import DispatchPipeline
+from kinovsr.native.dispatch import QOS_CLASS_USER_INITIATED
 
 pytestmark = pytest.mark.unit
 
@@ -76,3 +77,34 @@ class TestDispatchPipeline:
         pipeline.close()
         assert done == [True]
         pipeline.close()
+
+    def test_optional_worker_qos_is_applied(self):
+        import ctypes
+
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        libc.pthread_self.restype = ctypes.c_void_p
+        getter = libc.pthread_get_qos_class_np
+        getter.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        getter.restype = ctypes.c_int
+        seen = []
+
+        def capture():
+            qos_class = ctypes.c_uint()
+            relative = ctypes.c_int()
+            assert getter(
+                libc.pthread_self(),
+                ctypes.byref(qos_class),
+                ctypes.byref(relative),
+            ) == 0
+            seen.append((qos_class.value, relative.value))
+
+        pipeline = DispatchPipeline(
+            "test", qos_class=QOS_CLASS_USER_INITIATED)
+        pipeline.submit(capture)
+        pipeline.join()
+        pipeline.close()
+        assert seen == [(QOS_CLASS_USER_INITIATED, 0)]

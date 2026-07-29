@@ -44,6 +44,119 @@ class TestGraphBuilder:
         assert mx.array_equal(out["diff"], a - c)
         assert set(graph.feed_names) == {"left", "right"}
 
+    def test_dynamic_result_binding_can_become_a_later_feed(self):
+        """A delay-ring slot stays in shared storage between dispatches."""
+        b = mg.GraphBuilder(mg.FLOAT32)
+        fixed = b.placeholder((1, 1, 2, 2), "fixed")
+        delayed = b.placeholder((1, 1, 2, 2), "delayed")
+        total = b.add(fixed, delayed, "total")
+        graph = mg.compile_graph(
+            b, [("total", total, (1, 1, 2, 2))],
+            device=mg.DEVICE_GPU, dynamic={"delayed", "total"})
+        zero = graph.bind("delayed")
+        zero.write(mx.zeros((1, 1, 2, 2), dtype=mx.float32))
+        slot = graph.bind("total")
+        one = mx.ones((1, 1, 2, 2), dtype=mx.float32)
+
+        graph.run({"fixed": one},
+                  bindings={"delayed": zero, "total": slot})
+        assert mx.array_equal(slot.array(), one)
+
+        next_slot = graph.bind("total")
+        graph.run({"fixed": one * 2},
+                  bindings={"delayed": slot, "total": next_slot})
+        assert mx.array_equal(next_slot.array(), one * 3)
+
+    def test_binding_storage_can_be_shared_across_compiled_graphs(self):
+        """Each executable gets its own tensor-data wrapper over one buffer."""
+        first_builder = mg.GraphBuilder(mg.FLOAT32)
+        value = first_builder.placeholder((1, 1, 2, 2), "value")
+        one = first_builder.constant(
+            mx.ones((1, 1, 2, 2), dtype=mx.float32))
+        incremented = first_builder.add(value, one, "incremented")
+        first = mg.compile_graph(
+            first_builder,
+            [("incremented", incremented, (1, 1, 2, 2))],
+            device=mg.DEVICE_GPU,
+            dynamic={"incremented"},
+        )
+
+        second_builder = mg.GraphBuilder(mg.FLOAT32)
+        shared = second_builder.placeholder((1, 1, 2, 2), "shared")
+        two = second_builder.constant(
+            mx.full((1, 1, 2, 2), 2.0, dtype=mx.float32))
+        doubled = second_builder.multiply(shared, two, "doubled")
+        second = mg.compile_graph(
+            second_builder,
+            [("doubled", doubled, (1, 1, 2, 2))],
+            device=mg.DEVICE_GPU,
+            dynamic={"shared"},
+        )
+
+        slot = first.bind("incremented")
+        first.run(
+            {"value": mx.full((1, 1, 2, 2), 3.0)},
+            bindings={"incremented": slot},
+        )
+        second_view = second.bind("shared", shared=slot)
+        out = second.run({}, bindings={"shared": second_view})
+        assert mx.array_equal(
+            out["doubled"],
+            mx.full((1, 1, 2, 2), 8.0, dtype=mx.float32),
+        )
+        first.close()
+        second.close()
+
+    def test_executable_cache_round_trips_in_a_fresh_graph(
+        self, tmp_path, monkeypatch
+    ):
+        """A package reload keeps the named feed/target contract and values."""
+        cache = tmp_path / "cached-graph"
+
+        def make():
+            builder = mg.GraphBuilder(mg.FLOAT32)
+            value = builder.placeholder((1, 2, 4, 4), "value")
+            bias = builder.constant(
+                mx.full((1, 2, 4, 4), 3.0, dtype=mx.float32))
+            result = builder.add(value, bias, "result")
+            return builder, result
+
+        first_builder, first_result = make()
+        first = mg.compile_graph(
+            first_builder,
+            [("result", first_result, (1, 2, 4, 4))],
+            device=mg.DEVICE_GPU,
+            executable_cache=cache,
+        )
+        value = mx.ones((1, 2, 4, 4), dtype=mx.float32)
+        assert mx.array_equal(first.run({"value": value})["result"],
+                              value + 3.0)
+        first.close()
+        assert (cache / "contract.json").is_file()
+        assert (cache / "model.mpsgraphpackage").is_dir()
+
+        loaded = False
+        original = mg._load_cached_executable
+
+        def observe(*args, **kwargs):
+            nonlocal loaded
+            result = original(*args, **kwargs)
+            loaded = result is not None
+            return result
+
+        monkeypatch.setattr(mg, "_load_cached_executable", observe)
+        second_builder, second_result = make()
+        second = mg.compile_graph(
+            second_builder,
+            [("result", second_result, (1, 2, 4, 4))],
+            device=mg.DEVICE_GPU,
+            executable_cache=cache,
+        )
+        assert loaded
+        assert mx.array_equal(second.run({"value": value})["result"],
+                              value + 3.0)
+        second.close()
+
     def test_pixel_shuffle_biased_matches_the_reference_arrangement(self):
         """The bias must land per PRE-shuffle channel: output channel c at
         spatial phase (i, j) receives bias[c*4 + 2i + j].  This is the

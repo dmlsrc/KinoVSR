@@ -770,7 +770,9 @@ class BsvdDenoiser:
 
         begin_window = getattr(self.net, "begin_window", None)
         capable = getattr(self.net, "window_capable", None)
-        if callable(begin_window) and len(conditioned) >= 16 and (
+        minimum_window = int(getattr(
+            self.net, "MIN_WINDOW_FRAMES", 16))
+        if callable(begin_window) and len(conditioned) >= minimum_window and (
                 not callable(capable)
                 or capable(int(conditioned[0].shape[1]),
                            int(conditioned[0].shape[2]))):
