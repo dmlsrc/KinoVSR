@@ -70,34 +70,6 @@ def test_spatial_ensemble_identity_roundtrip():
         assert float(mx.max(mx.abs(o - f))) < 1e-5
 
 
-def test_windowed_no_policy_processing_ranges_unchanged():
-    # The ordinary fixed path keeps its exact processing ranges, including
-    # the deliberate full-window tail rerun.
-    from kinovsr.modeling.upscaler_base import WindowedUpscaler
-
-    class _Stub(WindowedUpscaler):
-        SCALE = 1
-        def __init__(self):
-            self.calls = []
-            super().__init__(window=8, trim=2)
-        def _upscale_window(self, frames):
-            self.calls.append([
-                round(frame[0, 0, 0, 0].item() * 200) for frame in frames
-            ])
-            yield from frames
-
-    up = _Stub()
-    em = []
-    for i in range(20):
-        em += up.feed(mx.full((1, 1, 1, 3), i / 200.0), token=i)
-    em += up.flush()
-    assert [t for _, t in em] == list(range(20))
-    assert up.calls == [
-        list(range(8)), list(range(4, 12)), list(range(8, 16)),
-        list(range(12, 20)), list(range(12, 20)),
-    ]
-
-
 def test_restore_variant_tokens_resolve_names():
     # every documented token maps to a distinct filename
     v = net._RESTORE_VARIANTS

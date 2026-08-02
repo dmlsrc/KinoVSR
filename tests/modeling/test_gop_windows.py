@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from kinovsr.modeling.gop_windows import GopWindows
+from kinovsr.modeling.window_buffer import WindowBuffer
 from kinovsr.processors.protocol import GopWindowPolicy
 from kinovsr.processors.units import FrameUnit, SourceFrameInfo
 
@@ -16,7 +16,7 @@ def _windows(keyframes, count, minimum, maximum, source_indices=None):
                       frames[emit_start], frames[emit_end - 1] + 1))
         return [(frames[i], tokens[i]) for i in range(emit_start, emit_end)]
 
-    machine = GopWindows(minimum, maximum, run)
+    machine = WindowBuffer.gop(minimum, maximum, run)
     syncs = set(keyframes)
     for position, source_index in enumerate(
             range(count) if source_indices is None else source_indices):
@@ -60,7 +60,7 @@ def test_flush_then_reset_clamps_a_hard_cut():
         windows.append((list(frames), start, end))
         return ()
 
-    machine = GopWindows(4, 8, run)
+    machine = WindowBuffer.gop(4, 8, run)
     for index in range(3):
         list(machine.feed(index))
     list(machine.flush())
@@ -69,6 +69,32 @@ def test_flush_then_reset_clamps_a_hard_cut():
         list(machine.feed(index))
     list(machine.flush())
     assert windows == [([0, 1, 2], 0, 3), ([100, 101, 102, 103], 0, 4)]
+
+
+@pytest.mark.parametrize("window,trim,count,expected", [
+    (1, 0, 3, [(0, 1), (1, 2), (2, 3)]),
+    (8, 0, 0, []),
+    (8, 0, 7, [(0, 7)]),
+    (8, 0, 8, [(0, 8)]),
+    (8, 0, 9, [(0, 8), (1, 9)]),
+    (8, 2, 8, [(0, 8), (0, 8)]),
+    (8, 2, 17, [(0, 8), (4, 12), (8, 16), (9, 17)]),
+    (8, 2, 20, [(0, 8), (4, 12), (8, 16), (12, 20), (12, 20)]),
+])
+def test_fixed_sliding_processing_ranges(window, trim, count, expected):
+    calls = []
+
+    def run(frames, tokens, emit_start, emit_end):
+        calls.append((frames[0], frames[-1] + 1))
+        return [(frames[i], tokens[i]) for i in range(emit_start, emit_end)]
+
+    machine = WindowBuffer(window, trim, run)
+    runs = [machine.feed(index, index) for index in range(count)]
+    tail = machine.flush()
+    assert all(isinstance(ready, list) for ready in (*runs, tail))
+    emitted = [item for ready in (*runs, tail) for item in ready]
+    assert calls == expected
+    assert [token for _, token in emitted] == list(range(count))
 
 
 @pytest.mark.parametrize(

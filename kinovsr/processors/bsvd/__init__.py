@@ -518,9 +518,9 @@ class BsvdDenoiser:
         if policy is None:
             self._gop = None
             return
-        from kinovsr.modeling.gop_windows import GopWindows
+        from kinovsr.modeling.window_buffer import WindowBuffer
 
-        self._gop = GopWindows(
+        self._gop = WindowBuffer.gop(
             policy.min_window, policy.max_window, self._run_window)
 
     def run_diagnostics(self) -> list:

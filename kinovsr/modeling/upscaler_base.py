@@ -13,7 +13,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from .gop_windows import GopWindows
+from .window_buffer import WindowBuffer
 
 
 def to_rgb_batch(rgb: Any) -> Any:
@@ -52,15 +52,13 @@ class WindowedUpscaler:
         *,
         vt_flow_geometries: int = 0,
     ):
-        self._T = int(trim)
-        self._W = int(window)
-        self._gop: GopWindows | None = None
+        self._fixed_window = (int(window), int(trim))
+        self._windows = WindowBuffer(*self._fixed_window, self._run_window)
         self._vt_flow_services: Any = None
         if vt_flow_geometries:
             from kinovsr.modeling.vt_flow import VtFlowServices
 
             self._vt_flow_services = VtFlowServices(vt_flow_geometries)
-        self.reset()
 
     def close(self) -> None:
         """Release buffered frames and this driver's native flow services."""
@@ -70,63 +68,29 @@ class WindowedUpscaler:
             services.close()
 
     def reset(self) -> None:
-        self._frames: list = []  # sliding LR buffer (1,H,W,3)
-        self._tokens: list = []
-        self._base = 0  # global index of _frames[0]
-        self._emitted = 0  # global index of the next frame to emit
-        if self._gop is not None:
-            self._gop.reset()
+        self._windows.reset()
 
     def set_gop_policy(self, policy: Any) -> None:
-        self._gop = (
-            None
+        self._windows = (
+            WindowBuffer(*self._fixed_window, self._run_window)
             if policy is None
-            else GopWindows(
-                policy.min_window, policy.max_window, self._run_gop_window)
+            else WindowBuffer.gop(
+                policy.min_window, policy.max_window, self._run_window)
         )
 
     def feed(self, rgb: Any, token: Any = None) -> Iterable:
-        frame = to_rgb_batch(rgb)
-        if self._gop is not None:
-            return self._gop.feed(frame, token)
-        self._frames.append(frame)
-        self._tokens.append(token)
-        out: list = []
-        while (self._base + len(self._frames)) >= max(0, self._emitted - self._T) + self._W:
-            ws = max(0, self._emitted - self._T)
-            out.extend(self._run(ws, ws + self._W, last=False))
-        # Retain enough for the next interior window (back to emitted-T) AND a
-        # full-width flush window (back to total-W); drop only what neither needs.
-        total = self._base + len(self._frames)
-        keep = max(0, min(self._emitted - self._T, total - self._W)) - self._base
-        if keep > 0:
-            self._frames = self._frames[keep:]
-            self._tokens = self._tokens[keep:]
-            self._base += keep
-        return out
+        return self._windows.feed(to_rgb_batch(rgb), token)
 
     def flush(self) -> Iterable:
-        if self._gop is not None:
-            return self._flush_gop()
-        total = self._base + len(self._frames)
-        if self._emitted >= total:
-            self.reset()
-            return []
-        ws = max(0, min(self._emitted - self._T, total - self._W))
-        out = self._run(ws, total, last=True)
-        self.reset()
-        return out
+        return self._windows.flush()
 
-    def _flush_gop(self) -> Iterable:
-        yield from self._gop.flush()
-        self.reset()
-
-    def _run_gop_window(
+    def _run_window(
         self, frames: list, tokens: list, emit_start: int, emit_end: int,
     ) -> Iterable:
         # Conditioning consumers read the source identities parallel to this
         # one window without owning any boundary or buffer bookkeeping.
-        self._window_tokens = tokens
+        if self._windows.is_gop:
+            self._window_tokens = tokens
         produced = 0
         for produced, frame in enumerate(self._upscale_window(frames), start=1):
             index = produced - 1
@@ -135,17 +99,6 @@ class WindowedUpscaler:
         if produced != len(frames):
             raise RuntimeError(
                 f"window returned {produced} outputs for {len(frames)} frames")
-
-    def _run(self, ws: int, we: int, last: bool) -> list:
-        # Both window nets (BasicVSR++ _upsample, RealBasicVSR _basicvsr) mx.eval each
-        # output frame as it is produced, so the frames arrive materialized -- no extra
-        # sync barrier here.
-        sr = list(self._upscale_window(
-            self._frames[ws - self._base : we - self._base]))
-        end = we if last else we - self._T
-        out = [(sr[g - ws][0], self._tokens[g - self._base]) for g in range(self._emitted, end)]
-        self._emitted = end
-        return out
 
     def _upscale_window(self, frames: list) -> Iterable:
         raise NotImplementedError

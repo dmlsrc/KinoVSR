@@ -150,14 +150,14 @@ def test_windowed_driver_close_releases_owned_manager(monkeypatch):
 
     monkeypatch.setattr(vt_flow, "VtFlowServices", Manager)
     driver = upscaler_base.WindowedUpscaler(window=5, trim=1, vt_flow_geometries=2)
-    driver._frames = [object()]
+    driver._windows._frames = [object()]
 
     driver.close()
     driver.close()
 
     assert created[0].capacity == 2
     assert created[0].close_count == 1
-    assert driver._frames == []
+    assert driver._windows._frames == []
     assert driver._vt_flow_services is None
 
 

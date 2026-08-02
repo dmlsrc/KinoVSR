@@ -1184,7 +1184,7 @@ def _install_gop_window_probe(monkeypatch):
 
         def _upscale_window(self, frames):
             self.calls.append(
-                None if self._gop is None else
+                None if not self._windows.is_gop else
                 tuple(token.source.index for token in self._window_tokens))
             yield from frames
 
