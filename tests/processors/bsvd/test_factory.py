@@ -130,12 +130,13 @@ class TestStreaming:
                           for b in u.boundaries)]
         assert flagged == [3 * 960]
 
-    def test_gop_policy_keeps_mlx_continuous_under_conditioning(self):
+    def test_gop_policy_windows_mlx_and_skips_discarded_tail_steps(self):
         import mlx.core as mx
 
-        from kinovsr.analysis.noise.track import NoiseMapTracker
+        from kinovsr.analysis.noise.track import NoiseMapTracker, PulseGain
         from kinovsr.processors import GopWindowPolicy
         from kinovsr.processors.bsvd import BsvdDenoiser, default_weights_path
+        from kinovsr.processors.units import SourceFrameInfo
 
         weights = default_weights_path("c64")
         if not weights.is_file():
@@ -143,7 +144,7 @@ class TestStreaming:
 
         driver = BsvdDenoiser(
             weights, strength=0.3, noise_map=NoiseMapTracker(min_frames=2),
-            map_refresh=3, backend="mlx")
+            pulse=PulseGain(), map_refresh=3, backend="mlx")
         original_step = driver.net.step
         step_count = 0
 
@@ -153,31 +154,34 @@ class TestStreaming:
             return original_step(frame)
 
         driver.net.step = counted_step
-        frames = [
-            mx.full((16, 16, 3), 0.2 + index / 100, dtype=mx.float32)
-            for index in range(12)
+        pairs = [
+            (mx.full((16, 16, 3), 0.2 + i / 100, dtype=mx.float32),
+             FrameUnit(None, i, 1, source=SourceFrameInfo(i, i in {0, 8, 16})))
+            for i in range(18)
         ]
 
         def run(policy):
             before = step_count
             driver.set_gop_policy(policy)
-            assert driver._gop is None
-            output = [item for index, frame in enumerate(frames)
-                      for item in driver.feed(frame, token=index)]
+            output = [item for frame, token in pairs
+                      for item in driver.feed(frame, token=token)]
             output.extend(driver.flush())
             return output, step_count - before
 
         try:
             plain, plain_steps = run(None)
-            aligned, aligned_steps = run(GopWindowPolicy(4, 8))
-            tokens = list(range(len(frames)))
-            assert [token for _, token in plain] == tokens
-            assert [token for _, token in aligned] == tokens
-            assert plain_steps == aligned_steps == len(frames) + driver.net.SHIFT_NUM
+            aligned, aligned_steps = run(GopWindowPolicy(4, 12))
+            assert driver._gop is not None
+            assert [token.pts for _, token in plain] == list(range(18))
+            assert [token.pts for _, token in aligned] == list(range(18))
+            assert plain_steps == 18 + driver.net.SHIFT_NUM
+            # [0,9) and [8,17) discard their shared anchors; [16,18) is tail.
+            assert aligned_steps == (9 + 16) * 2 + (2 + 16) - 2
             assert driver.last_noise_map is not None
-            assert all(float(mx.max(mx.abs(left - right))) == 0.0
-                       for (left, _), (right, _) in
-                       zip(plain, aligned, strict=True))
+            assert any(
+                float(mx.max(mx.abs(left - right))) > 0.0
+                for (left, _), (right, _) in zip(plain, aligned, strict=True)
+            )
         finally:
             driver.close()
 

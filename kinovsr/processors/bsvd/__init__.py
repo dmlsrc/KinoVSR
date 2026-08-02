@@ -162,13 +162,13 @@ class _BiBufferConv:
     def __init__(self, conv: tuple[Any, Any, int], relu: bool = False):
         self._conv = conv
         self._relu = relu
+        self._zero: Any = None
         self.reset()
 
     def reset(self) -> None:
         self._left_fold_2fold: Any = None
         self._center: Any = None
         self._shape: tuple[int, int, int, int] | None = None
-        self._zero_right: Any = None
         self._fold = 0
 
     def __call__(self, input_right: Any | None) -> Any | None:
@@ -181,20 +181,20 @@ class _BiBufferConv:
             self._center = input_right
             if input_right is not None and self._left_fold_2fold is None:
                 n, h, w, _c = self._shape
-                self._left_fold_2fold = mx.zeros((n, h, w, self._fold), dtype=input_right.dtype)
+                zero_shape = (n, h, w, self._fold)
+                if (
+                    self._zero is None
+                    or self._zero.shape != zero_shape
+                    or self._zero.dtype != input_right.dtype
+                ):
+                    self._zero = mx.zeros(zero_shape, dtype=input_right.dtype)
+                self._left_fold_2fold = self._zero
             return None
 
         if input_right is None:
             if self._shape is None:
                 return None
-            n, h, w, _c = self._shape
-            if (
-                self._zero_right is None
-                or self._zero_right.shape != (n, h, w, self._fold)
-                or self._zero_right.dtype != self._center.dtype
-            ):
-                self._zero_right = mx.zeros((n, h, w, self._fold), dtype=self._center.dtype)
-            right = self._zero_right
+            right = self._zero
         else:
             right = input_right[..., : self._fold]
 
@@ -427,7 +427,6 @@ class BsvdDenoiser:
             self.net = MpsGraphBSVD(wp, dtype=dtype)
         else:
             self.net = BSVD(wp, dtype=dtype)
-        self._window_backend = backend != "mlx"
         self.sigma = _strength_to_sigma(strength)
         # optional NoiseMapTracker: replaces the constant sigma plane with a
         # per-pixel estimate (sigma units, same scale as the constant).
@@ -441,7 +440,7 @@ class BsvdDenoiser:
                 "--noise-map / --noise-map-pulse need a non-blind (4-channel) "
                 "BSVD checkpoint; this one is blind RGB-only."
             )
-        # Streaming-mode map refresh cadence (frames); 0 disables. The ANE
+        # Streaming-mode map refresh cadence (frames); 0 disables. The
         # GOP-window path re-estimates per window instead and ignores this.
         self._map_refresh = max(0, int(map_refresh))
         # user sigma floor under the map: the temporal estimator only measures
@@ -515,8 +514,8 @@ class BsvdDenoiser:
             self._wavefront.poll()
 
     def set_gop_policy(self, policy: Any) -> None:
-        """Window accelerator backends; keep the reference MLX stream continuous."""
-        if policy is None or not self._window_backend:
+        """Apply the shared GOP-window policy on every BSVD backend."""
+        if policy is None:
             self._gop = None
             return
         from kinovsr.modeling.gop_windows import GopWindows
@@ -729,24 +728,27 @@ class BsvdDenoiser:
                 nm = self._plane_from_map(sig)
         from kinovsr.analysis.noise.track import source_since_sync
 
-        conditioned = []
-        for i, x in enumerate(frames):
-            # window starts break temporal adjacency (proc ranges overlap), so
-            # the pulse tracker restarts its diff chain at each window.
-            gain = self._pulse_gain(
-                x, new_segment=(i == 0),
-                since_sync=source_since_sync(
-                    tokens[i] if i < len(tokens) else None))
-            conditioned.append(self._with_nm(x, nm, gain=gain))
+        # Window starts break temporal adjacency (proc ranges overlap), so the
+        # pulse tracker restarts its diff chain at each window. Keep this lazy
+        # for synchronous MLX; accelerator backends materialize their batch.
+        conditioned = (
+            self._with_nm(
+                x, nm, gain=self._pulse_gain(
+                    x, new_segment=(i == 0),
+                    since_sync=source_since_sync(token)))
+            for i, (x, token) in enumerate(zip(frames, tokens, strict=True))
+        )
 
         begin_window = getattr(self.net, "begin_window", None)
+        if callable(begin_window):
+            conditioned = list(conditioned)
         capable = getattr(self.net, "window_capable", None)
         minimum_window = int(getattr(
             self.net, "MIN_WINDOW_FRAMES", 16))
-        if callable(begin_window) and len(conditioned) >= minimum_window and (
+        if callable(begin_window) and len(frames) >= minimum_window and (
                 not callable(capable)
-                or capable(int(conditioned[0].shape[1]),
-                           int(conditioned[0].shape[2]))):
+                or capable(int(frames[0].shape[1]),
+                           int(frames[0].shape[2]))):
             # Depth-one cross-window pipelining: submit completes the
             # window in flight (emitting it), then starts this one; its
             # dispatches then run while feed() buffers the NEXT window -
@@ -801,7 +803,11 @@ class BsvdDenoiser:
                 if y is None:
                     raise RuntimeError("BSVD GOP window emitted an empty frame")
                 yield self._emit(y, tokens[idx])
-        for i in range(self.net.SHIFT_NUM):
+        # The proc range may end with a shared anchor or forced-split trim
+        # whose own outputs are deliberately not emitted. Stop the delay-line
+        # drain as soon as the last requested output can emerge.
+        tail_steps = max(0, emit_end + self.net.SHIFT_NUM - len(frames))
+        for i in range(tail_steps):
             y = self.net.step(None)
             idx = len(frames) + i - self.net.SHIFT_NUM
             if emit_start <= idx < emit_end:
