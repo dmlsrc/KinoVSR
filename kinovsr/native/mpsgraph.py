@@ -44,7 +44,6 @@ import ctypes
 import functools
 import json
 import logging
-import os
 import shutil
 import tempfile
 from collections.abc import Mapping
@@ -89,7 +88,7 @@ def _fw() -> dict[str, Any]:
     # MPSDataType values hardcoded above.
     import MetalPerformanceShaders as MPS
     import objc
-    from Foundation import NSData, NSMutableDictionary, NSURL
+    from Foundation import NSURL, NSData, NSMutableDictionary
 
     if (int(MPS.MPSDataTypeFloat16), int(MPS.MPSDataTypeFloat32)) != (
             FLOAT16, FLOAT32):
@@ -700,8 +699,7 @@ def _load_cached_executable(
         (str(name), tuple(int(value) for value in shape))
         for name, shape in record.get("order", ())
     ]
-    if len(order) != len(feed_shapes) or {
-            name: shape for name, shape in order} != feed_shapes:
+    if len(order) != len(feed_shapes) or dict(order) != feed_shapes:
         raise RuntimeError(
             f"MPSGraph cache feed contract changed at {cache_directory}")
     expected_targets = _target_contract(targets)
@@ -759,7 +757,7 @@ def _publish_executable_cache(
             "targets": [[name, list(shape)] for name, shape in targets],
         }, indent=2))
         try:
-            os.replace(staging, cache_directory)
+            staging.replace(cache_directory)
         except OSError:
             # Another process may have won the same cold-cache race.
             if not cache_directory.is_dir():
