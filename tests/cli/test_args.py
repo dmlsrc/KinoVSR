@@ -97,8 +97,9 @@ class TestExitCodes:
         assert "--upscale" in capsys.readouterr().out
 
     def test_missing_video_exits_two(self, parser, capsys):
+        args = parser.parse_args(["--output-dir", "out"])
         with pytest.raises(SystemExit) as exc:
-            parser.parse_args(["--output-dir", "out"])
+            validate_args(parser, args)
         assert exc.value.code == 2
         capsys.readouterr()
 
@@ -244,6 +245,95 @@ class TestSettingsTrifecta:
         assert inv.config["denoise"]["processor"] == "bsvd"
 
 
+class TestFoundationTables:
+    def test_config_can_supply_the_complete_run_boundary(
+            self, parser, tmp_path: Path):
+        toml = tmp_path / "run.toml"
+        toml.write_text(
+            '[input]\nvideo = "clip.mp4"\nreader = "native"\n'
+            '[output]\noutput_dir = "out"\naudio = true\n'
+            '[diagnostics]\ncut_log = "cuts.txt"\n')
+        args = parser.parse_args(["--config", str(toml)])
+        inv = assemble(args, base=Settings())
+        validate_args(parser, inv.options)
+        assert inv.options.video == "clip.mp4"
+        assert inv.options.reader == "native"
+        assert inv.options.output_dir == "out"
+        assert inv.options.audio is True
+        assert inv.options.cut_log == "cuts.txt"
+
+    def test_flags_then_set_override_foundation_toml(
+            self, parser, tmp_path: Path):
+        toml = tmp_path / "run.toml"
+        toml.write_text(
+            '[input]\nvideo = "toml.mp4"\nreader = "native"\n'
+            '[output]\noutput_dir = "toml-out"\nencode_quality = 0.4\n')
+        args = parser.parse_args([
+            "--config", str(toml),
+            "--video", "flag.mp4", "--reader", "ffmpeg",
+            "--output-dir", "flag-out", "--encode-quality", "0.8",
+            "--set", "input.reader=auto",
+            "--set", "output.encode_quality=0.9",
+        ])
+        inv = assemble(args, base=Settings())
+        assert inv.options.video == "flag.mp4"
+        assert inv.options.output_dir == "flag-out"
+        assert inv.options.reader == "auto"
+        assert inv.options.encode_quality == 0.9
+
+    def test_set_can_override_resolved_settings(self, parser):
+        args = parser.parse_args([
+            *BASE, "--mlx-cache-limit-gb", "1.5",
+            "--set", "settings.mlx_cache_limit_gb=2.5",
+        ])
+        inv = assemble(args, base=Settings())
+        assert inv.settings.mlx_cache_limit_gb == 2.5
+
+    @pytest.mark.parametrize("body, match", [
+        ('[input]\nvidoe = "x.mp4"\n', r"\[input\].*vidoe"),
+        ('[output]\nencode_quality = "high"\n', "must be a number"),
+        ('[diagnostics]\nprobe_noise = "yes"\n', "must be a boolean"),
+    ])
+    def test_foundation_table_unknown_keys_and_types_fail(
+            self, parser, tmp_path: Path, body, match):
+        toml = tmp_path / "bad.toml"
+        toml.write_text(body)
+        args = parser.parse_args([*BASE, "--config", str(toml)])
+        with pytest.raises(ConfigError, match=match):
+            assemble(args, base=Settings())
+
+    def test_print_config_round_trips_a_complete_flag_invocation(
+            self, monkeypatch, tmp_path: Path, capsys):
+        import tomllib
+
+        from kinovsr.cli.commands.run import run_video_command
+        from kinovsr.media import video_reader
+
+        monkeypatch.setattr(
+            video_reader, "probe_video",
+            lambda _path: (640, 480, 25.0, 10, None, (1, 1)),
+        )
+        argv = [
+            "--video", str(tmp_path / "clip.mp4"),
+            "--output-dir", str(tmp_path / "out"),
+            "--denoise", "bsvd", "--bsvd-strength", "0.7",
+            "--print-config",
+        ]
+        assert run_video_command(argv) == 0
+        first_text = capsys.readouterr().out
+        first = tomllib.loads(first_text)
+        assert first["input"]["video"] == str(tmp_path / "clip.mp4")
+        assert first["denoise_bsvd"]["strength"] == 0.7
+
+        printed = tmp_path / "resolved.toml"
+        printed.write_text(first_text)
+        assert run_video_command([
+            "--config", str(printed), "--print-config",
+        ]) == 0
+        second = tomllib.loads(capsys.readouterr().out)
+        assert second == first
+
+
 class TestDeblockWeights:
     def test_family_weight_flags_are_independent(self, parser):
         args = parser.parse_args(
@@ -331,8 +421,7 @@ class TestTypedSourceLayout:
 
 
 class TestPipelineOwnedFlags:
-    """A [pipeline] config owns the whole chain; stage AND geometry flags
-    alongside it are a config error, not silently ignored (parity trap C8)."""
+    """A [pipeline] owns composition; registry-derived dials still merge."""
 
     def _flags(self, **overrides):
         from types import SimpleNamespace
@@ -342,10 +431,13 @@ class TestPipelineOwnedFlags:
         base = {
             "upscale": "none", "denoise": "off", "deblock": "off",
             "restore": "off", "nafnet": "off", "deflicker": "off",
-            "cut_detect": "off", "crop_bars": None, "crop_aspect": None,
+            "level": "off", "cut_detect": "off", "crop_bars": None,
+            "crop_aspect": None,
             "square_pixels": False, "sanitize_edges": None, "snap_start": False,
             "gop_align": False, "target_fps": None,
-            "temporal_mode": "normal"}
+            "temporal_mode": "normal", "vt_sr_flow": "vt",
+            "conform_cfr": None, "preprocess_order": None,
+            "denoise_first": False}
         base.update(overrides)
         return _pipeline_owned_flags(SimpleNamespace(**base))
 
@@ -354,12 +446,15 @@ class TestPipelineOwnedFlags:
 
     def test_stage_selector_is_flagged(self):
         assert "denoise" in self._flags(denoise="mc,bsvd")
+        assert "level" in self._flags(level="hist")
 
     def test_upscale_selector_is_flagged(self):
         assert "upscale" in self._flags(upscale="balanced")
 
-    def test_vt_sr_flow_is_flagged(self):
-        assert "vt_sr_flow" in self._flags(vt_sr_flow="vision")
+    def test_stage_dials_are_not_composition(self):
+        assert self._flags(vt_sr_flow="vision") == []
+        assert self._flags(temporal_mode="high") == []
+        assert self._flags(crop_anchor="top") == []
 
     def test_geometry_flags_are_flagged(self):
         # C8: crop/anamorphic/sanitize flags were silently ignored alongside
@@ -378,10 +473,13 @@ class TestPipelineOwnedFlags:
 
     def test_target_fps_is_rejected_with_an_explicit_pipeline(self):
         assert "target_fps" in self._flags(target_fps=50.0)
-        assert "temporal_mode" in self._flags(temporal_mode="high")
 
     def test_conform_cfr_is_rejected_with_an_explicit_pipeline(self):
         assert "conform_cfr" in self._flags(conform_cfr=30.0)
+
+    def test_ordering_flags_are_rejected_with_an_explicit_pipeline(self):
+        assert "preprocess_order" in self._flags(preprocess_order=["denoise"])
+        assert "denoise_first" in self._flags(denoise_first=True)
 
     def test_typed_command_returns_config_error_for_target_fps(self):
         from types import SimpleNamespace

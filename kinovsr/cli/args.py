@@ -94,15 +94,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--base-config", action="append", default=[], metavar="TOML",
         help=(
             "Base TOML config file; repeatable, applied in order before "
-            "--config. In M2 only the [settings] table is consumed (the "
-            "global settings trifecta: defaults < env < base TOML(s) < "
-            "specific TOML < CLI flags); pipeline/stage tables arrive with "
-            "the M3 builder."
+            "--config. Foundation and stage tables merge recursively; a "
+            "pipeline list replaces the earlier list. Flags then override "
+            "their matching settings/stages, followed by --set."
         ),
     )
     config_group.add_argument(
         "--config", metavar="TOML", default=None,
         help="Specific TOML overlay applied after every --base-config.",
+    )
+    config_group.add_argument(
+        "--set", action="append", default=[], metavar="TABLE.KEY=VALUE",
+        help=(
+            "Typed config override; repeatable and applied after config files "
+            "and flag dials. Values use TOML scalar syntax."
+        ),
+    )
+    config_group.add_argument(
+        "--print-config", action="store_true",
+        help="Print the fully resolved invocation as TOML and exit.",
     )
 
     add_argparse_args(parser, skip=settings_owned_dests())
@@ -112,6 +122,8 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_args(parser: argparse.ArgumentParser,
                   args: argparse.Namespace) -> None:
     """Cross-option checks that argparse cannot express per-flag."""
+    if not args.video:
+        parser.error("--video is required (or set [input] video in TOML)")
     if not args.output_dir and not (args.probe_noise and args.video):
         parser.error(
             "--output-dir is required unless --probe-noise is used with --video")

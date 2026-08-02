@@ -23,13 +23,13 @@ _log = logging.getLogger(__name__)
 def run_video_command(argv: list[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    validate_args(parser, args)
 
     try:
         invocation = assemble(args)
     except ConfigError as exc:
         _log.error("config error: %s", exc)
         return 2
+    validate_args(parser, invocation.options)
 
     settings = invocation.settings
     from kinovsr.ui import configure_logging_from_settings
@@ -39,7 +39,7 @@ def run_video_command(argv: list[str]) -> int:
     # --probe-noise analyzes instead of processing; same implementation
     # as `kinovsr probe noise`.
     options = invocation.options
-    if getattr(options, "probe_noise", False):
+    if getattr(options, "probe_noise", False) and not options.print_config:
         from pathlib import Path
 
         from .probe_noise import probe_noise
@@ -52,42 +52,7 @@ def run_video_command(argv: list[str]) -> int:
             chunk_size=options.video_chunk_size,
         )
 
-    # A config that declares a pipeline list runs through the typed
-    # pipeline as written; a flag-driven invocation assembles into the
-    # same typed config (M6 step 3: one engine, two authoring surfaces).
-    if invocation.config.get("pipeline") is not None:
-        return _run_typed(invocation)
-    return _run_typed(invocation, assemble_flags=True)
-
-
-# Flags that select stages on the flag-driven surface; a [pipeline]
-# config owns stage composition, so these cannot be combined with it.
-_STAGE_SELECTORS = (
-    ("upscale", "none"),
-    ("denoise", "off"),
-    ("deblock", "off"),
-    ("restore", "off"),
-    ("nafnet", "off"),
-    ("deflicker", "off"),
-    ("cut_detect", "off"),
-)
-
-# Geometry flags a [pipeline] config also owns (crop, anamorphic, junk-edge
-# sanitize compose as stages). Silently ignoring them was a parity trap;
-# reject them loudly like the stage selectors. A flag is "set" when its value
-# is not one of these unset sentinels. Keyframe windowing (--snap-start /
-# --gop-align) is NOT here: it is run-level orchestration like --start, now
-# threaded through the typed endpoints.
-_GEOMETRY_FLAGS = (
-    "crop_bars", "crop_aspect", "square_pixels", "sanitize_edges",
-)
-_PIPELINE_OPTIONS = (
-    ("target_fps", None),
-    ("temporal_mode", "normal"),
-    ("conform_cfr", None),
-    ("vt_sr_flow", "vt"),
-)
-_UNSET = (None, False, "off", "")
+    return _run_typed(invocation)
 
 
 def _pipeline_owned_flags(options) -> list[str]:
@@ -97,13 +62,9 @@ def _pipeline_owned_flags(options) -> list[str]:
     geometry/orchestration flag alongside it is a config error, not silently
     ignored.
     """
-    owned = [name for name, default in _STAGE_SELECTORS
-             if getattr(options, name, default) != default]
-    owned += [name for name in _GEOMETRY_FLAGS
-              if getattr(options, name, None) not in _UNSET]
-    owned += [name for name, default in _PIPELINE_OPTIONS
-              if getattr(options, name, default) != default]
-    return owned
+    from ..assemble_pipeline import compositional_flags
+
+    return compositional_flags(options)
 
 
 def _source_layout(config, *, source_color: str = "auto",
@@ -158,21 +119,23 @@ def _source_layout(config, *, source_color: str = "auto",
     return Layout.MLX_RGB_HWC
 
 
-def _run_typed(invocation, assemble_flags: bool = False) -> int:
+def _run_typed(invocation) -> int:
     """Run file-to-file through the typed pipeline.
 
-    ``assemble_flags=False``: the invocation carries a hand-written
-    ``[pipeline]`` config; stage/geometry flags alongside it are a config
-    error (C8). ``assemble_flags=True``: the flag surface IS the config
-    source - the stage selectors and geometry flags assemble into the
-    same typed config after the source is probed.
+    A hand-written ``[pipeline]`` owns composition; otherwise the structural
+    flags create it after the source probe. Both routes then share the same
+    stage-dial and typed-override merge.
     """
     from datetime import datetime
     from pathlib import Path
     from uuid import uuid4
 
     options = invocation.options
-    selected = () if assemble_flags else _pipeline_owned_flags(options)
+    selected = (
+        _pipeline_owned_flags(options)
+        if "pipeline" in invocation.config
+        else ()
+    )
     if selected:
         flags = ", ".join("--" + n.replace("_", "-") for n in selected)
         _log.error(
@@ -181,7 +144,7 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
             flags,
         )
         return 2
-    if not options.output_dir:
+    if not options.output_dir and not (options.print_config and options.probe_noise):
         _log.error("config error: --output-dir is required")
         return 2
 
@@ -215,6 +178,25 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
         except (OSError, RuntimeError, PipelineError) as fallback_exc:
             _log.error("cannot open %s: %s", video, fallback_exc)
             return 2
+
+    # Resolve both authoring surfaces here because the flag-owned crop chain
+    # needs the probed dimensions for its evenness adjustment.
+    from ..assemble_pipeline import resolve_pipeline_config
+
+    try:
+        config = resolve_pipeline_config(
+            options, invocation.config, width=_w, height=_h)
+    except (ConfigError, PipelineError) as exc:
+        _log.error("config error: %s", exc)
+        return 2
+    if options.print_config:
+        from kinovsr.config import dump_config
+        from kinovsr.ui import configure_machine_output
+
+        output_log = configure_machine_output("kinovsr.cli.config_output")
+        output_log.info("%s", dump_config(config).rstrip("\n"))
+        return 0
+
     # A time-form window needs the real clock when it is not uniform;
     # frame-form windows are ordinals and need no table walk.
     trim_table = None
@@ -270,18 +252,6 @@ def _run_typed(invocation, assemble_flags: bool = False) -> int:
     limit = resolve_mlx_cache_limit_gb(invocation.settings)
     if limit > 0:
         _log.info("MLX cache limit: %g GB", limit)
-
-    # The flag surface assembles into the same typed config a hand-written
-    # [pipeline] TOML expresses (the probed dims feed the evenness bump).
-    config = invocation.config
-    if assemble_flags:
-        from ..assemble_pipeline import assemble_pipeline
-
-        try:
-            config = assemble_pipeline(options, width=_w, height=_h)
-        except ConfigError as exc:
-            _log.error("config error: %s", exc)
-            return 2
 
     try:
         from kinovsr.ui import RichReporter

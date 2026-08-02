@@ -20,7 +20,9 @@ from kinovsr.settings import (
 ALL_ENV_VARS = [
     "KINOVSR_VERBOSE", "KINOVSR_QUIET",
     "SHARED_TEMP_DIR", "TMPDIR", "KINOVSR_MLX_CACHE_LIMIT_GB",
-    "KINOVSR_BSVD_DIRECT",
+    "KINOVSR_CACHE_DIR", "XDG_CACHE_HOME",
+    "KINOVSR_SPYNET_BACKEND", "SPYNET_BACKEND",
+    "KINOVSR_BSVD_BACKEND", "BSVD_BACKEND", "KINOVSR_BSVD_DIRECT",
     "BASICVSRPP_WEIGHTS", "BASICVSRPP_RESTORE_WEIGHTS", "BSVD_WEIGHTS",
     "ESC_WEIGHTS", "FASTDVD_WEIGHTS", "FBCNN_WEIGHTS", "NAFNET_WEIGHTS",
     "PVDD_WEIGHTS", "REALBASICVSR_WEIGHTS", "REALESRGAN_WEIGHTS",
@@ -60,6 +62,23 @@ def test_from_env_reads_declared_variables(monkeypatch):
     assert s.toflow_graph == "/some/graph.json"
     assert s.bsvd_direct == "require"
     assert s.bsvd_weights is None
+
+
+def test_prefixed_backend_env_wins_over_legacy(monkeypatch):
+    monkeypatch.setenv("SPYNET_BACKEND", "mlx")
+    monkeypatch.setenv("KINOVSR_SPYNET_BACKEND", "ane")
+    monkeypatch.setenv("BSVD_BACKEND", "ane")
+    monkeypatch.setenv("KINOVSR_BSVD_BACKEND", "mpsgraph")
+    settings = Settings.from_env()
+    assert settings.spynet_backend == "ane"
+    assert settings.bsvd_backend == "mpsgraph"
+
+
+def test_cache_dir_fallback_is_isolated_and_ordered(monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", "/xdg")
+    assert Settings.from_env().cache_dir == "/xdg/KinoVSR"
+    monkeypatch.setenv("KINOVSR_CACHE_DIR", "/kinovsr")
+    assert Settings.from_env().cache_dir == "/kinovsr"
 
 
 def test_weight_fields_stay_strings_for_variant_tokens(monkeypatch):

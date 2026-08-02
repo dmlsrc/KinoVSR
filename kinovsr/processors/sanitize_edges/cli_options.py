@@ -7,6 +7,7 @@ SANITIZE_EDGE_OPTIONS = [
         group='Trim, Cropping, And Cuts',
         metavar='auto|T,B,L,R',
         family='sanitize_edges',
+        compositional=True,
         help='Detect and clean synthetic border junk (letterbox lines, capture garbage rows) BEFORE any processor sees the frame: the affected edge rows/cols are overwritten with the adjacent interior line (replicate fill), because learned restorers are trained on photographic content and hallucinate texture around synthetic edges. Frame dimensions and pixel-aspect are untouched, so the output geometry is identical. auto (needs --video) samples early frames and only trims edges that are anomalous in every sample, capped at 8 px per edge; thick constant bars (letterbox-class) are reported but never filled -- crop those instead. T,B,L,R forces explicit per-edge pixel counts. Default: off.'),
     Opt(flag='--sanitize-edges-fill',
         group='Trim, Cropping, And Cuts',

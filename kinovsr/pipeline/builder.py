@@ -20,7 +20,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from kinovsr.config import validate_config
-from kinovsr.config.merge import resolve_stage_config, split_stage_table
+from kinovsr.config.merge import merge_configs, split_stage_table
 from kinovsr.processors import (
     BoundaryKind,
     BracketFactory,
@@ -167,7 +167,7 @@ def _resolve_stage(
     profile_defaults = getattr(factory, "profile_defaults", None)
     if profile is not None and callable(profile_defaults):
         preset = profile_defaults(capability=capability, profile=profile)
-    resolved = resolve_stage_config(None, preset, family_settings)
+    resolved = merge_configs(preset or {}, family_settings)
 
     try:
         config = factory.parse_config(

@@ -3,6 +3,13 @@
 from kinovsr.cli.options import Opt
 
 REALESRGAN_OPTIONS = [
+    Opt(flag='--realesrgan-scale',
+        group='Spatial Upscalers',
+        type=int,
+        metavar='N',
+        family='realesrgan',
+        key='scale',
+        help='Declared output scale for an explicit --realesrgan-weights path; must match the checkpoint and any named profile.'),
     Opt(flag='--realesrgan-weights',
         group='Spatial Upscalers',
         metavar='PATH',

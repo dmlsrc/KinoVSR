@@ -8,6 +8,7 @@ DEFLICKER_OPTIONS = [
         default='off',
         choices=('off', 'on'),
         family='deflicker',
+        compositional=True,
         help='Verified-static temporal state integration, run before deblock/denoise. For starved, loop-filtered encodes whose damage is temporally UNSTABLE quantization states on static content (GOP pulses, coding-cadence flicker, re-quantization flashes): integrates each pixel over a +/-window trajectory, but ONLY where phase correlation verifies the surrounding 32px tiles as static between the two frames -- moving content is passthrough BY CONSTRUCTION, and nothing is ever warped, so misalignment cannot smear. A pixel is only ever replaced by an average of its own trajectory samples (no spatial mixing: no softening budget); real content changes are one-sided in time and refuse the two-sided consensus gate. Lets --denoise run gentler on compressed junk.'),
     Opt(flag='--deflicker-window',
         group='Temporal Restore And Deflicker',

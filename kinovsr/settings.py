@@ -13,8 +13,10 @@ Each :class:`Settings` field declares its env source(s) in
 ``metadata["env"]``. A single string is one source; a list is a fallback
 chain (try the first; if unresolved, try the next).
 
-**Substitution is explicit, never implicit:** ``{{VAR}}`` references are
-looked up in ``os.environ``; entries with no ``{{}}`` are literal values.
+**Substitution is explicit, never implicit:** only ``metadata["env"]``
+templates resolve ``{{VAR}}`` through ``os.environ``; TOML, ``--set``, and
+ordinary CLI values keep braces literally. Entries with no ``{{}}`` are
+literal values.
 A bare string like ``"/tmp"`` in a fallback list reads as a literal path,
 not an env-var name, so a chain like ``["{{SHARED_TEMP_DIR}}", "/tmp"]``
 cannot accidentally treat the fallback as a variable name. If any
@@ -145,7 +147,8 @@ class Settings:
     # with an automatic fall back to MLX), "ane" (require the ANE path), or
     # "mlx" (pure MLX only).
     spynet_backend: str = field(
-        default="auto", metadata={"env": "{{SPYNET_BACKEND}}"})
+        default="auto", metadata={
+            "env": ["{{KINOVSR_SPYNET_BACKEND}}", "{{SPYNET_BACKEND}}"]})
 
     # Which BSVD implementation runs: "mlx" (the reference GPU path,
     # default - it is the faster standalone), "ane" (one Core ML dispatch
@@ -155,7 +158,8 @@ class Settings:
     # no Core ML involved). The ANE paths pay off in chains where other
     # stages need the GPU they vacate.
     bsvd_backend: str = field(
-        default="mlx", metadata={"env": "{{BSVD_BACKEND}}"})
+        default="mlx", metadata={
+            "env": ["{{KINOVSR_BSVD_BACKEND}}", "{{BSVD_BACKEND}}"]})
 
     # Which implementation serves large BSVD ANE graphs: "auto" selects the
     # direct private route where the Core ML graph would need its fp32 island,
@@ -174,7 +178,7 @@ class Settings:
 
     basicvsrpp_weights: str | None = field(
         default=None, metadata={"env": "{{BASICVSRPP_WEIGHTS}}"})
-    basicvsrpp_restore_weights: str | None = field(
+    restore_weights: str | None = field(
         default=None, metadata={"env": "{{BASICVSRPP_RESTORE_WEIGHTS}}"})
     bsvd_weights: str | None = field(
         default=None, metadata={"env": "{{BSVD_WEIGHTS}}"})
@@ -200,7 +204,7 @@ class Settings:
         default=None, metadata={"env": "{{REALVIFORMER_WEIGHTS}}"})
     safmn_weights: str | None = field(
         default=None, metadata={"env": "{{SAFMN_WEIGHTS}}"})
-    spynet_weights: str | None = field(
+    mc_flow_weights: str | None = field(
         default=None, metadata={"env": "{{SPYNET_WEIGHTS}}"})
     stdf_weights: str | None = field(
         default=None, metadata={"env": "{{STDF_WEIGHTS}}"})

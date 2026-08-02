@@ -244,7 +244,7 @@ class McTemporalDenoiser:
         self._prev: Any = None
         self._hist: list[Any] = []
         if self.flow_source == "spynet":
-            path = flow_weights or default_settings().spynet_weights
+            path = flow_weights or default_settings().mc_flow_weights
             if not path:
                 # The stock checkpoint ships as the shared modeling
                 # component (5.5 MB); the family package carries none.
@@ -947,7 +947,8 @@ class McFactory:
             occlusion=typed_value(raw, "occlusion", bool, False),
             confidence=typed_value(raw, "confidence", bool, False),
             flow=flow,
-            flow_weights=(typed_value(raw, "flow_weights", str) or settings.spynet_weights),
+            flow_weights=(typed_value(raw, "flow_weights", str)
+                          or settings.mc_flow_weights),
             noise_map=parse_noise_map(raw),
             luma_strength=luma_strength,
             chroma_strength=chroma_strength,

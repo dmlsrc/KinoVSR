@@ -134,7 +134,7 @@ class BasicVsrppFactory:
             raise ValueError("history_strength must be >= 0")
         if restore:
             weights = (typed_value(raw, "weights", str)
-                       or settings.basicvsrpp_restore_weights
+                       or settings.restore_weights
                        or profile or _RESTORE_DEFAULT)
         else:
             weights = (typed_value(raw, "weights", str)

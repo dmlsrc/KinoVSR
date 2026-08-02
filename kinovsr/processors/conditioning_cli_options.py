@@ -40,6 +40,7 @@ NOISE_MAP_OPTIONS = [
         default=False,
         family='noise_map',
         key='debug',
+        config_table='diagnostics',
         help='With --noise-map auto: after the run, write the estimated sigma map as <output>_noisemap.png (grayscale, sigma 0..0.15 -> black..white) and print its stats, so the estimate can be eyeballed.'),
     Opt(flag='--noise-map-refresh',
         group='Denoise And Noise Maps',

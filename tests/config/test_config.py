@@ -2,19 +2,30 @@
 
 from __future__ import annotations
 
+import tomllib
+from fractions import Fraction
+
 import pytest
 
 from kinovsr.config import (
     ConfigError,
     apply_set_overrides,
     compose_config,
+    dump_config,
     load_config,
     merge_configs,
     parse_set_argument,
-    resolve_stage_config,
     split_stage_table,
     validate_config,
 )
+from kinovsr.pipeline import resolve_pipeline
+from kinovsr.processors import (
+    Geometry,
+    StreamSpec,
+    TimelineSpec,
+    frame_spec_for_matrix,
+)
+from kinovsr.settings import Settings
 
 # The documented example pair from the planning target structure: a base
 # config with a stage library and a clip overlay that restates the list.
@@ -26,10 +37,11 @@ quiet = false
 mlx_cache_limit_gb = 1.0
 
 [input]
+video = "clip.mp4"
 
 [output]
-codec = "hevc"
-audio = "copy"
+output_dir = "out"
+audio = true
 
 [denoise]
 processor = "bsvd"
@@ -59,7 +71,7 @@ profile = "deblur_dvd"
 [upscale]
 processor = "realesrgan"
 profile = "general"
-tile_size = 512
+denoise_strength = 0.35
 """
 
 
@@ -123,10 +135,26 @@ def test_compose_base_plus_clip_matches_documented_semantics(base_and_clip):
     assert cfg["restore"] == {"processor": "basicvsrpp", "profile": "deblur_dvd"}
     # Overlay swapped the upscaler and added a setting.
     assert cfg["upscale"] == {
-        "processor": "realesrgan", "profile": "general", "tile_size": 512}
+        "processor": "realesrgan", "profile": "general",
+        "denoise_strength": 0.35}
     # Foundation tables pass through untouched.
-    assert cfg["output"] == {"codec": "hevc", "audio": "copy"}
+    assert cfg["input"] == {"video": "clip.mp4"}
+    assert cfg["output"] == {"output_dir": "out", "audio": True}
     validate_config(cfg)
+
+
+def test_documented_example_preflights_through_family_parsers(base_and_clip):
+    base, clip = base_and_clip
+    config = compose_config([base], clip)
+    stream = StreamSpec(
+        frame=frame_spec_for_matrix(
+            "bt709", full_range=False, geometry=Geometry(640, 480)),
+        timeline=TimelineSpec(
+            time_base=Fraction(1, 24000), cadence=Fraction(25)),
+    )
+    assert resolve_pipeline(
+        config, input_spec=stream, settings=Settings()
+    ).output_spec is not None
 
 
 def test_compose_applies_bases_in_order(tmp_path):
@@ -149,6 +177,20 @@ def test_load_config_errors_name_the_file(tmp_path):
         load_config(bad)
     with pytest.raises(ConfigError, match="missing.toml"):
         load_config(tmp_path / "missing.toml")
+
+
+def test_dump_config_round_trips_resolved_data():
+    config = {
+        "pipeline": ["denoise-one", "upscale"],
+        "settings": {"quiet": True, "mlx_cache_limit_gb": 1.5},
+        "input": {"video": "a clip.mp4", "snap_start": False},
+        "denoise-one": {
+            "processor": "bsvd", "strength": 0.3,
+            "tuning": {"passes": 2, "enabled": True},
+        },
+        "upscale": {"processor": "safmn", "scale": 4},
+    }
+    assert tomllib.loads(dump_config(config)) == config
 
 
 # ---- typed --set ----------------------------------------------------------------
@@ -246,6 +288,22 @@ def test_validate_top_level_scalar_rejected():
         validate_config({"quiet": True})
 
 
+def test_validate_unknown_top_level_table_rejected():
+    with pytest.raises(ConfigError, match="unknown top-level table.*setings"):
+        validate_config({"setings": {"quiet": True}})
+
+
+def test_validate_unlisted_stage_library_table_is_legal():
+    validate_config({"unused": {"processor": "bsvd", "strength": 0.3}})
+
+
+def test_validate_flag_path_may_defer_partial_stage_table():
+    validate_config(
+        {"denoise_bsvd": {"strength": 0.3}},
+        allow_stage_fragments=True,
+    )
+
+
 def test_validate_pipeline_must_be_string_list():
     with pytest.raises(ConfigError, match="pipeline"):
         validate_config({"pipeline": "denoise"})
@@ -267,9 +325,6 @@ def test_validate_selector_types():
             "pipeline": ["s"], "s": {"processor": "toflow", "capability": 3}})
 
 
-# ---- stage precedence ----------------------------------------------------------------
-
-
 def test_split_stage_table_reserved_vs_family_keys():
     selector, settings = split_stage_table({
         "processor": "toflow", "capability": "deblock", "profile": "deblock",
@@ -277,24 +332,3 @@ def test_split_stage_table_reserved_vs_family_keys():
     assert selector == {
         "processor": "toflow", "capability": "deblock", "profile": "deblock"}
     assert settings == {"passes": 1, "flow_scale": "half"}
-
-
-def test_stage_precedence_defaults_profile_table_set():
-    resolved = resolve_stage_config(
-        family_defaults={"strength": 1.0, "window": 14, "mode": "auto"},
-        profile_preset={"strength": 0.5, "weights": "gopro"},
-        stage_settings={"strength": 0.35, "passes": 2},
-        set_overrides={"passes": 3},
-    )
-    assert resolved == {
-        "strength": 0.35,   # stage table beats profile beats defaults
-        "window": 14,       # untouched default survives
-        "mode": "auto",
-        "weights": "gopro",  # profile contribution survives
-        "passes": 3,        # --set beats the stage table
-    }
-
-
-def test_stage_precedence_layers_are_optional():
-    assert resolve_stage_config(None, None, {"x": 1}, None) == {"x": 1}
-    assert resolve_stage_config(None, None, None, None) == {}

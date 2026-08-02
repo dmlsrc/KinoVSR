@@ -15,11 +15,10 @@ TOML expresses, encoding the harness's semantics:
   ``auto`` values resolve in the probe pass), with the harness's +1px
   even-bump applied here for explicit counts;
 - every ``--<family>-<key>`` dial routed into its stage table via the
-  registry's ``family=``/``key=`` metadata, with the shared groups
+  registry's targeting metadata, with the shared groups
   (denoise/deblock/restore dials, noise-map and deblock-map
   conditioning) distributed across their slot's members exactly as the
-  harness applied them. Dials for families not in the chain are ignored,
-  as the harness ignored them.
+  harness applied them. A set dial with no matching stage is an error.
 
 Run-level flags (trim window, gop windowing, cut log, encode, audio,
 dumps) are NOT mapped here - they already thread through
@@ -29,11 +28,17 @@ dumps) are NOT mapped here - they already thread through
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
-from kinovsr.config import ConfigError
+from kinovsr.config import (
+    ConfigError,
+    apply_set_overrides,
+    merge_configs,
+    validate_config,
+)
 
-from .options import PP_STAGE_NAMES
+from .options import PP_STAGE_NAMES, option_roles
 
 _log = logging.getLogger(__name__)
 
@@ -62,12 +67,25 @@ _SLOT_KEY_UNSUPPORTED = {
     ("denoise", "strength"): ("pvdd",),
 }
 
-# Flag-groups consumed structurally below; the generic registry
-# distribution skips them.
-_SPECIAL_FAMILIES = frozenset({
-    "crop", "sanitize_edges", "cut", "gop", "denoise", "deblock",
-    "restore", "noise_map", "deblock_map", "toflow_sr",
-})
+_SLOT_FAMILIES = frozenset({"denoise", "deblock", "restore"})
+_BROADCAST_FAMILIES = frozenset({"noise_map", "deblock_map"})
+
+
+def compositional_flags(options: Any) -> list[str]:
+    """Set options that would compete with a TOML-owned stage list.
+
+    The ownership set lives on the parser registry rows consumed by this
+    assembler.  That keeps parsing, assembly, and the conflict guard on one
+    source of truth.
+    """
+    from ._registry import REGISTRY
+
+    return [
+        opt.resolved_dest
+        for opt in REGISTRY
+        if opt.compositional
+        and getattr(options, opt.resolved_dest, opt.default) != opt.default
+    ]
 
 
 def _set_flags(options: Any) -> list:
@@ -77,8 +95,7 @@ def _set_flags(options: Any) -> list:
 
     rows = []
     for opt in REGISTRY:
-        family = getattr(opt, "family", None)
-        if family is None:
+        if "dial" not in option_roles(opt):
             continue
         value = getattr(options, opt.resolved_dest, opt.default)
         if value is None or value == opt.default:
@@ -131,6 +148,162 @@ def _slot_values(opt: Any, raw_value: Any,
     return [_coerce(opt, token) for token in tokens]
 
 
+def _stage_capability(name: str, table: Mapping[str, Any]) -> str:
+    """Return a stage's effective capability without parsing its config."""
+    token = table.get("capability")
+    if isinstance(token, str):
+        return token
+
+    from kinovsr.pipeline.builder import _resolve_capability
+    from kinovsr.processors import get_factory
+
+    factory = get_factory(table.get("processor"))
+    return _resolve_capability(
+        name, factory, None, table.get("profile")
+    ).value
+
+
+def apply_flag_dials(config: Mapping[str, Any], options: Any) -> dict[str, Any]:
+    """Overlay set CLI dials on stages from either chain producer.
+
+    Slot dials target effective capabilities in pipeline order.  Family dials
+    target processors, with the few multi-capability exceptions declared on
+    their registry rows.  The input mapping and its stage tables are not
+    mutated.
+    """
+    out = dict(config)
+    pipeline = list(out.get("pipeline", []))
+    for name in set(pipeline):
+        table = out.get(name)
+        if isinstance(table, Mapping):
+            out[name] = dict(table)
+
+    def members(
+        capability: str | None = None,
+        processors: tuple[str, ...] | None = None,
+    ) -> list[str]:
+        names = []
+        for name in pipeline:
+            table = out.get(name)
+            if not isinstance(table, Mapping):
+                continue
+            if processors is not None and table.get("processor") not in processors:
+                continue
+            if capability is not None and _stage_capability(name, table) != capability:
+                continue
+            names.append(name)
+        return names
+
+    # Broadcast/slot fills precede family-specific flags, so the narrower flag
+    # wins regardless of registry fragment order.
+    rows = _set_flags(options)
+    broad = _SLOT_FAMILIES | _BROADCAST_FAMILIES
+    ordered = ([row for row in rows if row[0].family in broad]
+               + [row for row in rows if row[0].family not in broad])
+    conditioned: list[tuple[Any, str]] = []
+    for opt, raw_value in ordered:
+        family, key = opt.family, opt.key
+        value = _coerce(opt, raw_value)
+        if family == "noise_map":
+            stage_key = "noise_map" if key is None else f"noise_map_{key}"
+            names = members("denoise", _NOISE_MAP_FAMILIES)
+            if not names:
+                raise ConfigError(
+                    f"{opt.flag} applies to no stage accepting a noise map")
+            for name in names:
+                out[name][stage_key] = value
+            conditioned.append((opt, stage_key))
+            continue
+        if family == "deblock_map":
+            stage_key = "deblock_map" if key is None else f"deblock_map_{key}"
+            names = members("deblock", _DEBLOCK_MAP_FAMILIES)
+            if not names:
+                raise ConfigError(
+                    f"{opt.flag} targets no deblock stage accepting a block map")
+            for name in names:
+                out[name][stage_key] = value
+            continue
+        if family in _SLOT_FAMILIES:
+            if key is None:
+                continue
+            names = members(family)
+            if not names:
+                raise ConfigError(
+                    f"{opt.flag} targets no {family} stage in the pipeline")
+            blocked = _SLOT_KEY_UNSUPPORTED.get((family, key), ())
+            skipped = []
+            for name, slot_value in zip(
+                    names, _slot_values(opt, raw_value, names), strict=True):
+                if out[name]["processor"] in blocked:
+                    skipped.append(name)
+                    continue
+                out[name][key] = slot_value
+            for name in skipped:
+                _log.warning(
+                    "%s does not apply to %s: PVDD has no dry/wet dial "
+                    "(its intensity comes from noise conditioning: "
+                    "--pvdd-noise-preset / --pvdd-noise-variance, or "
+                    "--noise-map auto with --pvdd-profile pvdd_level); "
+                    "the stage runs at full effect", opt.flag, name)
+            if names and skipped and len(skipped) == len(names):
+                raise ConfigError(
+                    f"{opt.flag} applies to no stage in this chain")
+            continue
+        if key is None:
+            continue
+        if (family == "sanitize_edges" and key == "fill" and value == "trim"
+                and getattr(options, "sanitize_edges", None)):
+            continue                      # folded into the generated crop stage
+
+        processor = opt.stage_processor or family
+        capabilities = frozenset(opt.stage_capabilities)
+        applied = 0
+        for name in pipeline:
+            table = out.get(name)
+            if not isinstance(table, Mapping) or table.get("processor") != processor:
+                continue
+            if capabilities and _stage_capability(name, table) not in capabilities:
+                continue
+            if (processor == "crop" and key in {"anchor", "offset"}
+                    and "aspect" not in table):
+                continue
+            out[name][key] = value
+            applied += 1
+        if not applied:
+            target = processor
+            if capabilities:
+                target += " (" + ", ".join(sorted(capabilities)) + ")"
+            raise ConfigError(f"{opt.flag} targets no {target} stage in the pipeline")
+
+    # A broadcast noise map may be accepted by the family in general but not
+    # by the selected blind PVDD profile.  Strip that one target, retaining the
+    # existing warning/error contract for a broadcast that reaches nothing.
+    for name in pipeline:
+        table = out[name]
+        if table.get("processor") != "pvdd":
+            continue
+        if "level" in (table.get("profile") or "pvdd"):
+            continue
+        stripped = [k for k in table if k.startswith("noise_map")]
+        if stripped:
+            for key in stripped:
+                del table[key]
+            _log.warning(
+                "noise map does not apply to %s: PVDD profile %r is blind "
+                "(use --pvdd-profile pvdd_level for map conditioning); the "
+                "stage runs unconditioned",
+                name, table.get("profile", "pvdd"))
+    if getattr(options, "noise_map", None) == "auto" and not any(
+            out[name].get("noise_map") == "auto" for name in pipeline):
+        raise ConfigError(
+            "--noise-map auto applies to no stage in this chain (capable: "
+            "mc, bsvd, fastdvdnet, and pvdd with a level profile)")
+    for opt, stage_key in conditioned:
+        if not any(stage_key in out[name] for name in pipeline):
+            raise ConfigError(f"{opt.flag} applies to no stage in this chain")
+    return out
+
+
 def _bump_even(edges: list[int], width: int, height: int) -> list[int]:
     """The harness's evenness bump: eat one content pixel bottom/right so
     the active area keeps even dimensions."""
@@ -141,7 +314,13 @@ def _bump_even(edges: list[int], width: int, height: int) -> list[int]:
     return edges
 
 
-def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
+def assemble_pipeline(
+    options: Any,
+    *,
+    width: int,
+    height: int,
+    base_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """The [pipeline] config equivalent of a flag invocation.
 
     ``width``/``height`` are the probed source dimensions (the evenness
@@ -152,9 +331,8 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
 
     config: dict[str, Any] = {}
     pipeline: list[str] = []
-    slot_members: dict[str, list[str]] = {}   # slot -> stage names, in order
 
-    def add(name: str, table: dict, slot: str | None = None) -> None:
+    def add(name: str, table: dict) -> None:
         # A family repeated in one chain (--denoise mc,mc) is a request for
         # two independently configured passes, so each instance needs its
         # own table. Sharing one would make the positional dial lists
@@ -166,8 +344,6 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
             name = f"{name}_{suffix}"
         config[name] = table
         pipeline.append(name)
-        if slot is not None:
-            slot_members.setdefault(slot, []).append(name)
 
     # ---- timeline: explicit CFR conform (ingest normalization) -----------
     # First in the chain: it retains one frame of lookahead, which the
@@ -260,29 +436,29 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
             for variant in chain(options.restore):
                 add(f"restore_{variant}", {
                     "processor": "basicvsrpp", "capability": "restore",
-                    "profile": variant}, slot="restore")
+                    "profile": variant})
         elif slot == "level" and options.level != "off":
-            add("level", {"processor": "level"}, slot="level")
+            add("level", {"processor": "level"})
         elif slot == "deflicker" and options.deflicker != "off":
-            add("deflicker", {"processor": "deflicker"}, slot="deflicker")
+            add("deflicker", {"processor": "deflicker"})
         elif slot == "deblock" and options.deblock != "off":
             for family in chain(options.deblock):
                 table = {
                     "processor": family,
                     "capability": "deblock",
                 }
-                add(f"deblock_{family}", table, slot="deblock")
+                add(f"deblock_{family}", table)
         elif slot == "denoise" and options.denoise != "off":
             for family in chain(options.denoise):
                 table = {
                     "processor": family,
                     "capability": "denoise",
                 }
-                add(f"denoise_{family}", table, slot="denoise")
+                add(f"denoise_{family}", table)
         elif slot == "nafnet" and options.nafnet != "off":
             capability, profile = _NAFNET[options.nafnet]
             add("nafnet", {"processor": "nafnet", "capability": capability,
-                           "profile": profile}, slot="nafnet")
+                           "profile": profile})
 
     # ---- upscale + frame-rate conversion ---------------------------------
     if options.upscale in _VT_MODES:
@@ -297,14 +473,14 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
                     "--vt-sr-flow is only valid with --upscale balanced"
                 )
             table["flow"] = options.vt_sr_flow
-        add("upscale", table, slot="upscale")
+        add("upscale", table)
     elif options.upscale != "none":
         if options.vt_sr_flow != "vt":
             raise ConfigError(
                 "--vt-sr-flow is only valid with --upscale balanced"
             )
         table = {"processor": options.upscale, "capability": "upscale"}
-        add("upscale", table, slot="upscale")
+        add("upscale", table)
     elif options.vt_sr_flow != "vt":
         raise ConfigError(
             "--vt-sr-flow is only valid with --upscale balanced"
@@ -316,109 +492,40 @@ def assemble_pipeline(options: Any, *, width: int, height: int) -> dict:
                     "profile": options.temporal_mode,
                     "target_fps": options.target_fps})
 
-    # ---- registry-driven dial routing ------------------------------------
-    def members(slot: str, families: tuple[str, ...] | None = None) -> list:
-        names = slot_members.get(slot, ())
-        if families is None:
-            return list(names)
-        return [n for n in names if config[n]["processor"] in families]
-
-    # Shared slot fills first, family-specific dials second, so a family
-    # flag (--bsvd-strength) deterministically overrides its slot's shared
-    # dial (--denoise-strength) regardless of registry row order.
-    rows = _set_flags(options)
-    ordered = ([r for r in rows if r[0].family in _SPECIAL_FAMILIES]
-               + [r for r in rows if r[0].family not in _SPECIAL_FAMILIES])
-    for opt, raw_value in ordered:
-        family, key = opt.family, getattr(opt, "key", None)
-        value = _coerce(opt, raw_value)
-        if family in ("gop",):
-            continue                      # run-level, threaded separately
-        if family == "cut":
-            # An unset threshold stays absent so the family resolves its
-            # per-mode default (the modes' statistics differ in scale).
-            if (key in ("detect", "threshold") and "cut" in config
-                    and value is not None):
-                config["cut"][key] = value
-            continue                      # log is run-level
-        if family == "noise_map":
-            if key == "debug":
-                continue                  # run-level (noise_map_debug)
-            stage_key = "noise_map" if key is None else f"noise_map_{key}"
-            for name in members("denoise", _NOISE_MAP_FAMILIES):
-                config[name][stage_key] = value
-            continue
-        if family == "deblock_map":
-            stage_key = "deblock_map" if key is None else f"deblock_map_{key}"
-            for name in members("deblock", _DEBLOCK_MAP_FAMILIES):
-                config[name][stage_key] = value
-            continue
-        if family in ("denoise", "deblock", "restore"):
-            if key is None or key == "first":
-                continue                  # the selector / ordering itself
-            names = members(family)
-            blocked = _SLOT_KEY_UNSUPPORTED.get((family, key), ())
-            skipped = []
-            for name, slot_value in zip(
-                    names, _slot_values(opt, raw_value, names), strict=True):
-                if config[name]["processor"] in blocked:
-                    skipped.append(name)
-                    continue
-                config[name][key] = slot_value
-            for name in skipped:
-                _log.warning(
-                    "%s does not apply to %s: PVDD has no dry/wet dial "
-                    "(its intensity comes from noise conditioning: "
-                    "--pvdd-noise-preset / --pvdd-noise-variance, or "
-                    "--noise-map auto with --pvdd-profile pvdd_level); "
-                    "the stage runs at full effect", opt.flag, name)
-            if names and skipped and len(skipped) == len(names):
-                raise ConfigError(
-                    f"{opt.flag} applies to no stage in this chain")
-            continue
-        if family == "toflow_sr":
-            up = config.get("upscale")
-            if up is not None and up["processor"] == "toflow":
-                up[key] = value
-            continue
-        if family in _SPECIAL_FAMILIES or key is None:
-            continue                      # geometry built structurally above
-        # Family-specific dial: every stage of that processor gets it
-        # (family flags override the shared-slot fills applied above
-        # because the registry lists them after the shared rows).
-        for name in pipeline:
-            if config[name]["processor"] == family:
-                config[name][key] = value
-
-    # ---- broadcast conditioning is capability-scoped, not a build error --
-    # The shared --noise-map dial fans out to every capable denoiser in the
-    # slot; a stage whose loaded model cannot take a map (a blind PVDD
-    # checkpoint) is skipped with a warning instead of refusing the whole
-    # chain. An explicit per-stage noise_map in a hand-written [pipeline]
-    # config still hits the family's loud guard.
-    for name in pipeline:
-        table = config[name]
-        if table.get("processor") != "pvdd":
-            continue
-        if "level" in (table.get("profile") or "pvdd"):
-            continue
-        stripped = [k for k in table if k.startswith("noise_map")]
-        if stripped:
-            for k in stripped:
-                del table[k]
-            _log.warning(
-                "noise map does not apply to %s: PVDD profile %r is blind "
-                "(use --pvdd-profile pvdd_level for map conditioning); the "
-                "stage runs unconditioned",
-                name, table.get("profile", "pvdd"))
-    if getattr(options, "noise_map", None) == "auto" and not any(
-            config[n].get("noise_map") == "auto" for n in pipeline):
-        raise ConfigError(
-            "--noise-map auto applies to no stage in this chain (capable: "
-            "mc, bsvd, fastdvdnet, and pvdd with a level profile)")
-
     config["pipeline"] = pipeline
-    return config
+    # A flag-owned chain still consumes matching TOML stage tables.  Generated
+    # selectors win; table settings survive; explicit dials are overlaid last.
+    composed = merge_configs(base_config or {}, config)
+    return apply_flag_dials(composed, options)
 
 
-__all__ = ["assemble_pipeline"]
+def resolve_pipeline_config(
+    options: Any,
+    config: Mapping[str, Any],
+    *,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    """Resolve either authoring surface through the same merge pipeline."""
+    if "pipeline" in config:
+        owned = compositional_flags(options)
+        if owned:
+            flags = ", ".join("--" + name.replace("_", "-") for name in owned)
+            raise ConfigError(
+                "a [pipeline] config owns the full chain; drop the flags "
+                f"({flags}) or the pipeline table")
+        resolved = apply_flag_dials(config, options)
+    else:
+        resolved = assemble_pipeline(
+            options, width=width, height=height, base_config=config)
+    resolved = apply_set_overrides(resolved, getattr(options, "set", None))
+    validate_config(resolved)
+    return resolved
+
+
+__all__ = [
+    "apply_flag_dials",
+    "assemble_pipeline",
+    "compositional_flags",
+    "resolve_pipeline_config",
+]

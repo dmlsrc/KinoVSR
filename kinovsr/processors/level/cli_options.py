@@ -8,6 +8,7 @@ LEVEL_OPTIONS = [
         default='off',
         choices=('off', 'hist'),
         family='level',
+        compositional=True,
         help="Global exposure/flicker leveler, run FIRST in the preprocess chain. For footage whose brightness pumps as a whole - auto-exposure hunting, camcorder AGC flicker, gamma-like exposure wobble - which deflicker deliberately does not cover (it fixes per-tile quantization flicker on verified-static content; a global gain swing fails its verification wholesale, so the two compose: level, then deflicker). hist = each frame's luma distribution is matched to a centered +-window reference (histograms via native vImage on the CPU, immune to GPU load; measured +11 to +21 dB pumping removal on oscillatory cases, 4-5 dB over plain gain matching on gamma-type pumping). Scope is honest: global pumping only; a slow drift is indistinguishable from a real lighting change and is followed, not fought; fades and dissolves pass through (the centered reference tracks them); clipped flash frames cannot be unclipped. Every downstream temporal stage benefits: the noise map stops over-reading pumping as noise, mc's photometric gate stops closing on gain swings, learned temporal denoisers see in-distribution brightness."),
     Opt(flag='--level-window',
         group='Temporal Restore And Deflicker',

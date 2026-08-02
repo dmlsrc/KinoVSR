@@ -3,6 +3,14 @@
 from kinovsr.cli.options import Opt
 
 SAFMN_OPTIONS = [
+    Opt(flag='--safmn-scale',
+        group='Spatial Upscalers',
+        type=int,
+        choices=(2, 4),
+        metavar='N',
+        family='safmn',
+        key='scale',
+        help='Declared 2x or 4x output scale for an explicit --safmn-weights path; must match the checkpoint. Named profiles declare this themselves.'),
     Opt(flag='--safmn-weights',
         group='Spatial Upscalers',
         metavar='PATH',

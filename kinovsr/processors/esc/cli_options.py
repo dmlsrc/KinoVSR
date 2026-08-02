@@ -3,6 +3,13 @@
 from kinovsr.cli.options import Opt
 
 ESC_OPTIONS = [
+    Opt(flag='--esc-scale',
+        group='Spatial Upscalers',
+        type=int,
+        metavar='N',
+        family='esc',
+        key='scale',
+        help='Declared output scale for an explicit --esc-weights path; must match the checkpoint. Named profiles declare this themselves.'),
     Opt(flag='--esc-weights',
         group='Spatial Upscalers',
         metavar='PATH',

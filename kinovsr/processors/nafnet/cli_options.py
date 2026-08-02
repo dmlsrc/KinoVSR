@@ -9,6 +9,7 @@ NAFNET_OPTIONS = [
         choices=('off', 'gopro', 'gopro32', 'sidd', 'sidd32', 'reds'),
         profile_tokens=('gopro', 'gopro32', 'sidd', 'sidd32', 'reds'),
         family='nafnet',
+        compositional=True,
         help='NAFNet restoration pass, run LAST in the preprocess chain (a light detail/deblur residual after deblock + denoise). off (default); gopro/gopro32 = motion deblur (width 64/32); sidd/sidd32 = real-noise denoise; reds = video restore. Single-image RGB net; weights are downloaded, not bundled (see kinovsr/processors/nafnet/weights/README.md).'),
     Opt(flag='--nafnet-weights',
         group='NAFNet',

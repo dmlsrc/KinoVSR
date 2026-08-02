@@ -89,7 +89,6 @@ FAMILY_KEYS: dict[str, frozenset[str]] = {
                             "motion_cap", "floor_mode", "floor", "pulse",
                             "upsample"}),
     "deblock_map": frozenset({"gain"}),
-    "conform": frozenset({"fps"}),
     "cut": frozenset({"detect", "threshold", "log"}),
     "crop": frozenset({"bars", "aspect", "anchor", "offset"}),
     "sanitize_edges": frozenset({"fill", "feather"}),
@@ -116,6 +115,19 @@ class Opt:
     required: bool = False
     family: str | None = None               # prefix for conformance checks
     key: str | None = None                  # vocabulary key (flag suffix)
+    # Composition options create, remove, or order stages.  A TOML pipeline
+    # owns those decisions, so the run command derives its conflict guard from
+    # this same registry row instead of maintaining a second flag list.
+    compositional: bool = False
+    # Most family dials target stages whose processor matches ``family``.
+    # These two fields describe the few intentional exceptions: CLI pseudo-
+    # families (restore/toflow_sr) and multi-capability processors.
+    stage_processor: str | None = None
+    stage_capabilities: tuple[str, ...] = ()
+    # Run-level options live in one of the reserved foundation tables.  The
+    # registry mapping drives both TOML -> Namespace resolution and printable
+    # config materialization.
+    config_table: str | None = None
     # Dest is a Settings field: the flag participates in the settings
     # trifecta (default < env < TOML < CLI), so its argparse default must
     # stay None for the env/TOML layers to show through.
@@ -124,6 +136,25 @@ class Opt:
     @property
     def resolved_dest(self) -> str:
         return self.dest or self.flag.lstrip("-").replace("-", "_")
+
+
+def option_roles(opt: Opt) -> frozenset[str]:
+    """Semantic layers a registry row participates in (never implicit)."""
+    roles = set()
+    if opt.compositional:
+        roles.add("composition")
+    if opt.config_table is not None:
+        roles.add("run")
+    if opt.settings_backed:
+        roles.add("settings")
+    is_stage_dial = (
+        opt.stage_processor is not None
+        or (opt.family is not None and opt.key is not None)
+        or opt.family in {"noise_map", "deblock_map"}
+    )
+    if not opt.compositional and opt.config_table is None and is_stage_dial:
+        roles.add("dial")
+    return frozenset(roles)
 
 
 def vocabulary_violations(registry: list[Opt]) -> list[str]:
@@ -153,4 +184,12 @@ def vocabulary_violations(registry: list[Opt]) -> list[str]:
             problems.append(
                 f"{opt.flag}: settings-backed options must default to None "
                 f"so env/TOML layers apply")
+        if opt.compositional and opt.stage_processor is not None:
+            problems.append(
+                f"{opt.flag}: a compositional option cannot target a stage")
+        if opt.config_table not in (None, "input", "output", "diagnostics"):
+            problems.append(
+                f"{opt.flag}: unknown foundation table {opt.config_table!r}")
+        if not option_roles(opt):
+            problems.append(f"{opt.flag}: option has no config role")
     return problems

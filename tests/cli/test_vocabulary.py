@@ -13,7 +13,13 @@ from dataclasses import fields
 import pytest
 
 from kinovsr.cli._registry import REGISTRY
-from kinovsr.cli.options import FAMILY_KEYS, SHARED_KEYS, vocabulary_violations
+from kinovsr.cli.args import build_parser
+from kinovsr.cli.options import (
+    FAMILY_KEYS,
+    SHARED_KEYS,
+    option_roles,
+    vocabulary_violations,
+)
 from kinovsr.settings import Settings
 
 pytestmark = pytest.mark.unit
@@ -66,10 +72,50 @@ def test_registry_flags_are_unique():
     assert len(flags) == len(set(flags))
 
 
+def test_compositional_flags_are_registry_owned_and_parser_complete():
+    expected = {
+        "--upscale", "--denoise", "--deblock", "--restore", "--nafnet",
+        "--deflicker", "--cut-detect", "--level", "--crop-bars",
+        "--crop-aspect", "--square-pixels", "--sanitize-edges",
+        "--target-fps", "--conform-cfr", "--preprocess-order",
+        "--denoise-first",
+    }
+    owned = {opt.flag for opt in REGISTRY if opt.compositional}
+    parsed = {
+        flag
+        for action in build_parser()._actions
+        for flag in action.option_strings
+    }
+    assert owned == expected
+    assert owned <= parsed
+
+
+def test_foundation_tables_cover_the_27_run_options_once():
+    rows = [opt for opt in REGISTRY if opt.config_table is not None]
+    assert len(rows) == 27
+    assert {opt.config_table for opt in rows} == {
+        "input", "output", "diagnostics"}
+    dests = [opt.resolved_dest for opt in rows]
+    assert len(dests) == len(set(dests))
+
+
+def test_every_registry_row_has_an_explicit_config_role():
+    assert all(option_roles(opt) for opt in REGISTRY)
+    assert set().union(*(option_roles(opt) for opt in REGISTRY)) == {
+        "composition", "dial", "run", "settings"}
+
+
 def test_shared_and_family_keys_do_not_overlap():
     for family, keys in FAMILY_KEYS.items():
         overlap = keys & SHARED_KEYS
         assert not overlap, f"{family}: {overlap} shadow shared keys"
+
+
+def test_every_family_specific_key_is_used():
+    for family, keys in FAMILY_KEYS.items():
+        used = {opt.key for opt in REGISTRY if opt.family == family}
+        unused = keys - used
+        assert not unused, f"{family}: {sorted(unused)}"
 
 
 def test_every_family_with_weights_has_a_profile_or_selector():

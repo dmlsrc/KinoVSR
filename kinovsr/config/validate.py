@@ -19,7 +19,9 @@ class ConfigError(Exception):
     """A user-config problem, reported before any processing starts."""
 
 
-def validate_config(config: dict[str, Any]) -> None:
+def validate_config(
+    config: dict[str, Any], *, allow_stage_fragments: bool = False,
+) -> None:
     """Validate the composed config's structure.
 
     - top-level keys are ``pipeline`` (a list of strings) or tables;
@@ -43,6 +45,15 @@ def validate_config(config: dict[str, Any]) -> None:
                 f"top-level key {key!r} must be a table (stage tables and the "
                 f"reserved tables {list(RESERVED_TABLES)} are tables; only "
                 f"'pipeline' is a list)")
+        if key in RESERVED_TABLES or key in pipeline:
+            continue
+        processor = value.get("processor")
+        if allow_stage_fragments and processor is None:
+            continue
+        if not isinstance(processor, str) or not processor:
+            raise ConfigError(
+                f"unknown top-level table [{key}]: an unlisted stage table "
+                "must select processor = \"<family>\"")
 
     for name in pipeline:
         if name in RESERVED_TABLES:

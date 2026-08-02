@@ -5,7 +5,10 @@ from fractions import Fraction
 import pytest
 
 from kinovsr.cli.args import build_parser
-from kinovsr.cli.assemble_pipeline import assemble_pipeline
+from kinovsr.cli.assemble_pipeline import (
+    assemble_pipeline,
+    resolve_pipeline_config,
+)
 from kinovsr.config import ConfigError
 from kinovsr.pipeline import resolve_pipeline
 from kinovsr.processors import (
@@ -26,6 +29,13 @@ def asm(*argv, width=640, height=480):
     args = PARSER.parse_args(
         ["--video", "x.mp4", "--output-dir", "/tmp/o", *argv])
     return assemble_pipeline(args, width=width, height=height)
+
+
+def resolved(*argv, config=None, width=640, height=480):
+    args = PARSER.parse_args(
+        ["--video", "x.mp4", "--output-dir", "out", *argv])
+    return resolve_pipeline_config(
+        args, config or {}, width=width, height=height)
 
 
 def spec(w=640, h=480):
@@ -134,6 +144,12 @@ class TestGeometry:
                      "--sanitize-edges-fill", "extend")
         assert config["sanitize"]["fill"] == "extend"
 
+    def test_crop_placement_dials_require_an_aspect_crop(self):
+        with pytest.raises(ConfigError, match="targets no crop stage"):
+            asm("--crop-bars", "16,16,0,0", "--crop-anchor", "top")
+        config = asm("--crop-aspect", "16:9", "--crop-anchor", "top")
+        assert config["crop"]["anchor"] == "top"
+
 
 class TestDialRouting:
     def test_shared_dial_fills_the_slot_family_overrides(self):
@@ -204,14 +220,129 @@ class TestDialRouting:
             asm("--denoise", "pvdd", "--noise-map", "auto")
         assert any("does not apply" in r.message for r in caplog.records)
 
-    def test_unused_family_dials_are_ignored(self):
-        config = asm("--bsvd-strength", "0.7")   # no bsvd in the chain
-        assert config["pipeline"] == []
+    def test_unused_family_dials_are_refused(self):
+        with pytest.raises(ConfigError, match="targets no bsvd stage"):
+            asm("--bsvd-strength", "0.7")
+
+    @pytest.mark.parametrize("argv, target", [
+        (["--denoise-strength", "0.7"], "denoise stage"),
+        (["--crop-anchor", "top"], "crop stage"),
+        (["--sanitize-edges-fill", "extend"], "sanitize_edges stage"),
+        (["--temporal-mode", "high"], "videotoolbox.*interpolate"),
+        (["--cut-threshold", "0.4"], "cut_detect stage"),
+    ])
+    def test_every_set_dial_needs_a_target(self, argv, target):
+        with pytest.raises(ConfigError, match=target):
+            asm(*argv)
 
     def test_nafnet_value_selects_capability_and_profile(self):
         config = asm("--nafnet", "sidd32")
         assert config["nafnet"]["capability"] == "denoise"
         assert config["nafnet"]["profile"] == "sidd32"
+
+
+class TestUnifiedConfigResolution:
+    def test_flag_owned_chain_keeps_matching_toml_stage_settings(self):
+        config = resolved(
+            "--denoise", "bsvd",
+            config={"denoise_bsvd": {"strength": 0.9, "window": 20}},
+        )
+        assert config["denoise_bsvd"] == {
+            "processor": "bsvd", "capability": "denoise",
+            "strength": 0.9, "window": 20,
+        }
+
+    def test_family_dial_applies_to_a_toml_owned_chain(self):
+        config = resolved(
+            "--bsvd-strength", "0.7",
+            config={
+                "pipeline": ["clean"],
+                "clean": {"processor": "bsvd", "strength": 0.2},
+            },
+        )
+        assert config["clean"]["strength"] == 0.7
+
+    def test_slot_dial_distributes_over_toml_pipeline_order(self):
+        config = resolved(
+            "--denoise-strength", "0.3,0.7",
+            config={
+                "pipeline": ["first", "second"],
+                "first": {"processor": "mc"},
+                "second": {"processor": "bsvd"},
+            },
+        )
+        assert config["first"]["strength"] == 0.3
+        assert config["second"]["strength"] == 0.7
+
+    def test_family_dial_is_capability_scoped_for_multi_role_family(self):
+        config = resolved(
+            "--basicvsrpp-history-strength", "0.5",
+            config={
+                "pipeline": ["restore", "upscale"],
+                "restore": {
+                    "processor": "basicvsrpp", "capability": "restore",
+                    "profile": "denoise",
+                },
+                "upscale": {
+                    "processor": "basicvsrpp", "capability": "upscale",
+                    "profile": "reds4",
+                },
+            },
+        )
+        assert "history_strength" not in config["restore"]
+        assert config["upscale"]["history_strength"] == 0.5
+
+    def test_weights_flag_has_same_precedence_on_both_paths(self):
+        table = {
+            "processor": "bsvd", "capability": "denoise",
+            "weights": "/toml.st",
+        }
+        by_flags = resolved(
+            "--denoise", "bsvd", "--bsvd-weights", "/cli.st",
+            config={"denoise_bsvd": table},
+        )
+        by_toml = resolved(
+            "--bsvd-weights", "/cli.st",
+            config={"pipeline": ["denoise_bsvd"], "denoise_bsvd": table},
+        )
+        assert by_flags == by_toml
+        assert by_flags["denoise_bsvd"]["weights"] == "/cli.st"
+
+    def test_set_is_identical_and_last_on_both_paths(self):
+        table = {
+            "processor": "bsvd", "capability": "denoise",
+            "strength": 0.2,
+        }
+        override = ["--bsvd-strength", "0.7", "--set",
+                    "denoise_bsvd.strength=0.9"]
+        by_flags = resolved(
+            "--denoise", "bsvd", *override,
+            config={"denoise_bsvd": table},
+        )
+        by_toml = resolved(
+            *override,
+            config={"pipeline": ["denoise_bsvd"], "denoise_bsvd": table},
+        )
+        assert by_flags == by_toml
+        assert by_flags["denoise_bsvd"]["strength"] == 0.9
+
+    def test_set_unknown_table_fails_structural_validation(self):
+        with pytest.raises(ConfigError, match="unknown top-level table.*typo"):
+            resolved("--denoise", "bsvd", "--set", "typo.strength=0.9")
+
+    @pytest.mark.parametrize("family, scale", [
+        ("esc", 4),
+        ("safmn", 2),
+        ("realesrgan", 4),
+        ("realplksr", 2),
+    ])
+    def test_explicit_sr_weights_can_declare_scale(self, family, scale):
+        config = resolved(
+            "--upscale", family,
+            f"--{family}-weights", f"/{family}.safetensors",
+            f"--{family}-scale", str(scale),
+        )
+        assert config["upscale"]["scale"] == scale
 
 
 class TestResolves:

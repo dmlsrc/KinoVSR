@@ -183,7 +183,7 @@ def run(name: str, cmd: list[str], log_path: Path, python: Path) -> dict[str, An
     proc = subprocess.run(
         [str(python), *cmd],
         cwd=REPO,
-        env={**os.environ, "MLX_CACHE_LIMIT": "1"},
+        env={**os.environ, "KINOVSR_MLX_CACHE_LIMIT_GB": "1"},
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

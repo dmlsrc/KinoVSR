@@ -3,6 +3,14 @@
 from kinovsr.cli.options import Opt
 
 REALPLKSR_OPTIONS = [
+    Opt(flag='--realplksr-scale',
+        group='Spatial Upscalers',
+        type=int,
+        choices=(2, 4),
+        metavar='N',
+        family='realplksr',
+        key='scale',
+        help='Declared 2x or 4x output scale for an explicit --realplksr-weights path; must match the checkpoint. Named profiles declare this themselves.'),
     Opt(flag='--realplksr-weights',
         group='Spatial Upscalers',
         metavar='PATH',
