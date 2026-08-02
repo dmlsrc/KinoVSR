@@ -456,28 +456,35 @@ def _geo_tf(f: Any, mode: str) -> Any:
     return f
 
 
-def _spatial_ensemble(frames: list, run_fn) -> list:
+def _spatial_ensemble(frames: list, run_fn) -> Iterator[Any]:
     """8-way geometric self-ensemble, exact scheme from the reference
-    mmedit/models/common/ensemble.py: build the 8 variants by successively applying
-    vertical/horizontal/transpose, run_fn each, invert the transforms, average.
-    run_fn(list_of_frames) -> list_of_outputs (same length). Works for the 1x
-    restore and the 4x upscale paths alike (transforms are resolution-agnostic)."""
-    lists = [frames]
-    for mode in ("v", "h", "t"):
-        lists = lists + [[_geo_tf(f, mode) for f in fl] for fl in lists]
-    acc: list | None = None
-    for i, fl in enumerate(lists):
-        o = list(run_fn(fl))
-        if i > 3:
-            o = [_geo_tf(f, "t") for f in o]
-        if i % 4 > 1:
-            o = [_geo_tf(f, "h") for f in o]
-        if (i % 4) % 2 == 1:
-            o = [_geo_tf(f, "v") for f in o]
-        acc = o if acc is None else [a + b for a, b in zip(acc, o, strict=True)]
-        for a in acc:
-            mx.eval(a)  # free each variant's graph before the next
-    return [mx.clip(a * 0.125, 0.0, 1.0) for a in acc]
+    mmedit/models/common/ensemble.py: apply vertical/horizontal/transpose,
+    run each variant, invert the transforms, and average. Only one transformed
+    input window and one new output frame exist at a time; the accumulator is
+    released progressively during the eighth pass.
+    """
+    acc: list[Any] = []
+    transforms = ((1, "v"), (2, "h"), (4, "t"))
+    for variant in range(8):
+        transformed = frames
+        for bit, mode in transforms:
+            if variant & bit:
+                transformed = [_geo_tf(frame, mode) for frame in transformed]
+        for index, output in enumerate(run_fn(transformed)):
+            for bit, mode in reversed(transforms):
+                if variant & bit:
+                    output = _geo_tf(output, mode)
+            if variant == 0:
+                acc.append(output)
+            else:
+                output = acc[index] + output
+                acc[index] = output
+            if variant == 7:
+                output = mx.clip(output * 0.125, 0.0, 1.0)
+                acc[index] = None
+            mx.eval(output)
+            if variant == 7:
+                yield output
 
 
 def restore_ensemble(
@@ -485,7 +492,7 @@ def restore_ensemble(
     p: dict,
     flow_mode: str = "spynet",
     vt_flow_services: Any = None,
-) -> list:
+) -> Iterable:
     """1x restoration under the reference's 8-way spatial self-ensemble (8x the
     cost of restore()). See _spatial_ensemble."""
     scope = (
@@ -494,7 +501,7 @@ def restore_ensemble(
         else nullcontext(None)
     )
     with scope as services:
-        return _spatial_ensemble(
+        yield from _spatial_ensemble(
             frames,
             lambda fl: restore(
                 fl,
@@ -512,7 +519,7 @@ def upscale_ensemble(
     history_strength: float = 1.0,
     history_gate: str = "off",
     vt_flow_services: Any = None,
-) -> list:
+) -> Iterable:
     """4x SR under the reference's 8-way spatial self-ensemble -- the NTIRE
     ntire_vsr config declares it (the small reds4/vimeo SR configs do not). 8x the
     cost of upscale(). See _spatial_ensemble."""
@@ -522,7 +529,7 @@ def upscale_ensemble(
         else nullcontext(None)
     )
     with scope as services:
-        return _spatial_ensemble(
+        yield from _spatial_ensemble(
             frames,
             lambda fl: upscale(
                 fl,

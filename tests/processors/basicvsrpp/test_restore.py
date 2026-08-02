@@ -63,7 +63,17 @@ def test_spatial_ensemble_identity_roundtrip():
     # the transpose variants.
     mx.random.seed(2)
     frames = [mx.clip(mx.random.uniform(shape=(1, 8, 12, 3)), 0, 1) for _ in range(3)]
-    out = net._spatial_ensemble(frames, lambda fl: fl)
+    seen = []
+
+    def identity(transformed):
+        for frame in transformed:
+            seen.append(frame)
+            yield frame
+
+    stream = net._spatial_ensemble(frames, identity)
+    first = next(stream)
+    assert len(seen) == 7 * len(frames) + 1
+    out = [first, *stream]
     assert len(out) == len(frames)
     for o, f in zip(out, frames, strict=True):
         assert o.shape == f.shape
