@@ -1170,6 +1170,42 @@ class TestRunDiagnostics:
         assert not (tmp_path / "o_noisemap.png").exists()
 
 
+def _install_gop_window_probe(monkeypatch):
+    from kinovsr.modeling.upscaler_base import WindowedUpscaler
+    from kinovsr.processors.basicvsrpp.factory import FACTORY
+    from kinovsr.processors.feed_driver import FeedFlushProcessor
+
+    probes = []
+
+    class Probe(WindowedUpscaler):
+        def __init__(self):
+            self.calls = []
+            super().__init__(window=8, trim=2)
+
+        def _upscale_window(self, frames):
+            self.calls.append(
+                None if self._gop is None else
+                tuple(token.source.index for token in self._window_tokens))
+            yield from frames
+
+    def build(_config, *, context):
+        probe = Probe()
+        probes.append(probe)
+        return FeedFlushProcessor(lambda: probe)
+
+    monkeypatch.setattr(FACTORY, "build", build)
+    return probes
+
+
+_GOP_PROBE_CONFIG = {
+    "pipeline": ["restore"],
+    "restore": {"processor": "basicvsrpp", "profile": "decompress_track1",
+                "window": 8, "trim": 2, "flow": "zero"},
+}
+_GOP_PROBE_CALLS = [tuple(range(9)), tuple(range(8, 17)),
+                    tuple(range(16, 24))]
+
+
 class TestGopAlign:
     """--snap-start / --gop-align parity: keyframe windowing on the typed
     endpoints. The clip fixture encodes g=8, so keyframes sit at 0, 8, 16."""
@@ -1412,39 +1448,44 @@ class TestGopAlign:
             settings=SETTINGS, start=11, end=20, snap_start=True)
         assert res.frames_out == 12
 
-    def test_schedule_windows_a_recurrent_stage(self, clip, tmp_path):
-        # The one-schedule-drives-all contract, end to end on real weights:
-        # gop-align resets the recurrent net per keyframe window, so its
-        # output DIFFERS from continuous-stream mode while the frame count
-        # and timeline stay identical. Runs through the public
-        # process_video_file (which caps + clears the MLX cache, keeping
-        # this net-loading test from starving later writer sessions in the
-        # same process) and so also covers the api-level gop threading.
-        from kinovsr.api import process_video_file
-        from kinovsr.processors.bsvd import default_weights_path
+    def test_table_source_reacts_only_when_policy_is_enabled(
+            self, clip, tmp_path, monkeypatch):
+        probes = _install_gop_window_probe(monkeypatch)
 
-        if not default_weights_path().exists():
-            pytest.skip("bsvd weights not available")
-        cfg = {"pipeline": ["dn"],
-               "dn": {"processor": "bsvd", "strength": 0.05}}
-        gop = process_video_file(
-            cfg, video=clip, output=tmp_path / "gop.mp4", settings=SETTINGS,
-            start=12, end=20, gop_align=True, gop_min_window=4,
-            gop_max_window=16)
-        cont = process_video_file(
-            cfg, video=clip, output=tmp_path / "cont.mp4", settings=SETTINGS,
-            start=12, end=20)
-        assert gop.frames_out == cont.frames_out == 8
+        plain = run_file(
+            _GOP_PROBE_CONFIG, video=clip, output=tmp_path / "plain.mp4",
+            settings=SETTINGS, skip_post_mp4=True)
+        aligned = run_file(
+            _GOP_PROBE_CONFIG, video=clip, output=tmp_path / "aligned.mp4",
+            settings=SETTINGS, gop_align=True, gop_min_window=4,
+            gop_max_window=16, skip_post_mp4=True)
 
-        def frames(path):
-            with av.open(str(path)) as container:
-                return [f.to_ndarray(format="rgb24")
-                        for f in container.decode(video=0)]
-        a, b = frames(gop.post_path), frames(cont.post_path)
-        total = sum(
-            abs(x.astype("f4") - y.astype("f4")).mean()
-            for x, y in zip(a, b, strict=True))
-        assert total > 0.5   # windowed state != continuous state
+        assert plain.frames_out == aligned.frames_out == N
+        assert probes[0].calls == [None] * 6
+        assert probes[1].calls == _GOP_PROBE_CALLS
+
+    def test_tableless_source_stamps_sync_identity_for_policy(
+            self, clip, tmp_path, monkeypatch):
+        from kinovsr.media import video_reader
+
+        class Reader:
+            probe_video_timing = staticmethod(video_reader.probe_video_timing)
+            probe_video = staticmethod(video_reader.probe_video)
+            probe_color = staticmethod(video_reader.probe_color)
+            keyframe_display_indices = staticmethod(
+                video_reader.keyframe_display_indices)
+            iter_video_buffer_chunks = staticmethod(
+                video_reader.iter_video_buffer_chunks)
+
+        probes = _install_gop_window_probe(monkeypatch)
+        result = run_file(
+            _GOP_PROBE_CONFIG, video=clip,
+            output=tmp_path / "tableless-output.mp4", settings=SETTINGS,
+            reader=Reader, gop_align=True, gop_min_window=4,
+            gop_max_window=16, skip_post_mp4=True)
+
+        assert result.frames_in == result.frames_out == N
+        assert probes[0].calls == _GOP_PROBE_CALLS
 
 
 def test_learned_chain_through_endpoints(clip, tmp_path):
@@ -2291,26 +2332,6 @@ class TestSampleIdentityPairing:
 class TestConformGopWindows:
     """R2-1: GOP windows must count conformed units, not source ordinals."""
 
-    def test_slot_plan_maps_keyframes_onto_conform_output(self):
-        from kinovsr.media.timing import SampleTiming, analyze_sample_table
-        from kinovsr.pipeline.run import _conform_slot_plan
-
-        # Samples on grid slots 0..4 and 30..34 (the gapped-keyframes
-        # shape), keyframes at samples 0 and 5. Conform to the same 30
-        # grid: sample 4 owns slots 4..17 (through the gap midpoint),
-        # sample 5 starts at slot 18; the window spans 35 slots.
-        pts = [Fraction(s, 30) for s in (*range(5), *range(30, 35))]
-        table = analyze_sample_table(
-            [SampleTiming(pts=p, duration=Fraction(1, 30),
-                          is_sync=i in (0, 5))
-             for i, p in enumerate(pts)],
-            nominal_cadence=30, source_tick=Fraction(1, 90000))
-        first_slot_of, total = _conform_slot_plan(
-            table, start=0, read_start=0, end=10, fps=Fraction(30))
-        assert first_slot_of(0) == 0
-        assert first_slot_of(5) == 18
-        assert total == 35
-
     def test_conform_with_gop_align_emits_every_slot(
             self, gapped_keyframes_clip, tmp_path):
         # The source-ordinal schedule truncated this run; the slot-space
@@ -2326,18 +2347,19 @@ class TestConformGopWindows:
         assert result.frames_in == 10
         assert result.frames_out == 35
 
-    def test_mid_chain_conform_with_gop_align_is_refused(
+    def test_mid_chain_conform_with_gop_align_emits_every_slot(
             self, gapped_keyframes_clip, tmp_path):
         config = {
             "pipeline": ["df", "cfr"],
             "df": {"processor": "deflicker"},
             "cfr": {"processor": "conform", "fps": "30"},
         }
-        with pytest.raises(MediaError, match="lead the chain"):
-            run_file(
-                config, video=gapped_keyframes_clip,
-                output=tmp_path / "refused.mp4", settings=SETTINGS,
-                gop_align=True)
+        result = run_file(
+            config, video=gapped_keyframes_clip,
+            output=tmp_path / "mid_chain.mp4", settings=SETTINGS,
+            gop_align=True)
+        assert result.frames_in == 10
+        assert result.frames_out == 35
 
 
 class TestRoundTwoArtifacts:

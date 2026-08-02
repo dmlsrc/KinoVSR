@@ -9,6 +9,7 @@ loaded in NHWC layout, but follows the OpenMMLab key names after stripping
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -219,7 +220,7 @@ def _basicvsr(
     history_strength: float = 1.0,
     history_gate: str = "off",
     vt_flow_services: Any = None,
-) -> list:
+) -> Iterable:
     n, h, w, _ = frames[0].shape
     mid = int(p["basicvsr.backward_resblocks.main.0.bias"].shape[0])
     dt = frames[0].dtype
@@ -297,7 +298,6 @@ def _basicvsr(
         backward_feats[i] = feat_prop
 
     feat_prop = mx.zeros((n, h, w, mid), dtype=dt)
-    outs = []
     for i, frame in enumerate(frames):
         if i > 0:
             feat_prop = flow_warp(feat_prop, flows_forward[i - 1])
@@ -308,11 +308,11 @@ def _basicvsr(
             elif use_scalar:
                 feat_prop = feat_prop * float(history_strength)
         feat_prop, residual = _compiled_fwd(p)(frame, feat_prop, backward_feats[i])
+        backward_feats[i] = None
         base = resize(frame, h * 4, w * 4, False)
         out = mx.clip(base + residual * float(residual_strength), 0.0, 1.0)
         mx.eval(out, feat_prop)
-        outs.append(out)
-    return outs
+        yield out
 
 
 def upscale(
@@ -327,7 +327,7 @@ def upscale(
     history_strength: float = 1.0,
     history_gate: str = "off",
     vt_flow_services: Any = None,
-) -> list:
+) -> Iterable:
     """Upscale an LR clip 4x.
 
     ``frames`` is a list of NHWC arrays shaped ``(N,H,W,3)`` in [0,1]. The
@@ -340,11 +340,11 @@ def upscale(
     ``history_strength`` scales the propagated features (1.0 = reference).
     """
     if not frames:
-        return []
+        return
     dt = p["basicvsr.conv_last.weight"].dtype
     frames = [mx.clip(f, 0.0, 1.0).astype(dt) for f in frames]
     cleaned = _clean(frames, p, dynamic_refine_thres, clean_iters)
-    return _basicvsr(
+    yield from _basicvsr(
         cleaned,
         p,
         residual_strength,
@@ -365,6 +365,6 @@ if __name__ == "__main__":
     mx.random.seed(0)
     clip = [mx.random.uniform(shape=(1, 64, 64, 3)) for _ in range(2)]
     mx.eval(*clip)
-    sr = upscale(clip, params, clean_iters=1)
+    sr = list(upscale(clip, params, clean_iters=1))
     mx.eval(*sr)
     _log.info(f"upscale: {len(sr)} frames, 64x64 -> {sr[0].shape[1]}x{sr[0].shape[2]}")

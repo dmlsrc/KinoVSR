@@ -51,7 +51,7 @@ class FeedFlushDriver(Protocol):
 
 
 class AsyncWindowHandle(Protocol):
-    """One schedule window in flight on an accelerator, driven cooperatively.
+    """One recurrent window in flight on an accelerator, driven cooperatively.
 
     A family net whose backend can run a whole reset-window off the GPU
     (today: Core ML on the Neural Engine) returns one of these from
@@ -80,7 +80,7 @@ class AsyncWindowHandle(Protocol):
 
 
 class WindowWavefront:
-    """Depth-one cross-window pipelining for schedule-capable drivers.
+    """Depth-one cross-window pipelining for accelerator-window drivers.
 
     While one window's accelerator dispatches are in flight, the driver
     keeps buffering input - so upstream keeps decoding - and the
@@ -264,7 +264,7 @@ class FeedFlushProcessor:
         self._blend: Any = None
         # The driver's optional pump() hook, bound at prepare. Emissions
         # flow downstream one at a time through the pull scheduler, and a
-        # schedule-capable driver may have a whole accelerator window in
+        # GOP-windowed driver may have a whole accelerator window in
         # flight behind them; pumping between consumptions keeps those
         # dispatches advancing while later stages (VT upscale, encode)
         # run on this thread. Without it a burst of window outputs
@@ -280,13 +280,9 @@ class FeedFlushProcessor:
                 context: PipelineContext) -> None:
         if self._driver is None:
             self._driver = self._make_driver()
-        # The run's GOP-aligned window plan drives every schedule-capable
-        # driver (the harness's one-schedule-drives-all contract); per-frame
-        # drivers lack the method and stay in continuous-stream mode.
-        if (context.windowing is not None
-                and hasattr(self._driver, "set_schedule")):
-            self._driver.set_schedule(
-                [tuple(window) for window in context.windowing])
+        configure_gop = getattr(self._driver, "set_gop_policy", None)
+        if callable(configure_gop):
+            configure_gop(context.gop)
         # Accelerator-backed drivers can start loading their engine now,
         # before the first frame: the input geometry is already known, so
         # multi-second Core ML function loads overlap the source's startup

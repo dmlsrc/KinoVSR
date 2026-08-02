@@ -13,6 +13,7 @@ deform_conv2d. Flow is (N,H,W,2) = (x-offset, y-offset), matching flow_warp.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Iterator
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -285,8 +286,7 @@ def _propagate(
     return feats
 
 
-def _upsample(frames: list, feats: dict, p: dict) -> list:
-    outs = []
+def _upsample(frames: list, feats: dict, p: dict) -> Iterator[Any]:
     for i in range(len(feats["spatial"])):
         hr = [feats["spatial"][i]] + [feats[k][i] for k in feats if k != "spatial"]
         residual = _compiled_upsample(p)(mx.concatenate(hr, axis=-1))
@@ -296,8 +296,9 @@ def _upsample(frames: list, feats: dict, p: dict) -> list:
         # the recurrence, so clipping here is safe.
         out_frame = mx.clip(residual + resize(frames[i], fh * 4, fw * 4, False), 0.0, 1.0)
         mx.eval(out_frame)  # free each frame's upsample graph before the next
-        outs.append(out_frame)
-    return outs
+        for values in feats.values():
+            values[i] = None
+        yield out_frame
 
 
 def upscale(
@@ -307,7 +308,7 @@ def upscale(
     history_strength: float = 1.0,
     history_gate: str = "off",
     vt_flow_services: Any = None,
-) -> list:
+) -> Iterable:
     """Upscale an LR clip 4x. frames: list of (N,H,W,3) f32 [0,1]; out: same len,
     each (N,4H,4W,3). Bidirectional + second-order, so the whole clip is needed.
     ``history_gate="improve"`` admits aligned history per pixel only where the
@@ -394,7 +395,7 @@ def restore(
     p: dict,
     flow_mode: str = "spynet",
     vt_flow_services: Any = None,
-) -> list:
+) -> Iterable:
     """1x recurrent restoration (decompress / denoise / deblur checkpoints). frames:
     list of (N,H,W,3) f32 [0,1]; out: same length and SAME size, restored. The net
     downsamples the input 4x, runs bidirectional second-order propagation at 1/4 res,
@@ -421,15 +422,15 @@ def restore(
         for direction in ("backward", "forward"):
             mod = f"{direction}_{it}"
             feats = _propagate(feats, fb if direction == "backward" else ff, mod, p)
-    outs = []
     for i in range(len(spatial)):
         hr = [feats["spatial"][i]] + [feats[k][i] for k in feats if k != "spatial"]
         residual = _compiled_upsample(p)(mx.concatenate(hr, axis=-1))
         oh, ow = orig[i]
         out = mx.clip(residual + padded[i], 0.0, 1.0)[:, :oh, :ow, :]
         mx.eval(out)
-        outs.append(out)
-    return outs
+        for values in feats.values():
+            values[i] = None
+        yield out
 
 
 # ---- spatial self-ensemble (the reference's inference-time trick) -----------
@@ -466,7 +467,7 @@ def _spatial_ensemble(frames: list, run_fn) -> list:
         lists = lists + [[_geo_tf(f, mode) for f in fl] for fl in lists]
     acc: list | None = None
     for i, fl in enumerate(lists):
-        o = run_fn(fl)
+        o = list(run_fn(fl))
         if i > 3:
             o = [_geo_tf(f, "t") for f in o]
         if i % 4 > 1:
@@ -543,7 +544,7 @@ if __name__ == "__main__":
     mx.random.seed(0)
     frames = [mx.clip(mx.random.uniform(shape=(1, 48, 64, 3)), 0, 1) for _ in range(5)]
     mx.eval(*frames)
-    outs = upscale(frames, p)
+    outs = list(upscale(frames, p))
     mx.eval(*outs)
     _log.info(
         f"upscale: {len(outs)} frames, 48x64 -> {outs[0].shape[1]}x{outs[0].shape[2]}, "

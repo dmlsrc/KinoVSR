@@ -73,21 +73,17 @@ def open_pipeline(
     *,
     settings: Settings | None = None,
     reporter: Reporter | None = None,
-    windowing: Any = None,
 ) -> PipelineSession:
     """Resolve and preflight-validate ``config`` against ``input_spec``;
     return a session over the caller's own frame units.
 
     See :class:`kinovsr.pipeline.PipelineSession`: ``process(units)``
     yields output units with natural backpressure, weights load at the
-    first pull, and closing cancels deterministically. ``windowing``
-    optionally carries a GOP-aligned recurrent-window plan to every
-    schedule-capable stage (see ``PipelineContext.windowing``).
+    first pull, and closing cancels deterministically.
     """
     from kinovsr.pipeline import open_pipeline as _open
 
-    return _open(config, input_spec, settings=settings, reporter=reporter,
-                 windowing=windowing)
+    return _open(config, input_spec, settings=settings, reporter=reporter)
 
 
 def process_video_file(

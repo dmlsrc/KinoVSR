@@ -41,6 +41,26 @@ from .units import FrameUnit
 
 
 @dataclass(frozen=True, slots=True)
+class GopWindowPolicy:
+    """Enable reactive GOP windows with validated min/max frame bounds."""
+
+    min_window: int
+    max_window: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("min_window", self.min_window),
+            ("max_window", self.max_window),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+            if value <= 0:
+                raise ValueError(f"{name} must be > 0")
+        if self.min_window > self.max_window:
+            raise ValueError("min_window must be <= max_window")
+
+
+@dataclass(frozen=True, slots=True)
 class PipelineContext:
     """What every lifecycle call receives.
 
@@ -49,13 +69,8 @@ class PipelineContext:
     goes through the reporter contract, and nothing here may force MLX
     evaluation.
 
-    ``windowing`` is the run's GOP-aligned recurrent-window plan, when one
-    was computed: (proc_start, proc_end, emit_start, emit_end) specs whose
-    frame indices are stream-relative (0 = the first unit this run feeds,
-    context frames included) and whose emit ranges tile the fed stream.
-    Stages whose driver speaks ``set_schedule`` apply it at prepare; every
-    other stage ignores it - the same one-schedule-drives-all contract the
-    inherited harness used.
+    ``gop`` enables reactive recurrent windows and carries their min/max
+    bounds. Sync identity and all window positions travel on the units.
 
     ``publication_origin_pts`` is the file endpoint's explicit public origin,
     in stream time-base ticks, when leading warmup-only units precede it.
@@ -66,7 +81,7 @@ class PipelineContext:
     settings: Settings
     reporter: Reporter = NullReporter()
     stage_id: str | None = None
-    windowing: tuple[tuple[int, int, int, int], ...] | None = None
+    gop: GopWindowPolicy | None = None
     publication_origin_pts: int | None = None
 
     def for_stage(self, stage_id: str) -> PipelineContext:
@@ -155,6 +170,7 @@ class BracketFactory(Protocol):
 
 __all__ = [
     "BracketFactory",
+    "GopWindowPolicy",
     "PipelineContext",
     "Processor",
     "ProcessorFactory",

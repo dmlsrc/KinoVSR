@@ -68,9 +68,9 @@ class BasicVsrUpscaler(WindowedUpscaler):
             ),
         )
 
-    def _upscale_window(self, frames: list) -> list:
+    def _upscale_window(self, frames: list):
         fn = net.upscale_ensemble if self._ensemble else net.upscale
-        return fn(
+        yield from fn(
             frames,
             self._p,
             flow_mode=self._flow_mode,
@@ -96,7 +96,7 @@ if __name__ == "__main__":
     mx.random.seed(0)
     frames = [mx.random.uniform(shape=(1, 40, 56, 3)) for _ in range(N)]
     mx.eval(*frames)
-    full = net.upscale(frames, up._p)  # full-clip reference
+    full = list(net.upscale(frames, up._p))  # full-clip reference
     mx.eval(*full)
 
     emitted: list = []

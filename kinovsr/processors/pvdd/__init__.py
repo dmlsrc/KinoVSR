@@ -10,6 +10,7 @@ Weights are not bundled; see weights/README.md.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +122,7 @@ class PVDD:
 
     def denoise_clip(self, frames_nhwc: list, noise_variance: float | None = None,
                      noise_map: Any | None = None,
-                     frame_gains: list | None = None) -> list:
+                     frame_gains: list | None = None) -> Iterable:
         """frames: list of (1,H,W,C) mx arrays in [0,1]. Returns denoised list.
 
         Inputs are edge-padded to a multiple of 4 so the x4 down/up feature path
@@ -149,8 +150,8 @@ class PVDD:
                         f"frame_gains must match the clip length {len(frames)}; "
                         f"got {len(frame_gains)}")
                 nm = [nm * float(g) ** 2 for g in frame_gains]
-        outs = pvdd_forward(frames, self.params, self.cfg, noise_map=nm)
-        return [o[:, :h0, :w0, :] for o in outs]
+        for out in pvdd_forward(frames, self.params, self.cfg, noise_map=nm):
+            yield out[:, :h0, :w0, :]
 
 
 __all__ = ["PVDD", "load_pvdd", "default_weights_path", "LEVEL_PRESETS", "PVDDConfig"]

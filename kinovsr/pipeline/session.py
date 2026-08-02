@@ -24,6 +24,7 @@ from typing import Any
 
 from kinovsr.processors import (
     FrameUnit,
+    GopWindowPolicy,
     PipelineContext,
     PipelineError,
     StreamSpec,
@@ -187,7 +188,7 @@ def open_pipeline(
     *,
     settings: Settings | None = None,
     reporter: Reporter | None = None,
-    windowing: Any = None,
+    gop: GopWindowPolicy | None = None,
     publication_origin_pts: int | None = None,
 ) -> PipelineSession:
     """Resolve and validate ``config`` against ``input_spec``; return a
@@ -197,9 +198,8 @@ def open_pipeline(
     stage-config problems, stream-contract violations), so a session
     that opens will not fail preflight mid-stream. ``settings`` defaults
     to the environment-resolved product settings; ``reporter`` receives
-    phase progress (default: none). ``windowing`` is an optional
-    GOP-aligned recurrent-window plan carried to every stage via
-    :class:`PipelineContext` (see its docstring for the contract).
+    phase progress (default: none). ``gop`` is the optional internal
+    reactive-window policy carried through :class:`PipelineContext`.
     """
     if settings is None:
         settings = Settings.from_env()
@@ -207,10 +207,8 @@ def open_pipeline(
     kwargs: dict[str, Any] = {"settings": settings}
     if reporter is not None:
         kwargs["reporter"] = reporter
-    if windowing is not None:
-        kwargs["windowing"] = tuple(
-            (int(p0), int(p1), int(e0), int(e1))
-            for p0, p1, e0, e1 in windowing)
+    if gop is not None:
+        kwargs["gop"] = gop
     if publication_origin_pts is not None:
         kwargs["publication_origin_pts"] = int(publication_origin_pts)
     return PipelineSession(plan, PipelineContext(**kwargs))

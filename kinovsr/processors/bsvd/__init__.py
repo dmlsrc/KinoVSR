@@ -427,6 +427,7 @@ class BsvdDenoiser:
             self.net = MpsGraphBSVD(wp, dtype=dtype)
         else:
             self.net = BSVD(wp, dtype=dtype)
+        self._window_backend = backend != "mlx"
         self.sigma = _strength_to_sigma(strength)
         # optional NoiseMapTracker: replaces the constant sigma plane with a
         # per-pixel estimate (sigma units, same scale as the constant).
@@ -440,8 +441,8 @@ class BsvdDenoiser:
                 "--noise-map / --noise-map-pulse need a non-blind (4-channel) "
                 "BSVD checkpoint; this one is blind RGB-only."
             )
-        # streaming-mode map refresh cadence (frames); 0 disables. Scheduled
-        # (gop-aligned) mode re-estimates per window instead and ignores this.
+        # Streaming-mode map refresh cadence (frames); 0 disables. The ANE
+        # GOP-window path re-estimates per window instead and ignores this.
         self._map_refresh = max(0, int(map_refresh))
         # user sigma floor under the map: the temporal estimator only measures
         # FLICKERING noise, so static grain / structured junk reads near zero
@@ -452,7 +453,7 @@ class BsvdDenoiser:
         self.last_noise_map: Any = None   # fp32 (H,W,1) actually used (debug)
         # diagnostics: gains across the whole run (survives the end-of-stream reset)
         self._pulse_log: list[float] = []
-        self._schedule: list | None = None
+        self._gop: Any = None
         from kinovsr.processors.feed_driver import WindowWavefront
 
         # Cross-window pipelining for async-window-capable nets (the ANE
@@ -472,18 +473,16 @@ class BsvdDenoiser:
         self._nm: Any = None
         self._padded_hw: tuple[int, int] | None = None
         self._tokens: list[Any] = []
-        self._frames: list[Any] = []
-        self._frame_tokens: list[Any] = []
         self._warm: list = []    # (frame3ch, token, gain) held until the map is estimated
         self._recent: list = []  # rolling last frames for the streaming map refresh
         self._since_refresh = 0
         if self._pulse is not None:
             self._pulse.reset()
-        self._base = 0
-        self._sched_i = 0
         self._received = 0
         self._emitted = 0
         self._steps = 0
+        if self._gop is not None:
+            self._gop.reset()
 
     def reset(self) -> None:
         self._wavefront.abandon()
@@ -493,7 +492,7 @@ class BsvdDenoiser:
     def preheat(self, height: int, width: int) -> None:
         """Start loading the backend engine for this geometry, if it can.
 
-        Called at the pipeline's prepare edge (after ``set_schedule``);
+        Called at the pipeline's prepare edge (after GOP policy setup);
         the frame geometry maps to the net's padded working size exactly
         as ``_prepare`` will pad it. Backends without the hook (the MLX
         net) ignore this.
@@ -501,10 +500,10 @@ class BsvdDenoiser:
         hook = getattr(self.net, "preheat", None)
         if callable(hook):
             hook(height + (-height) % 4, width + (-width) % 4,
-                 scheduled=self._schedule is not None)
+                 scheduled=self._gop is not None)
 
     def pump(self) -> None:
-        """Advance the in-flight schedule window without blocking.
+        """Advance the in-flight GOP window without blocking.
 
         The pipeline adapter calls this between downstream consumptions
         of our emissions, so a window's remaining accelerator dispatches
@@ -512,19 +511,18 @@ class BsvdDenoiser:
         outputs on the driver thread. Continuous streams have no window
         in flight and this is a no-op.
         """
-        if self._schedule is not None:
+        if self._gop is not None:
             self._wavefront.poll()
 
-    def set_schedule(self, schedule: list | None) -> None:
-        """Use GOP-aligned windows instead of one continuous stream.
+    def set_gop_policy(self, policy: Any) -> None:
+        """Window accelerator backends; keep the reference MLX stream continuous."""
+        if policy is None or not self._window_backend:
+            self._gop = None
+            return
+        from kinovsr.modeling.gop_windows import GopWindows
 
-        The schedule is a list of (proc_start, proc_end, emit_start, emit_end)
-        specs whose emit ranges tile the stream. Default BSVD remains the
-        reference-like continuous stream; schedule mode resets BSVD per proc
-        window and emits only that window's requested output range.
-        """
-        self._schedule = list(schedule) if schedule else None
-        self._sched_i = 0
+        self._gop = GopWindows(
+            policy.min_window, policy.max_window, self._run_window)
 
     def run_diagnostics(self) -> list:
         from kinovsr.processors.conditioning import noise_map_diagnostics
@@ -550,10 +548,9 @@ class BsvdDenoiser:
             # before calling this lifecycle edge.
             self._nm = None
             self._tokens = []
-            self._frames = []
-            self._frame_tokens = []
             self._warm = []
             self._recent = []
+            self._gop = None
 
     def _prepare(self, frame: Any) -> Any:
         """Clip + pad one frame to a 3-channel net-dtype tensor (no noise map yet;
@@ -657,15 +654,13 @@ class BsvdDenoiser:
         from kinovsr.analysis.noise.track import source_since_sync
 
         x = self._prepare(frame)
-        if self._schedule is not None:
+        if self._gop is not None:
             # Opportunistically advance the window in flight: completed
             # dispatches are consumed and the next submitted while the
             # source keeps decoding, so the accelerator never waits for
             # a full window boundary.
             self._wavefront.poll()
-            self._frames.append(x)
-            self._frame_tokens.append(token)
-            return self._feed_scheduled(final=False)
+            return self._feed_gop(x, token)
         gain = self._pulse_gain(x, since_sync=source_since_sync(token))
         if self._tracker is not None and self._nm is None:
             # hold the first frames, estimate the spatial map from them, then
@@ -689,8 +684,9 @@ class BsvdDenoiser:
         return self._step(x, token=token, real=True, gain=gain)
 
     def flush(self) -> Iterable:
-        if self._schedule is not None:
-            yield from self._feed_scheduled(final=True)
+        if self._gop is not None:
+            yield from self._gop.flush()
+            yield from self._wavefront.drain()
             self._reset_state()
             self._reset_conditioning(clear_debug=False)
             return
@@ -709,36 +705,11 @@ class BsvdDenoiser:
         self._reset_state()
         self._reset_conditioning(clear_debug=False)
 
-    def _feed_scheduled(self, final: bool) -> Iterable:
+    def _feed_gop(self, frame: Any, token: Any) -> Iterable:
         # A feed-side poll may have materialized outputs since the previous
-        # call. Emit them before changing the schedule.
+        # call. Emit them before a new boundary can submit another window.
         yield from self._wavefront.available()
-        total = self._base + len(self._frames)
-        while self._sched_i < len(self._schedule):
-            p0, p1, e0, e1 = self._schedule[self._sched_i]
-            if not final and total < p1:
-                break
-            pe, ee = (min(p1, total), min(e1, total)) if final else (p1, e1)
-            if p0 < pe and e0 < ee:
-                rel_p0 = p0 - self._base
-                rel_pe = pe - self._base
-                local_frames = self._frames[rel_p0:rel_pe]
-                local_tokens = self._frame_tokens[rel_p0:rel_pe]
-                yield from self._run_window(
-                    local_frames, local_tokens, e0 - p0, ee - p0
-                )
-            self._sched_i += 1
-        keep_from = (self._schedule[self._sched_i][0] if self._sched_i < len(self._schedule)
-                     else self._base + len(self._frames))
-        drop = keep_from - self._base
-        if drop > 0:
-            self._frames = self._frames[drop:]
-            self._frame_tokens = self._frame_tokens[drop:]
-            self._base += drop
-        if final:
-            # Keep the accelerator and downstream temporal stages overlapped:
-            # yield each materialized output before advancing the final window.
-            yield from self._wavefront.drain()
+        yield from self._gop.feed(frame, token)
 
     def _run_window(
         self,
@@ -828,14 +799,14 @@ class BsvdDenoiser:
             idx = i - self.net.SHIFT_NUM
             if emit_start <= idx < emit_end:
                 if y is None:
-                    raise RuntimeError("BSVD scheduled window emitted an empty frame")
+                    raise RuntimeError("BSVD GOP window emitted an empty frame")
                 yield self._emit(y, tokens[idx])
         for i in range(self.net.SHIFT_NUM):
             y = self.net.step(None)
             idx = len(frames) + i - self.net.SHIFT_NUM
             if emit_start <= idx < emit_end:
                 if y is None:
-                    raise RuntimeError("BSVD scheduled window emitted an empty frame")
+                    raise RuntimeError("BSVD GOP window emitted an empty frame")
                 yield self._emit(y, tokens[idx])
         self.net.reset()
 

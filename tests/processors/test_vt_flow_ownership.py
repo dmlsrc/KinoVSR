@@ -71,7 +71,7 @@ def test_basicvsr_upscale_forwards_owned_services(monkeypatch):
         return []
 
     monkeypatch.setattr(upscaler.net, "upscale", run)
-    driver._upscale_window([])
+    list(driver._upscale_window([]))
 
     assert observed["vt_flow_services"] is driver._vt_flow_services
 
@@ -92,7 +92,7 @@ def test_basicvsr_restore_forwards_owned_services(monkeypatch):
         return []
 
     monkeypatch.setattr(restorer.net, "restore_ensemble", run)
-    driver._upscale_window([])
+    list(driver._upscale_window([]))
 
     assert observed["vt_flow_services"] is driver._vt_flow_services
 
@@ -117,6 +117,6 @@ def test_realbasicvsr_forwards_owned_services(monkeypatch):
         return []
 
     monkeypatch.setattr(upscaler.net, "upscale", run)
-    driver._upscale_window([])
+    list(driver._upscale_window([]))
 
     assert observed["vt_flow_services"] is driver._vt_flow_services

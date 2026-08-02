@@ -78,8 +78,8 @@ class RealBasicVsrUpscaler(WindowedUpscaler):
             vt_flow_geometries=1 if flow_mode == "vt" else 0,
         )
 
-    def _upscale_window(self, frames: list) -> list:
-        return net.upscale(
+    def _upscale_window(self, frames: list):
+        yield from net.upscale(
             frames,
             self._p,
             dynamic_refine_thres=self._dynamic_refine_thres,

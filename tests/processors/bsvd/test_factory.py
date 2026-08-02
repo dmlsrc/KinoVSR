@@ -130,6 +130,57 @@ class TestStreaming:
                           for b in u.boundaries)]
         assert flagged == [3 * 960]
 
+    def test_gop_policy_keeps_mlx_continuous_under_conditioning(self):
+        import mlx.core as mx
+
+        from kinovsr.analysis.noise.track import NoiseMapTracker
+        from kinovsr.processors import GopWindowPolicy
+        from kinovsr.processors.bsvd import BsvdDenoiser, default_weights_path
+
+        weights = default_weights_path("c64")
+        if not weights.is_file():
+            pytest.skip(f"bsvd weights not available at {weights}")
+
+        driver = BsvdDenoiser(
+            weights, strength=0.3, noise_map=NoiseMapTracker(min_frames=2),
+            map_refresh=3, backend="mlx")
+        original_step = driver.net.step
+        step_count = 0
+
+        def counted_step(frame):
+            nonlocal step_count
+            step_count += 1
+            return original_step(frame)
+
+        driver.net.step = counted_step
+        frames = [
+            mx.full((16, 16, 3), 0.2 + index / 100, dtype=mx.float32)
+            for index in range(12)
+        ]
+
+        def run(policy):
+            before = step_count
+            driver.set_gop_policy(policy)
+            assert driver._gop is None
+            output = [item for index, frame in enumerate(frames)
+                      for item in driver.feed(frame, token=index)]
+            output.extend(driver.flush())
+            return output, step_count - before
+
+        try:
+            plain, plain_steps = run(None)
+            aligned, aligned_steps = run(GopWindowPolicy(4, 8))
+            tokens = list(range(len(frames)))
+            assert [token for _, token in plain] == tokens
+            assert [token for _, token in aligned] == tokens
+            assert plain_steps == aligned_steps == len(frames) + driver.net.SHIFT_NUM
+            assert driver.last_noise_map is not None
+            assert all(float(mx.max(mx.abs(left - right))) == 0.0
+                       for (left, _), (right, _) in
+                       zip(plain, aligned, strict=True))
+        finally:
+            driver.close()
+
     def test_luma_chroma_split_reweights_the_output(self):
         # End to end through the real scheduler and denoiser: the same input
         # frames run with and without the split must stay frame-aligned but

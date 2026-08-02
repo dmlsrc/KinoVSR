@@ -68,7 +68,7 @@ class BasicVsrRestorer(WindowedUpscaler):
             ),
         )
 
-    def _upscale_window(self, frames: list) -> list:
+    def _upscale_window(self, frames: list):
         fn = net.restore_ensemble if self._ensemble else net.restore
         out = fn(
             frames,
@@ -76,14 +76,13 @@ class BasicVsrRestorer(WindowedUpscaler):
             flow_mode=self._flow_mode,
             vt_flow_services=self._vt_flow_services,
         )
-        if self._strength != 1.0:
-            s = self._strength
-            out = [
-                mx.clip(s * o + (1.0 - s) * f, 0.0, 1.0) for o, f in zip(out, frames, strict=True)
-            ]
-            for o in out:
-                mx.eval(o)
-        return out
+        for restored, frame in zip(out, frames, strict=True):
+            if self._strength != 1.0:
+                s = self._strength
+                restored = mx.clip(
+                    s * restored + (1.0 - s) * frame, 0.0, 1.0)
+                mx.eval(restored)
+            yield restored
 
 
 _log = logging.getLogger(__name__)

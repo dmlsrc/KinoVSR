@@ -8,44 +8,7 @@ issue #24), the geometric transforms, and the 8-way self-ensemble's round-trip.
 """
 import mlx.core as mx
 
-from kinovsr.modeling.upscaler_base import plan_gop_windows
 from kinovsr.processors.basicvsrpp import net
-
-
-def _emit_tiles(windows, n):
-    emit = [(a, b) for _, _, a, b in windows]
-    return (emit == sorted(emit) and emit[0][0] == 0 and emit[-1][1] == n
-            and all(emit[i][1] == emit[i + 1][0] for i in range(len(emit) - 1)))
-
-
-def test_plan_gop_windows_tiles_and_anchors():
-    kf = list(range(0, 300, 12))  # GOP 12
-    w = plan_gop_windows(kf, 300, min_window=24, max_window=64)
-    assert _emit_tiles(w, 300)
-    # every emit boundary is a keyframe; each GOP-aligned window re-processes only
-    # the single closing keyframe (proc = emit + 1)
-    kfset = set(kf)
-    for p0, p1, e0, e1 in w:
-        assert e0 in kfset            # emit starts on a keyframe
-        # +1 closing keyframe for the backward anchor, except the clip-end tail
-        assert p1 - p0 == (e1 - e0) + (1 if e1 < 300 else 0)
-    assert all((e1 - e0) >= 24 for *_, e0, e1 in w[:-1])  # >= min_window (except tail)
-
-
-def test_plan_gop_windows_single_keyframe_fallback():
-    # open-GOP clip (one keyframe): fixed max_window tiling with internal trim
-    w = plan_gop_windows([0], 100, min_window=24, max_window=60)
-    assert _emit_tiles(w, 100)
-    assert len(w) == 2  # 100 / 60 -> 2 sub-windows
-
-
-def test_plan_gop_windows_long_gop_splits():
-    # a 250-frame GOP must split under max_window with trim at internal splits,
-    # while the 250 boundary stays keyframe-anchored
-    w = plan_gop_windows([0, 250], 300, min_window=24, max_window=64)
-    assert _emit_tiles(w, 300)
-    # internal split sub-windows carry trim on both sides: max_window + 2*trim
-    assert all((p1 - p0) <= 64 + 2 * 2 for p0, p1, *_ in w)
 
 
 def test_bicubic_down4_shape_and_constant():
@@ -107,48 +70,32 @@ def test_spatial_ensemble_identity_roundtrip():
         assert float(mx.max(mx.abs(o - f))) < 1e-5
 
 
-def test_windowed_schedule_mode_emits_every_frame_once():
+def test_windowed_no_policy_processing_ranges_unchanged():
+    # The ordinary fixed path keeps its exact processing ranges, including
+    # the deliberate full-window tail rerun.
     from kinovsr.modeling.upscaler_base import WindowedUpscaler
 
     class _Stub(WindowedUpscaler):
         SCALE = 1
         def __init__(self):
-            super().__init__(window=10, trim=2)
-        def _upscale_window(self, frames):
-            return list(frames)   # identity
-
-    for n, kf in [(60, list(range(0, 60, 12))), (37, list(range(0, 37, 12))), (100, [0])]:
-        sched = plan_gop_windows(kf, n, 24, 64)
-        up = _Stub()
-        up.set_schedule(sched)
-        em = []
-        for i in range(n):
-            em += up.feed(mx.full((1, 1, 1, 3), i / 200.0), token=i)
-        em += up.flush()
-        toks = [t for _, t in em]
-        vals = [round(f[0, 0, 0].item() * 200) for f, _ in em]
-        assert toks == list(range(n))          # every frame emitted once, in order
-        assert vals == list(range(n))          # each output is the right input frame
-
-
-def test_windowed_no_schedule_unchanged():
-    # set_schedule(None) keeps the fixed window/trim path
-    from kinovsr.modeling.upscaler_base import WindowedUpscaler
-
-    class _Stub(WindowedUpscaler):
-        SCALE = 1
-        def __init__(self):
+            self.calls = []
             super().__init__(window=8, trim=2)
         def _upscale_window(self, frames):
-            return list(frames)
+            self.calls.append([
+                round(frame[0, 0, 0, 0].item() * 200) for frame in frames
+            ])
+            yield from frames
 
     up = _Stub()
-    up.set_schedule(None)
     em = []
     for i in range(20):
         em += up.feed(mx.full((1, 1, 1, 3), i / 200.0), token=i)
     em += up.flush()
     assert [t for _, t in em] == list(range(20))
+    assert up.calls == [
+        list(range(8)), list(range(4, 12)), list(range(8, 16)),
+        list(range(12, 20)), list(range(12, 20)),
+    ]
 
 
 def test_restore_variant_tokens_resolve_names():

@@ -36,6 +36,7 @@ from .errors import (
 )
 from .protocol import (
     BracketFactory,
+    GopWindowPolicy,
     PipelineContext,
     Processor,
     ProcessorFactory,
@@ -84,6 +85,7 @@ __all__ = [
     "FrameSpec",
     "FrameUnit",
     "Geometry",
+    "GopWindowPolicy",
     "Layout",
     "MediaError",
     "PipelineContext",

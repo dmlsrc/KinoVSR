@@ -71,6 +71,7 @@ def test_session_surface_is_video_only():
     from kinovsr.processors import FrameUnit
 
     params = inspect.signature(open_pipeline).parameters
+    assert tuple(params) == ("config", "input_spec", "settings", "reporter")
     assert not any("audio" in name.lower() for name in params), params
     # "source" is the raw-stream identity channel (sync flag, GOP
     # position, coded size) - video-stream metadata, not audio.

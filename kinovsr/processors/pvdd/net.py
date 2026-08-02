@@ -19,6 +19,7 @@ NHWC throughout; conv weights are transposed to OHWI at load. Reductions
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from typing import Any
 
 import mlx.core as mx
@@ -342,7 +343,7 @@ def _trunk(x: Any, p: dict, pre: str, cfg: PVDDConfig) -> Any:
     return _resblocks(x, p, f"{pre}.main.2", cfg.num_block)
 
 
-def _process(frames_nhwc: list, p: dict, cfg: PVDDConfig) -> list:
+def _process(frames_nhwc: list, p: dict, cfg: PVDDConfig) -> Iterable:
     """frames: list of T (1,H,W,C). Returns list of T denoised (1,H,W,C)."""
     T = len(frames_nhwc)
     feats = [_feat_extractor(f, p, cfg) for f in frames_nhwc]   # each (1,h/4,w/4,64)
@@ -373,7 +374,6 @@ def _process(frames_nhwc: list, p: dict, cfg: PVDDConfig) -> list:
         out_l[i] = feat_prop
 
     feat_prop = feats[0]
-    outs = []
     for i in range(T):
         feat_prop = sttb("forward_STTB", feats[i], feat_prop)
         feat_prop = _trunk(feat_prop, p, "forward_trunk", cfg)
@@ -383,12 +383,13 @@ def _process(frames_nhwc: list, p: dict, cfg: PVDDConfig) -> list:
         out = _lrelu(_pixelshuffle(_conv(out, p, "upconv2"), 2), 0.1)
         out = _lrelu(_conv(out, p, "conv_hr"), 0.1)
         out = _conv(out, p, "conv_last") + frames_nhwc[i]
-        outs.append(out)
-    return outs
+        out_l[i] = None
+        mx.eval(out, feat_prop)
+        yield out
 
 
 def pvdd_forward(frames_nhwc: list, p: dict, cfg: PVDDConfig,
-                 noise_map: Any | None = None) -> list:
+                 noise_map: Any | None = None) -> Iterable:
     """frames: list of T (1,H,W,C) in [0,1]. noise_map: (1,H,W,1) variance plane,
     or a list of T such planes for per-frame conditioning (GOP pulse gain)."""
     x = list(frames_nhwc)
@@ -408,4 +409,4 @@ def pvdd_forward(frames_nhwc: list, p: dict, cfg: PVDDConfig,
         x = cleaned
         if float((total / len(x)).item()) < cfg.thres:
             break
-    return _process(x, p, cfg)
+    yield from _process(x, p, cfg)

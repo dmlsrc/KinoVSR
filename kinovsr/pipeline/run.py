@@ -30,7 +30,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -310,81 +310,6 @@ def _table_window_tail(table: SampleTable, start: int, end: int) -> Fraction:
     return Fraction(1, 25)
 
 
-def _leading_conform_cadence(
-    config: Any, table: SampleTable | None,
-) -> Fraction | None:
-    """The output rate of a chain-leading conform stage, or ``None``.
-
-    A conform stage changes unit cardinality, so source-ordinal GOP
-    windows must be remapped onto its output slots. Only the chain-head
-    position (the CLI contract) is supported; the caller refuses other
-    placements when a schedule is requested.
-    """
-    try:
-        pipeline = list(config.get("pipeline") or [])
-    except AttributeError:
-        return None
-    if not pipeline:
-        return None
-    stage = config.get(pipeline[0])
-    if not isinstance(stage, Mapping) or stage.get("processor") != "conform":
-        return None
-    spec = str(stage.get("fps", "auto")).strip().lower()
-    if spec != "auto":
-        return rational_cadence(spec)
-    if table is None:
-        return None
-    if table.grid_cadence is not None:
-        return table.grid_cadence
-    if table.duration > 0 and table.sample_count > 0:
-        return Fraction(table.sample_count) / table.duration
-    return None
-
-
-def _conform_slot_plan(
-    table: SampleTable, *, start: int, read_start: int, end: int,
-    fps: Fraction,
-) -> tuple[Any, int]:
-    """Source-ordinal to conform-output-slot mapping for GOP windows.
-
-    Returns ``(first_slot_of, total_slots)`` where ``first_slot_of(a)``
-    is the RELATIVE output ordinal of source frame ``a``'s first slot
-    under conform's nearest/midpoint rule (ties to the earlier frame,
-    final slot requires midpoint coverage), and ``total_slots`` is the
-    emitted unit count for [read_start, end). GOP windows planned in
-    this space stay aligned with the keyframes' images after the
-    cardinality change.
-    """
-    import math
-
-    origin = table.samples[start].pts
-
-    def t(a: int) -> Fraction:
-        return table.samples[a].pts - origin
-
-    def absolute_first_slot(a: int) -> int:
-        if a <= read_start:
-            return math.ceil(t(read_start) * fps)
-        mid = (t(a - 1) + t(a)) / 2
-        return math.floor(mid * fps) + 1
-
-    zero = absolute_first_slot(read_start)
-    last_time = t(end - 1)
-    tail = _table_window_tail(table, start, end)
-    half = 1 / (2 * fps)
-    span_end = last_time + tail
-    if span_end - half > last_time:
-        end_slot = math.floor((span_end - half) * fps) + 1
-    else:
-        end_slot = math.floor(last_time * fps) + 1
-    end_slot = max(end_slot, absolute_first_slot(end - 1) + 1)
-
-    def first_slot_of(a: int) -> int:
-        return absolute_first_slot(a) - zero
-
-    return first_slot_of, end_slot - zero
-
-
 @contextlib.contextmanager
 def _reporter_phase(reporter: Any, phase: str, *,
                     total: int | None, unit: str) -> Iterator[None]:
@@ -426,6 +351,7 @@ class FileSource:
         context_frames: int = 0,
         reader: Any = None,
         timing: SampleTable | VideoTiming | None = None,
+        keyframe_indices: Iterable[int] | None = None,
     ) -> None:
         if layout not in _DECODE_FORMATS:
             supported = ", ".join(k.value for k in _DECODE_FORMATS)
@@ -442,6 +368,8 @@ class FileSource:
             timing = _probe_timing(self.path, self._vr)
         self._table = timing if isinstance(timing, SampleTable) else None
         self._timing = _timing_view(timing)
+        self._keyframes = (
+            None if keyframe_indices is None else frozenset(keyframe_indices))
 
         with _media_operation("failed to probe video source", self.path):
             width, height, fps, total, transform, pixel_aspect = (
@@ -670,18 +598,27 @@ class FileSource:
 
         GOP ordinals/lengths are ABSOLUTE source properties (a mid-GOP
         window start reports the frame's true distance from ITS
-        keyframe). ``None`` without a sample table.
+        keyframe). A table-less reader still stamps sync identity when the
+        run supplied its metadata-only keyframe indices.
         """
         table = self._table
         if table is None:
-            return None
+            if self._keyframes is None:
+                return None
+            return [
+                SourceFrameInfo(index=index, is_sync=index in self._keyframes)
+                for index in range(read_start, self.end)
+            ]
         infos = []
         for index in range(read_start, self.end):
             sample = table.samples[index]
             gop = table.frame_gop(index)
+            is_sync = sample.is_sync
+            if is_sync is None and self._keyframes is not None:
+                is_sync = index in self._keyframes
             infos.append(SourceFrameInfo(
                 index=index,
-                is_sync=sample.is_sync,
+                is_sync=is_sync,
                 gop_ordinal=None if gop is None else gop[0],
                 gop_length=None if gop is None else gop[1],
                 coded_size=sample.coded_size,
@@ -807,7 +744,7 @@ class FileSource:
         # must reach the window's last sample or say so - silently
         # committing a truncated timeline while reporting the full
         # frames_in count is exactly the failure this refuses.
-        if infos is not None and last_table_index != self.end - 1:
+        if self._table is not None and last_table_index != self.end - 1:
             delivered = ("nothing" if last_table_index is None
                          else f"through sample {last_table_index}")
             raise MediaError(
@@ -2219,13 +2156,19 @@ def _run_file_reserved(
     from .session import open_pipeline
 
     video_path = plan.input_path
-    # Keyframe-driven windowing (the harness's --snap-start / --gop-align).
-    # snap-start MOVES the window start to the nearest keyframe; gop-align
-    # KEEPS it, reads back to the enclosing keyframe as recurrence context
-    # (processed, never output), and plans keyframe-anchored windows that
-    # drive every schedule-capable stage through PipelineContext.windowing.
-    windowing = None
+    # snap-start MOVES the requested start. GOP alignment keeps it, reads
+    # back to the enclosing keyframe as recurrence context, and lets stages
+    # react to sync identity carried by the decoded units.
+    gop = None
+    if gop_align:
+        from kinovsr.processors import GopWindowPolicy
+
+        try:
+            gop = GopWindowPolicy(gop_min_window, gop_max_window)
+        except ValueError as exc:
+            raise MediaError(f"invalid GOP window bounds: {exc}") from exc
     context_frames = 0
+    keyframes: list[int] | None = None
     table = timing if isinstance(timing, SampleTable) else None
     timing_view = _timing_view(timing)
     if snap_start or gop_align:
@@ -2259,56 +2202,16 @@ def _run_file_reserved(
             else:
                 start = min(keyframes, key=lambda k: abs(k - start))
         if gop_align:
-            from kinovsr.modeling.upscaler_base import plan_gop_windows
-
-            if timing_view is not None:
-                total = timing_view.sample_count
-            else:
-                with _media_operation(
-                        "GOP video probe failed for", video_path):
-                    _, _, _, total, _, _ = vr.probe_video(video_path)
-            end_abs = total if end is None else min(end, total)
             enclosing = [k for k in keyframes if k <= start]
             read_start = max(enclosing) if enclosing else start
             context_frames = start - read_start
-            window_keyframes = [k for k in keyframes
-                                if read_start <= k < end_abs]
-            # A chain-leading conform stage changes unit cardinality: the
-            # schedule the drivers consume counts CONFORMED units, so the
-            # keyframe positions and total are mapped onto its output
-            # slots (source-ordinal windows silently truncated the run).
-            conform_fps = _leading_conform_cadence(config, table)
-            if conform_fps is None and any(
-                    isinstance(config.get(name), Mapping)
-                    and config.get(name, {}).get("processor") == "conform"
-                    for name in (config.get("pipeline") or [])):
-                raise MediaError(
-                    "gop-align windows count conformed units, so the "
-                    "conform stage must lead the chain (the CLI places it "
-                    "first); move it to the front or drop --gop-align")
-            if conform_fps is not None and table is not None:
-                first_slot_of, total_rel = _conform_slot_plan(
-                    table, start=start, read_start=read_start,
-                    end=end_abs, fps=conform_fps)
-                kf_rel = sorted({first_slot_of(k)
-                                 for k in window_keyframes})
-                plan_total = total_rel
-            else:
-                kf_rel = sorted({k - read_start
-                                 for k in window_keyframes})
-                plan_total = end_abs - read_start
-            try:
-                windowing = plan_gop_windows(
-                    kf_rel, plan_total,
-                    gop_min_window, gop_max_window)
-            except ValueError as exc:
-                raise MediaError(f"invalid GOP window bounds: {exc}") from exc
 
     source = FileSource(
         video_path, layout=layout, start=start, end=end,
         max_frames=max_frames, chunk_size=chunk_size,
         source_color=source_color, source_range=source_range,
-        context_frames=context_frames, reader=reader, timing=timing)
+        context_frames=context_frames, reader=reader, timing=timing,
+        keyframe_indices=keyframes if gop_align else None)
     # Probe-time auto geometry: rewrite bars="auto"/edges="auto" stage
     # tables into detected literal counts before the chain resolves
     # (sampling through the same reader the run decodes with).
@@ -2328,7 +2231,7 @@ def _run_file_reserved(
             chunk_size=auto_chunk_size)
     session = open_pipeline(
         config, source.spec, settings=settings, reporter=reporter,
-        windowing=windowing,
+        gop=gop,
         publication_origin_pts=0 if context_frames else None)
     # The output cap resolves against the OUTPUT cadence (a time-form cap
     # on a cadence-changing chain means output duration, not input).
