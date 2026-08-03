@@ -58,3 +58,32 @@ def test_frame_spec_resolution_preserves_independent_color_fields():
         Quartz.kCVImageBufferTransferFunction_ITU_R_709_2)
     assert properties[av.AVVideoYCbCrMatrixKey] == (
         Quartz.kCVImageBufferYCbCrMatrix_ITU_R_709_2)
+
+
+def test_av_constant_lists_cover_the_framework_metadata():
+    """color.py hand-lists the AV writer constants so importing FileSink does
+    not pay dir(AVFoundation)'s full lazy-framework materialization (~3.5 s,
+    50k+ symbols). The names remain enumerable for free in the framework's
+    metadata module, so an OS release that adds a primaries/transfer/matrix
+    constant fails here instead of silently falling back to BT.709."""
+    import re
+
+    import AVFoundation._metadata as metadata
+
+    from kinovsr.media import color
+    from kinovsr.native.frameworks import av
+
+    names = re.findall(r"\$([A-Za-z0-9_]+)", getattr(metadata, "constants", ""))
+    for prefix, listed in (
+        ("AVVideoColorPrimaries_", color._AV_PRIMS),
+        ("AVVideoTransferFunction_", color._AV_TRANS),
+        ("AVVideoYCbCrMatrix_", color._AV_MATS),
+    ):
+        declared = {
+            value
+            for name in names
+            if name.startswith(prefix)
+            and (value := getattr(av, name, None)) is not None
+        }
+        assert declared == set(listed), (
+            f"{prefix} constants drifted from kinovsr.media.color's list")
