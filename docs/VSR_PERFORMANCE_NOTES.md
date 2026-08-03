@@ -1,4 +1,9 @@
-# VSR Harness Performance Notes
+# VSR Performance Notes (deep reference)
+
+This is the deep implementation reference: kernel paths, dtype policy,
+measurement methodology, and per-family optimization history. For
+concise user-facing guidance (backend choice, chain planning, memory),
+read `docs/PERFORMANCE.md` first.
 
 Findings, gotchas, and methodology from the 2026-07 optimization campaign over
 the `kinovsr/` processors (deblockers, denoisers, restorers, and learned
