@@ -11,6 +11,7 @@ untagged), so range is always read directly.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from kinovsr.native.frameworks import CoreMedia, Quartz, av
@@ -45,12 +46,40 @@ _FRAME_MATRICES = {
 
 # AV writer constants, matched to a CV value by shared CFString value (with a
 # BT.709 fallback for anything AV doesn't expose, e.g. the SMPTE_C transfer).
-_AV_PRIMS = [getattr(av, k) for k in dir(av) if k.startswith("AVVideoColorPrimaries_")]
-_AV_TRANS = [getattr(av, k) for k in dir(av) if k.startswith("AVVideoTransferFunction_")]
-_AV_MATS = [getattr(av, k) for k in dir(av) if k.startswith("AVVideoYCbCrMatrix_")]
+# Keep this list explicit: ``dir(AVFoundation)`` asks PyObjC to enumerate the
+# whole lazy framework and adds seconds to every process that imports FileSink.
+def _available_av_constants(*names: str) -> tuple[Any, ...]:
+    return tuple(
+        value
+        for name in names
+        if (value := getattr(av, name, None)) is not None
+    )
 
 
-def _match(cv_val: Any, av_list: list, fallback: Any) -> Any:
+_AV_PRIMS = _available_av_constants(
+    "AVVideoColorPrimaries_EBU_3213",
+    "AVVideoColorPrimaries_ITU_R_2020",
+    "AVVideoColorPrimaries_ITU_R_709_2",
+    "AVVideoColorPrimaries_P3_D65",
+    "AVVideoColorPrimaries_SMPTE_C",
+)
+_AV_TRANS = _available_av_constants(
+    "AVVideoTransferFunction_IEC_sRGB",
+    "AVVideoTransferFunction_ITU_R_2100_HLG",
+    "AVVideoTransferFunction_ITU_R_709_2",
+    "AVVideoTransferFunction_Linear",
+    "AVVideoTransferFunction_SMPTE_240M_1995",
+    "AVVideoTransferFunction_SMPTE_ST_2084_PQ",
+)
+_AV_MATS = _available_av_constants(
+    "AVVideoYCbCrMatrix_ITU_R_2020",
+    "AVVideoYCbCrMatrix_ITU_R_601_4",
+    "AVVideoYCbCrMatrix_ITU_R_709_2",
+    "AVVideoYCbCrMatrix_SMPTE_240M_1995",
+)
+
+
+def _match(cv_val: Any, av_list: Sequence[Any], fallback: Any) -> Any:
     return next((a for a in av_list if a == cv_val), fallback)
 
 

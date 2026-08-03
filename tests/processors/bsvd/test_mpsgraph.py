@@ -11,13 +11,11 @@ from kinovsr.processors.bsvd import cli_options, factory
 from kinovsr.processors.bsvd.mps import MpsGraphBSVD
 from kinovsr.processors.bsvd.mps_phases import ScheduledMpsPhaseSuite
 
-pytestmark = pytest.mark.unit
-
-
 # --------------------------------------------------------------------------
 # Selection plumbing
 # --------------------------------------------------------------------------
 
+@pytest.mark.unit
 class TestBackendSelection:
     def test_factory_and_cli_agree_on_the_backend_set(self):
         row = next(opt for opt in cli_options.BSVD_OPTIONS
@@ -81,6 +79,9 @@ def _stream(height: int, width: int, count: int, sigma: float) -> list:
     return frames
 
 
+@pytest.mark.slow
+@pytest.mark.integration
+@pytest.mark.requires_weights
 class TestParityWithTheMlxReference:
     def test_fill_steady_and_drain_match(self):
         """The full emitted sequence must match the reference frame for

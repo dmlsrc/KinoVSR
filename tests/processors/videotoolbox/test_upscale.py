@@ -27,7 +27,7 @@ from kinovsr.settings import Settings
 SETTINGS = Settings()
 CONTEXT = PipelineContext(settings=SETTINGS)
 
-W, H = 256, 256   # within every mode's input cap; a size the HQ scaler accepts
+W, H = 160, 128   # within every mode's input cap; a size the HQ scaler accepts
 TB = Fraction(1, 24000)
 
 

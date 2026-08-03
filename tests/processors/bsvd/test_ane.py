@@ -10,9 +10,6 @@ from kinovsr.processors import bsvd as B
 from kinovsr.processors.bsvd import ane as A
 from kinovsr.processors.bsvd import ane_phases as P
 
-pytestmark = pytest.mark.unit
-
-
 # --------------------------------------------------------------------------
 # Schedule mirror vs the instrumented product classes
 # --------------------------------------------------------------------------
@@ -130,6 +127,7 @@ def _mirror_schedule(length: int):
             "tail": tail}
 
 
+@pytest.mark.unit
 class TestNoneFlowMirror:
     @pytest.mark.parametrize(
         "length", [1, 2, 3, 4, 7, 8, 15, 16, 17, 24, 33, 48])
@@ -159,6 +157,7 @@ class TestNoneFlowMirror:
 # Geometry envelope: width alignment and reflect padding
 # --------------------------------------------------------------------------
 
+@pytest.mark.unit
 class TestGeometry:
     def test_pad_width_reflect_mirrors_the_right_edge(self):
         x = mx.arange(2 * 3 * 6 * 1, dtype=mx.float32).reshape(2, 3, 6, 1)
@@ -260,6 +259,7 @@ class _ScheduledFakeSuite:
         self.events.append((kind, start, len(frames)))
 
 
+@pytest.mark.unit
 class TestScheduledPhases:
     def test_asset_keeps_only_the_two_stable_specializations(self):
         assert P._FUNCTIONS == {
@@ -347,6 +347,7 @@ class TestScheduledPhases:
 # Backend selection plumbing
 # --------------------------------------------------------------------------
 
+@pytest.mark.unit
 class TestBackendSelection:
     def _parse(self, raw, settings=None):
         from kinovsr.processors.bsvd.factory import FACTORY
@@ -430,6 +431,7 @@ def _lifecycle_net(monkeypatch) -> A.AneBSVD:
     return A.AneBSVD("unused.safetensors", dtype=mx.float16)
 
 
+@pytest.mark.unit
 class TestAneLifecycle:
     def test_runner_uses_logical_zero_slots(self):
         runner = object.__new__(A.BsvdRunner)
@@ -530,6 +532,7 @@ class TestAneLifecycle:
         assert net._runner is None
 
 
+@pytest.mark.unit
 class TestDenoiserLifecycle:
     def test_close_delegates_and_releases_stream_buffers(self):
         class Net:
@@ -833,7 +836,9 @@ class TestAneParity:
             pytest.skip(f"bsvd weights not available at {weights}")
         net = A.AneBSVD(weights, dtype=mx.float16)
         reference = B.BSVD(weights, dtype=mx.float32)
-        frames = _real_frames(20, net.input_channels, 288, 352)
+        # Four real frames exercise CIF padding, emission, and drain. The
+        # aligned 24-frame test above owns the full recurrent schedule.
+        frames = _real_frames(4, net.input_channels, 288, 352)
         try:
             net._ensure_runner(288, 352)
         except Exception as exc:  # noqa: BLE001 - environment, not correctness
@@ -857,7 +862,7 @@ class TestAneParity:
             full.append(float(delta.mean()))
             interior.append(float(delta[:, :, :352 - 64, :].mean()))
             band.append(float(delta[:, :, 352 - 64:, :].mean()))
-        assert len(full) == 20
+        assert len(full) == 4
         assert max(interior) < 8e-4, f"interior {max(interior):.3e}"
         assert max(band) < 8e-3, f"right band {max(band):.3e}"
         assert max(full) < 2e-3, f"full frame {max(full):.3e}"

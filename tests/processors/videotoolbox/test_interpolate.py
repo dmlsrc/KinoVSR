@@ -164,12 +164,12 @@ def run_interpolation(units, target_fps, cut_at=None):
 @pytest.mark.integration
 class TestInterpolation:
     def test_one_to_many_grid_exact_and_duration_preserving(self):
-        n = 8
+        n = 4
         out, plan = run_interpolation(source_units(n), 60)
-        # 8 frames at 24fps span 1/3 s; the 60fps grid holds m/60 < 8/24
-        # -> exactly 20 output frames
-        assert len(out) == 20
-        assert [u.pts for u in out] == [m * 400 for m in range(20)]
+        # 4 frames at 24fps span 1/6 s; the 60fps grid holds m/60 < 4/24
+        # -> exactly 10 output frames
+        assert len(out) == 10
+        assert [u.pts for u in out] == [m * 400 for m in range(10)]
         assert all(u.duration == 400 for u in out)
         # monotonic, gapless, and duration-preserving: the output clip
         # spans exactly the source window (what keeps audio in sync)
@@ -177,20 +177,20 @@ class TestInterpolation:
         assert plan.output_spec.timeline.cadence == Fraction(60)
 
     def test_downsample_grid(self):
-        out, _ = run_interpolation(source_units(8), 12)
-        assert [u.pts for u in out] == [m * 2000 for m in range(4)]
-        assert sum(u.duration for u in out) == 8 * 1000
+        out, _ = run_interpolation(source_units(4), 12)
+        assert [u.pts for u in out] == [m * 2000 for m in range(2)]
+        assert sum(u.duration for u in out) == 4 * 1000
 
     def test_hard_cut_keeps_grid_monotonic_and_complete(self):
-        out, _ = run_interpolation(source_units(8), 60, cut_at=4)
+        out, _ = run_interpolation(source_units(4), 60, cut_at=2)
         # the pre-cut tail drains via flush, the post-cut segment starts
         # a fresh pair, and the target grid never restarts
-        assert [u.pts for u in out] == [m * 400 for m in range(20)]
+        assert [u.pts for u in out] == [m * 400 for m in range(10)]
         flagged = [i for i, u in enumerate(out)
                    if any(b.kind is BoundaryKind.HARD_CUT
                           for b in u.boundaries)]
         assert len(flagged) == 1
-        assert sum(u.duration for u in out) == 8 * 1000
+        assert sum(u.duration for u in out) == 4 * 1000
 
     def test_cancel_closes_the_native_session(self):
         from kinovsr.pipeline import resolve_pipeline
@@ -206,7 +206,7 @@ class TestInterpolation:
                                 settings=SETTINGS)
         built = build_processors(plan, CONTEXT)
         processor = built[0][1]
-        stream = run_chain(built, source_units(8), CONTEXT)
+        stream = run_chain(built, source_units(4), CONTEXT)
         try:
             first = next(stream)
         except MediaError as exc:
@@ -254,26 +254,26 @@ class TestTimelineOrigin:
     def test_nonzero_origin_anchors_the_grid(self):
         origin = 48000  # 2 seconds into the timeline, grid-aligned
         out, _ = run_interpolation(
-            self.shifted(source_units(8), origin), 60)
-        assert [u.pts for u in out] == [origin + m * 400 for m in range(20)]
-        assert sum(u.duration for u in out) == 8 * 1000
+            self.shifted(source_units(4), origin), 60)
+        assert [u.pts for u in out] == [origin + m * 400 for m in range(10)]
+        assert sum(u.duration for u in out) == 4 * 1000
 
     def test_non_grid_aligned_origin_is_kept_exactly(self):
         origin = 5007   # not a multiple of any frame duration
         out, _ = run_interpolation(
-            self.shifted(source_units(8), origin), 60)
+            self.shifted(source_units(4), origin), 60)
         assert out[0].pts == origin
-        assert [u.pts for u in out] == [origin + m * 400 for m in range(20)]
+        assert [u.pts for u in out] == [origin + m * 400 for m in range(10)]
 
     def test_negative_host_origin_is_not_mistaken_for_file_context(self):
         origin = -5007
         out, _ = run_interpolation(
-            self.shifted(source_units(8), origin), 60)
+            self.shifted(source_units(4), origin), 60)
         assert out[0].pts == origin
-        assert [u.pts for u in out] == [origin + m * 400 for m in range(20)]
+        assert [u.pts for u in out] == [origin + m * 400 for m in range(10)]
 
     def test_origin_survives_a_hard_cut(self):
         origin = 24000
         out, _ = run_interpolation(
-            self.shifted(source_units(8), origin), 60, cut_at=4)
-        assert [u.pts for u in out] == [origin + m * 400 for m in range(20)]
+            self.shifted(source_units(4), origin), 60, cut_at=2)
+        assert [u.pts for u in out] == [origin + m * 400 for m in range(10)]

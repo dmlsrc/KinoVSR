@@ -360,7 +360,9 @@ def test_sequential_flow_estimator_stays_bounded_on_repaired_destinations(
 
         previous = wrap(sources[0], 0)
         trace = []
-        for index in range(1, 65):
+        # One Random submission followed by the eleven Sequential submissions
+        # that exposed the old divergence is the complete regression horizon.
+        for index in range(1, 13):
             current = wrap(sources[index % 2], index)
             mode = (
                 vt.VTOpticalFlowParametersSubmissionModeRandom

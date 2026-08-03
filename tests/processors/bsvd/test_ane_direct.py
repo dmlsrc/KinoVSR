@@ -11,8 +11,6 @@ from kinovsr.processors.bsvd import ane as A
 from kinovsr.processors.bsvd import ane_direct as D
 from kinovsr.settings import Settings
 
-pytestmark = pytest.mark.unit
-
 
 def _synthetic_block(cin: int, seed: int) -> dict:
     """Tiny structurally faithful _DenBlock params (see test_ane)."""
@@ -42,6 +40,7 @@ def _synthetic_params() -> tuple[dict, int]:
             "temp2": _synthetic_block(4, seed=17)}, 4
 
 
+@pytest.mark.unit
 class TestHalfEmission:
     def test_port_contract(self):
         params, cin = _synthetic_params()
@@ -85,6 +84,7 @@ class TestHalfEmission:
         assert plain_bytes == spelled_bytes
 
 
+@pytest.mark.unit
 class TestSelection:
     LARGE = (1080, 1920)
     SMALL = (480, 640)
@@ -147,6 +147,7 @@ class _FakePort:
         self.surface = _FakeSurface(nbytes)
 
 
+@pytest.mark.unit
 class TestSkipRing:
     def test_ring_matches_a_fifo_model(self, monkeypatch):
         """The ring must present: the push from ``depth`` dispatches ago
@@ -199,6 +200,7 @@ class _FakeVectorPort:
         return 256, 256, 4, 2
 
 
+@pytest.mark.unit
 class TestWriteLanes:
     def _lanes(self, backing: bytearray) -> list[bytes]:
         return [bytes(backing[lane * 4: lane * 4 + 2]) for lane in range(16)]

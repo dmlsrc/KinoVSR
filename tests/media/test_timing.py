@@ -8,6 +8,7 @@ import pytest
 
 from kinovsr.media import pixel_buffers
 from kinovsr.media.timing import (
+    SampleTable,
     SampleTiming,
     TimingVerdict,
     analyze_sample_table,
@@ -375,18 +376,23 @@ def test_pair_view_matches_table_timing(pairs, nominal, tick):
 def test_one_hour_ntsc_grid_never_accumulates_rounding_drift(cadence):
     scale = pixel_buffers.VIDEO_TIME_SCALE
     time_base = Fraction(1, scale)
+    # The rounded rational tick pattern repeats after this denominator. Check
+    # every phase once; the one-hour endpoint below still proves bounded drift.
+    tick_step = Fraction(scale, 1) / cadence
+    period = tick_step.denominator
+    local = [pixel_buffers.frame_ticks(index, cadence)
+             for index in range(period + 2)]
+    assert all(current > previous
+               for previous, current in zip(local[:-1], local[1:], strict=True))
+
     frame_count = round(3600 * cadence)
-    previous = -1
-    for index in range(frame_count + 1):
-        current = pixel_buffers.frame_ticks(index, cadence)
-        assert current > previous
-        previous = current
+    end_ticks = pixel_buffers.frame_ticks(frame_count, cadence)
 
     exact_end = Fraction(frame_count) / cadence
-    encoded_end = Fraction(previous, scale)
+    encoded_end = Fraction(end_ticks, scale)
     assert abs(encoded_end - exact_end) <= time_base
-    assert previous == grid_ticks(frame_count, cadence, time_base)
-    assert pixel_buffers.frame_pts(frame_count, cadence).value == previous
+    assert end_ticks == grid_ticks(frame_count, cadence, time_base)
+    assert pixel_buffers.frame_pts(frame_count, cadence).value == end_ticks
 
 
 def test_short_final_duration_is_a_container_end_artifact():
@@ -411,12 +417,19 @@ def test_frame_gop_scales_to_long_clips():
     import time
 
     count = 120_000
-    pairs = [(Fraction(i, 30), Fraction(1, 30)) for i in range(count)]
-    sync = [i % 30 == 0 for i in range(count)]
-    table = analyze_sample_table(
-        _records(pairs, sync=sync),
-        nominal_cadence=30,
+    # Classification and keyframe extraction are covered above. Construct the
+    # feature-length table directly so this regression test times frame_gop,
+    # not 120,000 Fraction allocations and an unrelated classification pass.
+    sample = SampleTiming(Fraction(), Fraction(1, 30), is_sync=False)
+    table = SampleTable(
+        samples=(sample,) * count,
+        verdict=TimingVerdict.EXACT_CFR,
+        cadence=Fraction(30),
+        grid_cadence=Fraction(30),
+        first_pts=Fraction(),
+        duration=Fraction(count, 30),
         source_tick=Fraction(1, 30000),
+        keyframe_indices=tuple(range(0, count, 30)),
     )
     t0 = time.perf_counter()
     assert table.frame_gop(count - 1) == ((count - 1) % 30, 30)

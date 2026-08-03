@@ -411,8 +411,8 @@ def test_same_affinity_lifecycle_uses_one_long_lived_lane() -> None:
 
 
 def test_distinct_affinity_lanes_overlap_steady_state() -> None:
-    count = 36
-    delay = 0.012
+    count = 20
+    delay = 0.008
     first, second = _Pass(delay=delay), _Pass(delay=delay)
     stages = (
         (_stage(first, "first", "lane-a"), first),

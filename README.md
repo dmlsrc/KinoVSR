@@ -98,6 +98,22 @@ through a validated chain - bounded internal execution behind a
 synchronous iterator. `docs/API.md` is the contract, including frame
 ownership and lifetime rules.
 
+## Development
+
+Install the `[dev]` extra, then use the lightweight runner for the common
+feedback loops:
+
+```bash
+python scripts/dev/test.py                 # quick: no integration/slow/weight tests
+python scripts/dev/test.py full            # the complete suite
+python scripts/dev/test.py quick -x tests/media/test_timing.py
+python -m ruff check .
+```
+
+The quick lane includes both unit-marked and unmarked tests; it is intentionally
+defined by what it excludes because the older test tree is not exhaustively
+marked. The full lane remains the pre-merge correctness check.
+
 ## Documentation
 
 - `docs/CONFIG.md` - flags, TOML, `--set`, `--print-config`.
