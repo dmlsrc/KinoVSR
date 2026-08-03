@@ -223,7 +223,7 @@ class TestLifecycle:
         resets = [e for e in log if e[1] == "reset"]
         assert resets == [("a", "reset", "stream_start")]
 
-    def test_pull_based_laziness(self):
+    def test_bounded_source_read_ahead(self):
         pulled = []
 
         def source():
@@ -232,9 +232,17 @@ class TestLifecycle:
                 yield unit
 
         stream = run_chain(chain(Recorder("a")), source(), CONTEXT)
-        next(stream)
-        assert len(pulled) <= 2  # no eager drain of the source
-        stream.close()
+        try:
+            next(stream)
+            # Two two-unit edges, one stage-local input, the returned unit,
+            # and at most one source item waiting to enter a full edge.
+            assert len(pulled) <= 7
+            assert all(
+                metric.high_water_units <= metric.max_units
+                for metric in stream.metrics
+            )
+        finally:
+            stream.close()
 
     @pytest.mark.parametrize(
         "hook", ["prepare", "reset", "process", "flush", "close"],

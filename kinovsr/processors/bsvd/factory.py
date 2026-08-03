@@ -59,6 +59,68 @@ class BsvdStageConfig:
 
 class BsvdFactory:
     name = "bsvd"
+    execution_affinity = "mlx"
+    execution_native_slots = 4
+
+    @staticmethod
+    def execution_resource_handoff_seconds(config: BsvdStageConfig) -> float:
+        """Yield scarce SoC resources only while a downstream user is live.
+
+        Back-to-back recurrent submissions make opaque VideoToolbox work
+        substantially slower even when BSVD's realized placement remains ANE.
+        MPSGraph's four-step jobs need a proportionally larger handoff than
+        Core ML's single-step dispatches. The runtime activates this metadata
+        only under downstream pressure, leaving isolated throughput unchanged.
+        """
+        return {
+            "ane": 0.010,
+            "mpsgraph": 0.040,
+        }.get(config.backend, 0.0)
+
+    @staticmethod
+    def execution_resources(config: BsvdStageConfig) -> tuple[str, ...]:
+        if config.backend in {"ane", "mpsgraph"}:
+            return ("gpu", "ane", "memory_bandwidth")
+        return ("gpu", "memory_bandwidth")
+
+    @staticmethod
+    def execution_buffering(
+        config: BsvdStageConfig,
+        *,
+        input_spec: Any,
+        output_spec: Any,
+        context: PipelineContext,
+        default: Any,
+    ) -> Any:
+        """Declare BSVD's delay, window wavefront, and native slot budget."""
+        from kinovsr.pipeline.execution import BufferingSpec, estimate_frame_bytes
+
+        warmup = 9 if config.noise_map.mode == "auto" else 0
+        if context.gop is None:
+            retained = 16 + warmup + 1
+            pending = 2
+        else:
+            # One accelerator window can run while the next reactive window
+            # buffers. The completed window's bounded emissions are a separate
+            # egress charge rather than a third retained input copy.
+            retained = 2 * (context.gop.max_window + 2) + warmup
+            pending = context.gop.max_window + 2
+        native_slots = 4 if config.backend in {"ane", "mpsgraph"} else 0
+        frame_bytes = max(
+            estimate_frame_bytes(input_spec),
+            estimate_frame_bytes(output_spec),
+        )
+        # The recurrent feature/skip state is opaque to the transport layer;
+        # charge two frame-equivalent slabs per native slot conservatively.
+        estimated = frame_bytes * (
+            retained + pending + 2 * native_slots
+        )
+        return BufferingSpec(
+            retained_input_units=retained,
+            pending_output_units=pending,
+            native_slots=native_slots,
+            estimated_bytes=estimated,
+        )
 
     capabilities = {
         Capability.DENOISE: CapabilitySpec(

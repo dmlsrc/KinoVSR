@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scheduler overhead microbenchmark (planning 06 M3 gate).
+"""Scheduler overhead microbenchmark (planning 06 runtime gate).
 
 In-memory source and sink, no MLX work: measures pure framework cost per
 stage per frame across no-op chains of 1, 4, and 8 stages. Gate values
@@ -36,10 +36,12 @@ WARMUP = 30
 FRAMES = 120
 RUNS = 3
 STAGE_COUNTS = (1, 4, 8)
-# Ratcheted from the 0.25/0.50 pre-implementation budget after the first
-# real run (planning 06): measured ~0.0007 median worst case on M1 Max.
-MEDIAN_GATE_MS = 0.01
-P95_GATE_MS = 0.02
+# M8's independent stage actors deliberately replace the generator-chain
+# timings that supported the old 0.01/0.02 M3 ratchet. The original
+# 0.25/0.50 budget is now the worst-case physical-lane transit gate; adjacent
+# same-affinity stages fuse and do not pay one transit per logical stage.
+MEDIAN_GATE_MS = 0.25
+P95_GATE_MS = 0.50
 
 
 def _chain(n_stages: int):
@@ -47,6 +49,7 @@ def _chain(n_stages: int):
     from kinovsr.processors import (
         Capability,
         CapabilitySpec,
+        Layout,
         StreamConstraint,
         StreamSpec,
         TimelineSpec,
@@ -72,7 +75,11 @@ def _chain(n_stages: int):
 
     spec = StreamSpec(
         frame=frame_spec_for_matrix(
-            "bt709", full_range=False, geometry=Geometry(640, 480)),
+            "bt709",
+            full_range=False,
+            geometry=Geometry(640, 480),
+            layout=Layout.CV_BGRA,
+        ),
         timeline=TimelineSpec(time_base=Fraction(1, 24000),
                               cadence=Fraction(25)))
     cap = CapabilitySpec(

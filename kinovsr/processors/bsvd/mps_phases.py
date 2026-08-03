@@ -652,7 +652,12 @@ class ScheduledMpsPhaseSuite:
 
 
 class WindowMachine:
-    """Cooperatively drive one reset window, one four-step job in flight."""
+    """Cooperatively drive one reset window, one four-step job in flight.
+
+    ``wait_until_ready()`` joins only the native MPSGraph job. The runtime
+    can wait there outside the MLX owner, then return to that owner for the
+    next nonblocking prepare/submit transition.
+    """
 
     def __init__(self, suite: ScheduledMpsPhaseSuite, frames: list[Any]):
         if not frames:
@@ -701,6 +706,11 @@ class WindowMachine:
                     next(self._sequence)
                 except StopIteration:
                     self._done = True
+                if not block:
+                    # Bound an owner turn to one native transition even when
+                    # the next MPSGraph completion races ahead. This keeps the
+                    # shared MLX/GPU lane fair to downstream physical bridges.
+                    break
         except BaseException:
             self._failed = True
             pipeline.drain()
@@ -709,6 +719,20 @@ class WindowMachine:
 
     def advance(self, block: bool = False) -> bool:
         return self._advance(block, stop_on_output=False)
+
+    def wait_until_ready(self) -> None:
+        """Join only the current native dispatch; perform no MLX work."""
+        if self._failed:
+            raise RuntimeError("MPSGraph window failed; reset the stream")
+        pipeline = self._suite.pipeline
+        if self._done or not pipeline.in_flight:
+            return
+        try:
+            pipeline.join()
+        except BaseException:
+            self._failed = True
+            pipeline.drain()
+            raise
 
     def advance_until_output(self, block: bool = True) -> bool:
         return self._advance(block, stop_on_output=True)

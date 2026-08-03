@@ -48,18 +48,35 @@ class SpatialDenoiser:
     def close(self) -> None:
         pass
 
-    def denoise(self, rgb_f32: Any) -> Any:
-        # fp16 in / fp16 out: feed CoreImage a half-float CIImage and render back
-        # to half-float (kCIFormatRGBAh), so no 8-bit quantization round trip.
+    @dataclasses.dataclass(frozen=True, slots=True)
+    class PreparedInput:
+        rgba: bytes
+        width: int
+        height: int
+
+    @dataclasses.dataclass(frozen=True, slots=True)
+    class PreparedOutput:
+        rgba: bytearray
+        width: int
+        height: int
+
+    def prepare_input(self, rgb_f32: Any) -> PreparedInput:
+        # fp16 in / fp16 out: materialize the MLX pack on the shared lane.
         rgb_f32 = mx.clip(rgb_f32[..., :3].astype(mx.float32), 0.0, 1.0)
         h, w = int(rgb_f32.shape[0]), int(rgb_f32.shape[1])
-        rgba = mx.concatenate(
+        rgba = mx.contiguous(mx.concatenate(
             [rgb_f32.astype(mx.float16), mx.ones((h, w, 1), dtype=mx.float16)], axis=-1,
-        )
-        src = memoryview(mx.contiguous(rgba)).cast("B")
+        ))
+        mx.eval(rgba)
+        return self.PreparedInput(bytes(memoryview(rgba)), w, h)
+
+    def _denoise_prepared(self, prepared: PreparedInput) -> PreparedOutput:
+        h, w = prepared.height, prepared.width
         buf = bytearray(w * h * 8)
         with _pb.ci_render_scope() as context:
-            data = Foundation.NSData.dataWithBytes_length_(src, len(src))
+            data = Foundation.NSData.dataWithBytes_length_(
+                prepared.rgba, len(prepared.rgba)
+            )
             ci = Quartz.CIImage.alloc().initWithBitmapData_bytesPerRow_size_format_colorSpace_(
                 data, w * 8, (w, h), Quartz.kCIFormatRGBAh, _pb.srgb_colorspace(),
             )
@@ -72,8 +89,19 @@ class SpatialDenoiser:
                 out, buf, w * 8, ((0, 0), (w, h)),
                 Quartz.kCIFormatRGBAh, _pb.srgb_colorspace(),
             )
-        rgba_out = mx.array(memoryview(buf)).view(mx.float16).reshape(h, w, 4)
-        return mx.contiguous(rgba_out[..., :3]).astype(mx.float32)
+        return self.PreparedOutput(buf, w, h)
+
+    def prepare_output(self, prepared: PreparedOutput) -> Any:
+        rgba_out = mx.array(memoryview(prepared.rgba)).view(mx.float16).reshape(
+            prepared.height, prepared.width, 4
+        )
+        output = mx.contiguous(rgba_out[..., :3]).astype(mx.float32)
+        mx.eval(output)
+        return output
+
+    def denoise(self, rgb_f32: Any) -> Any:
+        prepared = self.prepare_input(rgb_f32)
+        return self.prepare_output(self._denoise_prepared(prepared))
 
 
 # ===========================================================================
@@ -98,7 +126,15 @@ class _SpatialDriver:
         self._engine = SpatialDenoiser(strength=config.strength)
 
     def feed(self, rgb: Any, token: Any = None) -> list:
+        if isinstance(rgb, SpatialDenoiser.PreparedInput):
+            return [(self._engine._denoise_prepared(rgb), token)]
         return [(self._engine.denoise(rgb), token)]
+
+    def prepare_input(self, rgb: Any) -> SpatialDenoiser.PreparedInput:
+        return self._engine.prepare_input(rgb)
+
+    def prepare_output(self, output: SpatialDenoiser.PreparedOutput) -> Any:
+        return self._engine.prepare_output(output)
 
     def flush(self) -> list:
         return []
@@ -112,6 +148,12 @@ class _SpatialDriver:
 
 class SpatialFactory:
     name = "spatial"
+    # All instances share the process-wide CIContext/cache owner.
+    execution_affinity = "coreimage"
+    execution_input_affinity = "mlx"
+    execution_output_affinity = "mlx"
+    execution_resources = ("gpu", "opaque_native", "memory_bandwidth")
+    execution_native_slots = 1
 
     capabilities = {
         Capability.DENOISE: CapabilitySpec(

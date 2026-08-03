@@ -588,6 +588,25 @@ class VsrSession:
             return self._submit_explicit(src_pb, frame_index)
         return self._process(src_pb, frame_index)
 
+    def prepare_upscale_source(self, frame: Any) -> Any:
+        """Upload one MLX frame into a ready, pool-owned source buffer.
+
+        The streaming executor calls this on its MLX bridge lane. The returned
+        CVPixelBuffer is a durable cross-affinity value; the caller retains it
+        until :meth:`submit_prepared_upscale` returns.
+        """
+        return self._upload_src_buffer(frame)
+
+    def submit_prepared_upscale(
+        self,
+        src_pb: Any,
+        frame_index: int,
+    ) -> Any | None:
+        """Submit a source produced by :meth:`prepare_upscale_source`."""
+        if self._explicit_flow:
+            return self._submit_explicit(src_pb, frame_index)
+        return self._process(src_pb, frame_index)
+
     def submit_upscale_buffer_to_buffer(
         self,
         src_pb: Any,

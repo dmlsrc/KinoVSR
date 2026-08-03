@@ -13,6 +13,8 @@ no matter how deep the family's buffer is.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .boundaries import Boundary
@@ -68,6 +70,10 @@ class AsyncWindowHandle(Protocol):
       next output is materialized (or the window completes). It lets a final
       window drain through downstream stages without first completing the
       entire accelerator batch.
+    - ``wait_until_ready()``, when present, blocks only for an in-flight
+      native dispatch. It must not perform MLX work. The streaming executor
+      uses that edge outside the serial MLX owner, then calls nonblocking
+      ``advance`` on the owner to prepare and submit the next dispatch.
     - ``outputs`` holds one entry per input frame, in input order, once
       complete.
     - a raised ``advance`` poisons the handle; the stream needs a reset.
@@ -75,12 +81,14 @@ class AsyncWindowHandle(Protocol):
 
     def advance(self, block: bool = False) -> bool: ...
 
+    def wait_until_ready(self) -> None: ...
+
     @property
     def outputs(self) -> list: ...
 
 
 class WindowWavefront:
-    """Depth-one cross-window pipelining for accelerator-window drivers.
+    """Depth-one, owner-driven progress for accelerator-window drivers.
 
     While one window's accelerator dispatches are in flight, the driver
     keeps buffering input - so upstream keeps decoding - and the
@@ -89,7 +97,10 @@ class WindowWavefront:
     feed/flush driver may emit any input's output arbitrarily late, as
     long as tokens pair correctly.
 
-    ``submit`` completes the window in flight first (that wait is the
+    ``bind_background_submit`` lets the streaming executor queue a blocking
+    advance on the driver's own affinity lane.  Once submitted, native
+    dispatch therefore keeps advancing even while a downstream channel or
+    writer consumes earlier output. ``submit`` completes the window in flight first (that wait is the
     depth-one backpressure: at most one window's dispatches plus one
     window's buffered frames are ever held), starts the next, and returns
     the finished window's remaining emissions. ``poll`` opportunistically
@@ -99,10 +110,34 @@ class WindowWavefront:
     window. ``abandon`` quiesces on reset/close paths.
     """
 
+    _POLL_INTERVAL_SECONDS = 0.002
+
     def __init__(self) -> None:
         self._handle: AsyncWindowHandle | None = None
         self._collect: Any = None
         self._done = False
+        self._background_submit: Any = None
+        self._completion_submit: Any = None
+        self._owner_wait: Any = None
+        self._progress: Future[Any] | None = None
+        self._progress_phase: str | None = None
+        self._progress_failure: BaseException | None = None
+
+    def bind_background_submit(
+        self,
+        submit: Any,
+        completion_submit: Any = None,
+        owner_wait: Any = None,
+    ) -> None:
+        if not callable(submit):
+            raise TypeError("window progress submitter must be callable")
+        if completion_submit is not None and not callable(completion_submit):
+            raise TypeError("window completion submitter must be callable")
+        if owner_wait is not None and not callable(owner_wait):
+            raise TypeError("window owner waiter must be callable")
+        self._background_submit = submit
+        self._completion_submit = completion_submit
+        self._owner_wait = owner_wait
 
     @property
     def in_flight(self) -> bool:
@@ -110,7 +145,75 @@ class WindowWavefront:
 
     def poll(self) -> None:
         if self._handle is not None:
+            if self._progress_failure is not None:
+                raise self._progress_failure
+            if self._progress is not None:
+                return
             self._done = self._handle.advance(block=False)
+
+    def _queue_lane_progress(
+        self,
+        handle: AsyncWindowHandle,
+        *,
+        delay: float = 0.0,
+    ) -> None:
+        def progress() -> bool:
+            # One nonblocking dispatch transition per lane turn. Native work
+            # remains in flight between polls, while immediate MLX bridges
+            # queued by downstream run before the next delayed poll. This is
+            # owner-driven (no downstream callback), but it avoids holding the
+            # MLX lane across an accelerator wait or monopolizing the GPU in
+            # the shadow of VideoToolbox.
+            return bool(handle.advance(block=False))
+
+        future = self._background_submit(progress, delay=delay)
+        self._progress = future
+        self._progress_phase = "lane"
+
+        def completed(done: Future[Any]) -> None:
+            if self._handle is not handle:
+                return
+            try:
+                complete = bool(done.result())
+            except BaseException as exc:  # re-delivered on the owner lane
+                self._progress_failure = exc
+                return
+            self._done = complete
+            if not complete and self._handle is handle:
+                wait = getattr(handle, "wait_until_ready", None)
+                if callable(wait) and self._completion_submit is not None:
+                    self._queue_native_wait(handle, wait)
+                else:
+                    # Generic handles without an explicit native wait edge use
+                    # a bounded fallback poll. Already-waiting lane calls run
+                    # before the delayed poll.
+                    self._queue_lane_progress(
+                        handle,
+                        delay=self._POLL_INTERVAL_SECONDS,
+                    )
+
+        future.add_done_callback(completed)
+
+    def _queue_native_wait(
+        self,
+        handle: AsyncWindowHandle,
+        wait: Any,
+    ) -> None:
+        future = self._completion_submit(wait)
+        self._progress = future
+        self._progress_phase = "wait"
+
+        def completed(done: Future[Any]) -> None:
+            if self._handle is not handle:
+                return
+            try:
+                done.result()
+            except BaseException as exc:
+                self._progress_failure = exc
+                return
+            self._queue_lane_progress(handle)
+
+        future.add_done_callback(completed)
 
     def submit(self, begin: Any, collect: Any) -> Iterable:
         """Complete the in-flight window, then start the next.
@@ -121,16 +224,65 @@ class WindowWavefront:
         ``collect(handle, complete)`` detaches newly available outputs and,
         at completion, validates them and resets shared network state.
         """
+        if self._owner_wait is not None and self._handle is not None:
+            return self._handoff(begin, collect)
         out = self.barrier()
+        self._begin(begin, collect)
+        return out
+
+    def _begin(self, begin: Any, collect: Any) -> None:
+        """Start one handle and bind its owner-driven progress chain."""
         self._handle = begin()
         self._collect = collect
-        self._done = self._handle.advance(block=False)
-        return out
+        self._done = False
+        self._progress_failure = None
+        if self._background_submit is None:
+            self._progress = None
+            self._done = self._handle.advance(block=False)
+        else:
+            handle = self._handle
+            self._queue_lane_progress(handle)
+
+    def _handoff(self, begin: Any, collect: Any) -> Iterable:
+        """Progressively emit one window before starting its successor.
+
+        This path runs only inside the streaming owner's cooperative turn.
+        It preserves the logical one-window barrier while allowing outputs
+        already admitted by the family algorithm to reach downstream before
+        the final native dispatch completes.
+        """
+        handle = self._handle
+        assert handle is not None
+        while self._handle is handle and not self._done:
+            if self._progress_failure is not None:
+                raise self._progress_failure
+            emitted = False
+            for output in self._collect(handle, False):
+                emitted = True
+                yield output
+            if emitted:
+                continue
+            output_count = len(getattr(handle, "outputs", ()))
+            self._owner_wait(
+                lambda handle=handle, output_count=output_count: (
+                    self._handle is not handle
+                    or self._done
+                    or self._progress_failure is not None
+                    or len(getattr(handle, "outputs", ())) > output_count
+                )
+            )
+        if self._progress_failure is not None:
+            raise self._progress_failure
+        out = self._finish()
+        self._begin(begin, collect)
+        yield from out
 
     def available(self) -> Iterable:
         """Collect outputs materialized by nonblocking progress so far."""
         if self._handle is None:
             return []
+        if self._progress_failure is not None:
+            raise self._progress_failure
         if self._done:
             return self._finish()
         return self._collect(self._handle, False)
@@ -149,6 +301,31 @@ class WindowWavefront:
                 continue
             if self._handle is None:
                 return
+            if self._owner_wait is not None:
+                handle = self._handle
+                output_count = len(getattr(handle, "outputs", ()))
+                self._owner_wait(
+                    lambda handle=handle, output_count=output_count: (
+                        self._handle is not handle
+                        or self._done
+                        or self._progress_failure is not None
+                        or len(getattr(handle, "outputs", ())) > output_count
+                    )
+                )
+                continue
+            if self._progress is not None and not self._progress.done():
+                if self._progress_phase == "wait":
+                    self._progress.result()
+                # This can occur when flush reaches drain in the same lane
+                # callback that queued the background task. Advance inline to
+                # the next output; the queued task later observes a completed
+                # handle or continues from this exact serial state.
+                advance = getattr(self._handle, "advance_until_output", None)
+                if callable(advance):
+                    self._done = advance(block=True)
+                else:
+                    self._done = self._handle.advance(block=True)
+                continue
             advance = getattr(self._handle, "advance_until_output", None)
             if callable(advance):
                 self._done = advance(block=True)
@@ -160,11 +337,44 @@ class WindowWavefront:
         if self._handle is None:
             return []
         try:
-            self._done = self._handle.advance(block=True)
+            if self._background_submit is None:
+                self._done = self._handle.advance(block=True)
+            elif self._progress_failure is not None:
+                raise self._progress_failure
+            if self._done:
+                pass
+            elif self._owner_wait is not None:
+                handle = self._handle
+                self._owner_wait(
+                    lambda: (
+                        self._handle is not handle
+                        or self._done
+                        or self._progress_failure is not None
+                    )
+                )
+                if self._progress_failure is not None:
+                    raise self._progress_failure
+            else:
+                if (
+                    self._progress_phase == "wait"
+                    and self._progress is not None
+                    and not self._progress.done()
+                ):
+                    # Native completion waiting runs outside the MLX lane.
+                    # Let that join finish before taking over the remaining
+                    # serialized state inline; never join the same pipeline
+                    # concurrently from two threads.
+                    self._progress.result()
+                # See drain(): a barrier may be reached inside the callback
+                # that just queued progress, where waiting on that Future
+                # would deadlock its own affinity lane.
+                self._done = self._handle.advance(block=True)
         except BaseException:
             self._handle = None
             self._collect = None
             self._done = False
+            self._progress = None
+            self._progress_phase = None
             raise
         return self._finish()
 
@@ -172,6 +382,9 @@ class WindowWavefront:
         handle, self._handle = self._handle, None
         collect, self._collect = self._collect, None
         self._done = False
+        self._progress = None
+        self._progress_phase = None
+        self._progress_failure = None
         return collect(handle, True)
 
     def abandon(self) -> None:
@@ -181,9 +394,18 @@ class WindowWavefront:
         handle, self._handle = self._handle, None
         self._collect = None
         self._done = False
+        self._progress = None
+        self._progress_phase = None
+        self._progress_failure = None
         if handle is not None:
             with contextlib.suppress(BaseException):
                 handle.advance(block=True)
+
+
+@dataclass(frozen=True, slots=True)
+class _BridgeOutput:
+    value: Any
+    source_payload: Any
 
 
 class PerFrameDriver:
@@ -262,16 +484,7 @@ class FeedFlushProcessor:
         self._chroma_strength = float(chroma_strength)
         # A blend closure bound at prepare when the split is active, else None.
         self._blend: Any = None
-        # The driver's optional pump() hook, bound at prepare. Emissions
-        # flow downstream one at a time through the pull scheduler, and a
-        # GOP-windowed driver may have a whole accelerator window in
-        # flight behind them; pumping between consumptions keeps those
-        # dispatches advancing while later stages (VT upscale, encode)
-        # run on this thread. Without it a burst of window outputs
-        # serializes the chain: the accelerator idles while downstream
-        # works through the burst, then downstream idles while the next
-        # window runs (measured additive at 640x480, 2026-07-23).
-        self._pump: Any = None
+        self._driver_prepare_output: Any = None
         # The family's final report, stashed at close (see run_diagnostics).
         self._final_diagnostics: list[str] = []
         self._final_debug_images: dict[str, Any] = {}
@@ -292,8 +505,10 @@ class FeedFlushProcessor:
         if callable(preheat):
             geometry = input_spec.frame.geometry
             preheat(int(geometry.height), int(geometry.width))
-        pump = getattr(self._driver, "pump", None)
-        self._pump = pump if callable(pump) else None
+        prepare_output = getattr(self._driver, "prepare_output", None)
+        self._driver_prepare_output = (
+            prepare_output if callable(prepare_output) else None
+        )
         if self._blend is None and (self._luma_strength != 1.0
                                     or self._chroma_strength != 1.0):
             from kinovsr.media.yuv import luma_chroma_blend
@@ -307,16 +522,58 @@ class FeedFlushProcessor:
 
             self._blend = blend
 
+    def bind_background_submit(
+        self,
+        submit: Any,
+        completion_submit: Any = None,
+        owner_wait: Any = None,
+    ) -> None:
+        """Give an async-window driver its affinity-lane progress queue."""
+        if self._driver is None:
+            raise RuntimeError("cannot bind progress before prepare")
+        bind = getattr(self._driver, "bind_background_submit", None)
+        if callable(bind):
+            if completion_submit is None and owner_wait is None:
+                bind(submit)
+            else:
+                bind(submit, completion_submit, owner_wait)
+
+    def prepare_input(
+        self,
+        unit: FrameUnit,
+        context: PipelineContext,
+    ) -> FrameUnit:
+        if self._driver is None:
+            raise RuntimeError("cannot bridge input before prepare")
+        hook = getattr(self._driver, "prepare_input", None)
+        if not callable(hook):
+            return unit
+        return unit.with_payload(hook(unit.payload))
+
+    def prepare_output(
+        self,
+        unit: FrameUnit,
+        context: PipelineContext,
+    ) -> FrameUnit:
+        hook = self._driver_prepare_output
+        if hook is None:
+            return unit
+        bridged = unit.payload
+        if not isinstance(bridged, _BridgeOutput):
+            raise RuntimeError("driver output bridge lost its source payload")
+        out = hook(bridged.value)
+        if self._blend is not None:
+            out = self._blend(bridged.source_payload, out)
+        return unit.with_payload(out)
+
     def process(self, unit: FrameUnit,
                 context: PipelineContext) -> Iterable[FrameUnit]:
         for out, token in self._driver.feed(unit.payload, token=unit):
-            if self._blend is not None:
+            if self._driver_prepare_output is not None:
+                out = _BridgeOutput(out, token.payload)
+            elif self._blend is not None:
                 out = self._blend(token.payload, out)
             yield token.with_payload(out)
-            if self._pump is not None:
-                # Downstream just consumed one emission; let the driver's
-                # in-flight window progress before handing over the next.
-                self._pump()
 
     def reset(self, boundary: Boundary,
               context: PipelineContext) -> None:
@@ -327,11 +584,11 @@ class FeedFlushProcessor:
         if self._driver is None:
             return
         for out, token in self._driver.flush():
-            if self._blend is not None:
+            if self._driver_prepare_output is not None:
+                out = _BridgeOutput(out, token.payload)
+            elif self._blend is not None:
                 out = self._blend(token.payload, out)
             yield token.with_payload(out)
-            if self._pump is not None:
-                self._pump()
 
     def run_diagnostics(self) -> list[str]:
         """End-of-run diagnostic lines from the wrapped driver, when the

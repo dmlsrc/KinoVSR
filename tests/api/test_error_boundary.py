@@ -221,6 +221,56 @@ class _Session:
         context = PipelineContext(settings=Settings(mlx_cache_limit_gb=0))
         return run_chain(((stage, _Processor()),), units, context)
 
+    def _consume(self, units, consumer, *, source_bridge=None):
+        context = PipelineContext(settings=Settings(mlx_cache_limit_gb=0))
+        built = ()
+        if self.failure is not None:
+            failure = self.failure
+
+            class _Processor:
+                def prepare(self, input_spec, context):
+                    pass
+
+                def process(self, unit, context):
+                    raise failure
+                    yield unit
+
+                def reset(self, boundary, context):
+                    pass
+
+                def flush(self, context):
+                    return ()
+
+                def close(self, context):
+                    pass
+
+            stage = ResolvedStage(
+                name="injected",
+                position=0,
+                family="injected",
+                factory=None,
+                capability=Capability.PREPROCESS,
+                capability_spec=CapabilitySpec(
+                    capability=Capability.PREPROCESS,
+                    profiles=(),
+                    accepts=StreamConstraint(),
+                    produces=preserve_stream,
+                ),
+                profile=None,
+                config=None,
+                input_spec=self.output_spec,
+                output_spec=self.output_spec,
+            )
+            built = ((stage, _Processor()),)
+        return run_chain(
+            built,
+            units,
+            context,
+            input_spec=self.output_spec,
+            source_bridge=source_bridge,
+            terminal_consumer=consumer,
+        )
+
     def stage_diagnostics(self):
         return []
 

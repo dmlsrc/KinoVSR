@@ -29,9 +29,15 @@ config = {"pipeline": ["dn", "up"],
 
 session = open_pipeline(config, input_spec)      # validates everything now
 with session, session.process(my_units()) as run:
-    for unit in run:                             # natural backpressure
+    for unit in run:                             # synchronous host iterator
         consume(unit.payload, unit.pts)
 ```
+
+The host surface is synchronous, but the chain behind it is not a nested pull
+stack. A bounded source actor, serial stage owners, physical framework bridges,
+and a terminal channel make independent progress. Each edge is limited by both
+unit count and estimated payload bytes; `next(run)` waits only for the terminal
+channel and still supplies ordinary host backpressure.
 
 - **Validation is at open.** Unknown families, bad stage config, and
   stream-contract violations raise typed errors
@@ -39,6 +45,11 @@ with session, session.process(my_units()) as run:
   is touched. A session that opens will not fail preflight mid-stream.
 - **Weights load at the first pull.** Opening is cheap; stage
   `prepare` runs when iteration starts.
+- **The input iterable is consumed by bounded ingress, not by the calling
+  thread.** Native-only chains advance it on the source actor. If producing an
+  input may construct MLX work, the runtime advances it on the same long-lived
+  MLX lane that owns MLX graph construction and evaluation. Hosts must not rely
+  on generator thread-local state; close the returned iterator to stop ingress.
 - **One session, one run.** Stage instances are stateful; a consumed
   session refuses a second `process` instead of silently reusing
   state. Open another session for the next stream.
@@ -57,9 +68,10 @@ with session, session.process(my_units()) as run:
 ## Frame ownership and lifetime
 
 A `FrameUnit` payload is either an MLX array or a `CVPixelBuffer` - the
-input `StreamSpec`'s `Layout` says which. MLX arrays are immutable
-values, so they are never an ownership question. CVPixelBuffers are, and
-`process(units, *, retain_outputs=True)` is the switch.
+input `StreamSpec`'s `Layout` says which. Internally, every payload travels with
+a reference-counted lease, storage description, readiness token, and byte
+charge. `process(units, *, retain_outputs=True)` controls the host-facing
+ownership boundary.
 
 - **Input CVPixelBuffers you pass to `process()` are borrowed, and a
   stateful stage may hold one across pulls.** Temporal interpolation
@@ -69,7 +81,7 @@ values, so they are never an ownership question. CVPixelBuffers are, and
   finishes or you close it; hand in a fresh or retained buffer per
   unit.
 - **Outputs are yours to keep by default (`retain_outputs=True`).** MLX
-  outputs pass through as the immutable values they are; for a
+  outputs are materialized and re-homed onto the caller's MLX stream; for a
   CVPixelBuffer layout, `process()` yields a fresh deep copy of each
   output, so you can retain it indefinitely - even after you feed or
   recycle the next input. The copy preserves Core Video attachments marked
@@ -84,8 +96,9 @@ values, so they are never an ownership question. CVPixelBuffers are, and
   (a pass-through or identity stage yields the input buffer unchanged)
   or a stage's reused buffer, so it is valid only until the next pull.
   Copy it, or hand it off (retain it, enqueue it to an encoder) before
-  advancing the iterator. The file sink runs this way - it consumes each
-  unit into the encoder synchronously, so there is nothing to retain.
+  advancing the iterator. The file endpoint uses the internal lease directly:
+  its terminal actor converts or appends the unit before releasing pooled
+  storage, without exposing that borrowed value to a host iterator.
 - **Frame count is not preserved.** One unit in can yield zero, one, or
   several out (interpolation), and a stateful stage can absorb several
   before it emits. Do not assume a 1:1 mapping or a stable total; drive
@@ -95,11 +108,19 @@ values, so they are never an ownership question. CVPixelBuffers are, and
 
 `process_video_file` is the same chain grounded by the file endpoints:
 the input is probed into a concrete spec, the chain preflights against
-it, decoded frames stream through with bounded memory, and the sink
-verifies the declared output timeline unit by unit while carrying
+it, then decode and publication run as the source and terminal actors of the
+same bounded graph. The sink verifies the declared output timeline unit by
+unit while carrying
 audio only when duration was preserved (the synchronization-correct
 policy). The CLI's `[pipeline]`-config route calls exactly this
 function.
+
+The terminal actor also owns the one-frame final-duration holdback, optional
+comparison and post-frame outputs, ordered writer appends, and writer
+backpressure. MLX-to-writer conversion runs on the MLX bridge lane; native
+append/finalization stays serialized on the writer owner. Exact-start context
+with negative PTS can warm every processor but is filtered before any file
+holdback, comparison, progress count, or append.
 
 File runs plan and reserve the complete artifact set before opening a
 writer: post and comparison videos, audio sidecar, cut log, debug images,

@@ -625,17 +625,19 @@ class FileSource:
             ))
         return infos
 
-    def units(self) -> Iterator[FrameUnit]:
+    def units(self, *, native_payloads: bool = False) -> Iterator[FrameUnit]:
         """Decode the window and yield timestamped units, one per frame.
 
         Context frames (gop-align) extend the read BEFORE the window and
         carry negative pts; the window's first frame stays at pts 0.
         Uniform sources stamp the cadence grid; explicit carry stamps each
         frame's rebased source tick, preserving the source clock (gaps
-        included) exactly.
+        included) exactly. ``native_payloads`` leaves the decoder-owned
+        CVPixelBuffer on otherwise-MLX units so the streaming runtime can
+        schedule the upload on its explicit source bridge.
         """
         decode_format = getattr(self._pb, _DECODE_FORMATS[self.layout])
-        to_mlx = self.layout is Layout.MLX_RGB_HWC
+        to_mlx = self.layout is Layout.MLX_RGB_HWC and not native_payloads
         read_start = self.start - self.context_frames
         timing_kwargs: dict[str, Any] = {}
         if self._table is not None and hasattr(self._vr, "read_sample_table"):
@@ -841,6 +843,12 @@ class FileSource:
                 "placed %s samples late to preserve sync",
                 float(place) * 1000.0, track.placement_samples)
         return track
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _PreparedWriterPayload:
+    payload: Any
+    direct_yuv: bool
 
 
 class FileSink:
@@ -1057,7 +1065,7 @@ class FileSink:
             self._pb.write_fp16_rgba(rgba, pb)
         return pb
 
-    def append(self, unit: FrameUnit) -> None:
+    def _validate_timeline(self, unit: FrameUnit) -> None:
         if self._explicit_timeline:
             # A carried source clock has no index grid to verify against;
             # the invariant a mistimed chain would break is monotonicity.
@@ -1096,6 +1104,85 @@ class FileSink:
                     f"{unit.pts} but the previous unit was stamped "
                     f"{last}; cadence-grid stamps must strictly increase")
             self._last_grid_pts = unit.pts
+
+    def prepare_input(
+        self,
+        unit: FrameUnit,
+        *,
+        detach: bool = False,
+    ) -> FrameUnit:
+        """Materialize MLX-to-writer conversion on the MLX bridge lane."""
+        if not self._is_mlx:
+            if detach:
+                with _media_operation(
+                    "writer input copy failed for",
+                    self._final_path,
+                ):
+                    payload = self._pb.copy_pixel_buffer(
+                        unit.payload,
+                        frame_spec=self.spec.frame,
+                    )
+                return unit.with_payload(payload)
+            return unit
+        self._validate_mlx_frame(unit.payload)
+        try:
+            if self._direct_mlx_encode:
+                payload = self.writer.prepare_mlx_rgb(unit.payload)
+                direct_yuv = True
+            else:
+                payload = self._mlx_to_buffer(unit.payload)
+                direct_yuv = False
+        except Exception as exc:
+            if is_native_operation_error(exc, allow_value_error=True):
+                raise MediaError(
+                    f"writer input conversion failed for "
+                    f"{self._final_path}: {exc}"
+                ) from exc
+            raise
+        return unit.with_payload(
+            _PreparedWriterPayload(payload, direct_yuv)
+        )
+
+    def _append_payload(
+        self,
+        unit: FrameUnit,
+        payload: Any,
+        *,
+        direct_yuv: bool = False,
+    ) -> None:
+        try:
+            append = (
+                self.writer.append_prepared_yuv
+                if direct_yuv
+                else self.writer.append
+            )
+            append(
+                payload,
+                pts_ticks=unit.pts,
+                duration_ticks=unit.duration or None,
+            )
+        except Exception as exc:
+            if is_native_operation_error(exc, allow_value_error=True):
+                raise MediaError(
+                    f"writer append failed for {self._final_path}: {exc}"
+                ) from exc
+            raise
+
+    def append_prepared(self, unit: FrameUnit) -> None:
+        """Append a unit after an optional :meth:`prepare_input` bridge."""
+        self._validate_timeline(unit)
+        prepared = unit.payload
+        if isinstance(prepared, _PreparedWriterPayload):
+            self._append_payload(
+                unit,
+                prepared.payload,
+                direct_yuv=prepared.direct_yuv,
+            )
+            return
+        self._append_payload(unit, prepared)
+
+    def append(self, unit: FrameUnit) -> None:
+        self._validate_timeline(unit)
         # The chain's timeline is the validated one: stamp the unit's own
         # ticks (the writer's index grid quantizes NTSC-family rates).
         if self._is_mlx:
@@ -1116,16 +1203,7 @@ class FileSink:
             payload = self._mlx_to_buffer(unit.payload)
         else:
             payload = unit.payload
-        try:
-            self.writer.append(
-                payload, pts_ticks=unit.pts,
-                duration_ticks=unit.duration or None)
-        except Exception as exc:
-            if is_native_operation_error(exc, allow_value_error=True):
-                raise MediaError(
-                    f"writer append failed for {self._final_path}: {exc}"
-                ) from exc
-            raise
+        self._append_payload(unit, payload)
 
     def finalize(self) -> None:
         """Finish encoding while the file is still transaction-private."""
@@ -1881,6 +1959,8 @@ class _ComparisonTee:
             encode_chroma=encode_chroma, overwrite=overwrite)
         try:
             self._retained: Any = deque()  # (seconds, uint8 (H,W,3) mx.array)
+            self._retained_limit: int | None = None
+            self._retained_lock = threading.Lock()
             self._src_time_base = float(source.spec.timeline.time_base)
             self._out_time_base = float(output_spec.timeline.time_base)
             self._src_layout = source.spec.frame.layout
@@ -1903,6 +1983,11 @@ class _ComparisonTee:
             self.sink.discard()
             raise
 
+    def bind_capture_limit(self, units: int) -> None:
+        if units <= 0:
+            raise ValueError("comparison capture limit must be positive")
+        self._retained_limit = int(units)
+
     def _to_uint8_rgb(self, payload: Any, layout: Layout) -> Any:
         import mlx.core as mx
 
@@ -1922,53 +2007,69 @@ class _ComparisonTee:
             mx.eval(rgb)  # materialize: free decode graph, retain only uint8
         return rgb
 
+    def capture(self, unit: FrameUnit) -> None:
+        """Retain one decoded source frame on the graph's MLX bridge."""
+        retained = (
+            unit.pts * self._src_time_base,
+            unit.source.index if unit.source is not None else None,
+            self._to_uint8_rgb(unit.payload, self._src_layout),
+        )
+        with self._retained_lock:
+            if (
+                self._retained_limit is not None
+                and len(self._retained) >= self._retained_limit
+            ):
+                raise PipelineError(
+                    "comparison source capture exceeded its resolved "
+                    f"{self._retained_limit}-unit runtime bound"
+                )
+            self._retained.append(retained)
+
     def tap(self, units: Any) -> Any:
-        """Wrap the source iterator, retaining each decoded frame."""
+        """Compatibility wrapper around :meth:`capture`."""
         for unit in units:
-            self._retained.append(
-                (unit.pts * self._src_time_base,
-                 unit.source.index if unit.source is not None else None,
-                 self._to_uint8_rgb(unit.payload, self._src_layout)))
+            self.capture(unit)
             yield unit
 
-    def emit(self, unit: FrameUnit) -> None:
-        """Composite ``unit`` against its paired source frame and append."""
+    def _composite(self, unit: FrameUnit) -> FrameUnit:
+        """Build one paired comparison unit on the MLX lane."""
         import mlx.core as mx
 
         wanted = unit.source.index if unit.source is not None else None
-        if wanted is not None and self._retained \
-                and self._retained[0][1] is not None:
-            # The output carries its source sample's identity (conform
-            # keeps it on duplicated slots): pair EXACTLY. The time rule
-            # below picks the latest at-or-before frame, which is the
-            # wrong image whenever a nearest-slot stage assigned the slot
-            # to the LATER source of the pair.
-            while (len(self._retained) >= 2
-                   and self._retained[1][1] is not None
-                   and self._retained[1][1] <= wanted):
-                self._retained.popleft()
-            head = self._retained[0]
-            if head[1] != wanted:
-                raise PipelineError(
-                    f"comparison tee lost the source frame for sample "
-                    f"{wanted} (holding {head[1]}); pairing desynced")
-            pre = head[2]
-        else:
-            out_seconds = unit.pts * self._out_time_base
-            # Advance to the LATEST retained source frame at-or-before
-            # this output instant; drop everything strictly earlier
-            # (paired frames can repeat for cadence-upsampled outputs, so
-            # keep the pair). Identity-less outputs (interpolation
-            # synthesizes between sources) keep this rule.
-            while (len(self._retained) >= 2
-                   and self._retained[1][0] <= out_seconds + 1e-9):
-                self._retained.popleft()
-            if not self._retained:
-                raise PipelineError(
-                    "comparison tee has no retained source frame to pair "
-                    "with an emitted output unit; the chain emitted before "
-                    "consuming")
-            pre = self._retained[0][2]
+        with self._retained_lock:
+            if wanted is not None and self._retained \
+                    and self._retained[0][1] is not None:
+                # The output carries its source sample's identity (conform
+                # keeps it on duplicated slots): pair EXACTLY. The time rule
+                # below picks the latest at-or-before frame, which is the
+                # wrong image whenever a nearest-slot stage assigned the slot
+                # to the LATER source of the pair.
+                while (len(self._retained) >= 2
+                       and self._retained[1][1] is not None
+                       and self._retained[1][1] <= wanted):
+                    self._retained.popleft()
+                head = self._retained[0]
+                if head[1] != wanted:
+                    raise PipelineError(
+                        f"comparison tee lost the source frame for sample "
+                        f"{wanted} (holding {head[1]}); pairing desynced")
+                pre = head[2]
+            else:
+                out_seconds = unit.pts * self._out_time_base
+                # Advance to the LATEST retained source frame at-or-before
+                # this output instant; drop everything strictly earlier
+                # (paired frames can repeat for cadence-upsampled outputs, so
+                # keep the pair). Identity-less outputs (interpolation
+                # synthesizes between sources) keep this rule.
+                while (len(self._retained) >= 2
+                       and self._retained[1][0] <= out_seconds + 1e-9):
+                    self._retained.popleft()
+                if not self._retained:
+                    raise PipelineError(
+                        "comparison tee has no retained source frame to pair "
+                        "with an emitted output unit; the chain emitted before "
+                        "consuming")
+                pre = self._retained[0][2]
         pre_up = mx.take(mx.take(pre, self._iy, axis=0), self._ix, axis=1)
         pre_f = pre_up.astype(mx.float32) / 255.0
         if self._out_layout is Layout.MLX_RGB_HWC:
@@ -1981,7 +2082,17 @@ class _ComparisonTee:
                 post_f = _pb.read_pixel_buffer_rgb(
                     unit.payload).astype(mx.float32) / 255.0
         payload = mx.concatenate([pre_f, post_f], axis=1)
-        self.sink.append(unit.with_payload(payload))
+        return unit.with_payload(payload)
+
+    def prepare_emit(self, unit: FrameUnit) -> FrameUnit:
+        return self.sink.prepare_input(self._composite(unit))
+
+    def emit_prepared(self, unit: FrameUnit) -> None:
+        self.sink.append_prepared(unit)
+
+    def emit(self, unit: FrameUnit) -> None:
+        """Composite ``unit`` against its paired source frame and append."""
+        self.sink.append(self._composite(unit))
 
 
 def _save_frame_png(payload: Any, layout: Layout, out_dir: Path,
@@ -2006,6 +2117,266 @@ def _save_frame_png(payload: Any, layout: Layout, out_dir: Path,
             rgb = _pb.read_pixel_buffer_rgb(payload)
     with _media_operation("frame image write failed for", frame_path):
         save_image(rgb, frame_path)
+
+
+class _FileSourceBridge:
+    """MLX upload and source debug taps, separate from decode admission."""
+
+    execution_affinity = "mlx"
+    execution_resources = ("gpu", "memory_bandwidth")
+
+    def __init__(
+        self,
+        *,
+        source: FileSource,
+        pre_dir: Path | None,
+        pixel_buffers: Any,
+        tee: _ComparisonTee | None,
+    ) -> None:
+        from kinovsr.pipeline.execution import (
+            BufferingSpec,
+            estimate_frame_bytes,
+        )
+
+        frame_bytes = estimate_frame_bytes(source.spec)
+        self.execution_buffering = BufferingSpec(
+            retained_input_units=1,
+            pending_output_units=1,
+            native_slots=0,
+            estimated_bytes=frame_bytes,
+        )
+        self._source = source
+        self._pre_dir = pre_dir
+        self._pixel_buffers = pixel_buffers
+        self._tee = tee
+        self._index = 0
+
+    def prepare_input(self, unit: FrameUnit) -> FrameUnit:
+        if self._source.spec.frame.layout is Layout.MLX_RGB_HWC:
+            with _media_operation(
+                "failed to read decoded pixel buffer",
+                self._source.path,
+            ):
+                payload = self._pixel_buffers.read_buffer_rgb_f32(unit.payload)
+            unit = unit.with_payload(payload)
+        if self._pre_dir is not None:
+            _save_frame_png(
+                unit.payload,
+                self._source.spec.frame.layout,
+                self._pre_dir,
+                self._index,
+                self._pixel_buffers,
+            )
+            self._index += 1
+        if self._tee is not None:
+            self._tee.capture(unit)
+        return unit
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _PreparedFileUnit:
+    unit: FrameUnit
+    primary: FrameUnit | None
+    comparison: FrameUnit | None
+
+    def retimed(self, pts: int, duration: int) -> _PreparedFileUnit:
+        return _PreparedFileUnit(
+            unit=self.unit.retimed(pts, duration),
+            primary=(
+                self.primary.retimed(pts, duration)
+                if self.primary is not None
+                else None
+            ),
+            comparison=(
+                self.comparison.retimed(pts, duration)
+                if self.comparison is not None
+                else None
+            ),
+        )
+
+
+class _FileTerminalConsumer:
+    """Duration holdback, comparison, and writers on one terminal actor."""
+
+    execution_affinity = "writer"
+    execution_resources = ("io", "media", "memory_bandwidth")
+    execution_input_resources = ("gpu", "memory_bandwidth")
+
+    def __init__(
+        self,
+        *,
+        output_spec: StreamSpec,
+        sink: FileSink | None,
+        tee: _ComparisonTee | None,
+        cut_log_path: Path | None,
+        cut_log_final_path: Path | None,
+        post_dir: Path | None,
+        post_layout: Layout,
+        pixel_buffers: Any,
+        preserve_duration: bool,
+        source_end_ticks: int,
+        max_output_frames: int | None,
+        advance: Any,
+    ) -> None:
+        from kinovsr.pipeline.execution import (
+            BufferingSpec,
+            estimate_frame_bytes,
+        )
+
+        needs_mlx = (
+            output_spec.frame.layout is Layout.MLX_RGB_HWC
+            or tee is not None
+            or post_dir is not None
+        )
+        self.execution_input_affinity = (
+            "mlx" if needs_mlx else "writer-input"
+        )
+        self.execution_input_resources = (
+            ("gpu", "memory_bandwidth")
+            if needs_mlx
+            else ("cpu", "memory_bandwidth")
+        )
+        frame_bytes = estimate_frame_bytes(output_spec)
+        self._frame_bytes = frame_bytes
+        self.execution_buffering = BufferingSpec(
+            retained_input_units=1,
+            pending_output_units=0,
+            native_slots=1,
+            estimated_bytes=2 * frame_bytes,
+        )
+        self._sink = sink
+        self._tee = tee
+        self._cut_log_path = cut_log_path
+        self._cut_log_final_path = cut_log_final_path
+        self._post_dir = post_dir
+        self._post_layout = post_layout
+        self._pixel_buffers = pixel_buffers
+        self._preserve_duration = preserve_duration
+        self._source_end_ticks = source_end_ticks
+        self._max_output_frames = max_output_frames
+        self._advance = advance
+        self._post_index = 0
+        self._pending: _PreparedFileUnit | None = None
+        self._frames_out = 0
+        self._finished = False
+        self._output_is_mlx = (
+            output_spec.frame.layout is Layout.MLX_RGB_HWC
+        )
+        self._detach_input = False
+        self.retains_input_payload = sink is not None and not self._output_is_mlx
+
+    def bind_runtime_buffering(
+        self,
+        units: int,
+        *,
+        detach_input: bool = False,
+    ) -> None:
+        if self._tee is not None:
+            self._tee.bind_capture_limit(units)
+        self._detach_input = bool(detach_input)
+        self.retains_input_payload = (
+            self._sink is not None
+            and not self._output_is_mlx
+            and not self._detach_input
+        )
+        capture_bytes = units * self._frame_bytes if self._tee is not None else 0
+        self.execution_buffering = dataclasses.replace(
+            self.execution_buffering,
+            estimated_bytes=(2 * self._frame_bytes) + capture_bytes,
+        )
+
+    def prepare_input(self, unit: FrameUnit) -> _PreparedFileUnit:
+        if unit.pts < 0:
+            return _PreparedFileUnit(unit.with_payload(None), None, None)
+        if self._post_dir is not None:
+            _save_frame_png(
+                unit.payload,
+                self._post_layout,
+                self._post_dir,
+                self._post_index,
+                self._pixel_buffers,
+            )
+            self._post_index += 1
+        primary = (
+            self._sink.prepare_input(unit, detach=self._detach_input)
+            if self._sink is not None
+            else None
+        )
+        comparison = (
+            self._tee.prepare_emit(unit)
+            if self._tee is not None
+            else None
+        )
+        return _PreparedFileUnit(unit.with_payload(None), primary, comparison)
+
+    @staticmethod
+    def _unprepared(unit: FrameUnit) -> _PreparedFileUnit:
+        return _PreparedFileUnit(unit, unit, None)
+
+    def _write(self, prepared: _PreparedFileUnit) -> None:
+        if self._sink is not None and prepared.primary is not None:
+            self._sink.append_prepared(prepared.primary)
+        if self._tee is not None and prepared.comparison is not None:
+            self._tee.emit_prepared(prepared.comparison)
+        self._frames_out += 1
+        self._advance()
+
+    def consume(self, value: _PreparedFileUnit | FrameUnit) -> bool:
+        prepared = (
+            value
+            if isinstance(value, _PreparedFileUnit)
+            else self._unprepared(value)
+        )
+        unit = prepared.unit
+        if self._cut_log_path is not None and unit.boundaries:
+            with (
+                _media_operation(
+                    "cut log append failed for",
+                    self._cut_log_final_path,
+                ),
+                self._cut_log_path.open("a", encoding="utf-8") as log,
+            ):
+                for boundary in unit.boundaries:
+                    if boundary.kind is BoundaryKind.HARD_CUT:
+                        log.write(f"{boundary.source_index}\n")
+        if unit.pts < 0:
+            return True
+        if self._pending is not None:
+            self._write(self._pending)
+        self._pending = prepared
+        return not (
+            self._max_output_frames is not None
+            and self._frames_out + 1 == self._max_output_frames
+        )
+
+    def finish(self) -> int:
+        if self._finished:
+            return self._frames_out
+        self._finished = True
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            if self._preserve_duration:
+                unit = pending.unit
+                clamped_end = min(
+                    self._source_end_ticks,
+                    unit.pts + unit.duration,
+                )
+                pending = pending.retimed(
+                    unit.pts,
+                    max(1, clamped_end - unit.pts),
+                )
+            self._write(pending)
+        # Seal every writer on this actor before the graph releases its
+        # affinity lane. The transaction still owns publication and calls
+        # finalize() idempotently as a pre-rename check.
+        if self._sink is not None:
+            self._sink.finalize()
+        if self._tee is not None:
+            self._tee.sink.finalize()
+        return self._frames_out
+
+    def close(self) -> None:
+        return None
 
 
 def run_file(
@@ -2301,24 +2672,14 @@ def _run_file_reserved(
 
     # Optional per-frame PNG dumps: pre = the SOURCE frames (before the chain),
     # post = the encoded output frames (after it). Debug taps, not chain
-    # stages - the PRE tap wraps the source iterator so it dumps exactly the
-    # frames the session pulls, and the POST tap dumps each emitted unit.
+    # stages; the explicit source bridge dumps exactly the admitted source
+    # units without making decode share the MLX owner lane.
     from kinovsr.media import pixel_buffers as _pbmod
     pre_dir = (transaction.temp_directory("pre-frame directory")
                if plan.get("pre-frame directory") is not None else None)
     post_dir = (transaction.temp_directory("post-frame directory")
                 if plan.get("post-frame directory") is not None else None)
-    source_units = source.units()
-    if pre_dir is not None:
-        src_layout = source.spec.frame.layout
-
-        def _pre_tapped(units: Any) -> Any:
-            for i, unit in enumerate(units):
-                _save_frame_png(unit.payload, src_layout, pre_dir, i, _pbmod)
-                yield unit
-        source_units = _pre_tapped(source_units)
     post_layout = session.output_spec.frame.layout
-    post_index = 0
 
     # The side-by-side comparison output (harness --comparison parity):
     # retained source frames pair with emitted output units into a second
@@ -2338,7 +2699,27 @@ def _run_file_reserved(
             audio_track=track, audio_codec=audio_codec,
             encode_chroma=comp_chroma, overwrite=plan.overwrite)
         transaction.register_sink("comparison output", tee.sink)
-        source_units = tee.tap(source_units)
+
+    needs_source_bridge = (
+        source.spec.frame.layout is Layout.MLX_RGB_HWC
+        or pre_dir is not None
+        or tee is not None
+    )
+    source_bridge = (
+        _FileSourceBridge(
+            source=source,
+            pre_dir=pre_dir,
+            pixel_buffers=_pbmod,
+            tee=tee,
+        )
+        if needs_source_bridge
+        else None
+    )
+    source_units = (
+        source.units(native_payloads=True)
+        if source_bridge is not None
+        else source.units()
+    )
 
     # A terminal native processor may write directly into the primary file
     # writer's adaptor pool, but only when its actual destination format and
@@ -2373,8 +2754,6 @@ def _run_file_reserved(
         # Explicit carry is 1:1 (cadence-changing stages refuse a variable
         # timeline), so the source window's exact end IS the output end.
         source_end_ticks = source.window_end_ticks()
-    frames_out = 0
-    pending: FrameUnit | None = None
     # Per-frame progress on the OUTPUT count (the number a user watches):
     # exact for 1:1 and conform chains, within one frame of the final
     # count for interpolation's clamped tail. Advisory only - a source
@@ -2394,56 +2773,34 @@ def _run_file_reserved(
         if reporter is not None:
             reporter.phase_advance(_progress_phase)
 
-    # retain_outputs=False: the sink consumes each unit into the encoder
-    # synchronously, so outputs need not be copied for retention. A one-unit
-    # holdback lets the final frame be clamped before it is written.
+    terminal = _FileTerminalConsumer(
+        output_spec=session.output_spec,
+        sink=sink,
+        tee=tee,
+        cut_log_path=cut_log_path,
+        cut_log_final_path=(
+            plan.path("cut log") if cut_log_path is not None else None
+        ),
+        post_dir=post_dir,
+        post_layout=post_layout,
+        pixel_buffers=_pbmod,
+        preserve_duration=preserve_duration,
+        source_end_ticks=source_end_ticks,
+        max_output_frames=max_output_frames,
+        advance=_advance,
+    )
+
+    # The file endpoint is the graph's terminal actor. Its one-unit duration
+    # holdback owns the terminal lease until the next unit or EOS, while the
+    # bounded final edge applies writer backpressure without reviving a pull
+    # stack through the processors.
     # The reporter phase opens first so it closes LAST: its summary line
     # lands after the session has drained, success or failure.
     with _reporter_phase(
             reporter, _progress_phase, total=expected_out,
-            unit="frame"), session, session.process(
-            source_units, retain_outputs=False) as run:
-        for unit in run:
-            if cut_log_path is not None and unit.boundaries:
-                with (
-                    _media_operation(
-                        "cut log append failed for", plan.path("cut log")),
-                    cut_log_path.open("a", encoding="utf-8") as log,
-                ):
-                    for boundary in unit.boundaries:
-                        if boundary.kind is BoundaryKind.HARD_CUT:
-                            log.write(f"{boundary.source_index}\n")
-            if unit.pts < 0:
-                # gop-align context frames: recurrence warmup, never output.
-                continue
-            if post_dir is not None:
-                _save_frame_png(unit.payload, post_layout, post_dir,
-                                post_index, _pbmod)
-                post_index += 1
-            if pending is not None:
-                if sink is not None:
-                    sink.append(pending)
-                if tee is not None:
-                    tee.emit(pending)
-                frames_out += 1
-                _advance()
-            pending = unit
-            if (max_output_frames is not None
-                    and frames_out + 1 == max_output_frames):
-                break
-        if pending is not None:
-            if preserve_duration:
-                clamped_end = min(
-                    source_end_ticks, pending.pts + pending.duration)
-                pending = pending.retimed(
-                    pending.pts, max(1, clamped_end - pending.pts))
-            if sink is not None:
-                sink.append(pending)
-            if tee is not None:
-                tee.emit(pending)
-            frames_out += 1
-            _advance()
-        # Stage state is still live here (drained, not yet closed).
+            unit="frame"), session, session._consume(
+            source_units, terminal, source_bridge=source_bridge) as run:
+        frames_out = run.wait()
         diagnostics = session.stage_diagnostics()
         debug_images = (
             session.stage_debug_images()

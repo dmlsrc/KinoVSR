@@ -72,6 +72,11 @@ _UPSCALE_NATIVE_SRC = {
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class _PreparedVtInput:
+    buffer: Any
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class VtInterpolateConfig:
     target_fps: Fraction
     mode: str
@@ -222,7 +227,9 @@ class VtInterpolateProcessor:
             )
         assert self._time_base is not None
         payload = unit.payload
-        if self._upload_bridge is not None:
+        if isinstance(payload, _PreparedVtInput):
+            payload = payload.buffer
+        elif self._upload_bridge is not None:
             payload = self._upload_bridge.upload(payload)
         if self._source_cadence is not None:
             index = round(Fraction(unit.pts - self._origin) * self._time_base * self._source_cadence)
@@ -253,6 +260,18 @@ class VtInterpolateProcessor:
             if self._pending is not None:
                 yield self._pending
             self._pending = out
+
+    def prepare_input(
+        self,
+        unit: FrameUnit,
+        context: PipelineContext,
+    ) -> FrameUnit:
+        """Materialize the optional MLX upload on the shared MLX lane."""
+        if self._upload_bridge is None:
+            return unit
+        return unit.with_payload(
+            _PreparedVtInput(self._upload_bridge.upload(unit.payload))
+        )
 
     def reset(self, boundary: Boundary, context: PipelineContext) -> None:
         # The scheduler drained the pre-boundary tail via flush(), which
@@ -414,7 +433,12 @@ class VtUpscaleProcessor:
             raise MediaError(f"VideoToolbox VSR session unavailable: {exc}") from exc
 
     def process(self, unit: FrameUnit, context: PipelineContext) -> Iterable[FrameUnit]:
-        if self._cv_input:
+        if isinstance(unit.payload, _PreparedVtInput):
+            out = self._session.submit_prepared_upscale(
+                unit.payload.buffer,
+                self._index,
+            )
+        elif self._cv_input:
             out = self._session.submit_upscale_buffer_to_buffer(
                 unit.payload,
                 self._index,
@@ -443,6 +467,30 @@ class VtUpscaleProcessor:
             return
         pending, self._pending = self._pending, unit
         yield pending.with_payload(out)
+
+    def prepare_input(
+        self,
+        unit: FrameUnit,
+        context: PipelineContext,
+    ) -> FrameUnit:
+        """Pack/upload MLX input before entering the VideoToolbox owner."""
+        if self._cv_input:
+            return unit
+        mx = self._mx
+        rgb = unit.payload
+        rgba = mx.contiguous(
+            mx.concatenate(
+                [
+                    rgb.astype(mx.float16),
+                    mx.ones((*rgb.shape[:2], 1), mx.float16),
+                ],
+                axis=-1,
+            )
+        )
+        mx.eval(rgba)
+        return unit.with_payload(
+            _PreparedVtInput(self._session.prepare_upscale_source(rgba))
+        )
 
     def reset(self, boundary: Boundary, context: PipelineContext) -> None:
         if self._session is not None:
@@ -479,6 +527,14 @@ class VtUpscaleProcessor:
 
 class VideoToolboxFactory:
     name = "videotoolbox"
+    execution_affinity = "videotoolbox:{stage}"
+    execution_input_affinity = "mlx"
+    execution_resources = ("media", "opaque_native", "memory_bandwidth")
+    execution_native_slots = 2
+    # Destination pools are hard-capped at two. The runtime acquires a slot
+    # before advancing the output generator and returns it with the payload
+    # lease, so asynchronous downstream pressure cannot overrun that pool.
+    execution_output_slots = 2
 
     capabilities = {
         Capability.INTERPOLATE: CapabilitySpec(

@@ -826,6 +826,7 @@ class AVWriter:
         payload: Any,
         *,
         direct_mlx_rgb: bool,
+        prepared_yuv: bool = False,
         pts_ticks: int | None,
         duration_ticks: int | None,
     ) -> None:
@@ -851,7 +852,9 @@ class AVWriter:
                             f"{self._state}")
                     frame_index = self.frame_count
                 self._wait_for_ready(self.video_input, "video")
-                if direct_mlx_rgb:
+                if prepared_yuv:
+                    pb = payload
+                elif direct_mlx_rgb:
                     pb = self._rgb_to_yuv_buffer(payload)
                 elif self._yuv_feed:
                     pb = self._rgb_to_yuv_buffer(
@@ -943,6 +946,33 @@ class AVWriter:
         self._append_payload(
             equivalent,
             direct_mlx_rgb=True,
+            pts_ticks=pts_ticks,
+            duration_ticks=duration_ticks,
+        )
+
+    def prepare_mlx_rgb(self, rgb: Any) -> Any:
+        """Convert MLX RGB into a pooled YUV buffer without appending it."""
+        if not self.accepts_mlx_rgb:
+            raise RuntimeError(
+                f"[{self.label}] direct MLX RGB input requires the YUV feed"
+            )
+        import mlx.core as mx
+
+        equivalent = rgb[..., :3].astype(mx.float16).astype(mx.float32)
+        return self._rgb_to_yuv_buffer(equivalent)
+
+    def append_prepared_yuv(
+        self,
+        payload: Any,
+        *,
+        pts_ticks: int | None = None,
+        duration_ticks: int | None = None,
+    ) -> None:
+        """Append a YUV buffer returned by :meth:`prepare_mlx_rgb`."""
+        self._append_payload(
+            payload,
+            direct_mlx_rgb=False,
+            prepared_yuv=True,
             pts_ticks=pts_ticks,
             duration_ticks=duration_ticks,
         )

@@ -438,7 +438,9 @@ class WindowMachine:
     waiting - joining finished dispatches, materializing their outputs,
     prepping and submitting the next - and returns True once the window
     is complete and ``outputs`` holds one entry per input frame.
-    ``advance(block=True)`` runs to completion. Every MLX operation
+    ``advance(block=True)`` runs to completion. ``wait_until_ready()`` joins
+    only an in-flight Core ML dispatch, so a runtime may wait outside the
+    MLX owner before resuming nonblocking progress there. Every MLX operation
     (input prep, output materialization) happens inside ``advance`` on
     the caller's thread; only the Core ML dispatches run on the suite's
     pipeline worker. ``advance_until_output(block=True)`` provides a
@@ -542,6 +544,13 @@ class WindowMachine:
                     next(self._sequence)
                 except StopIteration:
                     self._done = True
+                if not block:
+                    # A native completion may already be observable by the
+                    # time MLX prep submits the next dispatch. Yield after one
+                    # transition regardless: greedily consuming another ready
+                    # dispatch can monopolize the shared MLX/GPU owner for a
+                    # whole window and starve downstream VideoToolbox work.
+                    break
         except BaseException:
             self._failed = True
             pipeline.drain()
@@ -555,6 +564,20 @@ class WindowMachine:
         finished; a blocking call runs the window to completion.
         """
         return self._advance(block, stop_on_output=False)
+
+    def wait_until_ready(self) -> None:
+        """Join only the current native dispatch; perform no MLX work."""
+        if self._failed:
+            raise RuntimeError("window failed; reset the stream")
+        pipeline = self._suite.pipeline
+        if self._done or not pipeline.in_flight:
+            return
+        try:
+            pipeline.join()
+        except BaseException:
+            self._failed = True
+            pipeline.drain()
+            raise
 
     def advance_until_output(self, block: bool = True) -> bool:
         """Progress until one more output is ready or the window completes."""

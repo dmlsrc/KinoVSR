@@ -6,6 +6,8 @@ computed from - not the frame currently arriving.
 """
 from __future__ import annotations
 
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from fractions import Fraction
 
 import mlx.core as mx
@@ -20,7 +22,11 @@ from kinovsr.processors import (
     TimelineSpec,
     frame_spec_for_matrix,
 )
-from kinovsr.processors.feed_driver import FeedFlushProcessor, parse_luma_chroma
+from kinovsr.processors.feed_driver import (
+    FeedFlushProcessor,
+    WindowWavefront,
+    parse_luma_chroma,
+)
 from kinovsr.processors.specs import ColorMatrix, luma_coefficients
 from kinovsr.settings import Settings
 
@@ -88,69 +94,24 @@ def run(proc: FeedFlushProcessor, spec: StreamSpec, units: list) -> list:
     return out
 
 
-class _BurstPumpDriver:
-    """Emits a three-frame burst per feed and counts pump() calls - the
-    stand-in for a windowed accelerator driver with dispatches in flight
-    behind its emissions."""
+class TestBackgroundProgress:
+    def test_adapter_binds_owner_progress_after_prepare(self):
+        submitted = []
 
-    def __init__(self) -> None:
-        self.pumps = 0
-        self.pumps_seen_at_yield: list[int] = []
+        class Driver(_HalveDelayDriver):
+            def bind_background_submit(self, submit):
+                submitted.append(submit)
 
-    def feed(self, frame, token=None) -> list:
-        return [(frame, token)] * 3
-
-    def flush(self) -> list:
-        return []
-
-    def reset(self) -> None:
-        pass
-
-    def pump(self) -> None:
-        self.pumps += 1
-
-
-class TestPump:
-    def test_pump_fires_between_lazy_consumptions(self):
-        """The adapter must let the driver advance in-flight work each
-        time downstream consumes one emission - not once per batch."""
-        driver = _BurstPumpDriver()
-        proc = FeedFlushProcessor(lambda: driver)
+        proc = FeedFlushProcessor(lambda: Driver(0))
         proc.prepare(stream(), CTX)
-        emissions = proc.process(gray_unit(0.4, 0), CTX)
-        assert driver.pumps == 0
-        next(emissions)
-        assert driver.pumps == 0, "pump follows a consumption, not a yield"
-        next(emissions)
-        assert driver.pumps == 1
-        next(emissions)
-        assert driver.pumps == 2
-        assert list(emissions) == []
-        assert driver.pumps == 3
+        callback = object()
+        proc.bind_background_submit(callback)
+        assert submitted == [callback]
 
-    def test_drivers_without_pump_bind_none(self):
+    def test_driver_without_background_progress_needs_no_hook(self):
         proc = FeedFlushProcessor(lambda: _HalveDelayDriver(0))
         proc.prepare(stream(), CTX)
-        assert proc._pump is None
-
-    def test_bsvd_pump_polls_only_when_gop_windowed(self):
-        from types import SimpleNamespace
-
-        from kinovsr.processors.bsvd import BsvdDenoiser
-
-        class _Wavefront:
-            polls = 0
-
-            def poll(self):
-                self.polls += 1
-
-        wavefront = _Wavefront()
-        stub = SimpleNamespace(_gop=object(), _wavefront=wavefront)
-        BsvdDenoiser.pump(stub)
-        assert wavefront.polls == 1
-        stub._gop = None
-        BsvdDenoiser.pump(stub)
-        assert wavefront.polls == 1, "continuous streams must not poll"
+        proc.bind_background_submit(lambda callback: callback())
 
 
 class TestNoSplit:
@@ -305,6 +266,87 @@ class _ScriptedHandle:
 class TestWindowWavefront:
     """Depth-one cross-window pipelining: the shared async window protocol
     any accelerator-backed family implements via ``begin_window``."""
+
+    def test_bound_owner_advances_without_downstream_poll(self):
+        advanced = threading.Event()
+
+        class Handle(_ScriptedHandle):
+            def advance(self, block=False):
+                result = super().advance(block=block)
+                if result:
+                    advanced.set()
+                return result
+
+        wavefront = WindowWavefront()
+        with ThreadPoolExecutor(max_workers=1) as owner:
+            wavefront.bind_background_submit(
+                lambda callback, delay=0.0: owner.submit(callback)
+            )
+            handle = Handle(["window"], advances_needed=100)
+            assert wavefront.submit(
+                lambda: handle,
+                lambda current, complete: list(current.outputs),
+            ) == []
+            assert advanced.wait(1.0)
+            assert list(wavefront.available()) == ["window"]
+        assert handle.blocking_calls == 0
+        assert handle.nonblocking_calls > 1
+
+    def test_owner_handoff_publishes_before_the_window_finishes(self):
+        pending = []
+
+        def submit(callback, delay=0.0):
+            del delay
+            future = Future()
+            pending.append((future, callback))
+            return future
+
+        def owner_wait(predicate):
+            while not predicate():
+                future, callback = pending.pop(0)
+                future.set_result(callback())
+
+        class IncrementalHandle:
+            def __init__(self, prefix):
+                self.prefix = prefix
+                self.outputs = []
+                self.done = False
+
+            def advance(self, block=False):
+                if block:
+                    while not self.done:
+                        self.advance()
+                    return True
+                self.outputs.append(f"{self.prefix}{len(self.outputs)}")
+                self.done = len(self.outputs) == 3
+                return self.done
+
+        wavefront = WindowWavefront()
+        wavefront.bind_background_submit(submit, owner_wait=owner_wait)
+        first = IncrementalHandle("first-")
+        cursor = 0
+
+        def collect(handle, complete):
+            del complete
+            nonlocal cursor
+            ready = tuple(handle.outputs[cursor:])
+            cursor = len(handle.outputs)
+            return ready
+
+        assert wavefront.submit(lambda: first, collect) == []
+        second = IncrementalHandle("second-")
+        handoff = iter(wavefront.submit(lambda: second, collect))
+
+        assert next(handoff) == "first-0"
+        assert not first.done
+        assert wavefront._handle is first
+        assert next(handoff) == "first-1"
+        assert not first.done
+        assert wavefront._handle is first
+        assert list(handoff) == ["first-2"]
+        assert first.done
+        assert wavefront._handle is second
+        wavefront.abandon()
 
     def test_submit_completes_the_previous_window_first(self):
         from kinovsr.processors.feed_driver import WindowWavefront

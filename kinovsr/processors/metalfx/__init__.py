@@ -38,6 +38,22 @@ _SCALES = (2, 3, 4)
 _DEFAULT_SCALE = 2
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _PreparedMetalFxInput:
+    rgba: bytes
+    width: int
+    height: int
+    dtype: Any
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _PreparedMetalFxOutput:
+    rgba: memoryview
+    width: int
+    height: int
+    dtype: Any
+
+
 class MetalFxSpatialUpscaler:
     """feed()/flush() driver for the MetalFX spatial scaler.
 
@@ -102,12 +118,33 @@ class MetalFxSpatialUpscaler:
         return (device.newCommandQueue(), scaler, in_tex, out_tex,
                 readback, width, height)
 
-    def feed(self, rgb: Any, token: Any = None) -> list:
-        import Metal
+    def prepare_input(self, rgb: Any) -> _PreparedMetalFxInput:
         import mlx.core as mx
 
         frame = rgb[0] if rgb.ndim == 4 else rgb
         height, width = int(frame.shape[0]), int(frame.shape[1])
+        clipped = mx.clip(frame[..., :3].astype(mx.float32), 0.0, 1.0)
+        rgba = mx.contiguous(
+            mx.concatenate(
+                [clipped, mx.ones((height, width, 1))], axis=-1
+            ).astype(mx.float16)
+        )
+        mx.eval(rgba)
+        return _PreparedMetalFxInput(
+            rgba=bytes(memoryview(rgba)),
+            width=width,
+            height=height,
+            dtype=frame.dtype,
+        )
+
+    def _feed_prepared(
+        self,
+        prepared: _PreparedMetalFxInput,
+        token: Any,
+    ) -> _PreparedMetalFxOutput:
+        import Metal
+
+        height, width = prepared.height, prepared.width
         if self._state is None:
             self._state = self._setup(width, height)
         queue, scaler, in_tex, out_tex, readback, w, h = self._state
@@ -116,14 +153,9 @@ class MetalFxSpatialUpscaler:
                 f"frame geometry changed mid-stream: scaler is bound to "
                 f"{w}x{h}, got {width}x{height}")
 
-        # Clip like every learned upscaler: decoded RGBAHalf carries legal
-        # YUV->RGB overshoot outside the scaler's expected display range.
-        clipped = mx.clip(frame[..., :3].astype(mx.float32), 0.0, 1.0)
-        rgba = mx.contiguous(mx.concatenate(
-            [clipped, mx.ones((height, width, 1))], axis=-1).astype(mx.float16))
         in_tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(
             Metal.MTLRegionMake2D(0, 0, width, height), 0,
-            bytes(memoryview(rgba)), width * 8)
+            prepared.rgba, width * 8)
 
         ow, oh = width * self.scale, height * self.scale
         cmd = queue.commandBuffer()
@@ -138,12 +170,33 @@ class MetalFxSpatialUpscaler:
         if cmd.error() is not None:
             raise MediaError(f"MetalFX encode failed: {cmd.error()}")
 
-        raw = mx.array(memoryview(
-            readback.contents().as_buffer(ow * oh * 8)).cast("B"))
-        sr = mx.view(raw, mx.float16).reshape(oh, ow, 4)[..., :3]
-        sr = mx.clip(sr, 0.0, 1.0).astype(frame.dtype)
+        raw = memoryview(
+            readback.contents().as_buffer(ow * oh * 8)
+        ).cast("B")
+        return _PreparedMetalFxOutput(
+            rgba=raw,
+            width=ow,
+            height=oh,
+            dtype=prepared.dtype,
+        )
+
+    def prepare_output(self, output: _PreparedMetalFxOutput) -> Any:
+        import mlx.core as mx
+
+        raw = mx.array(output.rgba)
+        sr = mx.view(raw, mx.float16).reshape(
+            output.height, output.width, 4
+        )[..., :3]
+        sr = mx.clip(sr, 0.0, 1.0).astype(output.dtype)
         mx.eval(sr)
-        return [(sr, token)]
+        return sr
+
+    def feed(self, rgb: Any, token: Any = None) -> list:
+        if isinstance(rgb, _PreparedMetalFxInput):
+            return [(self._feed_prepared(rgb, token), token)]
+        prepared = self.prepare_input(rgb)
+        output = self._feed_prepared(prepared, token)
+        return [(self.prepare_output(output), token)]
 
     def flush(self) -> list:
         return []
@@ -169,6 +222,11 @@ def _produces(spec: StreamSpec, config: object) -> StreamSpec:
 
 class MetalFxFactory:
     name = "metalfx"
+    execution_affinity = "metalfx:{stage}"
+    execution_input_affinity = "mlx"
+    execution_output_affinity = "mlx"
+    execution_resources = ("gpu", "memory_bandwidth")
+    execution_native_slots = 2
 
     # No profiles: the family has no weights to pick between - the model
     # ships inside the OS framework. The only knob is the scale factor.

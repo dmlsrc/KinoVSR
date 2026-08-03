@@ -501,17 +501,18 @@ class BsvdDenoiser:
             hook(height + (-height) % 4, width + (-width) % 4,
                  scheduled=self._gop is not None)
 
-    def pump(self) -> None:
-        """Advance the in-flight GOP window without blocking.
-
-        The pipeline adapter calls this between downstream consumptions
-        of our emissions, so a window's remaining accelerator dispatches
-        keep flowing while later stages process the previous window's
-        outputs on the driver thread. Continuous streams have no window
-        in flight and this is a no-op.
-        """
-        if self._gop is not None:
-            self._wavefront.poll()
+    def bind_background_submit(
+        self,
+        submit: Any,
+        completion_submit: Any = None,
+        owner_wait: Any = None,
+    ) -> None:
+        """Bind window progress to the runtime's serial BSVD owner lane."""
+        self._wavefront.bind_background_submit(
+            submit,
+            completion_submit,
+            owner_wait,
+        )
 
     def set_gop_policy(self, policy: Any) -> None:
         """Apply the shared GOP-window policy on every BSVD backend."""

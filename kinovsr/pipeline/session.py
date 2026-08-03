@@ -4,12 +4,12 @@
 input :class:`~kinovsr.processors.specs.StreamSpec` and preflight-
 validates every edge before any processing - typed errors surface at
 open time, not mid-stream. The returned :class:`PipelineSession` is
-bound to that spec: :meth:`~PipelineSession.process` pulls the caller's
-frame units through the chain with natural backpressure, weights load
-lazily at the first pull, and closing the iterator (or the session, or
-leaving the ``with`` block) cancels the run and releases every stage
-exactly once - the :class:`~kinovsr.pipeline.scheduler.ChainRun`
-semantics, which also fix the exception-precedence rules.
+bound to that spec: :meth:`~PipelineSession.process` feeds the caller's
+frame units into a bounded streaming graph, weights load lazily at the
+first pull, and closing the iterator (or the session, or leaving the
+``with`` block) cancels the run and releases every stage exactly once -
+the :class:`~kinovsr.pipeline.scheduler.ChainRun` semantics, which also
+fix the exception-precedence rules.
 
 A session runs once: stage instances are stateful, so a consumed
 session refuses a second ``process`` instead of silently reusing state.
@@ -76,7 +76,7 @@ class PipelineSession:
 
     def process(self, units: Iterable[FrameUnit], *,
                 retain_outputs: bool = True) -> Iterator[FrameUnit]:
-        """Pull ``units`` through the chain; yields output FrameUnits.
+        """Stream ``units`` through a bounded graph; yield output FrameUnits.
 
         Returns an owning iterator: close it (or this session) to cancel
         at any point, including before the first pull. Stage instances
@@ -92,8 +92,8 @@ class PipelineSession:
         - ``retain_outputs=False``: outputs are yielded as produced, so a
           payload may alias a borrowed input or a stage's reused buffer and
           is valid only until the next pull. Copy or hand it off before
-          advancing. The file sink uses this (it consumes each unit into
-          the encoder synchronously, so there is nothing to retain).
+          advancing. The file endpoint attaches its writer as an internal
+          terminal actor instead of exposing these borrowed values.
         """
         if self._consumed:
             raise PipelineError(
@@ -117,6 +117,7 @@ class PipelineSession:
                 units,
                 self._context,
                 finalizers=(lease.close,),
+                input_spec=self._plan.input_spec,
             )
             self._run = run
             if binding is not None and built:
@@ -128,6 +129,56 @@ class PipelineSession:
                 self._plan.output_spec,
                 retain_outputs=retain_outputs,
             )
+        except BaseException as exc:  # noqa: BLE001 - cleanup precedence below
+            active = exc
+        self._run = None
+        winner = _close_after_failure(
+            active,
+            run.close if run is not None else lease.close,
+        )
+        raise winner
+
+    def _consume(
+        self,
+        units: Iterable[FrameUnit],
+        consumer: Any,
+        *,
+        source_bridge: Any = None,
+    ) -> ChainRun:
+        """Run the file endpoint as the graph's bounded terminal actor."""
+        if self._consumed:
+            raise PipelineError(
+                "this session was already consumed; open_pipeline again "
+                "for the next stream (stage state is never reused)"
+            )
+        self._consumed = True
+        binding, self._terminal_pool_binding = (
+            self._terminal_pool_binding,
+            None,
+        )
+        from kinovsr.media.pixel_buffers import ci_cache_owner
+
+        lease = ci_cache_owner()
+        run: ChainRun | None = None
+        active: BaseException | None = None
+        try:
+            built = build_processors(self._plan, self._context)
+            self._built = built
+            run = run_chain(
+                built,
+                units,
+                self._context,
+                finalizers=(lease.close,),
+                input_spec=self._plan.input_spec,
+                source_bridge=source_bridge,
+                terminal_consumer=consumer,
+            )
+            self._run = run
+            if binding is not None and built:
+                hook = getattr(built[-1][1], "_bind_output_pool", None)
+                if callable(hook):
+                    hook(*binding)
+            return run
         except BaseException as exc:  # noqa: BLE001 - cleanup precedence below
             active = exc
         self._run = None
