@@ -80,21 +80,21 @@ def test_destination_fanout_is_submitted_in_fixed_batches(
 
 
 def _source_buffer(seed: int):
-    import numpy as np
+    import mlx.core as mx
 
     from kinovsr.media import pixel_buffers as pb
 
     width, height = 128, 96
-    y, x = np.mgrid[0:height, 0:width]
-    rgba = np.stack(
+    x, y = mx.meshgrid(mx.arange(width), mx.arange(height), indexing="xy")
+    rgba = mx.stack(
         (
             ((x + seed * 3) % width) / (width - 1),
             ((y + seed * 5) % height) / (height - 1),
             ((x + y + seed * 7) % (width + height)) / (width + height - 1),
-            np.ones_like(x),
+            mx.ones_like(x),
         ),
         axis=-1,
-    ).astype(np.float16)
+    ).astype(mx.float16)
     buffer = pb.make_pixel_buffer_from_attrs(
         width,
         height,

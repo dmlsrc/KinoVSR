@@ -7,6 +7,11 @@ import pytest
 
 
 def _write_flow_buffer(buffer, field) -> None:
+    # Deliberately numpy, not the product's MLX marshaling: these helpers are
+    # an INDEPENDENT implementation of the row-strided fp16 flow layout, so a
+    # bug in the product's buffer views cannot cancel out in the assertions
+    # (the advertised-geometry arc caught exactly that class of shared-bug
+    # masking). Do not "clean this up" to the mx idiom.
     import numpy as np
 
     from kinovsr.native.frameworks import Quartz
