@@ -68,13 +68,14 @@ class BsvdFactory:
 
         Back-to-back recurrent submissions make opaque VideoToolbox work
         substantially slower even when BSVD's realized placement remains ANE.
-        MPSGraph's four-step jobs need a proportionally larger handoff than
-        Core ML's single-step dispatches. The runtime activates this metadata
-        only under downstream pressure, leaving isolated throughput unchanged.
+        Both direct ANE paths submit one recurrent step at a time so downstream
+        GPU work sees the same short, preemptible cadence. The runtime activates
+        this metadata only under downstream pressure, leaving isolated
+        throughput unchanged.
         """
         return {
             "ane": 0.010,
-            "mpsgraph": 0.040,
+            "mpsgraph": 0.010,
         }.get(config.backend, 0.0)
 
     @staticmethod

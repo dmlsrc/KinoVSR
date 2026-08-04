@@ -40,7 +40,44 @@ BSVD_OPTIONS = [
         family='bsvd',
         key='backend',
         settings_backed=True,
-        help='Which BSVD implementation runs for --denoise bsvd. mlx (default): the reference MLX/GPU path. Under --gop-align it uses the same reactive GOP windows and per-window conditioning as the other backends. mpsgraph: direct MPSGraph execution placed on the Neural Engine, with no Core ML package or prediction. Recurrent state and skip rings stay in shared Metal storage; streaming dispatches are pipelined one deep, while --gop-align uses one schedule-generic four-step entry with persistent ANE state and stable bindings through fill, steady state, and drain. Result writes are verified so the mapped runtime cannot silently return stale frames. fp16 only; sides must be multiples of four. The window path covers padded geometries from 128x256 pixels through 1024x576 and fails loudly outside that envelope. The first window at a new geometry builds an OS-specific executable cache under $KINOVSR_CACHE_DIR. ane: the full per-step network as one Core ML dispatch pinned to the Neural Engine, pipelined one dispatch deep so the prediction overlaps the rest of the per-frame work (one extra frame of output delay, absorbed into the family delay). Slightly SLOWER standalone (about 91 vs 78 ms/frame at 640x480 c64) but it vacates the GPU, so chains with other GPU stages can hide its cost; numerics are marginally closer to fp32 than fp16 MLX. Under --gop-align through the verified 640x480 padded envelope, fixed eight-step fill 0-7 and drain 8-15 functions omit the None work; the inner boundary steps stay on the full graph to keep only three ANE programs resident. Short light clips can still favor MLX because the extra Core ML functions have a one-time load cost. fp16 only; frames need at least 96 px per side, and widths are reflect-padded internally to the next multiple of 128 (the ANE alignment envelope - CIF 352 runs as 384) and cropped back. Fails loudly rather than fall back: a partial Core ML CPU placement computes this graph WRONG, so non-ANE placement is refused outright. The first run at a new padded geometry builds and compiles the model (seconds to a minute, cached under $KINOVSR_CACHE_DIR); later runs load it in about a second.'),
+        help=(
+            'Which BSVD implementation runs for --denoise bsvd. mlx '
+            '(default): the reference MLX/GPU path. Under --gop-align it '
+            'uses the same reactive GOP windows and per-window conditioning '
+            'as the other backends. mpsgraph: MPSGraph compiles BSVD for the '
+            'Neural Engine; cached ANECIR products execute directly, with no '
+            'Core ML package or prediction. Recurrent state and skip rings '
+            'stay in shared IOSurfaces. Streaming dispatches remain pipelined '
+            'one deep, while --gop-align uses sparse fill, one-step middle, '
+            'and sparse drain entries. Phase switches use explicit ANE '
+            'load/map/evaluate/unmap/unload ownership, retaining one program '
+            'until the phase changes; the compiler cache records realized live '
+            'port order. Result writes are verified so a runtime no-op cannot '
+            'return stale frames. fp16 only; sides must be multiples of four. '
+            'The window path covers padded geometries from 128x256 pixels '
+            'through 1024x576 and fails loudly outside that envelope. The '
+            'first window at a new geometry builds an OS-specific executable '
+            'cache under $KINOVSR_CACHE_DIR. ane: the full per-step network '
+            'as one Core ML dispatch pinned to the Neural Engine, pipelined '
+            'one dispatch deep so the prediction overlaps the rest of the '
+            'per-frame work (one extra frame of output delay, absorbed into '
+            'the family delay). Slightly SLOWER standalone (about 91 vs 78 '
+            'ms/frame at 640x480 c64) but it vacates the GPU, so chains with '
+            'other GPU stages can hide its cost; numerics are marginally '
+            'closer to fp32 than fp16 MLX. Under --gop-align through the '
+            'verified 640x480 padded envelope, fixed eight-step fill 0-7 and '
+            'drain 8-15 functions omit the None work; the inner boundary '
+            'steps stay on the full graph to keep only three ANE programs '
+            'resident. Short light clips can still favor MLX because the '
+            'extra Core ML functions have a one-time load cost. fp16 only; '
+            'frames need at least 96 px per side, and widths are reflect-'
+            'padded internally to the next multiple of 128 (the ANE alignment '
+            'envelope - CIF 352 runs as 384) and cropped back. Fails loudly '
+            'rather than fall back: a partial Core ML CPU placement computes '
+            'this graph WRONG, so non-ANE placement is refused outright. The '
+            'first run at a new padded geometry builds and compiles the model '
+            '(seconds to a minute, cached under $KINOVSR_CACHE_DIR); later '
+            'runs load it in about a second.')),
 ]
 
 __all__ = ["BSVD_STRENGTH_OPTIONS", "BSVD_OPTIONS"]

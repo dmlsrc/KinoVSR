@@ -153,10 +153,10 @@ class Settings:
     # Which BSVD implementation runs: "mlx" (the reference GPU path,
     # default - it is the faster standalone), "ane" (one Core ML dispatch
     # per step on the Neural Engine; explicitly opt-in, fails loudly when
-    # unavailable), or "mpsgraph" (direct MPSGraph on the Neural Engine,
-    # with one persistent-state four-step entry for scheduled windows and no
-    # Core ML involved). The ANE paths pay off in chains where other stages
-    # need the GPU they vacate.
+    # unavailable), or "mpsgraph" (MPSGraph-compiled ANECIR on the Neural
+    # Engine, with one persistent-state one-step entry for scheduled windows
+    # and no Core ML involved). The ANE paths pay off in chains where other
+    # stages need the GPU they vacate.
     bsvd_backend: str = field(
         default="mlx", metadata={
             "env": ["{{KINOVSR_BSVD_BACKEND}}", "{{BSVD_BACKEND}}"]})

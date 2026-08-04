@@ -22,14 +22,14 @@ of the tradeoffs; measure your own machine and content before deciding.
   First run at a new geometry compiles the model (seconds to a minute,
   cached); frames need at least 96 px per side.
 - `mpsgraph`: the same network on the Neural Engine through MPSGraph,
-  with no Core ML prediction. GOP windows use one cached schedule-generic
-  four-step entry with persistent ANE state and stable skip-ring bindings;
-  the ordinary stream keeps the one-step graph. One resident program avoids
-  mapped-product phase re-entry, and the generic runtime verifies owned
-  result buffers before exposing them: an all-results-untouched activation
-  is retried within a fixed bound, while partial or repeated failures raise
-  instead of serving stale frames. It has the same overlap behavior as `ane`
-  and a different window envelope (padded geometries from 128x256 through
+  with no Core ML prediction. GOP windows use a cached schedule-generic
+  one-step entry with persistent ANE state and stable skip-ring bindings;
+  the ordinary stream keeps the one-step graph. The active raw ANECIR program
+  and its IOSurface maps remain resident until a semantic phase change. The
+  runtime poisons and verifies result buffers around every evaluation, so an
+  incomplete write raises instead of exposing stale frames. Its one-step
+  dispatch cadence lets GPU stages advance between ANE evaluations, like `ane`.
+  It accepts a different window envelope (padded geometries from 128x256 through
   1024x576). Both accelerator backends fail loudly outside their envelopes
   rather than degrade.
 

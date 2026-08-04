@@ -284,6 +284,69 @@ class Port:
                 and batch_s == depth * depth_s
                 and self.logical_nbytes() == self.nbytes)
 
+    def _row_segments(self):
+        """Yield physical row offsets and logical byte counts in NCDHW order."""
+        batches, channels, depth, height, width = self.logical_dims()
+        batch_s, depth_s, plane_s, row_s = self.strides()
+        row_bytes = width * 2
+        for batch in range(batches):
+            for channel in range(channels):
+                for plane in range(depth):
+                    base = (
+                        batch * batch_s
+                        + plane * depth_s
+                        + channel * plane_s
+                    )
+                    for row in range(height):
+                        yield base + row * row_s, row_bytes
+
+    def write(self, payload: bytes | bytearray | memoryview) -> None:
+        """Write contiguous fp16 NCDHW bytes into this possibly-strided port."""
+        source = memoryview(payload).cast("B")
+        expected = self.logical_nbytes()
+        if len(source) != expected:
+            raise ValueError(
+                f"port {self.name!r} expects {expected} bytes, got {len(source)}")
+        self.surface.lock()
+        try:
+            target = self.surface.view()
+            if self.is_contiguous():
+                target[:expected] = source
+                return
+            position = 0
+            for offset, count in self._row_segments():
+                target[offset:offset + count] = source[position:position + count]
+                position += count
+        finally:
+            self.surface.unlock()
+
+    def read(self) -> bytes:
+        """Return contiguous fp16 NCDHW bytes from a possibly-strided port."""
+        expected = self.logical_nbytes()
+        payload = bytearray(expected)
+        target = memoryview(payload)
+        self.surface.lock(readonly=True)
+        try:
+            source = self.surface.view()
+            if self.is_contiguous():
+                target[:] = source[:expected]
+                return bytes(payload)
+            position = 0
+            for offset, count in self._row_segments():
+                target[position:position + count] = source[offset:offset + count]
+                position += count
+        finally:
+            self.surface.unlock(readonly=True)
+        return bytes(payload)
+
+    def probe_offsets(self) -> tuple[int, ...]:
+        """Three physical fp16 offsets spanning the logical tensor."""
+        offsets = [offset for offset, count in self._row_segments()
+                   for offset in (offset, offset + count - 2)]
+        if not offsets:
+            raise RuntimeError(f"port {self.name!r} has no logical elements")
+        return tuple(sorted({offsets[0], offsets[len(offsets) // 2], offsets[-1]}))
+
 
 def _symbol(info) -> str:
     return str(info.get("Symbol") or "").split("@", 1)[0]

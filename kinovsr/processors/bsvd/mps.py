@@ -37,9 +37,10 @@ per-frame work.  This adds one step of output delay: ``SHIFT_NUM`` is 17
 it because a pop never needs a push younger than four steps.
 
 Like the Core ML backend this executes fp16 only and fails loudly.
-``--gop-align`` windows use one schedule-generic four-step MPSGraph entry.
-It keeps persistent ANE state and stable Metal skip-ring bindings through
-fill, steady state, drain, and window resets without calling Core ML.
+``--gop-align`` windows use MPSGraph-compiled sparse fill, schedule-generic
+one-step middle, and sparse drain ANECIR entries. An explicit direct runtime
+switches those entries with one program resident at a time while persistent
+state and skip rings stay in shared IOSurfaces; Core ML is never called.
 """
 
 from __future__ import annotations
@@ -474,7 +475,7 @@ class MpsGraphBSVD:
     def preheat(
         self, height: int, width: int, scheduled: bool = False
     ) -> None:
-        """Attach a warm stateful phase cache while source startup proceeds."""
+        """Open a warm direct phase cache while source startup proceeds."""
         if (
             self._closed
             or not scheduled
@@ -501,7 +502,7 @@ class MpsGraphBSVD:
             preload_stateful_executable, self, height, width)
 
     def begin_window(self, frames: list[Any]):
-        """Start one independent window on pure MPSGraph schedule chunks."""
+        """Start one window on MPSGraph-compiled direct ANE phases."""
         self._require_open()
         if not frames:
             raise ValueError("BSVD MPSGraph window cannot be empty")

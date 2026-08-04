@@ -66,7 +66,7 @@ class TestBackendSelection:
         assert net._preheated_geometry == (128, 256)
         assert net._preheated_executable is executable
 
-    def test_scheduled_cache_has_one_resident_program(
+    def test_scheduled_cache_uses_explicit_lifecycle_phase_entries(
         self, monkeypatch, tmp_path
     ):
         captured = {}
@@ -88,16 +88,16 @@ class TestBackendSelection:
             captured["kwargs"] = kwargs
             return executable
 
-        monkeypatch.setattr(mgs, "compile_stateful", compile_stateful)
+        monkeypatch.setattr(mgs, "compile_stateful_direct", compile_stateful)
         states = (object(),)
 
         result = mps_phases._compile_stateful_executable(
             net, 480, 640, states)
 
         assert result is executable
-        assert captured["entries"] == ("generic4",)
+        assert captured["entries"] == ("fill8_11", "generic1", "drain16")
         assert captured["cache"] == (
-            "scheduled-stateful-generic4", 480, 640)
+            "scheduled-stateful-direct-v2", 480, 640)
         assert captured["states"] is states
         assert captured["kwargs"]["cache_directory"] == tmp_path
 
@@ -115,12 +115,12 @@ class TestBackendSelection:
         assert suite._views == {(1, "skip", 2): view}
 
     @pytest.mark.parametrize("count", [16, 17, 18, 19, 20, 23, 24, 63])
-    def test_four_step_window_actions_cover_fill_and_drain_exactly(
+    def test_one_step_window_actions_cover_fill_and_drain_exactly(
         self, count
     ):
         actions = ScheduledMpsPhaseSuite._actions(list(range(count)))
         assert all(
-            len(action.frames) == len(action.records) == 4
+            len(action.frames) == len(action.records) == 1
             for action in actions
         )
         assert sum(
@@ -133,7 +133,27 @@ class TestBackendSelection:
         assert flattened[:count] == list(range(count))
         assert all(frame is None for frame in flattened[count:])
         assert len(flattened) >= count + 16
-        assert len(flattened) < count + 20
+        assert len(flattened) == count + 16
+
+    @pytest.mark.parametrize("count", [16, 17, 18, 19, 20, 23, 24, 63])
+    def test_sparse_fill_aligns_the_all_real_middle(self, count):
+        fill_length = 8
+        actions = ScheduledMpsPhaseSuite._middle_actions(
+            list(range(count)), fill_length
+        )
+        pairs = [
+            (frame, record)
+            for action in actions
+            for frame, record in zip(
+                action.frames, action.records, strict=True
+            )
+        ]
+
+        assert [frame for frame, _record in pairs] == list(
+            range(fill_length, count)
+        )
+        assert all(len(action.frames) == 1 for action in actions)
+        assert all(record.out_real is (frame >= 16) for frame, record in pairs)
 
 
 # --------------------------------------------------------------------------

@@ -4,8 +4,10 @@ MPSGraph's graph API has no public state operation, but the placed ANE
 dialect does.  This module keeps that SPI behind a model-neutral contract:
 callers describe named state tensors and ordinary MPSGraph programs; the
 compiler turns matching input/result ports into ``anec.state`` readers and
-writers, then exposes all programs as entries of one executable sharing one
-set of Metal backings.
+writers, then publishes the placed module, ANECIR products, and their realized
+live-port ABI. Callers may open that cache as one mapped MPSGraph executable
+with shared Metal backings or through the explicit-lifecycle ANECIR runtime
+with shared IOSurfaces.
 
 The lowering deliberately operates on names, contracts, and def-use links.
 It does not depend on operation numbers emitted by MPSGraph.  Family code
@@ -39,7 +41,7 @@ import mlx.core as mx
 
 from . import mpsgraph as mg
 
-_CACHE_FORMAT = 1
+_CACHE_FORMAT = 3
 _RESOURCE_HEADER = b"{-#\n  dialect_resources: {\n    mps: {\n"
 _RESOURCE_FOOTER = b"\n    }\n  }\n#-}\n"
 _MODULE_MARKER = b"module attributes "
@@ -184,6 +186,8 @@ class _EntryContract:
     order: tuple[tuple[str, tuple[int, ...]], ...]
     targets: tuple[tuple[str, tuple[int, ...]], ...]
     state_results: tuple[tuple[str, str], ...]
+    ane_input_order: tuple[str, ...]
+    ane_output_order: tuple[str, ...]
     dynamic: frozenset[str]
     product: str
 
@@ -722,6 +726,8 @@ def _transform_placed_body(
     targets: Sequence[tuple[str, tuple[int, ...]]],
     states: Mapping[str, StateTensorSpec],
     state_results: Mapping[str, str],
+    ane_input_order: list[str] | None = None,
+    ane_output_order: list[str] | None = None,
 ) -> str:
     """Lower contracted ports in one placed module body to ``anec.state``."""
     lines = body.splitlines(keepends=True)
@@ -775,7 +781,12 @@ def _transform_placed_body(
         return_values[position]: state_name
         for position, state_name in result_positions.items()
     }
+    target_for_return_value = {
+        value: targets[position][0]
+        for position, value in enumerate(return_values)
+    }
     call_output_for_state: dict[int, str] = {}
+    call_output_names: dict[int, str] = {}
     conversion_lines: set[int] = set()
     conversion_pattern = re.compile(
         r'^\s*(%[A-Za-z0-9_.$-]+) = "placement\.memref_to_tensor"'
@@ -783,16 +794,19 @@ def _transform_placed_body(
     call_base = None
     for index in range(function_line + 1, len(lines)):
         match = conversion_pattern.match(lines[index])
-        if match is None or match.group(1) not in state_return_values:
+        if match is None or match.group(1) not in target_for_return_value:
             continue
         base = match.group(2)
         if call_base is None:
             call_base = base
         elif call_base != base:
             raise RuntimeError(f"{function}: state results use multiple region calls")
-        call_output_for_state[int(match.group(3))] = state_return_values[
-            match.group(1)]
-        conversion_lines.add(index)
+        position = int(match.group(3))
+        call_output_names[position] = target_for_return_value[match.group(1)]
+        if match.group(1) in state_return_values:
+            call_output_for_state[position] = state_return_values[
+                match.group(1)]
+            conversion_lines.add(index)
     if len(call_output_for_state) != len(result_positions):
         raise RuntimeError(
             f"{function}: resolved {len(call_output_for_state)} of "
@@ -822,6 +836,11 @@ def _transform_placed_body(
         raise RuntimeError(f"{function}: region call input count changed")
     if any(position >= len(call_outputs) for position in call_output_for_state):
         raise RuntimeError(f"{function}: state region result is out of range")
+    if set(call_output_names) != set(range(len(call_outputs))):
+        raise RuntimeError(
+            f"{function}: resolved {len(call_output_names)} of "
+            f"{len(call_outputs)} ANE result links"
+        )
 
     # Map each outer state argument through tensor_to_memref and the call
     # operand list to its ANE region argument position. MPSGraph preserves
@@ -875,29 +894,45 @@ def _transform_placed_body(
         region_formals.append(formal)
         region_types.append(value_type.strip())
 
-    region_arg_for_state = {}
+    region_arg_for_feed: dict[int, str] = {}
+    for outer_index, (feed_name, _shape) in enumerate(order):
+        converted = to_memref.get(function_formals[outer_index])
+        if converted is None or converted not in call_operands:
+            if feed_name not in states:
+                raise RuntimeError(
+                    f"{function}: ordinary feed {feed_name!r} is absent from "
+                    "the ANE region call"
+                )
+            continue
+        positions = [
+            position for position, operand in enumerate(call_operands)
+            if operand == converted
+        ]
+        if len(positions) != 1 or positions[0] in region_arg_for_feed:
+            raise RuntimeError(
+                f"{function}: feed {feed_name!r} has an ambiguous ANE argument"
+            )
+        region_arg_for_feed[positions[0]] = feed_name
+
     injected_conversions = []
     for outer_index in state_input_indices:
+        state_name = order[outer_index][0]
+        if state_name in region_arg_for_feed.values():
+            continue
         formal = function_formals[outer_index]
-        converted = to_memref.get(formal)
-        if converted is None or converted not in call_operands:
-            state_name = order[outer_index][0]
-            tensor_type = function_types[outer_index]
-            memref_type = "memref<" + tensor_type[len("tensor<"):]
-            converted = f"%kst_{state_name}_memref"
-            region_formal = f"%kstarg_{state_name}"
-            injected_conversions.append(
-                f'    {converted} = "placement.tensor_to_memref"({formal}) : '
-                f'({tensor_type}) -> {memref_type}\n')
-            call_operands.append(converted)
-            call_input_types.append(memref_type)
-            region_arg_for_state[len(region_formals)] = state_name
-            region_formals.append(region_formal)
-            region_types.append(memref_type)
-            region_args.append(f"{region_formal}: {memref_type}")
-        else:
-            region_arg_for_state[call_operands.index(converted)] = order[
-                outer_index][0]
+        tensor_type = function_types[outer_index]
+        memref_type = "memref<" + tensor_type[len("tensor<"):]
+        converted = f"%kst_{state_name}_memref"
+        region_formal = f"%kstarg_{state_name}"
+        injected_conversions.append(
+            f'    {converted} = "placement.tensor_to_memref"({formal}) : '
+            f'({tensor_type}) -> {memref_type}\n')
+        call_operands.append(converted)
+        call_input_types.append(memref_type)
+        region_arg_for_feed[len(region_formals)] = state_name
+        region_formals.append(region_formal)
+        region_types.append(memref_type)
+        region_args.append(f"{region_formal}: {memref_type}")
 
     if injected_conversions:
         lines[region_line] = _replace_span(
@@ -913,8 +948,25 @@ def _transform_placed_body(
             call = _replace_span(call, span[0], span[1], replacement)
         lines[call_line - 1] += "".join(injected_conversions)
         lines[call_line] = call
-    if any(position >= len(region_formals) for position in region_arg_for_state):
-        raise RuntimeError(f"{function}: state ANE argument is out of range")
+    if (
+        set(region_arg_for_feed.values()) != feed_names
+        or set(region_arg_for_feed) != set(range(len(region_formals)))
+    ):
+        raise RuntimeError(
+            f"{function}: ANE feed mapping is incomplete or ambiguous"
+        )
+    region_arg_for_state = {
+        position: name
+        for position, name in region_arg_for_feed.items()
+        if name in states
+    }
+    if ane_input_order is not None:
+        ane_input_order.extend(
+            region_arg_for_feed[position]
+            for wanted_state in (False, True)
+            for position in range(len(region_formals))
+            if (region_arg_for_feed[position] in states) is wanted_state
+        )
     region_formal_for_state = {
         region_formals[position]: state_name
         for position, state_name in region_arg_for_state.items()
@@ -1021,6 +1073,12 @@ def _transform_placed_body(
     keep_region_types = [
         value for index, value in enumerate(region_types)
         if index not in call_output_for_state]
+    if ane_output_order is not None:
+        ane_output_order.extend(
+            call_output_names[index]
+            for index in range(len(call_outputs))
+            if index not in call_output_for_state
+        )
 
     line = lines[region_return]
     for span, replacement in sorted(
@@ -1212,11 +1270,13 @@ def _write_transformed_module(
     targets: Sequence[tuple[str, tuple[int, ...]]],
     states: Mapping[str, StateTensorSpec],
     state_results: Mapping[str, str],
-) -> None:
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     bounds = _module_bounds(source_path)
     with source_path.open("rb") as source:
         source.seek(bounds.body_start)
         body = source.read(bounds.body_end - bounds.body_start).decode("utf-8")
+    ane_input_order: list[str] = []
+    ane_output_order: list[str] = []
     transformed = _transform_placed_body(
         body,
         function=function,
@@ -1224,6 +1284,8 @@ def _write_transformed_module(
         targets=targets,
         states=states,
         state_results=state_results,
+        ane_input_order=ane_input_order,
+        ane_output_order=ane_output_order,
     ).encode("utf-8")
     with output_path.open("wb") as output, source_path.open("rb") as source:
         _copy_range(source, output, 0, bounds.body_start)
@@ -1236,6 +1298,7 @@ def _write_transformed_module(
                 bounds.body_end + 1,
                 source_path.stat().st_size,
             )
+    return tuple(ane_input_order), tuple(ane_output_order)
 
 
 def _resources(path: Path, bounds: _ModuleBounds) -> list[_Resource]:
@@ -1598,11 +1661,14 @@ def _compile_product(
     archive = Path(str(executable.getMutableWeightsFilePath())).parent
     generated_product = archive / f"{region}.plist"
     generated_weights = archive / f"{region}.weights"
+    generated_options = archive / f"compiler_options_{region}.plist"
     if generated_product.is_file() and generated_weights.is_file():
         destination = output_root / "compiled"
         destination.mkdir()
         shutil.copy2(generated_product, destination / generated_product.name)
         shutil.copy2(generated_weights, destination / generated_weights.name)
+        if generated_options.is_file():
+            shutil.copy2(generated_options, destination / generated_options.name)
         product = destination / generated_product.name
     else:
         executable.setValue_forKey_(str(output_root), "dumpCompiledProductsPath")
@@ -1614,6 +1680,9 @@ def _compile_product(
         product = products[0]
     if not product.with_suffix(".weights").is_file():
         raise RuntimeError(f"{function}: compiled ANE weights are missing")
+    compiler_options = product.parent / f"compiler_options_{region}.plist"
+    if not compiler_options.is_file():
+        raise RuntimeError(f"{function}: ANE compiler options are missing")
     with product.open("rb") as handle:
         record = plistlib.load(handle)
     if record.get("Networks") != [region] or not isinstance(
@@ -1637,6 +1706,26 @@ def _compile_product(
     return product
 
 
+def _retarget_compiler_options(
+    product: Path, *, region: str, published_product: Path
+) -> None:
+    """Point copied MPSGraph options at the durable published netplist."""
+    path = product.parent / f"compiler_options_{region}.plist"
+    with path.open("rb") as handle:
+        options = plistlib.load(handle)
+    if not isinstance(options, dict) or not options:
+        raise RuntimeError(f"{region}: malformed ANE compiler options")
+    for architecture, record in options.items():
+        if not isinstance(record, dict):
+            raise RuntimeError(
+                f"{region}: malformed options for architecture {architecture!r}"
+            )
+        record["NetworkPlistName"] = region
+        record["NetworkPlistPath"] = str(published_product)
+    with path.open("wb") as handle:
+        plistlib.dump(options, handle, fmt=plistlib.FMT_BINARY)
+
+
 def _system_cache_key() -> str:
     value = f"{platform.mac_ver()[0]}-{platform.machine()}"
     return re.sub(r"[^A-Za-z0-9_.-]", "_", value)
@@ -1652,11 +1741,21 @@ def stateful_cache_ready(cache_directory: str | Path) -> bool:
     try:
         _dtype, _states, entries = _parse_contract(
             json.loads(contract.read_text()))
-    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+    except (
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
         return False
     return all(
         (product := root / entry.product).is_file()
         and product.with_suffix(".weights").is_file()
+        and (
+            product.parent / f"compiler_options_{entry.region}.plist"
+        ).is_file()
         for entry in entries
     )
 
@@ -1688,6 +1787,8 @@ def _contract_json(
                 "targets": [
                     [name, list(shape)] for name, shape in entry.targets],
                 "state_results": [list(item) for item in entry.state_results],
+                "ane_input_order": list(entry.ane_input_order),
+                "ane_output_order": list(entry.ane_output_order),
                 "dynamic": sorted(entry.dynamic),
                 "product": entry.product,
             }
@@ -1725,11 +1826,36 @@ def _parse_contract(record: Mapping[str, Any]) -> tuple[
             state_results=tuple(
                 (str(name), str(state))
                 for name, state in item["state_results"]),
+            ane_input_order=tuple(
+                str(name) for name in item["ane_input_order"]
+            ),
+            ane_output_order=tuple(
+                str(name) for name in item["ane_output_order"]
+            ),
             dynamic=frozenset(str(name) for name in item["dynamic"]),
             product=str(item["product"]),
         )
         for item in record["entries"]
     )
+    for entry in entries:
+        feed_names = [name for name, _shape in entry.order]
+        target_names = [name for name, _shape in entry.runtime_targets]
+        if (
+            len(entry.ane_input_order) != len(feed_names)
+            or len(set(entry.ane_input_order)) != len(feed_names)
+            or set(entry.ane_input_order) != set(feed_names)
+        ):
+            raise RuntimeError(
+                f"{entry.name}: cached ANE input order changed"
+            )
+        if (
+            len(entry.ane_output_order) != len(target_names)
+            or len(set(entry.ane_output_order)) != len(target_names)
+            or set(entry.ane_output_order) != set(target_names)
+        ):
+            raise RuntimeError(
+                f"{entry.name}: cached ANE output order changed"
+            )
     return int(record["dtype"]), states, entries
 
 
@@ -1867,7 +1993,7 @@ def _build_cache(
             contract = captured[name]
             function = name + "_0"
             region = function + "_ane_region_0_0"
-            _write_transformed_module(
+            ane_input_order, ane_output_order = _write_transformed_module(
                 placed_path,
                 transformed_path,
                 function=function,
@@ -1890,6 +2016,13 @@ def _build_cache(
                 state_count=len(state_by_name),
                 fw=fw,
             )
+            _retarget_compiler_options(
+                product,
+                region=region,
+                published_product=(
+                    cache_directory / product.relative_to(staging)
+                ),
+            )
             entry_contracts.append(_EntryContract(
                 name=name,
                 function=function,
@@ -1897,6 +2030,8 @@ def _build_cache(
                 order=tuple(contract["order"]),
                 targets=tuple(contract["targets"]),
                 state_results=tuple(contract["state_results"].items()),
+                ane_input_order=ane_input_order,
+                ane_output_order=ane_output_order,
                 dynamic=frozenset(contract["dynamic"]),
                 product=str(product.relative_to(staging)),
             ))
@@ -1922,13 +2057,13 @@ def _build_cache(
             shutil.rmtree(staging)
 
 
-def _load_cache(
+def _read_cache_contract(
     cache_directory: Path,
     *,
     expected_entries: Sequence[str],
     expected_states: Sequence[StateTensorSpec],
     expected_dtype: int,
-) -> StatefulExecutable | None:
+) -> tuple[_EntryContract, ...] | None:
     contract_path = cache_directory / "contract.json"
     module_path = cache_directory / "model.mlir"
     if not contract_path.is_file() or not module_path.is_file():
@@ -1938,7 +2073,41 @@ def _load_cache(
         raise RuntimeError(f"MPSGraph state cache contract changed at {cache_directory}")
     if [entry.name for entry in entries] != list(expected_entries):
         raise RuntimeError(f"MPSGraph state cache entries changed at {cache_directory}")
+    for entry in entries:
+        product = cache_directory / entry.product
+        compiler_options = (
+            product.parent / f"compiler_options_{entry.region}.plist"
+        )
+        if not (
+            product.is_file()
+            and product.with_suffix(".weights").is_file()
+            and compiler_options.is_file()
+        ):
+            raise RuntimeError(
+                f"{entry.function}: cached ANE product is incomplete"
+            )
+    return entries
 
+
+def _load_cache(
+    cache_directory: Path,
+    *,
+    expected_entries: Sequence[str],
+    expected_states: Sequence[StateTensorSpec],
+    expected_dtype: int,
+) -> StatefulExecutable | None:
+    entries = _read_cache_contract(
+        cache_directory,
+        expected_entries=expected_entries,
+        expected_states=expected_states,
+        expected_dtype=expected_dtype,
+    )
+    if entries is None:
+        return None
+
+    module_path = cache_directory / "model.mlir"
+    dtype = expected_dtype
+    states = tuple(expected_states)
     fw = mg._fw()
     _compilation, descriptor = _source_descriptor(fw)
     source = _load_mlir_source(module_path, fw)
@@ -1991,9 +2160,6 @@ def _load_cache(
         point = EntryPoint.alloc().initWithEntryFunctionName_inputTypes_(
             entry.function, input_types)
         product = cache_directory / entry.product
-        if not product.is_file() or not product.with_suffix(".weights").is_file():
-            raise RuntimeError(
-                f"{entry.function}: cached ANE product is incomplete")
         entry_points[entry.name] = point
         per_entry_map[point] = {
             entry.region: os.path.relpath(product, archive_directory)}
@@ -2004,6 +2170,63 @@ def _load_cache(
         executable, metal, dtype, states, entries, entry_map)
     result._entry_points = entry_points
     return result
+
+
+def _stateful_request(
+    factories: Mapping[str, Callable[[], Program]],
+    states: Sequence[StateTensorSpec],
+) -> tuple[list[str], tuple[StateTensorSpec, ...]]:
+    if not factories:
+        raise ValueError("MPSGraph state executable needs at least one entry")
+    names = list(factories)
+    if len(set(names)) != len(names):
+        raise ValueError("MPSGraph state entry names must be unique")
+    state_tuple = tuple(states)
+    if (
+        not state_tuple
+        or len({state.name for state in state_tuple}) != len(state_tuple)
+    ):
+        raise ValueError("MPSGraph state names must be nonempty and unique")
+    return names, state_tuple
+
+
+def _ensure_stateful_cache(
+    factories: Mapping[str, Callable[[], Program]],
+    states: Sequence[StateTensorSpec],
+    *,
+    dtype: int,
+    cache_directory: str | Path,
+    ane_fw_to_fw_signal: bool,
+    ane_late_latch: bool,
+) -> tuple[Path, tuple[StateTensorSpec, ...], tuple[_EntryContract, ...]]:
+    names, state_tuple = _stateful_request(factories, states)
+    resolved = Path(cache_directory) / _system_cache_key()
+    entries = _read_cache_contract(
+        resolved,
+        expected_entries=names,
+        expected_states=state_tuple,
+        expected_dtype=dtype,
+    )
+    if entries is None:
+        _build_cache(
+            resolved,
+            factories,
+            state_tuple,
+            dtype=dtype,
+            ane_fw_to_fw_signal=ane_fw_to_fw_signal,
+            ane_late_latch=ane_late_latch,
+        )
+        entries = _read_cache_contract(
+            resolved,
+            expected_entries=names,
+            expected_states=state_tuple,
+            expected_dtype=dtype,
+        )
+    if entries is None:
+        raise RuntimeError(
+            f"MPSGraph state cache was not published at {resolved}"
+        )
+    return resolved, state_tuple, entries
 
 
 def compile_stateful(
@@ -2022,41 +2245,55 @@ def compile_stateful(
     The caller's versioned cache path is the topology/weights identity; this
     layer adds an OS-runtime component because the lowered dialect is private.
     """
-    if not factories:
-        raise ValueError("MPSGraph state executable needs at least one entry")
-    names = list(factories)
-    if len(set(names)) != len(names):
-        raise ValueError("MPSGraph state entry names must be unique")
-    state_tuple = tuple(states)
-    if not state_tuple or len({state.name for state in state_tuple}) != len(state_tuple):
-        raise ValueError("MPSGraph state names must be nonempty and unique")
-    base = Path(cache_directory)
-    resolved = base / _system_cache_key()
-    loaded = _load_cache(
-        resolved,
-        expected_entries=names,
-        expected_states=state_tuple,
-        expected_dtype=dtype,
-    )
-    if loaded is not None:
-        return loaded
-    _build_cache(
-        resolved,
+    resolved, state_tuple, entries = _ensure_stateful_cache(
         factories,
-        state_tuple,
+        states,
         dtype=dtype,
+        cache_directory=cache_directory,
         ane_fw_to_fw_signal=ane_fw_to_fw_signal,
         ane_late_latch=ane_late_latch,
     )
     loaded = _load_cache(
         resolved,
-        expected_entries=names,
+        expected_entries=[entry.name for entry in entries],
         expected_states=state_tuple,
         expected_dtype=dtype,
     )
     if loaded is None:
         raise RuntimeError(f"MPSGraph state cache was not published at {resolved}")
     return loaded
+
+
+def compile_stateful_direct(
+    factories: Mapping[str, Callable[[], Program]],
+    states: Sequence[StateTensorSpec],
+    *,
+    dtype: int = mg.FLOAT16,
+    cache_directory: str | Path,
+    ane_fw_to_fw_signal: bool = False,
+    ane_late_latch: bool = False,
+) -> Any:
+    """Build/load stateful products and execute them with explicit ANE life.
+
+    The compilation and durable contract are identical to
+    :func:`compile_stateful`; only runtime ownership changes.  Consecutive
+    evaluations retain the active program and its binding maps; a semantic
+    entry change performs the explicit unload/load transition.  All entries
+    bind the same state IOSurfaces.
+    """
+    resolved, state_tuple, entries = _ensure_stateful_cache(
+        factories,
+        states,
+        dtype=dtype,
+        cache_directory=cache_directory,
+        ane_fw_to_fw_signal=ane_fw_to_fw_signal,
+        ane_late_latch=ane_late_latch,
+    )
+    from . import anecir
+
+    return anecir.StatefulExecutable(
+        resolved, dtype, state_tuple, entries
+    )
 
 
 __all__ = [
@@ -2066,6 +2303,7 @@ __all__ = [
     "StatefulExecutable",
     "TensorBinding",
     "compile_stateful",
+    "compile_stateful_direct",
     "safe_storage_shape",
     "stateful_cache_ready",
     "state_placeholders",

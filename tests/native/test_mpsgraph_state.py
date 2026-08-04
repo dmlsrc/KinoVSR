@@ -83,6 +83,8 @@ def test_structural_lowering_tracks_ports_without_ssa_number_assumptions(
         "  }\n"
     )
     spec = state.StateTensorSpec.create("memory", (1, 8, 32, 32))
+    ane_input_order = []
+    ane_output_order = []
     lowered = state._transform_placed_body(
         body,
         function="entry_0",
@@ -91,6 +93,8 @@ def test_structural_lowering_tracks_ports_without_ssa_number_assumptions(
                  ("visible", spec.logical_shape)),
         states={"memory": spec},
         state_results={"memory.next": "memory"},
+        ane_input_order=ane_input_order,
+        ane_output_order=ane_output_order,
     )
 
     assert '"anec.state"(%ane3)' in lowered
@@ -105,6 +109,64 @@ def test_structural_lowering_tracks_ports_without_ssa_number_assumptions(
     assert "%call782#1" not in lowered
     assert "%state_tensor" not in lowered
     assert "KINO_STATE_entry_0" in lowered
+    assert ane_input_order == ["value", "memory"]
+    assert ane_output_order == ["visible"]
+
+
+def test_structural_lowering_records_pruned_state_reinsertion_order():
+    tensor = "tensor<1x8x32x32xf16>"
+    memref = "memref<1x8x32x32xf16>"
+    body = (
+        f"  anec.A14 @entry_0_ane_region_0_0(%ane_value: {memref}, "
+        f"%ane_second: {memref}) -> ({memref}, {memref}, {memref}) {{\n"
+        f'    %sum = "anec.scaled_elementwise"(%ane_value, %ane_second) '
+        f'{{mode = "add"}} : ({memref}, {memref}) -> {memref}\n'
+        f'    "anec.region_return"(%sum, %sum, %sum) : '
+        f'({memref}, {memref}, {memref}) -> ()\n'
+        "  }\n"
+        f"  func.func @entry_0(%feed: {tensor}, %first: {tensor}, "
+        f"%second: {tensor}) -> ({tensor}, {tensor}, {tensor}) "
+        "attributes {mps.disablePreAllocate, mps.fullyPlacedOnANE} {\n"
+        f'    %to_value = "placement.tensor_to_memref"(%feed) : '
+        f'({tensor}) -> {memref}\n'
+        f'    %to_second = "placement.tensor_to_memref"(%second) : '
+        f'({tensor}) -> {memref}\n'
+        f'    %call:3 = "placement.region_call"(%to_value, %to_second) '
+        "{callee = @entry_0_ane_region_0_0, mps.regionSHA = \"old\", "
+        "region_type = #placement.region_type<ANE>} : "
+        f"({memref}, {memref}) -> ({memref}, {memref}, {memref})\n"
+        f'    %first_result = "placement.memref_to_tensor"(%call#0) : '
+        f'({memref}) -> {tensor}\n'
+        f'    %second_result = "placement.memref_to_tensor"(%call#1) : '
+        f'({memref}) -> {tensor}\n'
+        f'    %visible = "placement.memref_to_tensor"(%call#2) : '
+        f'({memref}) -> {tensor}\n'
+        f"    return %first_result, %second_result, %visible : "
+        f"{tensor}, {tensor}, {tensor}\n"
+        "  }\n"
+    )
+    first = state.StateTensorSpec.create("first", (1, 8, 32, 32))
+    second = state.StateTensorSpec.create("second", (1, 8, 32, 32))
+    ane_input_order = []
+    state._transform_placed_body(
+        body,
+        function="entry_0",
+        order=(
+            ("value", first.storage_shape),
+            ("first", first.storage_shape),
+            ("second", second.storage_shape),
+        ),
+        targets=(
+            ("first.next", first.storage_shape),
+            ("second.next", second.storage_shape),
+            ("visible", first.logical_shape),
+        ),
+        states={"first": first, "second": second},
+        state_results={"first.next": "first", "second.next": "second"},
+        ane_input_order=ane_input_order,
+    )
+
+    assert ane_input_order == ["value", "second", "first"]
 
 
 def test_module_merge_deduplicates_resources_and_namespaces_aliases(tmp_path):
@@ -189,6 +251,8 @@ def test_stateful_cache_ready_requires_every_published_product(tmp_path):
             "order": [],
             "targets": [],
             "state_results": [],
+            "ane_input_order": [],
+            "ane_output_order": [],
             "dynamic": [],
             "product": "products/entry.plist",
         }],
@@ -196,6 +260,8 @@ def test_stateful_cache_ready_requires_every_published_product(tmp_path):
 
     assert not state.stateful_cache_ready(tmp_path)
     product.with_suffix(".weights").touch()
+    assert not state.stateful_cache_ready(tmp_path)
+    (product.parent / "compiler_options_entry_0_ane_region_0_0.plist").touch()
     assert state.stateful_cache_ready(tmp_path)
 
 
