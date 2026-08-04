@@ -277,3 +277,64 @@ def test_port_packs_and_unpacks_strided_fp16_lanes():
         for lane in range(16)
     )
     assert set(port.probe_offsets()) <= {lane * 64 for lane in range(16)}
+
+
+class _GuardSurface:
+    def __init__(self, size):
+        self.storage = bytearray(size)
+        self.locks = []
+
+    def lock(self, readonly=False):
+        self.locks.append(("lock", readonly))
+
+    def unlock(self, readonly=False):
+        self.locks.append(("unlock", readonly))
+
+    def view(self):
+        return memoryview(self.storage)
+
+
+class _GuardPort:
+    def __init__(self, name, size):
+        self.name = name
+        self.nbytes = size
+        self.surface = _GuardSurface(size)
+
+    @staticmethod
+    def probe_offsets():
+        return 0, 2, 4
+
+
+def _guard_entry(evaluate):
+    entry = object.__new__(anecir.StatefulEntry)
+    entry._contract = SimpleNamespace(name="entry")
+    entry._model = object()
+    entry._owner = SimpleNamespace(_evaluate=evaluate)
+    return entry
+
+
+def test_request_liveness_guard_checks_only_the_smallest_result():
+    large = _GuardPort("large", 64)
+    small = _GuardPort("small", 16)
+
+    def evaluate(_model, _inputs, outputs):
+        for port in outputs:
+            port.surface.storage[:] = bytes(len(port.surface.storage))
+
+    entry = _guard_entry(evaluate)
+    entry._guarded_dispatch((), (large, small), 1)
+
+    assert large.surface.locks == []
+    assert small.surface.locks == [
+        ("lock", False),
+        ("unlock", False),
+        ("lock", True),
+        ("unlock", True),
+    ]
+
+
+def test_request_liveness_guard_rejects_a_successful_no_op():
+    entry = _guard_entry(lambda _model, _inputs, _outputs: None)
+
+    with pytest.raises(RuntimeError, match="did not completely write"):
+        entry._guarded_dispatch((), (_GuardPort("result", 16),), 1)

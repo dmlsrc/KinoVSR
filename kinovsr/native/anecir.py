@@ -598,39 +598,40 @@ class StatefulEntry:
         outputs: Sequence[direct.Port],
         nonce: int,
     ) -> None:
-        marker = struct.pack("<H", 0x7E01 + (nonce & 0xFF))
-        probes = []
-        for port in outputs:
-            offsets = port.probe_offsets()
-            port.surface.lock()
-            try:
-                view = port.surface.view()
-                for offset in offsets:
-                    view[offset:offset + 2] = marker
-            finally:
-                port.surface.unlock()
-            probes.append((port, offsets))
-        self._owner._evaluate(self._model, inputs, outputs)
-        untouched = []
-        partial = []
-        for port, offsets in probes:
-            port.surface.lock(readonly=True)
-            try:
-                view = port.surface.view()
-                marked = [
-                    bytes(view[offset:offset + 2]) == marker
-                    for offset in offsets
-                ]
-            finally:
-                port.surface.unlock(readonly=True)
-            if all(marked):
-                untouched.append(port.name)
-            elif any(marked):
-                partial.append(port.name)
-        if untouched or partial:
+        if not outputs:
             raise RuntimeError(
-                f"{self._contract.name}: ANECIR returned incomplete result "
-                f"writes for {sorted(set(untouched) | set(partial))}"
+                f"{self._contract.name}: ANECIR entry has no liveness output"
+            )
+        # The observed raw-runtime failure is request-wide: evaluate returns
+        # success without executing the activation, leaving every result
+        # untouched. Synchronizing every IOSurface to prove that same fact is
+        # expensive enough to erase the accelerator overlap. One deterministic
+        # result therefore acts as the request liveness witness; choose the
+        # smallest physical port to minimize its cache-coherency cost.
+        port = min(outputs, key=lambda item: (item.nbytes, item.name))
+        marker = struct.pack("<H", 0x7E01 + (nonce & 0xFF))
+        offsets = port.probe_offsets()
+        port.surface.lock()
+        try:
+            view = port.surface.view()
+            for offset in offsets:
+                view[offset:offset + 2] = marker
+        finally:
+            port.surface.unlock()
+        self._owner._evaluate(self._model, inputs, outputs)
+        port.surface.lock(readonly=True)
+        try:
+            view = port.surface.view()
+            marked = [
+                bytes(view[offset:offset + 2]) == marker
+                for offset in offsets
+            ]
+        finally:
+            port.surface.unlock(readonly=True)
+        if any(marked):
+            raise RuntimeError(
+                f"{self._contract.name}: ANECIR request did not completely "
+                f"write liveness output {port.name!r}"
             )
 
     def _check_binding(

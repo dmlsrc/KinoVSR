@@ -26,9 +26,10 @@ of the tradeoffs; measure your own machine and content before deciding.
   one-step entry with persistent ANE state and stable skip-ring bindings;
   the ordinary stream keeps the one-step graph. The active raw ANECIR program
   and its IOSurface maps remain resident until a semantic phase change. The
-  runtime poisons and verifies result buffers around every evaluation, so an
-  incomplete write raises instead of exposing stale frames. Its one-step
-  dispatch cadence lets GPU stages advance between ANE evaluations, like `ane`.
+  runtime poisons and verifies a deterministic request-liveness result around
+  every evaluation, so an activation-wide no-write raises instead of exposing
+  stale frames. Its one-step dispatch cadence lets GPU stages advance between
+  ANE evaluations, like `ane`.
   It accepts a different window envelope (padded geometries from 128x256 through
   1024x576). Both accelerator backends fail loudly outside their envelopes
   rather than degrade.
