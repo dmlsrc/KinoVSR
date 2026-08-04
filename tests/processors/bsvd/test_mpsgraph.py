@@ -66,7 +66,7 @@ class TestBackendSelection:
         assert net._preheated_geometry == (128, 256)
         assert net._preheated_executable is executable
 
-    def test_scheduled_cache_uses_explicit_lifecycle_phase_entries(
+    def test_scheduled_cache_uses_one_direct_lifecycle_entry(
         self, monkeypatch, tmp_path
     ):
         captured = {}
@@ -95,9 +95,9 @@ class TestBackendSelection:
             net, 480, 640, states)
 
         assert result is executable
-        assert captured["entries"] == ("fill8_11", "generic1", "drain16")
+        assert captured["entries"] == ("generic1",)
         assert captured["cache"] == (
-            "scheduled-stateful-direct-v2", 480, 640)
+            "scheduled-stateful-generic1-direct-v1", 480, 640)
         assert captured["states"] is states
         assert captured["kwargs"]["cache_directory"] == tmp_path
 
@@ -134,27 +134,6 @@ class TestBackendSelection:
         assert all(frame is None for frame in flattened[count:])
         assert len(flattened) >= count + 16
         assert len(flattened) == count + 16
-
-    @pytest.mark.parametrize("count", [16, 17, 18, 19, 20, 23, 24, 63])
-    def test_sparse_fill_aligns_the_all_real_middle(self, count):
-        fill_length = 8
-        actions = ScheduledMpsPhaseSuite._middle_actions(
-            list(range(count)), fill_length
-        )
-        pairs = [
-            (frame, record)
-            for action in actions
-            for frame, record in zip(
-                action.frames, action.records, strict=True
-            )
-        ]
-
-        assert [frame for frame, _record in pairs] == list(
-            range(fill_length, count)
-        )
-        assert all(len(action.frames) == 1 for action in actions)
-        assert all(record.out_real is (frame >= 16) for frame, record in pairs)
-
 
 # --------------------------------------------------------------------------
 # End-to-end parity with the MLX reference

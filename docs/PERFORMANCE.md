@@ -24,8 +24,9 @@ of the tradeoffs; measure your own machine and content before deciding.
 - `mpsgraph`: the same network on the Neural Engine through MPSGraph,
   with no Core ML prediction. GOP windows use a cached schedule-generic
   one-step entry with persistent ANE state and stable skip-ring bindings;
-  the ordinary stream keeps the one-step graph. The active raw ANECIR program
-  and its IOSurface maps remain resident until a semantic phase change. The
+  the ordinary stream keeps the one-step graph. The one raw ANECIR program
+  and its IOSurface maps remain resident across fill, steady state, drain,
+  and reset windows; no raw phase reload is attempted. The
   runtime poisons and verifies a deterministic request-liveness result around
   every evaluation, so an activation-wide no-write raises instead of exposing
   stale frames. Its one-step dispatch cadence lets GPU stages advance between

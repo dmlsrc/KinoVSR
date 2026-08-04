@@ -37,10 +37,10 @@ per-frame work.  This adds one step of output delay: ``SHIFT_NUM`` is 17
 it because a pop never needs a push younger than four steps.
 
 Like the Core ML backend this executes fp16 only and fails loudly.
-``--gop-align`` windows use MPSGraph-compiled sparse fill, schedule-generic
-one-step middle, and sparse drain ANECIR entries. An explicit direct runtime
-switches those entries with one program resident at a time while persistent
-state and skip rings stay in shared IOSurfaces; Core ML is never called.
+``--gop-align`` windows use one schedule-generic direct ANECIR entry. It
+keeps persistent ANE state and stable IOSurface skip-ring bindings through
+fill, steady state, drain, and window resets without calling Core ML or
+switching raw programs. Its one-step cadence preserves downstream GPU overlap.
 """
 
 from __future__ import annotations
@@ -475,7 +475,7 @@ class MpsGraphBSVD:
     def preheat(
         self, height: int, width: int, scheduled: bool = False
     ) -> None:
-        """Open a warm direct phase cache while source startup proceeds."""
+        """Open a warm direct entry cache while source startup proceeds."""
         if (
             self._closed
             or not scheduled
@@ -502,7 +502,7 @@ class MpsGraphBSVD:
             preload_stateful_executable, self, height, width)
 
     def begin_window(self, frames: list[Any]):
-        """Start one window on MPSGraph-compiled direct ANE phases."""
+        """Start one window on the persistent direct ANE entry."""
         self._require_open()
         if not frames:
             raise ValueError("BSVD MPSGraph window cannot be empty")
@@ -513,7 +513,7 @@ class MpsGraphBSVD:
         height, width = int(first.shape[1]), int(first.shape[2])
         if not self.window_capable(height, width):
             raise RuntimeError(
-                f"{width}x{height} is outside the MPSGraph phase-window "
+                f"{width}x{height} is outside the MPSGraph schedule-window "
                 f"envelope (maximum {_PHASE_MAX_WIDTH}x"
                 f"{_PHASE_MAX_HEIGHT})")
         for frame in frames:
@@ -532,7 +532,7 @@ class MpsGraphBSVD:
             if executable is not None:
                 if self._preheated_geometry != (height, width):
                     raise RuntimeError(
-                        "preheated MPSGraph phases changed resolution")
+                        "preheated MPSGraph entry changed resolution")
                 self._preheated_executable = None
             try:
                 self._phase_suite = ScheduledMpsPhaseSuite(
