@@ -1,21 +1,16 @@
 """Four-step BSVD windows executed directly by MPSGraph on ANE.
 
-The ordinary graph pays MPSGraph's explicit recurrent-boundary overhead
-once per frame. This window path carries four temporal steps inside one
-executable, reducing that toll without changing runtimes: it is MPSGraph
-from graph construction through ANE dispatch, with no Core ML package,
-model, state, or prediction involved.
+One schedule-generic ANE entry handles fill, steady state, and drain. Its
+sixteen recurrent tensors use persistent ``anec.state`` ports, so no state
+crosses through Python, MLX, or a Core ML prediction. Keeping one concrete
+program and one stable set of tensor-data views resident is intentional:
+mapped-product phase switching can return success before a newly selected
+ANE program has written its results.
 
-One schedule-generic executable handles fill, steady state, and drain.
-Per-step gates reproduce the backend-neutral ``NoneFlowNet`` schedule,
-while the graph carries recurrent state internally across the four steps.
-Keeping one unrolled ANE program resident is important: separate programs
-for every static fill/drain phase measured well in isolation but thrashed
-ANE program residency in full GOP-aligned video runs.
-
-The four recurrent state slabs and six skip rings reuse the ordinary
-MPSGraph graph's shared MTLBuffers. A chunk therefore hands state to the
-next chunk without copying it through Python or MLX.
+The six skip rings remain reusable Metal bindings with stable tensor-data
+views. Both state and delayed features therefore cross dispatch boundaries
+without host copies while the backend-neutral ``NoneFlowNet`` mirror remains
+the source of truth for frame order and output visibility.
 """
 
 from __future__ import annotations
@@ -28,12 +23,20 @@ from typing import Any
 import mlx.core as mx
 
 from kinovsr.native import mpsgraph as mg
+from kinovsr.native import mpsgraph_state as mgs
 
 from .schedule import NoneFlowNet
 
 _STEPS = 4
 _DRAIN_STEPS = 16
+_STATEFUL_CACHE_LABEL = "scheduled-stateful-generic4"
 _UNIT_KEYS = ("u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7")
+
+
+def stateful_cache_ready(net: Any, height: int, width: int) -> bool:
+    """Whether this runtime's single-entry persistent cache is complete."""
+    cache = net._executable_cache(_STATEFUL_CACHE_LABEL, height, width)
+    return cache is not None and mgs.stateful_cache_ready(cache)
 
 
 @dataclass
@@ -46,7 +49,7 @@ class _Emitted:
 
 @dataclass
 class _Chunk:
-    graph: mg.CompiledGraph
+    graph: Any
     frame_names: tuple[str, ...]
     gate_names: tuple[str, ...]
     left_gate_names: tuple[str, ...]
@@ -76,34 +79,13 @@ class _Prepared:
     rings: list[deque]
     free: list[deque]
 
-
-def _storage_shapes(
+def _line_shapes(
     net: Any, height: int, width: int
-) -> tuple[tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]]:
-    """State-slab and skip-line shapes without compiling the ordinary graph."""
-    from .mps import _STATE_GROUPS, _net_keys
+) -> tuple[tuple[int, ...], ...]:
+    """Skip-ring shapes without compiling the ordinary graph."""
+    from .mps import _net_keys
 
     keys_by_net = tuple(_net_keys(prefix) for prefix in net._prefixes)
-    unit_shapes = {}
-    for unit in range(16):
-        local = unit % 8
-        key = keys_by_net[unit // 8][_UNIT_KEYS[local]]
-        channels = int(net._weights[key + ".weight"].shape[0])
-        divisor = 2 if local < 2 or local > 5 else 4
-        unit_shapes[unit] = (
-            1,
-            channels + channels // 8,
-            height // divisor,
-            width // divisor,
-        )
-    state_shapes = []
-    for units in _STATE_GROUPS:
-        first = unit_shapes[units[0]]
-        if any(unit_shapes[unit] != first for unit in units):
-            raise RuntimeError("BSVD state slab groups incompatible shapes")
-        state_shapes.append((
-            1, first[1] * len(units), first[2], first[3]))
-
     line_shapes = []
     for keys in keys_by_net:
         line_shapes.extend((
@@ -123,7 +105,32 @@ def _storage_shapes(
                 width // 2,
             ),
         ))
-    return tuple(state_shapes), tuple(line_shapes)
+    return tuple(line_shapes)
+
+
+def _state_specs(
+    net: Any, height: int, width: int
+) -> tuple[mgs.StateTensorSpec, ...]:
+    """The sixteen BiBuffer cells as independent persistent state ports."""
+    from .mps import _net_keys
+
+    keys_by_net = tuple(_net_keys(prefix) for prefix in net._prefixes)
+    states = []
+    for unit in range(16):
+        local = unit % 8
+        key = keys_by_net[unit // 8][_UNIT_KEYS[local]]
+        channels = int(net._weights[key + ".weight"].shape[0])
+        divisor = 2 if local < 2 or local > 5 else 4
+        states.append(mgs.StateTensorSpec.create(
+            f"state_{unit}",
+            (
+                1,
+                channels + channels // 8,
+                height // divisor,
+                width // divisor,
+            ),
+        ))
+    return tuple(states)
 
 
 def _build_chunk(net: Any, height: int, width: int) -> _Chunk:
@@ -131,33 +138,57 @@ def _build_chunk(net: Any, height: int, width: int) -> _Chunk:
     from .mps import (
         _LINES,
         _PUSH_OUTPUTS,
-        _STATE_GROUPS,
         _net_keys,
     )
 
     weights = net._weights
     keys_by_net = tuple(_net_keys(prefix) for prefix in net._prefixes)
-    state_slab_shapes, line_shapes = _storage_shapes(net, height, width)
+    line_shapes = _line_shapes(net, height, width)
+    state_specs = _state_specs(net, height, width)
     builder = mg.GraphBuilder(mg.FLOAT16)
 
-    state_values: dict[int, Any] = {}
-    state_shapes: dict[int, tuple[int, ...]] = {}
-    state_feed_names: list[str] = []
-    for group, units in enumerate(_STATE_GROUPS):
-        shape = state_slab_shapes[group]
-        name = f"g{group}.state"
-        slab = builder.placeholder(shape, name)
-        state_feed_names.append(name)
-        channels = shape[1] // len(units)
-        unit_shape = (1, channels, shape[2], shape[3])
-        for slot, unit in enumerate(units):
-            state_values[unit] = builder.slice_channels(
-                slab,
-                slot * channels,
-                channels,
-                f"g{group}.u{unit}.initial",
-            )
-            state_shapes[unit] = unit_shape
+    dynamic: set[str] = set()
+    frame_names: list[str] = []
+    gate_names: list[str] = []
+    left_gate_names: list[str] = []
+    pop_names: list[tuple[str, ...]] = []
+    frame_tensors = []
+    gate_tensors = []
+    left_gate_tensors = []
+    pop_tensors = []
+    for step in range(_STEPS):
+        frame_name = f"frame_{step}"
+        gate_name = f"gate_{step}"
+        left_gate_name = f"left_gate_{step}"
+        frame_names.append(frame_name)
+        gate_names.append(gate_name)
+        left_gate_names.append(left_gate_name)
+        frame_tensors.append(builder.placeholder(
+            (1, net.input_channels, height, width), frame_name))
+        gate_tensors.append(builder.placeholder(
+            (1, 16, 1, 1), gate_name))
+        left_gate_tensors.append(builder.placeholder(
+            (1, 16, 1, 1), left_gate_name))
+        step_names = []
+        step_tensors = []
+        for line in range(_LINES):
+            name = f"skip_{step}_{line}"
+            step_names.append(name)
+            step_tensors.append(builder.placeholder(line_shapes[line], name))
+            dynamic.add(name)
+        pop_names.append(tuple(step_names))
+        pop_tensors.append(tuple(step_tensors))
+
+    # State ports trail every ordinary/dynamic port. This is the large-model
+    # ABI exercised by MPSGraph's own mapped-product runtime.
+    logical_states = mgs.state_placeholders(builder, state_specs)
+    state_values = {
+        unit: logical_states[state.name]
+        for unit, state in enumerate(state_specs)
+    }
+    state_shapes = {
+        unit: state.logical_shape for unit, state in enumerate(state_specs)
+    }
 
     def bibuffer(
         current: Any,
@@ -332,37 +363,14 @@ def _build_chunk(net: Any, height: int, width: int) -> _Chunk:
         return _Emitted(out, x0, x1, out_channels)
 
     targets: list[tuple[str, Any, tuple[int, ...]]] = []
-    dynamic: set[str] = set(state_feed_names)
-    frame_names: list[str] = []
-    gate_names: list[str] = []
-    left_gate_names: list[str] = []
     output_names: list[str] = []
-    pop_names: list[tuple[str, ...]] = []
     push_names: list[tuple[str | None, ...]] = []
 
     for step in range(_STEPS):
-        frame_name = f"frame_{step}"
-        frame = builder.placeholder(
-            (1, net.input_channels, height, width), frame_name)
-        frame_names.append(frame_name)
-        gate_name = f"gate_{step}"
-        left_gate_name = f"left_gate_{step}"
-        gate = builder.placeholder(
-            (1, 16, 1, 1), gate_name)
-        left_gate = builder.placeholder(
-            (1, 16, 1, 1), left_gate_name)
-        gate_names.append(gate_name)
-        left_gate_names.append(left_gate_name)
-
-        step_pop_names = []
-        pops = []
-        for line in range(_LINES):
-            name = f"skip_{step}_{line}"
-            pops.append(builder.placeholder(
-                line_shapes[line], name))
-            step_pop_names.append(name)
-            dynamic.add(name)
-        pop_names.append(tuple(step_pop_names))
+        frame = frame_tensors[step]
+        gate = gate_tensors[step]
+        left_gate = left_gate_tensors[step]
+        pops = pop_tensors[step]
 
         first = emit_net(
             0, frame, tuple(pops[:3]), gate, left_gate, step)
@@ -395,32 +403,18 @@ def _build_chunk(net: Any, height: int, width: int) -> _Chunk:
             dynamic.add(name)
         push_names.append(tuple(step_push_names))
 
-    for group, units in enumerate(_STATE_GROUPS):
-        shape = state_slab_shapes[group]
-        name = f"g{group}.state.next"
-        targets.append((
-            name,
-            builder.concat_channels(
-                [state_values[unit] for unit in units],
-                f"g{group}.state.final",
-            ),
-            shape,
-        ))
-        dynamic.add(name)
+    state_results = {}
+    for unit, state in enumerate(state_specs):
+        result = mgs.state_result(builder, state, state_values[unit])
+        targets.append(result)
+        state_results[result[0]] = state.name
 
-    label = "scheduled-generic4"
-    graph = mg.compile_graph(
-        builder,
-        targets,
-        device=mg.DEVICE_ANE,
+    graph = mgs.Program(
+        name="generic4",
+        builder=builder,
+        targets=targets,
+        state_results=state_results,
         dynamic=dynamic,
-        synchronize_results=False,
-        use_command_queue=net._use_command_queue,
-        ane_fw_to_fw_signal=net._ane_fw_to_fw_signal,
-        ane_late_latch=net._ane_late_latch,
-        ane_streaming_session=net._ane_streaming_session,
-        ane_energy_efficient=net._ane_energy_efficient,
-        executable_cache=net._executable_cache(label, height, width),
     )
     return _Chunk(
         graph=graph,
@@ -433,33 +427,94 @@ def _build_chunk(net: Any, height: int, width: int) -> _Chunk:
     )
 
 
-class ScheduledMpsPhaseSuite:
-    """One schedule-generic direct-MPSGraph executable for reset windows."""
+def _compile_stateful_executable(
+    net: Any,
+    height: int,
+    width: int,
+    states: tuple[mgs.StateTensorSpec, ...],
+) -> mgs.StatefulExecutable:
+    cache = net._executable_cache(_STATEFUL_CACHE_LABEL, height, width)
+    if cache is None:
+        raise RuntimeError(
+            "persistent MPSGraph windows require a versioned cache path")
+    return mgs.compile_stateful(
+        {
+            "generic4": lambda: _build_chunk(
+                net, height, width).graph,
+        },
+        states,
+        dtype=mg.FLOAT16,
+        cache_directory=cache,
+        ane_fw_to_fw_signal=net._ane_fw_to_fw_signal,
+        ane_late_latch=net._ane_late_latch,
+    )
 
-    def __init__(self, net: Any, height: int, width: int):
-        from .mps import _SKIP_DEPTHS
+
+def preload_stateful_executable(
+    net: Any, height: int, width: int
+) -> mgs.StatefulExecutable | None:
+    """Eagerly load and attach a warm phase cache without building graphs."""
+    cache = net._executable_cache(_STATEFUL_CACHE_LABEL, height, width)
+    if cache is None or not mgs.stateful_cache_ready(cache):
+        return None
+    states = _state_specs(net, height, width)
+    executable = _compile_stateful_executable(
+        net, height, width, states)
+    try:
+        executable.prepare()
+    except BaseException:
+        executable.close()
+        raise
+    return executable
+
+
+class ScheduledMpsPhaseSuite:
+    """One four-step entry with persistent ANE state and stable bindings."""
+
+    def __init__(
+        self,
+        net: Any,
+        height: int,
+        width: int,
+        *,
+        executable: mgs.StatefulExecutable | None = None,
+    ):
+        from .mps import _LINES, _SKIP_DEPTHS
 
         self.net = net
         self.height = height
         self.width = width
         self.pipeline = net._pipeline
-        self._views: dict[tuple[int, str, int], mg.TensorBinding] = {}
+        self._views: dict[tuple[int, str, int], mgs.TensorBinding] = {}
 
-        state_shapes, line_shapes = _storage_shapes(net, height, width)
-        self.chunk = _build_chunk(net, height, width)
-
-        # Scheduled mode owns its storage through the generic executable.
-        # It must not compile the ordinary one-step program just to obtain
-        # same-shaped MTLBuffers: a fourth resident ANE program is outside
-        # the measured-stable residency envelope at production geometry.
+        line_shapes = _line_shapes(net, height, width)
+        self.states = _state_specs(net, height, width)
+        if executable is not None and executable.state_specs != self.states:
+            raise RuntimeError(
+                "preloaded MPSGraph phases have incompatible state tensors")
+        self.executable = executable or _compile_stateful_executable(
+            net, height, width, self.states,
+        )
+        generic = self.executable.entry("generic4")
+        self.chunk = _Chunk(
+            graph=generic,
+            frame_names=tuple(f"frame_{step}" for step in range(_STEPS)),
+            gate_names=tuple(f"gate_{step}" for step in range(_STEPS)),
+            left_gate_names=tuple(
+                f"left_gate_{step}" for step in range(_STEPS)),
+            output_names=tuple(f"out_{step}" for step in range(_STEPS)),
+            pop_names=tuple(
+                tuple(f"skip_{step}_{line}" for line in range(_LINES))
+                for step in range(_STEPS)),
+            push_names=tuple(
+                tuple(
+                    None if line == 0 else f"skip_out_{step}_{line}"
+                    for line in range(_LINES))
+                for step in range(_STEPS)),
+        )
         net._line_shapes = list(line_shapes)
         net._state_slots = []
         net._state_bindings = {}
-        for group, shape in enumerate(state_shapes):
-            name = f"g{group}.state"
-            slot = self.chunk.graph.bind(name)
-            slot.write(bytes(2 * prod(shape)))
-            net._state_slots.append(slot)
 
         net._slots = []
         net._free = []
@@ -485,10 +540,10 @@ class ScheduledMpsPhaseSuite:
 
     def _view(
         self,
-        graph: mg.CompiledGraph,
+        graph: mgs.StatefulEntry,
         name: str,
-        backing: mg.TensorBinding,
-    ) -> mg.TensorBinding:
+        backing: mgs.TensorBinding,
+    ) -> mgs.TensorBinding:
         key = (id(graph), name, id(backing))
         if key not in self._views:
             self._views[key] = graph.bind(
@@ -546,7 +601,7 @@ class ScheduledMpsPhaseSuite:
             frames, gates, left_gates, action.records)
 
     def _prepare(self, resolved: _Resolved) -> _Prepared:
-        from .mps import _LINES, _STATE_GROUPS
+        from .mps import _LINES
 
         graph = self.chunk.graph
         values = {}
@@ -557,14 +612,7 @@ class ScheduledMpsPhaseSuite:
                 resolved.left_gates[step])
         graph.write_feeds(values)
 
-        bindings: dict[str, mg.TensorBinding] = {}
-        for group in range(len(_STATE_GROUPS)):
-            slot = self.net._state_slots[group]
-            for name in (
-                f"g{group}.state",
-                f"g{group}.state.next",
-            ):
-                bindings[name] = self._view(graph, name, slot)
+        bindings: dict[str, mgs.TensorBinding] = {}
 
         rings = [deque(line) for line in self.net._rings]
         free = [deque(line) for line in self.net._free]
@@ -644,10 +692,10 @@ class ScheduledMpsPhaseSuite:
         return WindowMachine(self, frames)
 
     def reset(self) -> None:
-        self.chunk.graph.reset()
+        self.executable.reset()
 
     def close(self) -> None:
-        self.chunk.graph.close()
+        self.executable.close()
         self._views.clear()
 
 
@@ -738,4 +786,9 @@ class WindowMachine:
         return self._advance(block, stop_on_output=True)
 
 
-__all__ = ["ScheduledMpsPhaseSuite", "WindowMachine"]
+__all__ = [
+    "ScheduledMpsPhaseSuite",
+    "WindowMachine",
+    "preload_stateful_executable",
+    "stateful_cache_ready",
+]

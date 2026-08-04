@@ -37,9 +37,9 @@ per-frame work.  This adds one step of output delay: ``SHIFT_NUM`` is 17
 it because a pop never needs a push younger than four steps.
 
 Like the Core ML backend this executes fp16 only and fails loudly.
-``--gop-align`` windows use the pure-MPSGraph four-step executable in
-:mod:`kinovsr.processors.bsvd.mps_phases`; it shares the same Metal state
-and ring storage and does not call Core ML.
+``--gop-align`` windows use one schedule-generic four-step MPSGraph entry.
+It keeps persistent ANE state and stable Metal skip-ring bindings through
+fill, steady state, drain, and window resets without calling Core ML.
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ _STATE_GROUP_OF = {
 _ANE_SESSION_MIN_PIXELS = 128 * 256
 _PHASE_MAX_WIDTH = 1024
 _PHASE_MAX_HEIGHT = 576
-_GRAPH_CACHE_VERSION = 1
+_GRAPH_CACHE_VERSION = 3
 # Skip lines 1..5 push graph outputs; line 0 pushes the frame's own RGB
 # head, which the host already holds.
 _PUSH_OUTPUTS = ((1, "n0.x0"), (2, "n0.x1"), (3, "n0.out3"),
@@ -173,6 +173,10 @@ class MpsGraphBSVD:
 
         self._graph: mg.CompiledGraph | None = None
         self._phase_suite: Any | None = None
+        self._preheat: Any | None = None
+        self._preheat_pool: Any | None = None
+        self._preheated_geometry: tuple[int, int] | None = None
+        self._preheated_executable: Any | None = None
         self._geometry: tuple[int, int] | None = None
         self._line_shapes: list[tuple[int, ...]] = []
         self._state_slots: list[mg.TensorBinding] = []
@@ -455,6 +459,47 @@ class MpsGraphBSVD:
             and width <= _PHASE_MAX_WIDTH
         )
 
+    def _join_preheat(self) -> None:
+        future, self._preheat = self._preheat, None
+        pool, self._preheat_pool = self._preheat_pool, None
+        try:
+            if future is not None:
+                executable = future.result()
+                if executable is not None:
+                    self._preheated_executable = executable
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=False)
+
+    def preheat(
+        self, height: int, width: int, scheduled: bool = False
+    ) -> None:
+        """Attach a warm stateful phase cache while source startup proceeds."""
+        if (
+            self._closed
+            or not scheduled
+            or self._preheat is not None
+            or self._phase_suite is not None
+            or self._preheated_executable is not None
+            or not self.window_capable(height, width)
+        ):
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        from .mps_phases import (
+            preload_stateful_executable,
+            stateful_cache_ready,
+        )
+
+        if not stateful_cache_ready(self, height, width):
+            return
+
+        self._preheated_geometry = (height, width)
+        self._preheat_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="bsvd-mpsgraph-preheat")
+        self._preheat = self._preheat_pool.submit(
+            preload_stateful_executable, self, height, width)
+
     def begin_window(self, frames: list[Any]):
         """Start one independent window on pure MPSGraph schedule chunks."""
         self._require_open()
@@ -478,11 +523,23 @@ class MpsGraphBSVD:
             raise RuntimeError(
                 f"BSVD MPSGraph stream changed resolution from "
                 f"{self._geometry} to {(height, width)}")
+        self._join_preheat()
         if self._phase_suite is None:
             from .mps_phases import ScheduledMpsPhaseSuite
 
-            self._phase_suite = ScheduledMpsPhaseSuite(
-                self, height, width)
+            executable = self._preheated_executable
+            if executable is not None:
+                if self._preheated_geometry != (height, width):
+                    raise RuntimeError(
+                        "preheated MPSGraph phases changed resolution")
+                self._preheated_executable = None
+            try:
+                self._phase_suite = ScheduledMpsPhaseSuite(
+                    self, height, width, executable=executable)
+            except BaseException:
+                if executable is not None:
+                    executable.close()
+                raise
             self._geometry = (height, width)
         self._dirty = True
         return self._phase_suite.machine(frames)
@@ -597,10 +654,18 @@ class MpsGraphBSVD:
             return
         self._closed = True
         try:
+            import contextlib
+
+            with contextlib.suppress(BaseException):
+                self._join_preheat()
             self._pipeline.drain()
         finally:
             self._pipeline.close()
             self._pending = None
+            if self._preheated_executable is not None:
+                self._preheated_executable.close()
+            self._preheated_executable = None
+            self._preheated_geometry = None
             if self._phase_suite is not None:
                 self._phase_suite.close()
             self._phase_suite = None

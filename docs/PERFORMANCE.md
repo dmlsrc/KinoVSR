@@ -22,11 +22,16 @@ of the tradeoffs; measure your own machine and content before deciding.
   First run at a new geometry compiles the model (seconds to a minute,
   cached); frames need at least 96 px per side.
 - `mpsgraph`: the same network on the Neural Engine through MPSGraph,
-  with no Core ML package or cache artifacts. Slower than `ane` in the
-  example (53 s solo, 66 s chained) but the same overlap behavior, and
-  a different envelope (padded geometries from 128x256 through
-  1024x576). Both accelerator backends fail loudly outside their
-  envelopes rather than degrade.
+  with no Core ML prediction. GOP windows use one cached schedule-generic
+  four-step entry with persistent ANE state and stable skip-ring bindings;
+  the ordinary stream keeps the one-step graph. One resident program avoids
+  mapped-product phase re-entry, and the generic runtime verifies owned
+  result buffers before exposing them: an all-results-untouched activation
+  is retried within a fixed bound, while partial or repeated failures raise
+  instead of serving stale frames. It has the same overlap behavior as `ane`
+  and a different window envelope (padded geometries from 128x256 through
+  1024x576). Both accelerator backends fail loudly outside their envelopes
+  rather than degrade.
 
 Rule of thumb: `mlx` for a denoise-only run or a chain that is
 otherwise idle; an accelerator backend whenever the chain also has GPU

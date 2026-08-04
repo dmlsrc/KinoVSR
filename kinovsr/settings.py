@@ -154,9 +154,9 @@ class Settings:
     # default - it is the faster standalone), "ane" (one Core ML dispatch
     # per step on the Neural Engine; explicitly opt-in, fails loudly when
     # unavailable), or "mpsgraph" (direct MPSGraph on the Neural Engine,
-    # with a four-step pure-MPSGraph executable for scheduled windows and
-    # no Core ML involved). The ANE paths pay off in chains where other
-    # stages need the GPU they vacate.
+    # with one persistent-state four-step entry for scheduled windows and no
+    # Core ML involved). The ANE paths pay off in chains where other stages
+    # need the GPU they vacate.
     bsvd_backend: str = field(
         default="mlx", metadata={
             "env": ["{{KINOVSR_BSVD_BACKEND}}", "{{BSVD_BACKEND}}"]})

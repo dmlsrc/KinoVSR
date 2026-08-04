@@ -219,6 +219,11 @@ class GraphBuilder:
     def concat_channels(self, tensors: list[Any], name: str) -> Any:
         return self.graph.concatTensors_dimension_name_(tensors, 1, name)
 
+    def reshape(self, x: Any, shape: tuple[int, ...], name: str) -> Any:
+        """Return a static reshape without changing element order."""
+        return self.graph.reshapeTensor_withShape_name_(
+            x, [int(value) for value in shape], name)
+
     def pixel_shuffle(self, x: Any, block: int, name: str) -> Any:
         """Raw depth-to-space in pixel-shuffle order.
 

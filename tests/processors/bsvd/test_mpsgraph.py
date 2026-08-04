@@ -3,11 +3,14 @@ MLX net through fill, steady state, and drain."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import pytest
 
+from kinovsr.native import mpsgraph_state as mgs
 from kinovsr.processors import bsvd as B
-from kinovsr.processors.bsvd import cli_options, factory
+from kinovsr.processors.bsvd import cli_options, factory, mps_phases
 from kinovsr.processors.bsvd.mps import MpsGraphBSVD
 from kinovsr.processors.bsvd.mps_phases import ScheduledMpsPhaseSuite
 
@@ -36,6 +39,80 @@ class TestBackendSelection:
         frame = mx.zeros((1, 94, 128, net.input_channels), dtype=mx.float16)
         with pytest.raises(ValueError, match="divisible by four"):
             net.step(frame)
+
+    def test_warm_scheduled_preheat_attaches_in_background(
+        self, monkeypatch, tmp_path
+    ):
+        executable = object()
+        net = object.__new__(MpsGraphBSVD)
+        net._closed = False
+        net._preheat = None
+        net._preheat_pool = None
+        net._preheated_geometry = None
+        net._preheated_executable = None
+        net._phase_suite = None
+        net.window_capable = lambda height, width: True
+        net._executable_cache = lambda label, height, width: tmp_path
+        monkeypatch.setattr(mgs, "stateful_cache_ready", lambda path: True)
+        monkeypatch.setattr(
+            mps_phases,
+            "preload_stateful_executable",
+            lambda owner, height, width: executable,
+        )
+
+        net.preheat(128, 256, scheduled=True)
+        net._join_preheat()
+
+        assert net._preheated_geometry == (128, 256)
+        assert net._preheated_executable is executable
+
+    def test_scheduled_cache_has_one_resident_program(
+        self, monkeypatch, tmp_path
+    ):
+        captured = {}
+        executable = object()
+
+        def executable_cache(label, height, width):
+            captured["cache"] = (label, height, width)
+            return tmp_path
+
+        net = SimpleNamespace(
+            _ane_fw_to_fw_signal=False,
+            _ane_late_latch=False,
+            _executable_cache=executable_cache,
+        )
+
+        def compile_stateful(factories, states, **kwargs):
+            captured["entries"] = tuple(factories)
+            captured["states"] = states
+            captured["kwargs"] = kwargs
+            return executable
+
+        monkeypatch.setattr(mgs, "compile_stateful", compile_stateful)
+        states = (object(),)
+
+        result = mps_phases._compile_stateful_executable(
+            net, 480, 640, states)
+
+        assert result is executable
+        assert captured["entries"] == ("generic4",)
+        assert captured["cache"] == (
+            "scheduled-stateful-generic4", 480, 640)
+        assert captured["states"] is states
+        assert captured["kwargs"]["cache_directory"] == tmp_path
+
+    def test_window_reset_keeps_concrete_tensor_data_views(self):
+        resets = []
+        suite = object.__new__(ScheduledMpsPhaseSuite)
+        suite.executable = SimpleNamespace(
+            reset=lambda: resets.append(True))
+        view = object()
+        suite._views = {(1, "skip", 2): view}
+
+        suite.reset()
+
+        assert resets == [True]
+        assert suite._views == {(1, "skip", 2): view}
 
     @pytest.mark.parametrize("count", [16, 17, 18, 19, 20, 23, 24, 63])
     def test_four_step_window_actions_cover_fill_and_drain_exactly(
