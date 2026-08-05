@@ -121,3 +121,4 @@ marked. The full lane remains the pre-merge correctness check.
 - `docs/PERFORMANCE.md` - practical backend and chain guidance.
 - `docs/VSR_PERFORMANCE_NOTES.md` - deep implementation reference.
 - `docs/API.md` - the public host API contract.
+- `docs/ANE.md` - field guide to the Apple Neural Engine: routes, compiler and lifecycle laws, cadence, and state.

@@ -1,13 +1,15 @@
 """Persistent-state, multi-procedure MPSGraph executables on the ANE.
 
-MPSGraph's graph API has no public state operation, but the placed ANE
-dialect does.  This module keeps that SPI behind a model-neutral contract:
-callers describe named state tensors and ordinary MPSGraph programs; the
-compiler moves their compute into ``mpsx.ane`` procedures while retaining
-MPSGraph's canonical variable read/write sequence around each procedure. All
-procedures then specialize into one ANE model and share the same Metal-backed
-live state. The older placed ``anec.state`` product path remains available for
-explicit ANECIR experiments.
+MPSGraph's public graph API has variables and read/assign operations, but it
+does not document an ``MLState``-equivalent contract for persistent ANE state
+shared across entry points. The placed ANE dialect exposes the live-state ABI
+used here. This module keeps that SPI behind a model-neutral contract: callers
+describe named state tensors and ordinary MPSGraph programs; the compiler
+moves their compute into ``mpsx.ane`` procedures while retaining MPSGraph's
+canonical variable read/write sequence around each procedure. All procedures
+then specialize into one ANE model and share the same Metal-backed live state.
+The older placed ``anec.state`` product path remains available for explicit
+ANECIR experiments.
 
 The lowering deliberately operates on names, contracts, and def-use links.
 It does not depend on operation numbers emitted by MPSGraph.  Family code
