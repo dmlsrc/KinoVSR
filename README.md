@@ -5,7 +5,7 @@ for Apple Silicon: native macOS video I/O, VideoToolbox spatial and
 temporal processing, learned MLX restoration and upscaling, evaluation
 tooling, and a CLI that composes them into arbitrary chains. Engine
 adapters live outside this repository and load KinoVSR through the
-frozen public API in `docs/API.md`.
+frozen public API in [docs/API.md](docs/API.md).
 
 ## Requirements
 
@@ -54,7 +54,7 @@ kinovsr run --video in.mp4 --output-dir out --gop-align --restore decompress_tra
 
 Temporal denoise on the Neural Engine while the GPU upscales - the
 accelerator split is why the chain costs little more than its slowest
-stage (see `docs/PERFORMANCE.md`):
+stage (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md)):
 
 ```bash
 kinovsr run --video in.mp4 --output-dir out --gop-align --denoise bsvd --bsvd-backend ane --upscale balanced
@@ -62,8 +62,9 @@ kinovsr run --video in.mp4 --output-dir out --gop-align --denoise bsvd --bsvd-ba
 
 Every run accepts `--print-config`, which prints the fully resolved
 run as TOML and exits - the same file `--config` accepts back.
-`docs/CONFIG.md` documents the config surface: one resolution order,
-the flag/TOML ownership rules, `--set`, and the run-level tables.
+[docs/CONFIG.md](docs/CONFIG.md) documents the config surface: one
+resolution order, the flag/TOML ownership rules, `--set`, and the
+run-level tables.
 
 ## Options vocabulary
 
@@ -78,8 +79,8 @@ accepts canonical vocabulary spellings only.
 ## Weights
 
 Learned families declare their profiles and weight artifacts in
-machine-readable manifests; `docs/PROCESSORS.md` is the generated
-matrix of every family, profile, artifact, license, and source. Most
+machine-readable manifests; [docs/PROCESSORS.md](docs/PROCESSORS.md) is
+the generated matrix of every family, profile, artifact, license, and source. Most
 weights are external: each family's `weights/README.md` documents how
 to obtain and convert them (`kinovsr weights convert`), and
 `weights/Attribution.md` credits the upstream work.
@@ -95,8 +96,8 @@ kinovsr weights verify    # presence and checksums
 `process_video_file` for file-to-file runs, and
 `open_pipeline`/`PipelineSession` for streaming a host's own frames
 through a validated chain - bounded internal execution behind a
-synchronous iterator. `docs/API.md` is the contract, including frame
-ownership and lifetime rules.
+synchronous iterator. [docs/API.md](docs/API.md) is the contract,
+including frame ownership and lifetime rules.
 
 ## Development
 
@@ -116,9 +117,13 @@ marked. The full lane remains the pre-merge correctness check.
 
 ## Documentation
 
-- `docs/CONFIG.md` - flags, TOML, `--set`, `--print-config`.
-- `docs/PROCESSORS.md` - generated processor/profile/weights matrix.
-- `docs/PERFORMANCE.md` - practical backend and chain guidance.
-- `docs/VSR_PERFORMANCE_NOTES.md` - deep implementation reference.
-- `docs/API.md` - the public host API contract.
-- `docs/ANE.md` - field guide to the Apple Neural Engine: routes, compiler and lifecycle laws, cadence, and state.
+- [docs/CONFIG.md](docs/CONFIG.md) - flags, TOML, `--set`, `--print-config`.
+- [docs/PROCESSORS.md](docs/PROCESSORS.md) - generated
+  processor/profile/weights matrix.
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md) - practical backend and
+  chain guidance.
+- [docs/VSR_PERFORMANCE_NOTES.md](docs/VSR_PERFORMANCE_NOTES.md) - deep
+  implementation reference.
+- [docs/API.md](docs/API.md) - the public host API contract.
+- [docs/ANE.md](docs/ANE.md) - field guide to the Apple Neural Engine:
+  routes, compiler and lifecycle constraints, cadence, and state.
