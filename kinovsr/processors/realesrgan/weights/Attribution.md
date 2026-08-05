@@ -1,9 +1,9 @@
 # Attribution
 
-`kinovsr/processors/realesrgan/` is an independent MLX reimplementation of the RRDBNet / SRVGG
+[`kinovsr/processors/realesrgan/`](../) is an independent MLX reimplementation of the RRDBNet / SRVGG
 generators below, written from the published architectures as a spec -- no upstream code is
 bundled. The model weights are the upstream projects', redistributed under their licenses
-(see `README.md` beside this file for the per-token downloads).
+(see [README.md](README.md) beside this file for the per-token downloads).
 
 ## Real-ESRGAN / ESRGAN
 
@@ -12,7 +12,7 @@ Covers the `general`, `general-wdn`, `x4plus`, `realesrnet`, `x2plus`, `anime`,
 
 Xintao Wang, Liangbin Xie, Chao Dong, Ying Shan -- "Real-ESRGAN: Training Real-World Blind
 Super-Resolution with Pure Synthetic Data" (ICCV Workshops 2021).
-https://github.com/xinntao/Real-ESRGAN
+<https://github.com/xinntao/Real-ESRGAN>
 
 The `esrgan` token is the original ESRGAN generator (Xintao Wang, Ke Yu, Shixiang Wu, et
 al. -- "ESRGAN: Enhanced Super-Resolution Generative Adversarial Networks", ECCV Workshops
@@ -55,10 +55,10 @@ Covers the `bsrgan` and `bsrnet` tokens.
 
 Kai Zhang, Jingyun Liang, Luc Van Gool, Radu Timofte -- "Designing a Practical Degradation
 Model for Deep Blind Image Super-Resolution" (ICCV 2021).
-https://github.com/cszn/BSRGAN
+<https://github.com/cszn/BSRGAN>
 
 Licensed under the Apache License, Version 2.0 (SPDX: Apache-2.0). Copyright 2022 Kai Zhang.
 You may not use these files except in compliance with the License; the full text is at
-https://www.apache.org/licenses/LICENSE-2.0 and in the upstream repository's `LICENSE`.
+<https://www.apache.org/licenses/LICENSE-2.0> and in the upstream repository's `LICENSE`.
 Unless required by applicable law or agreed to in writing, the software is distributed on
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND.

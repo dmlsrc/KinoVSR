@@ -2,8 +2,8 @@
 
 `dover_mobile.safetensors` (39 MB) is converted from the official
 DOVER-Mobile checkpoint and is **not bundled** in the repo; download
-and convert once as below.  The weights are under the NTU S-Lab
-License 1.0 (non-commercial) -- see `../ATTRIBUTION.md`.
+and convert once as below. The weights are under the NTU S-Lab
+License 1.0 (non-commercial) -- see [Attribution](Attribution.md).
 
 | File | Size | sha256 |
 | ---- | ---- | ------ |
@@ -31,4 +31,4 @@ Conversion needs torch and is layout-specific (channels-last conv3d
 kernels, per-block depthwise stacks whose temporal extent alternates 1
 and 3, pre-transposed linears, dropped ImageNet classifier heads) --
 the generic `kinovsr weights convert` re-serializer is not
-sufficient; use `convert_dover.py`.
+sufficient; use [`convert_dover.py`](../convert_dover.py).

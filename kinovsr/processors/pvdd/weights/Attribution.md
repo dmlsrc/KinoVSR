@@ -1,15 +1,15 @@
 # Attribution
 
-`kinovsr/processors/pvdd/` is an independent MLX reimplementation of PVDD, written from
+[`kinovsr/processors/pvdd/`](../) is an independent MLX reimplementation of PVDD, written from
 the published architecture and reference forward pass as a spec. No upstream code
-is bundled. The weights are not bundled; see `README.md` beside this file for sources and
+is bundled. The weights are not bundled; see [README.md](README.md) beside this file for sources and
 conversion notes.
 
 ## PVDD
 
 Xiaogang Xu, Yitong Yu, Nianjuan Jiang, Jiangbo Lu, Bei Yu, and Jiaya Jia --
 "PVDD: A Practical Video Denoising Dataset with Real-World Dynamic Scenes"
-(arXiv:2207.01356, 2022). https://github.com/Marinyyt/PVDD
+(arXiv:2207.01356, 2022). <https://github.com/Marinyyt/PVDD>
 
 Licensed under the MIT License (SPDX: MIT):
 

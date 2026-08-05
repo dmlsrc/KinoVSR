@@ -3,10 +3,10 @@
 This is the deep implementation reference: kernel paths, dtype policy,
 measurement methodology, and per-family optimization history. For
 concise user-facing guidance (backend choice, chain planning, memory),
-read `docs/PERFORMANCE.md` first.
+read [Performance](PERFORMANCE.md) first.
 
 Findings, gotchas, and methodology from the 2026-07 optimization campaign over
-the `kinovsr/` processors (deblockers, denoisers, restorers, and learned
+the [`kinovsr/`](../kinovsr/) processors (deblockers, denoisers, restorers, and learned
 upscalers driven by the `kinovsr` CLI). Everything here was measured on
 an M1 Max (64 GB) with MLX, fp16-first, MLX buffer cache capped at 1 GB.
 
@@ -65,7 +65,8 @@ is only 1-7x over floor (acceptable).
 **Fix:** a manual 9-tap shift-and-add (`sum over (i,j) of
 xp[:, i:i+H, j:j+W, :] * w[:, i, j, 0]`) is 8.2x faster at the pathological
 scale, 1.0x elsewhere, so it is safe to apply unconditionally. See
-`kinovsr/processors/nafnet/net.py:_depthwise3x3`. Whole-net NAFNet: 1.37-1.44x.
+[`kinovsr/processors/nafnet/net.py`](../kinovsr/processors/nafnet/net.py)
+(`_depthwise3x3`). Whole-net NAFNet: 1.37-1.44x.
 Output shift ~55 dB PSNR (fp32 summation-order compounding through 36 residual
 blocks; the op itself matches conv2d to 1e-6).
 
@@ -77,7 +78,8 @@ channel-norm (small C = 32-512, many N*H*W rows) the threadgroup underfills
 than a hand-rolled `mx.mean`/`mx.rsqrt` reduction. The penalty is shape-bound,
 not dtype-bound (the kernel accumulates in fp32 regardless). Reserve
 `mx.fast.*norm` for transformer-width axes; keep manual reductions for NHWC
-channel norms (see `kinovsr/processors/nafnet/net.py:_layernorm`). Re-verified on
+channel norms (see [`kinovsr/processors/nafnet/net.py`](../kinovsr/processors/nafnet/net.py)
+(`_layernorm`)). Re-verified on
 RealPLKSR (C=64): manual is 1.89x faster than `mx.fast.layer_norm`.
 
 ### GroupNorm: reduce the contiguous spatial axes first
@@ -93,7 +95,8 @@ ms/frame (1.38x). The reduction stays fp32 (load-bearing: refine-out activations
 reach ~370, so both `mean(x)` and `mean(x^2)` overflow an fp16 accumulator);
 use the two-pass form (mu, then `(x-mu)^2`) rather than `E[x^2]-E[x]^2` so the
 variance cannot go negative from cancellation. See
-`kinovsr/processors/realplksr/net.py:_groupnorm`.
+[`kinovsr/processors/realplksr/net.py`](../kinovsr/processors/realplksr/net.py)
+(`_groupnorm`).
 
 Corollary from the same audit: a numerically stable softplus Mish
 (`max(x,0)+log1p(exp(-|x|))`, `exp(-|x|)` <= 1 so no fp16 overflow) needs no
@@ -122,7 +125,8 @@ copies per block x 69 blocks) disappear. RRDBNet (bsrgan / x4plus / esrgan /
 realesrnet / bsrnet / anime / x2plus): **1.54x**, output parity 65.5 dB. The
 recombination sums must run in fp32: the split rounds each partial conv output
 to fp16 where the original GEMM accumulated all of K in fp32. See
-`kinovsr/processors/realesrgan/net.py:_restack_rdb_weights` and `_rdb`.
+[`kinovsr/processors/realesrgan/net.py`](../kinovsr/processors/realesrgan/net.py)
+(`_restack_rdb_weights` and `_rdb`).
 
 ### Window attention is intrinsically expensive on M1
 
@@ -139,7 +143,8 @@ tiny and the cost lives in the qkv convs.
 
 ### Deformable conv: follow the input dtype
 
-The DCNv2 path (`kinovsr/modeling/deform_conv.py`) originally forced fp32: three
+The DCNv2 path
+([`kinovsr/modeling/deform_conv.py`](../kinovsr/modeling/deform_conv.py)) originally forced fp32: three
 cast-copies plus a `Cin*K*K x N*oH*oW` fp32 columns buffer (~1.9 GB at
 128ch/480p) written by the im2col kernel and re-read by an fp32 GEMM -- 2x the
 necessary traffic for data that only ever had fp16 precision. Running the whole
@@ -203,7 +208,8 @@ All measured, all worth not re-litigating:
 - `mx.compile` every shape-stable forward once, in a module-level cache. Gains:
   1.3-1.4x for dispatch-bound graphs (many small ops), ~1.05x for compute-bound
   ones. Every net here follows the `make_forward` + bounded-cache pattern.
-- Compile caches must be **bounded** (`kinovsr/modeling/compile_cache.py`, FIFO cap
+- Compile caches must be **bounded**
+  ([`kinovsr/modeling/compile_cache.py`](../kinovsr/modeling/compile_cache.py), FIFO cap
   16): entries close over the checkpoint, so an unbounded id(p)-keyed dict
   retains every checkpoint ever constructed in the process. Eviction is safe --
   a params dict can only be collected (and its id recycled) after its entries
@@ -457,12 +463,13 @@ blamed on purescale was a harness bug -- unclipped decode overshoot at the
 upscaler entry (see the input-domain rule below); fixing it cut the speck
 area 1000x on the stress clip. Use purescale on clean to lightly-noisy
 material, real + --safmn-pool-clamp on noisy or compressed video. The
-bicubic phases cost ~20% over stock SAFMN-L (872 vs 729 ms measured same-run). They also degrade far more
+bicubic phases cost ~20% over stock SAFMN-L (872 vs 729 ms measured
+same-run). They also degrade far more
 gracefully on hard out-of-distribution frame edges (a junk half-dark border
 row becomes a near-scale thin line rather than a thick smeared band with
 blotches above it). CAUTION: unlike every other checkpoint in this table, the
 PureScale weights are CC BY-NC-SA 4.0 -- NON-COMMERCIAL use only (see
-`kinovsr/processors/safmn/ATTRIBUTION.md`).
+[`kinovsr/processors/safmn/weights/Attribution.md`](../kinovsr/processors/safmn/weights/Attribution.md)).
 
 Two SAFM dials expose what is and is not swappable at inference.
 `--safmn-safm-up auto|nearest|bicubic`: the upsampler is a mild shape-only

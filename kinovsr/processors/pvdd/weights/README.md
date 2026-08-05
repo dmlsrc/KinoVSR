@@ -9,7 +9,7 @@ are inferred from the weights at load).
 The pretrained checkpoints ship as a single archive from the official PVDD
 release ("Trained Weights"):
 
-- Google Drive: https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG
+- Google Drive: <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG>
 - The archive unpacks to six `g_net_100000.pth` files, one per subdir.
 
 | variant token | subdir / source `.pth` | domain | level | sha256 |

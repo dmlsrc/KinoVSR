@@ -7,9 +7,9 @@ Direct download and the sha256 of the source `.pth`:
 
 | variant | download | sha256 |
 | --- | --- | --- |
-| color | https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn_color.pth | `8b0e4ef23d59cf7ac934a342cb31a17619e4fa4a0b3374a9d78c5174312387e8` |
-| gray | https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn_gray.pth | `7beec25b883a6c3bd7d103429b78a2371f7e85c1f5261a6e2e5d0702d9e9f977` |
-| gray_double | https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn_gray_double.pth | `4444b8b2393649a4acd5d8730410ec3106d15b6e262a49081e4e87b44cfa5cea` |
+| color | <https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn_color.pth> | `8b0e4ef23d59cf7ac934a342cb31a17619e4fa4a0b3374a9d78c5174312387e8` |
+| gray | <https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn_gray.pth> | `7beec25b883a6c3bd7d103429b78a2371f7e85c1f5261a6e2e5d0702d9e9f977` |
+| gray_double | <https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn_gray_double.pth> | `4444b8b2393649a4acd5d8730410ec3106d15b6e262a49081e4e87b44cfa5cea` |
 
 Convert (color is the RGB model the driver uses):
 
@@ -20,8 +20,8 @@ kinovsr weights convert fbcnn_color.pth \
 ```
 
 `--deblock fbcnn` finds it here, or point `$FBCNN_WEIGHTS` / `--fbcnn-weights` at any
-path. `gray` and `gray_double` are listed in `net.py`'s `_VARIANTS` but the RGB driver
+path. `gray` and `gray_double` are listed in [`net.py`](../net.py)'s `_VARIANTS` but the RGB driver
 only uses `color`.
 
 Source: Jiang et al., "Towards Flexible Blind JPEG Artifacts Removal" (ICCV 2021) --
-https://github.com/jiaxi-jiang/FBCNN
+<https://github.com/jiaxi-jiang/FBCNN>

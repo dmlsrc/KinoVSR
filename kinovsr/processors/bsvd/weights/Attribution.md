@@ -1,15 +1,15 @@
 # Attribution
 
-`kinovsr/processors/bsvd/` is an independent MLX reimplementation of BSVD, written
+[`kinovsr/processors/bsvd/`](../) is an independent MLX reimplementation of BSVD, written
 from the published architecture and the reference forward pass as a spec. No
-upstream code is bundled. The weights are not bundled; see `README.md` beside this file
+upstream code is bundled. The weights are not bundled; see [README.md](README.md) beside this file
 for the source and conversion notes.
 
 ## BSVD
 
 Chenyang Qi, Junlin Zhang, Xuequan Lu, Jun Xu, and Ning Wang -- "Real-time
 Streaming Video Denoising with Bidirectional Buffers" (ACM MM 2022).
-https://github.com/ChenyangQiQi/BSVD
+<https://github.com/ChenyangQiQi/BSVD>
 
 Licensed under the MIT License (SPDX: MIT):
 

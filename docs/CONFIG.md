@@ -67,6 +67,7 @@ kinovsr run --config run.toml
 The printed TOML round-trips: feeding it back reproduces the identical
 resolved config with no additional flags, because run-level options are
 part of the config surface. It is also how you discover `--set` targets
+
 - stage names like `denoise_bsvd` are visible in the output, not
 guessed. Printing probes the source (stage assembly depends on the
 probed geometry), so `--video` must point at a readable file.
@@ -132,5 +133,5 @@ kinovsr run --video in.mp4 --output-dir out --gop-align --denoise bsvd --bsvd-st
   always literal.
 - Stage settings and shared dial names use one vocabulary: the same key
   (`strength`, `weights`, `profile`, `window`, `trim`, `flow`, ...)
-  means the same concept in every family. `docs/PROCESSORS.md` lists
+  means the same concept in every family. [Processors](PROCESSORS.md) lists
   every family, profile, and weight artifact.

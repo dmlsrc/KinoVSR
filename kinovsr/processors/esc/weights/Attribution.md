@@ -1,15 +1,15 @@
 # Attribution
 
-`kinovsr/processors/esc/` is an independent MLX reimplementation of ESC-Real, written from
+[`kinovsr/processors/esc/`](../) is an independent MLX reimplementation of ESC-Real, written from
 the published architecture as a spec -- no upstream code is bundled. The model weights
-are the upstream project's, redistributed under its license (see `README.md` beside this file
+are the upstream project's, redistributed under its license (see [README.md](README.md) beside this file
 for the downloads).
 
 ## ESC
 
 Dongheon Lee, Seokju Yun, Youngmin Ro -- "Emulating Self-attention with Convolution
 for Efficient Image Super-Resolution" (ICCV 2025).
-https://github.com/dslisleedh/ESC
+<https://github.com/dslisleedh/ESC>
 
 Licensed under the MIT License (SPDX: MIT):
 

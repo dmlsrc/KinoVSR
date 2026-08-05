@@ -3,7 +3,7 @@
 Short, practical guidance for choosing backends and chains. Everything
 here is measured behavior; the deep reference - kernel paths, dtype
 policy, per-family optimization history, and measurement methodology -
-is `docs/VSR_PERFORMANCE_NOTES.md`. Absolute times below are one
+is [VSR performance notes](VSR_PERFORMANCE_NOTES.md). Absolute times below are one
 recorded example (Apple M1 Max, 640x480, 300 frames) to show the shape
 of the tradeoffs; measure your own machine and content before deciding.
 
@@ -81,7 +81,7 @@ concurrently with processing and is rarely the bottleneck.
 
 ## Measuring
 
-`scripts/dev/bench_endpoint_gates.py` records a machine- and
+[`scripts/dev/bench_endpoint_gates.py`](../scripts/dev/bench_endpoint_gates.py) records a machine- and
 clip-specific baseline for the endpoint and gates later runs against
 it, refusing to compare across changed conditions - the honest way to
 answer "did this get slower on my machine".

@@ -1,6 +1,6 @@
 # Attribution
 
-`kinovsr/processors/toflow/` is an independent MLX runtime for the released TOFlow
+[`kinovsr/processors/toflow/`](../) is an independent MLX runtime for the released TOFlow
 Torch7 checkpoints. The Torch7 module tree is converted into a static JSON graph
 and interpreted by MLX-native operators; no upstream Lua code is bundled or
 executed at runtime.
@@ -9,7 +9,7 @@ executed at runtime.
 
 Tianfan Xue, Baian Chen, Jiajun Wu, Donglai Wei, and William T. Freeman --
 "Video Enhancement with Task-Oriented Flow" (IJCV 2019).
-https://github.com/anchen1011/toflow
+<https://github.com/anchen1011/toflow>
 
 Upstream license: MIT License, copyright (c) 2017 Baian Chen (Andrew).
 

@@ -17,9 +17,9 @@ headers, reached via `objc.lookUpClass` and exported-symbol contracts -
 and can shift with any OS release. KinoVSR's policy is to use such
 interfaces where they demonstrably work and fail loudly when they stop;
 nothing falls back silently. Treat every claim as "verified here,
-verify on yours." Prior art worth reading alongside this:
-the community `neural-engine` notes (hollance) and the Anemll project's
-LLM-on-ANE work.
+verify on yours." Prior art worth reading alongside this includes
+[hollance/neural-engine](https://github.com/hollance/neural-engine) and
+[Anemll/Anemll](https://github.com/Anemll/Anemll).
 
 Three evidence levels matter in this guide. **Public contract** means an
 SDK header or documented model format promises it. **Observed internal**
@@ -59,7 +59,7 @@ operator mix.
 faster standalone for fp16 conv workloads, and some ops never place.
 The ANE pays off when you need the GPU for something else (KinoVSR's
 chains run denoise on ANE precisely so VideoToolbox and MLX upscalers
-own the GPU - see `docs/PERFORMANCE.md`), or when you need its ~10x
+own the GPU - see [Performance](PERFORMANCE.md)), or when you need its ~10x
 power advantage (we measured ~2.5 W ANE vs ~37 W GPU power for
 the same network). Composition, not raw speed, is the reason to enter
 the maze.
@@ -78,13 +78,13 @@ reading.
 
 **Door 2 - Core ML via hand-authored mlpackage.** Same runtime
 envelope, but you write the MIL program yourself instead of converting
-(`kinovsr/native/anemil/`: a protobuf-level builder with no
+([`kinovsr/native/anemil/`](../kinovsr/native/anemil/): a protobuf-level builder with no
 `coremltools` dependency, a curated set of compiler-safe op spellings,
 and a schema for the model archive). This door exists because
 converters and the MIL-to-ANE translator both have ceilings: certain
 op spellings crash the translator, certain geometries fail to compile
 at all, and above one geometry ceiling we needed a value-exact fp32
-island to keep a network correct (`kinovsr/processors/bsvd/ane.py`).
+island to keep a network correct ([`kinovsr/processors/bsvd/ane.py`](../kinovsr/processors/bsvd/ane.py)).
 Authoring directly turns "the converter will not express this" into
 "emit the one spelling that compiles."
 
@@ -92,7 +92,7 @@ Authoring directly turns "the converter will not express this" into
 only a Metal device, but the shipping framework carries a compile-time
 ANE placement pass behind SPI knobs
 (`optimizationLevel = 1`, `preferredDevice = 2`, and a placement
-report; see `kinovsr/native/mpsgraph.py`). Placement quality on
+report; see [`kinovsr/native/mpsgraph.py`](../kinovsr/native/mpsgraph.py)). Placement quality on
 conv-heavy nets is excellent - our whole two-stage network places as
 one ANE region with no per-op coaxing. What this door does NOT give
 you is Core ML's envelope. MPSGraph has public executable-package
@@ -107,9 +107,9 @@ warm loop" therefore needs separate proof.
 
 **Door 4 - direct execution of compiled products.** Both front ends
 emit inspectable compiled products (a program plist plus weights).
-`kinovsr/native/anecir.py` executes MPSGraph-compiled products through
+[`kinovsr/native/anecir.py`](../kinovsr/native/anecir.py) executes MPSGraph-compiled products through
 `_ANEClient` load/evaluate/unload directly, with one program resident
-and explicit lifecycle; `kinovsr/processors/bsvd/ane_direct.py` does
+and explicit lifecycle; [`kinovsr/processors/bsvd/ane_direct.py`](../kinovsr/processors/bsvd/ane_direct.py) does
 the analogous thing with two Core ML-compiled halves above the geometry
 where Espresso cannot translate the island-free whole graph. This door
 is useful when a public front end cannot express or correctly translate
@@ -141,7 +141,7 @@ identity ops between bias and shuffle do not rescue (fusion sinks
 through them). It reproduces through both front ends. The working fix
 is structural: convolve without bias, shuffle, then add a precomputed
 full-size bias tile (`pixel_shuffle_biased` in
-`kinovsr/native/mpsgraph.py`).
+[`kinovsr/native/mpsgraph.py`](../kinovsr/native/mpsgraph.py)).
 
 **fp16 behaves better here than on the GPU.** On our conv stacks the
 ANE route's fp16 outputs tracked fp32 references roughly an order of
@@ -157,14 +157,15 @@ __arg1, __arg10, __arg11, ..., __arg2`. Runtimes above you silently
 reorder buffers to match. If you bind those products yourself (door 4),
 bind in live-table order (`LiveInputList` / `LiveStateList` /
 `LiveOutputList`). Numeric netplist order produced immediate status
-`0x1d` and untouched outputs in this runtime (`anecir.py` owns this).
+`0x1d` and untouched outputs in this runtime
+([`anecir.py`](../kinovsr/native/anecir.py) owns this).
 
 **The realized ABI is not your declared ABI.** Placement prunes unused
 inputs; lowering can re-inject them at the end; one of our procedures
 ended up with its sixteen states bank-rotated (`8..15, 0..7`) relative
 to declaration order. Record the realized ABI at lowering time into
 whatever cache/contract your runtime reads
-(`kinovsr/native/mpsgraph_state.py` does exactly this); never assume.
+([`kinovsr/native/mpsgraph_state.py`](../kinovsr/native/mpsgraph_state.py) does exactly this); never assume.
 
 **Some state descriptors have small fields.** In the probed `anec.state`
 slice/ring lowering, particular dimension fields behaved as 8-bit
@@ -183,7 +184,7 @@ count in this pair: our one-step program failed compilation outright at
 four physical slabs was the single change that reduced our final
 observed backend gap to roughly 3-5%. Keep logical-vs-physical state
 mapping a per-model choice
-(`StateTensorSpec` in `mpsgraph_state.py`).
+(`StateTensorSpec` in [`mpsgraph_state.py`](../kinovsr/native/mpsgraph_state.py)).
 
 **But state layout is runtime-dependent.** The opposite layout was
 correct on a different route: mapped multi-entry execution rejected
@@ -197,7 +198,7 @@ production geometry; an 8-step version of the same phase is stable
 (and measured 18% faster than emulating the edge with full steps).
 Relatedly, three large BSVD programs alternated in the tested Core ML
 phase suite while returning to a fourth failed with status `0x16`
-(`kinovsr/processors/bsvd/ane_phases.py`). Internal working set is the
+([`kinovsr/processors/bsvd/ane_phases.py`](../kinovsr/processors/bsvd/ane_phases.py)). Internal working set is the
 best explanation because shrinking or splitting the procedures moved
 the failure boundary while external tensor bytes did not predict it;
 the private runtime exposes no counter that proves that mechanism.
@@ -207,8 +208,8 @@ resolution thresholds, MIL-to-ANE translation of our network either
 failed or produced an unacceptable execution result. The practical
 fixes, in escalating order, were: respell
 the op, split the op, wrap the region in a value-exact fp32 island
-(`processors/bsvd/ane.py`), or leave the route for door 4
-(`ane_direct.py`). Treat this class of wall as a possibility on a
+([`kinovsr/processors/bsvd/ane.py`](../kinovsr/processors/bsvd/ane.py)), or leave the route for door 4
+([`ane_direct.py`](../kinovsr/processors/bsvd/ane_direct.py)). Treat this class of wall as a possibility on a
 large-geometry model, then locate its actual threshold rather than
 reusing BSVD's.
 
@@ -241,7 +242,7 @@ one program and own explicit `_ANEClient` load/map/evaluate/unload.
 **Consequences you must design for on a private route:**
 
 - The only end-to-end signal KinoVSR found for the silent-no-write class
-  is an observed write. `anecir.py` poisons probe offsets in one
+  is an observed write. [`anecir.py`](../kinovsr/native/anecir.py) poisons probe offsets in one
   deterministic smallest output surface before every dispatch and
   verifies them afterward. Every failure observed in the matrix left
   all outputs untouched, so one witness catches that measured class;
@@ -307,7 +308,7 @@ request issued after at least 10 ms of host idleness paid a 15-23 ms
 power-state ramp. A warmup can move that cost but cannot erase it. Use
 a dedicated submission worker with depth-one
 pipelining - submit one job, prepare the next, join before touching
-results (`kinovsr/native/dispatch.py`) - and pin it to
+results ([`kinovsr/native/dispatch.py`](../kinovsr/native/dispatch.py)) - and pin it to
 USER_INITIATED QoS. Background QoS measured 25% slower for this
 recurrent video workload; third-party results in the other direction
 did not transfer.
@@ -316,7 +317,7 @@ did not transfer.
 report can print misleading per-op complaints while still placing the
 whole graph. KinoVSR checks (1) the compiler's final partition report,
 (2) the ANE JIT-compilation counter moving, and (3) ANE package power
-under load (`kinovsr/native/sensors.py`). No one signal proves every
+under load ([`kinovsr/native/sensors.py`](../kinovsr/native/sensors.py)). No one signal proves every
 operation's realized runtime placement: `MLComputePlan` and placement
 reports describe a plan, while power proves device activity but not
 which operation caused it.
@@ -362,7 +363,7 @@ Getting recurrence on each door:
   wrapped as the private grouped-procedure form compile into ONE ANE
   model with multiple procedures sharing live state (selected
   per-request by procedure index), while the default form emits one
-  single-procedure model per region. `kinovsr/native/mpsgraph_state.py`
+  single-procedure model per region. [`kinovsr/native/mpsgraph_state.py`](../kinovsr/native/mpsgraph_state.py)
   keeps that behind a model-neutral contract: declare named states,
   provide ordinary graph programs, get one multi-procedure model with
   shared persistent state. The micro-contract is proven; the grouped
@@ -371,7 +372,7 @@ Getting recurrence on each door:
   lifetime, plus discipline: zero them only at reset boundaries, never
   while a request is mapped, and rotate surface *handles* instead of
   copying tensor bytes between frames
-  (`processors/bsvd/ane_direct.py`).
+  ([`kinovsr/processors/bsvd/ane_direct.py`](../kinovsr/processors/bsvd/ane_direct.py)).
 
 ## 7. Choosing your door
 
@@ -383,7 +384,8 @@ Getting recurrence on each door:
 2. Hitting converter or translator walls (crashes, miscompiles,
    geometry ceilings, missing spellings)? Move to door 2 and author
    the MIL yourself. Budget for op-spelling archaeology; keep a
-   curated list of known-good spellings like `anemil/` does.
+   curated list of known-good spellings like
+   [`kinovsr/native/anemil/`](../kinovsr/native/anemil/) does.
 3. Need GPU and ANE cooperating inside one graph, or a graph API for
    research iteration? Door 3 - and accept that you own persistence
    and readiness the moment you leave "one process, warm loop,
@@ -426,16 +428,16 @@ so you spend your budget elsewhere:
 
 | File | What it demonstrates |
 | --- | --- |
-| `kinovsr/native/mpsgraph.py` | ANE placement SPI, placement verification, safe pixel-shuffle spelling |
-| `kinovsr/native/mpsgraph_state.py` | state declaration/packing, grouped multi-procedure lowering, realized-ABI recording |
-| `kinovsr/native/anecir.py` | direct `_ANEClient` lifecycle, live-table binding, caching, write-verification canary |
-| `kinovsr/native/anemil/` | hand-authored mlpackage/MIL, curated compiler-safe spellings |
-| `kinovsr/native/dispatch.py` | depth-one dispatch pipelining, QoS pinning |
-| `kinovsr/native/sensors.py` | ANE power as runtime-device corroboration |
-| `kinovsr/processors/bsvd/ane.py` | Core ML + `MLState` backend, fp32 island above the translator ceiling |
-| `kinovsr/processors/bsvd/ane_phases.py` | phase-specialized sparse windows, resident-program ceiling |
-| `kinovsr/processors/bsvd/ane_direct.py` | direct route with rotating surface handles, alternating two-program lifecycle |
-| `kinovsr/processors/bsvd/mps.py`, `mps_phases.py` | the MPSGraph backend and its one-resident-program schedule |
+| [`kinovsr/native/mpsgraph.py`](../kinovsr/native/mpsgraph.py) | ANE placement SPI, placement verification, safe pixel-shuffle spelling |
+| [`kinovsr/native/mpsgraph_state.py`](../kinovsr/native/mpsgraph_state.py) | state declaration/packing, grouped multi-procedure lowering, realized-ABI recording |
+| [`kinovsr/native/anecir.py`](../kinovsr/native/anecir.py) | direct `_ANEClient` lifecycle, live-table binding, caching, write-verification canary |
+| [`kinovsr/native/anemil/`](../kinovsr/native/anemil/) | hand-authored mlpackage/MIL, curated compiler-safe spellings |
+| [`kinovsr/native/dispatch.py`](../kinovsr/native/dispatch.py) | depth-one dispatch pipelining, QoS pinning |
+| [`kinovsr/native/sensors.py`](../kinovsr/native/sensors.py) | ANE power as runtime-device corroboration |
+| [`kinovsr/processors/bsvd/ane.py`](../kinovsr/processors/bsvd/ane.py) | Core ML + `MLState` backend, fp32 island above the translator ceiling |
+| [`kinovsr/processors/bsvd/ane_phases.py`](../kinovsr/processors/bsvd/ane_phases.py) | phase-specialized sparse windows, resident-program ceiling |
+| [`kinovsr/processors/bsvd/ane_direct.py`](../kinovsr/processors/bsvd/ane_direct.py) | direct route with rotating surface handles, alternating two-program lifecycle |
+| [`kinovsr/processors/bsvd/mps.py`](../kinovsr/processors/bsvd/mps.py), [`mps_phases.py`](../kinovsr/processors/bsvd/mps_phases.py) | the MPSGraph backend and its one-resident-program schedule |
 
 The short version: on BSVD, once both front ends executed equivalent
 arithmetic, the remaining performance and reliability work was the

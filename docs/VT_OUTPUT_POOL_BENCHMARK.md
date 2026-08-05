@@ -46,7 +46,8 @@ Pool ownership is explicit:
 
 ## Controlled Protocol
 
-The committed-tree run uses `scripts/dev/bench_vt_output_pools.py` with:
+The committed-tree run uses
+[`scripts/dev/bench_vt_output_pools.py`](../scripts/dev/bench_vt_output_pools.py) with:
 
 - three fresh worker processes per path and workload;
 - alternating fresh/pooled execution order;

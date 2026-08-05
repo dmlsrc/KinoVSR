@@ -1,14 +1,14 @@
 # Attribution
 
-`kinovsr/processors/fastdvdnet/` is an independent MLX reimplementation of FastDVDnet, written
+[`kinovsr/processors/fastdvdnet/`](../) is an independent MLX reimplementation of FastDVDnet, written
 from the published architecture as a spec -- no upstream code is bundled. The model weights
-are the upstream project's, redistributed under its license (see `README.md` beside this file for
+are the upstream project's, redistributed under its license (see [README.md](README.md) beside this file for
 the download).
 
 ## FastDVDnet
 
 Matias Tassano, Julie Delon, Thomas Veit -- "FastDVDnet: Towards Real-Time Deep Video
-Denoising Without Flow Estimation" (CVPR 2020). https://github.com/m-tassano/fastdvdnet
+Denoising Without Flow Estimation" (CVPR 2020). <https://github.com/m-tassano/fastdvdnet>
 
 Licensed under the MIT License (SPDX: MIT):
 

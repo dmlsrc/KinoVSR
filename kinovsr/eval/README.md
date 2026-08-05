@@ -6,25 +6,27 @@ names stay out of git.
 
 ## Tools
 
-- `face_yunet_metrics.py`: detects faces in a baseline video with OpenCV YuNet,
+- [`face_yunet_metrics.py`](face_yunet_metrics.py): detects faces in a baseline video with OpenCV YuNet,
   tracks those face boxes, and scores each candidate on face-region cleanup
   versus preservation. It writes CSV/JSON plus an optional contact sheet.
-- `perceptual_metrics.py`: scores a manifest of variant videos (plus the
+- [`perceptual_metrics.py`](perceptual_metrics.py): scores a manifest of variant videos (plus the
   source) with MUSIQ, DOVER-Mobile (tech/aes/fused), NIQE, flicker on
   source-static pixels, moving-content deviation (the content-erasure
   guard: opinion metrics score erased movers the same or better, this
   column catches them), and VMAF-vs-source, printing one ranked table
   and writing CSV/JSON. The module docstring says what each column
   means and which are ranking columns versus tripwires/anchors.
-- `run_denoise_sweep.py`: runs the kinovsr processing CLI across configured clips
+- [`run_denoise_sweep.py`](../../scripts/dev/vsr_eval_sweep/run_denoise_sweep.py): runs the kinovsr processing CLI across configured clips
   and variants, writes per-run logs/manifests, then optionally invokes the face
   and perceptual evaluators and aggregates the metrics.
-- `musiq_score.py`, `dover_score.py`, `niqe.py`: the individual metric CLIs
-  behind `perceptual_metrics.py`, for scoring ad-hoc files.
+- [`musiq_score.py`](musiq_score.py), [`dover_score.py`](dover_score.py),
+  [`niqe.py`](niqe.py): the individual metric CLIs behind
+  [`perceptual_metrics.py`](perceptual_metrics.py), for scoring ad-hoc files.
 
 ## Local Config
 
-Copy `vsr_eval.example.toml` to `vsr_eval.local.toml` and put machine-local
+Copy [`vsr_eval.example.toml`](../../scripts/dev/vsr_eval_sweep/vsr_eval.example.toml)
+to `vsr_eval.local.toml` and put machine-local
 paths there:
 
 ```bash
@@ -49,6 +51,6 @@ kinovsr metrics faces --config scripts/dev/vsr_eval_sweep/vsr_eval.local.toml
 
 ## Weights
 
-The YuNet ONNX used by default is vendored under `weights/` because it is tiny
+The YuNet ONNX used by default is vendored under [`weights/`](weights/) because it is tiny
 and MIT licensed. Override `face_eval.model` in local config if you want to test
 a different detector.

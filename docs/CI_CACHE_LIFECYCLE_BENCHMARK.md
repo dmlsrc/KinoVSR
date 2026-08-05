@@ -51,7 +51,9 @@ with none is not counted at all.
 
 ## Acceptance Workloads
 
-The committed benchmark is `scripts/dev/bench_ci_cache_lifecycle.py`. Run each
+The committed benchmark is
+[`scripts/dev/bench_ci_cache_lifecycle.py`](../scripts/dev/bench_ci_cache_lifecycle.py).
+Run each
 measurement in a fresh process.
 
 The default `--path host` workload drives a typed `PipelineSession` through the

@@ -1,12 +1,12 @@
 # Attribution
 
-`kinovsr/eval/` contains the evaluation helpers for VSR denoiser comparisons. The
-YuNet model weights are redistributed under the upstream license (see `README.md`
+[`kinovsr/eval/`](../) contains the evaluation helpers for VSR denoiser comparisons. The
+YuNet model weights are redistributed under the upstream license (see [README.md](README.md)
 in this directory for provenance and hashes).
 
 ## NIQE pristine model
 
-`niqe_pristine_reds.safetensors` is a first-party artifact: multivariate-
+[`niqe_pristine_reds.safetensors`](niqe_pristine_reds.safetensors) is a first-party artifact: multivariate-
 Gaussian statistics fitted by this repo's own tool from pristine frames.
 It redistributes no upstream weights. The method is:
 
@@ -16,9 +16,9 @@ Blind' Image Quality Analyzer." IEEE Signal Processing Letters, 2013.
 ## YuNet Face Detector
 
 Wei Wu, Hanyang Peng, Shiqi Yu -- "Yunet: A tiny millisecond-level face detector."
-https://github.com/ShiqiYu/libfacedetection.train
+<https://github.com/ShiqiYu/libfacedetection.train>
 
-Bundled model source: https://huggingface.co/opencv/opencv_zoo/blob/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+Bundled model source: <https://huggingface.co/opencv/opencv_zoo/blob/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx>
 
 Licensed under the MIT License (SPDX: MIT):
 

@@ -1,15 +1,15 @@
 # Attribution
 
-`kinovsr/processors/realviformer/` is an independent MLX reimplementation of RealViformer,
+[`kinovsr/processors/realviformer/`](../) is an independent MLX reimplementation of RealViformer,
 written from the published architecture as a spec -- no upstream code is bundled. The
 model weights are the upstream project's, redistributed under its license (see
-`weights/README.md` for the download).
+[README.md](README.md) for the download).
 
 ## RealViformer
 
 Yuehan Zhang, Angela Yao -- "RealViformer: Investigating Attention for Real-World
 Video Super-Resolution" (ECCV 2024).
-https://github.com/Yuehan717/RealViformer
+<https://github.com/Yuehan717/RealViformer>
 
 Licensed under the MIT License (SPDX: MIT):
 

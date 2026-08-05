@@ -191,4 +191,5 @@ encode-with-audio means `process_video_file`.
 
 Pre-1.0: additions land freely; breaking changes to exported names or
 their semantics are called out in commit history and the planning
-record, and the surface is pinned by `tests/api/test_public_surface.py`.
+record, and the surface is pinned by
+[`tests/api/test_public_surface.py`](../tests/api/test_public_surface.py).

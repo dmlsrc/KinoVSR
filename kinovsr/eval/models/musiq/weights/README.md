@@ -6,7 +6,7 @@ convention), which matches the hash below.
 
 | file | source | sha256 | license |
 | --- | --- | --- | --- |
-| musiq_koniq_ckpt-e95806b9.pth | https://github.com/chaofengc/IQA-PyTorch/releases/download/v0.1-weights/musiq_koniq_ckpt-e95806b9.pth | `e95806b9eae5f3814c410f574ba8e552362bd5bc63d758ed5b97860f5d6185aa` | Apache-2.0 (Google Research MUSIQ lineage; see ../ATTRIBUTION.md) |
+| musiq_koniq_ckpt-e95806b9.pth | <https://github.com/chaofengc/IQA-PyTorch/releases/download/v0.1-weights/musiq_koniq_ckpt-e95806b9.pth> | `e95806b9eae5f3814c410f574ba8e552362bd5bc63d758ed5b97860f5d6185aa` | Apache-2.0 (Google Research MUSIQ lineage; see [Attribution](Attribution.md)) |
 
 Converted output (for reference after a correct conversion):
 

@@ -15,7 +15,6 @@ kinovsr weights list
 kinovsr weights verify
 ```
 
-
 ## basicvsrpp (processor)
 
 | profile | capabilities | weights |
@@ -44,7 +43,6 @@ kinovsr weights verify
 | `deblur_dvd` (basicvsrpp_deblur_dvd.safetensors) | external | Apache-2.0 | <https://download.openmmlab.com/mmediting/restorers/basicvsr_plusplus/basicvsr_plusplus_deblur_dvd-ecd08b7f.pth> |
 | `deblur_gopro` (basicvsrpp_deblur_gopro.safetensors) | external | Apache-2.0 | <https://download.openmmlab.com/mmediting/restorers/basicvsr_plusplus/basicvsr_plusplus_deblur_gopro-3c5bb9b5.pth> |
 
-
 ## bsvd (processor)
 
 | profile | capabilities | weights |
@@ -56,7 +54,6 @@ kinovsr weights verify
 | --- | --- | --- | --- |
 | `c64` (bsvd_64.safetensors) | external | MIT | <https://raw.githubusercontent.com/gmlwns2000/sharkshark-4k/master/src/upscale/model/bsvd/bsvd-64.pth> |
 | `c32` (bsvd_32.safetensors) | external | MIT | <https://raw.githubusercontent.com/gmlwns2000/sharkshark-4k/master/src/upscale/model/bsvd/bsvd-32.pth> |
-
 
 ## esc (processor)
 
@@ -70,7 +67,6 @@ kinovsr weights verify
 | `gan` (esc_real_x4_gan.safetensors) | external | MIT | <https://github.com/dslisleedh/ESC/releases/download/1.0.0/ESC_Real_X4_GAN.pth> |
 | `mse` (esc_real_x4_mse.safetensors) | external | MIT | <https://github.com/dslisleedh/ESC/releases/download/1.0.0/ESC_Real_X4_MSE.pth> |
 
-
 ## fastdvdnet (processor)
 
 | profile | capabilities | weights |
@@ -83,7 +79,6 @@ kinovsr weights verify
 | `clipped` (model_clipped_noise.safetensors) | bundled | MIT | <https://github.com/m-tassano/fastdvdnet/raw/master/model_clipped_noise.pth> |
 | `standard` (model.safetensors) | bundled | MIT | <https://github.com/m-tassano/fastdvdnet/raw/master/model.pth> |
 
-
 ## fbcnn (processor)
 
 | profile | capabilities | weights |
@@ -95,7 +90,6 @@ kinovsr weights verify
 | `color` (fbcnn_color.safetensors) | external | Apache-2.0 | <https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn_color.pth> |
 | `gray` (fbcnn_gray.safetensors) | external | Apache-2.0 | <https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn_gray.pth> |
 | `gray_double` (fbcnn_gray_double.safetensors) | external | Apache-2.0 | <https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn_gray_double.pth> |
-
 
 ## nafnet (processor)
 
@@ -115,7 +109,6 @@ kinovsr weights verify
 | `sidd32` (nafnet_sidd_width32.safetensors) | external | MIT | <https://huggingface.co/nyanko7/nafnet-models/resolve/main/NAFNet-SIDD-width32.pth> |
 | `reds` (nafnet_reds_width64.safetensors) | external | MIT | <https://huggingface.co/nyanko7/nafnet-models/resolve/main/NAFNet-REDS-width64.pth> |
 
-
 ## pvdd (processor)
 
 | profile | capabilities | weights |
@@ -129,13 +122,12 @@ kinovsr weights verify
 
 | asset | distribution | license | source |
 | --- | --- | --- | --- |
-| `pvdd` (pvdd_srgb_nolevel.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (pvdd_srgb_nolevel/g_net_100000.pth)> |
-| `crvd` (crvd_srgb_nolevel.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (crvd_srgb_nolevel/g_net_100000.pth)> |
-| `davis` (davis_srgb_nolevel.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (davis_srgb_nolevel/g_net_100000.pth)> |
-| `pvdd_level` (pvdd_srgb_level.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (pvdd_srgb_level/g_net_100000.pth)> |
-| `pvdd_raw` (pvdd_raw_nolevel.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (pvdd_raw_nolevel/g_net_100000.pth)> |
-| `pvdd_raw_level` (pvdd_raw_level.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (pvdd_raw_level/g_net_100000.pth)> |
-
+| `pvdd` (pvdd_srgb_nolevel.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG> (pvdd_srgb_nolevel/g_net_100000.pth) |
+| `crvd` (crvd_srgb_nolevel.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG> (crvd_srgb_nolevel/g_net_100000.pth) |
+| `davis` (davis_srgb_nolevel.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG> (davis_srgb_nolevel/g_net_100000.pth) |
+| `pvdd_level` (pvdd_srgb_level.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG> (pvdd_srgb_level/g_net_100000.pth) |
+| `pvdd_raw` (pvdd_raw_nolevel.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG> (pvdd_raw_nolevel/g_net_100000.pth) |
+| `pvdd_raw_level` (pvdd_raw_level.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG> (pvdd_raw_level/g_net_100000.pth) |
 
 ## realbasicvsr (processor)
 
@@ -146,7 +138,6 @@ kinovsr weights verify
 | asset | distribution | license | source |
 | --- | --- | --- | --- |
 | `x4` (realbasicvsr_x4.safetensors) | bundled | Apache-2.0 | <https://download.openmmlab.com/mmediting/restorers/real_basicvsr/realbasicvsr_c64b20_1x30x8_lr5e-5_150k_reds_20211104-52f77c2c.pth> |
-
 
 ## realesrgan (processor)
 
@@ -175,7 +166,6 @@ kinovsr weights verify
 | `animevideo` (realesr_animevideov3.safetensors) | external | BSD-3-Clause | <https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth> |
 | `esrgan` (esrgan_x4.safetensors) | external | BSD-3-Clause | <https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.1/ESRGAN_SRx4_DF2KOST_official-ff704c30.pth> |
 
-
 ## realplksr (processor)
 
 | profile | capabilities | weights |
@@ -190,7 +180,6 @@ kinovsr weights verify
 | `public2x-nn` (2xpublic_realplksr_dysample_layernorm_real_nn.safetensors) | external | Apache-2.0 | <https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real_nn/2xPublic_realplksr_dysample_layernorm_real_nn.safetensors> |
 | `nomos4x` (4xnomoswebphoto_realplksr.safetensors) | external | CC-BY-4.0 | <https://github.com/Phhofm/models/releases/download/4xNomosWebPhoto_RealPLKSR/4xNomosWebPhoto_RealPLKSR.safetensors> |
 
-
 ## realviformer (processor)
 
 | profile | capabilities | weights |
@@ -199,8 +188,7 @@ kinovsr weights verify
 
 | asset | distribution | license | source |
 | --- | --- | --- | --- |
-| `x4` (realviformer_x4.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1UzDfFSy5oELl7Z-umF_QhMQhUbUU378y (weights.pth)> |
-
+| `x4` (realviformer_x4.safetensors) | external | MIT | <https://drive.google.com/drive/folders/1UzDfFSy5oELl7Z-umF_QhMQhUbUU378y> (weights.pth) |
 
 ## safmn (processor)
 
@@ -222,7 +210,6 @@ kinovsr weights verify
 | `purescale2x` (safmn_purescale_x2.safetensors) | external | CC-BY-NC-SA-4.0 | <https://github.com/limitlesslab/AI-upscaling-models/releases/download/PureScale2/2x_SAFMN_PureScale.pth> |
 | `purescale2x-sharp` (safmn_purescale_sharper_x2.safetensors) | external | CC-BY-NC-SA-4.0 | <https://github.com/limitlesslab/AI-upscaling-models/releases/download/PureScale2/2x_SAFMN_PureScale_sharper.pth> |
 
-
 ## stdf (processor)
 
 | profile | capabilities | weights |
@@ -232,9 +219,8 @@ kinovsr weights verify
 
 | asset | distribution | license | source |
 | --- | --- | --- | --- |
-| `mfqev2` (stdf_mfqev2_r3.safetensors) | bundled | Apache-2.0 | <https://github.com/ryanxingql/stdf-pytorch/releases/download/v1.0.0/exp.zip (exp/MFQEv2_R3_enlarge300x/ckp_290000.pt)> |
-| `vimeo90k` (stdf_vimeo90k_r3.safetensors) | bundled | Apache-2.0 | <https://github.com/ryanxingql/stdf-pytorch/releases/download/v1.0.0/exp.zip (exp/Vimeo90K_R3_enlarge300x/ckp_300000.pt)> |
-
+| `mfqev2` (stdf_mfqev2_r3.safetensors) | bundled | Apache-2.0 | <https://github.com/ryanxingql/stdf-pytorch/releases/download/v1.0.0/exp.zip> (exp/MFQEv2_R3_enlarge300x/ckp_290000.pt) |
+| `vimeo90k` (stdf_vimeo90k_r3.safetensors) | bundled | Apache-2.0 | <https://github.com/ryanxingql/stdf-pytorch/releases/download/v1.0.0/exp.zip> (exp/Vimeo90K_R3_enlarge300x/ckp_300000.pt) |
 
 ## toflow (processor)
 
@@ -256,13 +242,11 @@ kinovsr weights verify
 | `interp` (toflow_interp.safetensors) | bundled | MIT | <http://data.csail.mit.edu/tofu/models/interp.t7> |
 | `interp_graph` (toflow_interp.json) | bundled | MIT | <http://data.csail.mit.edu/tofu/models/interp.t7> |
 
-
 ## spynet (component)
 
 | asset | distribution | license | source |
 | --- | --- | --- | --- |
 | `stock` (spynet_stock_20210409.safetensors) | bundled | Apache-2.0 | <https://download.openmmlab.com/mmediting/restorers/basicvsr/spynet_20210409-c6c1bd09.pth> |
-
 
 ## dover (evaluator)
 
@@ -270,14 +254,12 @@ kinovsr weights verify
 | --- | --- | --- | --- |
 | `dover_mobile` (dover_mobile.safetensors) | external | NTU S-Lab License 1.0 (non-commercial) | <https://github.com/QualityAssessment/DOVER/releases/download/v0.5.0/DOVER-Mobile.pth> |
 
-
 ## eval (evaluator)
 
 | asset | distribution | license | source |
 | --- | --- | --- | --- |
 | `face_yunet` (face_detection_yunet_2023mar.onnx) | bundled | MIT | <https://huggingface.co/opencv/opencv_zoo/blob/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx> |
 | `niqe_pristine` (niqe_pristine_reds.safetensors) | bundled | first-party fitted statistics | - |
-
 
 ## musiq (evaluator)
 

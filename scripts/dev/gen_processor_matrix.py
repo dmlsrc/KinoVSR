@@ -40,7 +40,7 @@ kinovsr weights verify
 
 
 def _owner_section(owner: str, manifest) -> list[str]:
-    lines = [f"\n## {owner} ({manifest.kind})\n"]
+    lines = [f"## {owner} ({manifest.kind})", ""]
     if manifest.profiles:
         lines.append("| profile | capabilities | weights |")
         lines.append("| --- | --- | --- |")
@@ -56,8 +56,9 @@ def _owner_section(owner: str, manifest) -> list[str]:
         asset = manifest.weights[asset_id]
         license_note = asset.license or "-"
         source = asset.source or "-"
-        if source.startswith("http"):
-            source = f"<{source}>"
+        if source.startswith(("http://", "https://")):
+            url, separator, suffix = source.partition(" ")
+            source = f"<{url}>{separator}{suffix}"
         lines.append(
             f"| `{asset_id}` ({asset.path.name}) | {asset.distribution} "
             f"| {license_note} | {source} |")
@@ -69,7 +70,7 @@ def main() -> int:
     sys.path.insert(0, str(REPO))
     from kinovsr.modeling.weights import load_registered, registered_owners
 
-    lines = [HEADER]
+    lines = [HEADER.rstrip(), ""]
     by_kind: dict[str, list[str]] = {}
     for owner in registered_owners():
         manifest = load_registered(owner)

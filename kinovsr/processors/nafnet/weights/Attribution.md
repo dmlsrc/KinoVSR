@@ -1,14 +1,14 @@
 # Attribution
 
-`kinovsr/processors/nafnet/` is an independent MLX reimplementation of NAFNet, written from the
+[`kinovsr/processors/nafnet/`](../) is an independent MLX reimplementation of NAFNet, written from the
 published architecture as a spec -- no upstream code is bundled. The model weights are the
-upstream project's, redistributed under its license (see `README.md` beside this file for the
+upstream project's, redistributed under its license (see [README.md](README.md) beside this file for the
 download).
 
 ## NAFNet
 
 Liangyu Chen, Xiaojie Chu, Xiangyu Zhang, Jian Sun -- "Simple Baselines for Image
-Restoration" (ECCV 2022). https://github.com/megvii-research/NAFNet
+Restoration" (ECCV 2022). <https://github.com/megvii-research/NAFNet>
 
 Licensed under the MIT License (SPDX: MIT):
 

@@ -10,7 +10,7 @@ frozen public API in [docs/API.md](docs/API.md).
 ## Requirements
 
 Apple Silicon Mac, macOS with VideoToolbox, Python 3.14+. Model weights
-are mostly not bundled; see Weights below.
+are mostly not bundled; see [Weights](#weights) below.
 
 ## Install
 
@@ -101,14 +101,15 @@ including frame ownership and lifetime rules.
 
 ## Development
 
-Install the `[dev]` extra, then use the lightweight runner for the common
-feedback loops:
+Install the `[dev]` extra with `uv pip install -e '.[dev]'`, then use the
+lightweight runner for the common feedback loops:
 
 ```bash
 python scripts/dev/test.py                 # quick: no integration/slow/weight tests
 python scripts/dev/test.py full            # the complete suite
 python scripts/dev/test.py quick -x tests/media/test_timing.py
 python -m ruff check .
+rumdl check .
 ```
 
 The quick lane includes both unit-marked and unmarked tests; it is intentionally

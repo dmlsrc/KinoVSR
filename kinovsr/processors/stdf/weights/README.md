@@ -1,10 +1,11 @@
 # STDF weights
 
-`stdf_mfqev2_r3.safetensors` and `stdf_vimeo90k_r3.safetensors` (~1.4MB each) ARE bundled
+[`stdf_mfqev2_r3.safetensors`](stdf_mfqev2_r3.safetensors) and
+[`stdf_vimeo90k_r3.safetensors`](stdf_vimeo90k_r3.safetensors) (~1.4MB each) ARE bundled
 (`--deblock stdf --stdf-profile mfqev2|vimeo90k`). Both are `.pt` checkpoints inside one
 release archive:
 
-https://github.com/ryanxingql/stdf-pytorch/releases/download/v1.0.0/exp.zip
+<https://github.com/ryanxingql/stdf-pytorch/releases/download/v1.0.0/exp.zip>
 
 | variant | path in the archive | sha256 |
 | --- | --- | --- |
@@ -26,4 +27,4 @@ kinovsr weights convert exp/Vimeo90K_R3_enlarge300x/ckp_300000.pt \
 ```
 
 Source: Deng et al., "Spatio-Temporal Deformable Convolution for Compressed Video Quality
-Enhancement" (AAAI 2020) -- https://github.com/ryanxingql/stdf-pytorch
+Enhancement" (AAAI 2020) -- <https://github.com/ryanxingql/stdf-pytorch>

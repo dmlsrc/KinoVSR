@@ -30,12 +30,12 @@ the manifest's recorded upstream hash at collection time.
 | --- | --- | --- |
 | basicvsrpp/ | 10 mmediting .pth (4 SR, 6 restore) | `--strip-prefix 'generator.'` |
 | bsvd/ | bsvd-64.pth, bsvd-32.pth | `--param-key params` per its README |
-| dover/ | DOVER-Mobile.pth | `kinovsr/eval/models/dover/convert_dover.py` |
+| dover/ | DOVER-Mobile.pth | [`kinovsr/eval/models/dover/convert_dover.py`](../kinovsr/eval/models/dover/convert_dover.py) |
 | esc/ | ESC_Real_X4_{GAN,MSE}.pth | `--param-key params_ema` |
 | eval/ | face_detection_yunet_2023mar.onnx | none (redistributed unmodified) |
 | fastdvdnet/ | model.pth, model_clipped_noise.pth | default (`--strip-prefix 'module.'`) |
 | fbcnn/ | fbcnn_color/gray/gray_double.pth | `--strip-prefix ''` |
-| musiq/ | musiq_koniq_ckpt-e95806b9.pth | `kinovsr/eval/models/musiq/convert_musiq.py` |
+| musiq/ | musiq_koniq_ckpt-e95806b9.pth | [`kinovsr/eval/models/musiq/convert_musiq.py`](../kinovsr/eval/models/musiq/convert_musiq.py) |
 | nafnet/ | 5 NAFNet-*.pth | `--strip-prefix ''` |
 | pvdd/ | 6 .pth (renamed from `<subdir>/g_net_100000.pth`) | no flags |
 | realbasicvsr/ | the mmediting c64b20 .pth | `--only-prefix generator_ema. --strip-prefix generator_ema.` |
@@ -43,13 +43,14 @@ the manifest's recorded upstream hash at collection time.
 | realplksr/ | 3 upstream .safetensors | none (shipped files are byte-identical renames) |
 | realviformer/ | weights.pth | `--param-key params` |
 | safmn/ | 3 stock + 3 PureScale .pth | `--param-key params` (stock) / `params_ema` (PureScale) |
-| spynet/ | spynet_20210409-c6c1bd09.pth | `kinovsr/modeling/spynet/convert_spynet.py` |
+| spynet/ | spynet_20210409-c6c1bd09.pth | [`kinovsr/modeling/spynet/convert_spynet.py`](../kinovsr/modeling/spynet/convert_spynet.py) |
 | stdf/ | exp/<config>/ckp_*.pt (exp.zip members) | default (`--strip-prefix 'module.'`) |
-| toflow/ | denoise/deblock/sr/interp.t7 | `kinovsr/processors/toflow/convert_t7_to_safetensors.py` |
+| toflow/ | denoise/deblock/sr/interp.t7 | [`kinovsr/processors/toflow/convert_t7_to_safetensors.py`](../kinovsr/processors/toflow/convert_t7_to_safetensors.py) |
 
-Not here: `kinovsr/eval/weights/niqe_pristine_reds.safetensors` is a
-first-party fitted artifact with no upstream source (see the eval
-weights README).
+Not here:
+[`kinovsr/eval/weights/niqe_pristine_reds.safetensors`](../kinovsr/eval/weights/niqe_pristine_reds.safetensors)
+is a first-party fitted artifact with no upstream source (see the
+[eval weights README](../kinovsr/eval/weights/README.md)).
 
 Conversion parity is re-checkable end to end:
 

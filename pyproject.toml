@@ -57,6 +57,7 @@ dev = [
     "opencv-python-headless>=5.0",
     "pytest>=9.1.0",
     "ruff>=0.15.17",
+    "rumdl>=0.2.44",
     # Torch is the checkpoint-reading oracle: test fixtures save .pth files,
     # the family-local layout converters read them, and
     # scripts/dev/pth_to_safetensors.py cross-checks the torch-free
@@ -122,3 +123,11 @@ ignore = [
 "__init__.py" = ["F401"]
 # Transitional: legacy tests predate KinoMLX's stricter pytest style.
 "tests/**" = ["PT006", "PT011", "PT018"]
+
+[tool.rumdl]
+line-length = 100
+respect-gitignore = true
+
+[tool.rumdl.MD013]
+code-blocks = false
+tables = false

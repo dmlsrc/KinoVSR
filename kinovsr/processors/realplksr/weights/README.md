@@ -11,11 +11,11 @@ directly on his releases, so no `.pth` conversion is needed -- download the
 
 | token | scale | variant | download | license |
 | --- | --- | --- | --- | --- |
-| public2x (default) | 2x | LayerNorm + DySample, real-world photo/JPEG | https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.safetensors | Apache-2.0 |
-| public2x-nn | 2x | same, trained without noise (cleaner sources) | https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real_nn/2xPublic_realplksr_dysample_layernorm_real_nn.safetensors | Apache-2.0 |
-| nomos4x | 4x | GroupNorm + PixelShuffle, photo restoration | https://github.com/Phhofm/models/releases/download/4xNomosWebPhoto_RealPLKSR/4xNomosWebPhoto_RealPLKSR.safetensors | CC-BY-4.0 |
+| public2x (default) | 2x | LayerNorm + DySample, real-world photo/JPEG | <https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.safetensors> | Apache-2.0 |
+| public2x-nn | 2x | same, trained without noise (cleaner sources) | <https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real_nn/2xPublic_realplksr_dysample_layernorm_real_nn.safetensors> | Apache-2.0 |
+| nomos4x | 4x | GroupNorm + PixelShuffle, photo restoration | <https://github.com/Phhofm/models/releases/download/4xNomosWebPhoto_RealPLKSR/4xNomosWebPhoto_RealPLKSR.safetensors> | CC-BY-4.0 |
 
-Download -- the output name must match `net.py`'s `_VARIANTS`:
+Download -- the output name must match [`net.py`](../net.py)'s `_VARIANTS`:
 
 ```bash
 curl -L -o kinovsr/processors/realplksr/weights/2xpublic_realplksr_dysample_layernorm_real.safetensors \
@@ -52,5 +52,5 @@ author on the PLKSR repo issue #4 and endorsed by the paper author. Reimplemente
 in MLX from the spandrel reference architecture as a spec; no upstream code is
 bundled.
 
-Source: https://github.com/Phhofm/models , architecture
-https://github.com/chaiNNer-org/spandrel (PLKSR/RealPLKSR).
+Source: <https://github.com/Phhofm/models> , architecture
+<https://github.com/chaiNNer-org/spandrel> (PLKSR/RealPLKSR).
