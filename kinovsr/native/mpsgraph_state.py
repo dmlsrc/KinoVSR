@@ -1,13 +1,13 @@
-"""Persistent-state, multi-entry MPSGraph executables on the ANE.
+"""Persistent-state, multi-procedure MPSGraph executables on the ANE.
 
 MPSGraph's graph API has no public state operation, but the placed ANE
 dialect does.  This module keeps that SPI behind a model-neutral contract:
 callers describe named state tensors and ordinary MPSGraph programs; the
-compiler turns matching input/result ports into ``anec.state`` readers and
-writers, then publishes the placed module, ANECIR products, and their realized
-live-port ABI. Callers may open that cache as one mapped MPSGraph executable
-with shared Metal backings or through the explicit-lifecycle ANECIR runtime
-with shared IOSurfaces.
+compiler moves their compute into ``mpsx.ane`` procedures while retaining
+MPSGraph's canonical variable read/write sequence around each procedure. All
+procedures then specialize into one ANE model and share the same Metal-backed
+live state. The older placed ``anec.state`` product path remains available for
+explicit ANECIR experiments.
 
 The lowering deliberately operates on names, contracts, and def-use links.
 It does not depend on operation numbers emitted by MPSGraph.  Family code
@@ -42,9 +42,11 @@ import mlx.core as mx
 from . import mpsgraph as mg
 
 _CACHE_FORMAT = 3
+_MULTIPROCEDURE_CACHE_FORMAT = 5
 _RESOURCE_HEADER = b"{-#\n  dialect_resources: {\n    mps: {\n"
 _RESOURCE_FOOTER = b"\n    }\n  }\n#-}\n"
 _MODULE_MARKER = b"module attributes "
+_PLAIN_MODULE_MARKER = b"module {"
 _WRITE_GUARD_ATTEMPTS = 4
 _log = logging.getLogger("kinovsr.mpsgraph.state")
 _operation_pointer_type: Any | None = None
@@ -370,8 +372,14 @@ class StatefulEntry:
             "MPSGraphExecutableExecutionDescriptor")
         self._execution = Execution.alloc().init()
         self._execution.setEntryFunctionName_(self._contract.function)
-        self._execution.setPerEntryPointToSymbolAndFileNameMap_(
-            self._owner._entry_map)
+        # The dispatch worker's completion is the pipeline's dependency edge.
+        # Without this, runWithMTLCommandQueue only enqueues work; callers can
+        # reuse shared state/results before ANE completion and the write guard
+        # races the device under GPU contention.
+        self._execution.setWaitUntilCompleted_(True)
+        if self._owner._entry_map is not None:
+            self._execution.setPerEntryPointToSymbolAndFileNameMap_(
+                self._owner._entry_map)
         self._dispatch_nonce = 0
         self._write_probes = tuple(
             (
@@ -516,7 +524,7 @@ class StatefulExecutable:
         dtype: int,
         states: Sequence[StateTensorSpec],
         contracts: Sequence[_EntryContract],
-        entry_map: Any,
+        entry_map: Any | None,
     ):
         self._exe = executable
         self._metal = metal
@@ -562,17 +570,21 @@ class StatefulExecutable:
             raise KeyError(f"unknown MPSGraph state entry '{name}'") from exc
 
     def prepare(self) -> None:
-        """Eagerly attach every cached ANE product to this executable.
+        """Finish any runtime-specific ANE attachment exactly once.
 
-        MPSGraph otherwise performs this multi-second operation lazily across
-        the entries' first dispatches.  The method is idempotent so a caller
-        can run it on a prepare-edge worker while ordinary input startup
-        continues, then join that work before the first dispatch.
+        Mapped-product executables need an eager attachment call; grouped
+        executables were already specialized as one model while loading.
+        The method remains idempotent for prepare-edge callers.
         """
         with self._prepare_lock:
             if self._closed:
                 raise RuntimeError("MPSGraph state executable is closed")
             if self._prepared:
+                return
+            if self._entry_map is None:
+                # Multiprocedure executables are specialized as one model at
+                # load time; there is no per-entry product map to attach.
+                self._prepared = True
                 return
             fw = mg._fw()
             device = fw["MPSGraphDevice"].deviceWithMTLDevice_(self._metal)
@@ -716,6 +728,309 @@ def _parse_return(line: str) -> tuple[list[str], list[str], tuple[int, int], tup
     types_start = type_marker + 3
     types = _split_top_level(line[types_start:].strip())
     return values, types, (value_start, type_marker), (types_start, len(line.rstrip("\n")))
+
+
+def _tensor_declaration(
+    declaration: str, *, function: str
+) -> tuple[str, str]:
+    """Return the SSA name and bare tensor type from a function argument."""
+    formal, separator, remainder = declaration.partition(":")
+    formal = formal.strip()
+    if not separator or not re.fullmatch(r"%[A-Za-z0-9_.$-]+", formal):
+        raise RuntimeError(
+            f"{function}: cannot parse function argument {declaration!r}")
+    remainder = remainder.lstrip()
+    if not remainder.startswith("tensor<"):
+        raise RuntimeError(
+            f"{function}: function argument is not a tensor: {declaration!r}")
+    angle = remainder.index("<")
+    end = _balanced_end(remainder, angle)
+    return formal, remainder[:end + 1]
+
+
+def _bare_tensor_type(value: str, *, function: str) -> str:
+    stripped = value.strip()
+    if not stripped.startswith("tensor<"):
+        raise RuntimeError(
+            f"{function}: result is not a tensor type: {value!r}")
+    end = _balanced_end(stripped, stripped.index("<"))
+    trailing = stripped[end + 1:].strip()
+    if trailing:
+        raise RuntimeError(
+            f"{function}: unsupported result type suffix {trailing!r}")
+    return stripped[:end + 1]
+
+
+def _memref_type(tensor_type: str) -> str:
+    if not tensor_type.startswith("tensor<"):
+        raise ValueError(f"not a tensor type: {tensor_type!r}")
+    return "memref<" + tensor_type[len("tensor<"):]
+
+
+def _formatted_result_types(types: Sequence[str]) -> str:
+    if len(types) == 1:
+        return types[0]
+    return "(" + ", ".join(types) + ")"
+
+
+def _transform_multiprocedure_body(
+    body: str,
+    *,
+    function: str,
+    family: str,
+    order: Sequence[tuple[str, tuple[int, ...]]],
+    targets: Sequence[tuple[str, tuple[int, ...]]],
+    states: Mapping[str, StateTensorSpec],
+    state_results: Mapping[str, str],
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Move one high-level graph behind an ``mpsx.ane`` procedure.
+
+    ``mpsx.ane`` is MPSGraph's multiprocedure compilation boundary. State
+    variables deliberately remain around that boundary in the same
+    read-region-slice-update-assign order emitted for Core ML ``MLState``.
+    Keeping variable operations out of the ANE procedure avoids adding their
+    full state tensors to its internal pressure analysis.
+    """
+    marker = f"func.func @{function}"
+    if body.count(marker) != 1 or body.count("func.func @") != 1:
+        raise RuntimeError(
+            f"{function}: expected exactly one captured graph function")
+    if "mpsx.ane" in body or "%kst_" in body:
+        raise RuntimeError(f"{function}: captured graph uses reserved MPSX names")
+
+    function_at = body.index(marker)
+    args_start = body.index("(", function_at + len(marker))
+    args_end = _balanced_end(body, args_start)
+    declarations = _split_top_level(body[args_start + 1:args_end])
+    parsed_args = [
+        _tensor_declaration(value, function=function)
+        for value in declarations
+    ]
+    if len(parsed_args) != len(order):
+        raise RuntimeError(
+            f"{function}: feed contract has {len(order)} values but IR has "
+            f"{len(parsed_args)}")
+
+    cursor = args_end + 1
+    while cursor < len(body) and body[cursor].isspace():
+        cursor += 1
+    if not body.startswith("->", cursor):
+        raise RuntimeError(f"{function}: captured result signature is missing")
+    cursor += 2
+    while cursor < len(body) and body[cursor].isspace():
+        cursor += 1
+    if cursor >= len(body):
+        raise RuntimeError(f"{function}: captured result signature is truncated")
+    if body[cursor] == "(":
+        cursor = _balanced_end(body, cursor) + 1
+    elif body.startswith("tensor<", cursor):
+        cursor = _balanced_end(body, body.index("<", cursor)) + 1
+    else:
+        raise RuntimeError(f"{function}: captured result is not a tensor")
+    while cursor < len(body) and body[cursor].isspace():
+        cursor += 1
+    if body.startswith("attributes", cursor):
+        attributes = body.index("{", cursor + len("attributes"))
+        cursor = _balanced_end(body, attributes) + 1
+        while cursor < len(body) and body[cursor].isspace():
+            cursor += 1
+    if cursor >= len(body) or body[cursor] != "{":
+        raise RuntimeError(f"{function}: captured function body is missing")
+    function_end = _balanced_end(body, cursor)
+    original_body = body[cursor + 1:function_end]
+
+    returns = list(re.finditer(
+        r"(?m)^[ \t]*return(?:[ \t].*)?$", original_body))
+    if len(returns) != 1:
+        raise RuntimeError(
+            f"{function}: expected one captured return, got {len(returns)}")
+    return_match = returns[0]
+    if original_body[return_match.end():].strip():
+        raise RuntimeError(f"{function}: operations follow the captured return")
+    return_line = original_body[return_match.start():return_match.end()]
+    return_values, raw_return_types, _values, _types = _parse_return(
+        return_line + "\n")
+    return_types = [
+        _bare_tensor_type(value, function=function)
+        for value in raw_return_types
+    ]
+    if len(return_values) != len(targets) or len(return_types) != len(targets):
+        raise RuntimeError(
+            f"{function}: target contract has {len(targets)} values but IR has "
+            f"{len(return_values)}")
+
+    feed_names = [name for name, _shape in order]
+    if len(set(feed_names)) != len(feed_names):
+        raise RuntimeError(f"{function}: feed contract names are not unique")
+    missing_states = set(states) - set(feed_names)
+    if missing_states:
+        raise RuntimeError(
+            f"{function}: missing state feeds {sorted(missing_states)}")
+    target_names = [name for name, _shape in targets]
+    unknown_results = set(state_results) - set(target_names)
+    if unknown_results:
+        raise RuntimeError(
+            f"{function}: missing state results {sorted(unknown_results)}")
+    result_positions = {
+        index: state_results[name]
+        for index, name in enumerate(target_names)
+        if name in state_results
+    }
+    visible_positions = [
+        index for index in range(len(targets))
+        if index not in result_positions
+    ]
+    if not visible_positions:
+        raise RuntimeError(
+            f"{function}: mpsx.ane needs at least one visible result")
+
+    input_memrefs = [
+        _memref_type(value_type) for _formal, value_type in parsed_args]
+    state_positions = {
+        name: index for index, name in enumerate(feed_names) if name in states
+    }
+    input_lines: list[str] = []
+    for index, ((formal, tensor_type), memref_type) in enumerate(
+        zip(parsed_args, input_memrefs, strict=True)
+    ):
+        block = f"%kst_input_{index}"
+        input_lines.append(
+            f'    {formal} = "placement.ane_io_cast"({block}) : '
+            f'({memref_type}) -> {tensor_type}')
+
+    operations = original_body[:return_match.start()]
+    operations = operations.strip("\n")
+
+    for position, state_name in sorted(result_positions.items()):
+        if state_name not in state_positions:
+            raise RuntimeError(
+                f"{function}: state result refers to unknown feed {state_name!r}")
+        input_type = parsed_args[state_positions[state_name]][1]
+        if return_types[position] != input_type:
+            raise RuntimeError(
+                f"{function}: state result {target_names[position]!r} has type "
+                f"{return_types[position]}, expected {input_type}")
+
+    visible_types = [return_types[index] for index in visible_positions]
+    result_memrefs = [_memref_type(value) for value in return_types]
+    output_lines = [
+        f'    %kst_output_{index} = "placement.ane_io_cast"('
+        f'{return_values[index]}) : ({return_types[index]}) -> '
+        f'{result_memrefs[index]}'
+        for index in range(len(return_values))
+    ]
+    output_values = [
+        f"%kst_output_{index}" for index in range(len(return_values))]
+    output_lines.append(
+        f'    "mpsx.region_return"({", ".join(output_values)}) : '
+        f' ({", ".join(result_memrefs)}) -> ()')
+
+    symbol = f"{function}_ANE_region_0_0"
+    block_args = ", ".join(
+        f"%kst_input_{index}: {value_type}"
+        for index, value_type in enumerate(input_memrefs)
+    )
+    region_lines = [
+        '  "mpsx.ane"() ({',
+        f"  ^bb0({block_args}):",
+        *input_lines,
+    ]
+    if operations:
+        region_lines.append(operations)
+    region_lines.extend(output_lines)
+    region_lines.append(
+        f'  }}) {{ane_family = "{family}", function_type = '
+        f'({", ".join(input_memrefs)}) -> '
+        f'{_formatted_result_types(result_memrefs)}, '
+        f'sym_name = "{symbol}"}} : () -> ()'
+    )
+
+    outer_lines = [
+        '    %kst_one = "mps.constant"() '
+        '<{value = dense<1> : tensor<4xsi32>}> : '
+        '() -> tensor<4xsi32>',
+        '    %kst_zero = "mps.constant"() '
+        '<{value = dense<0> : tensor<4xsi32>}> : '
+        '() -> tensor<4xsi32>',
+    ]
+    state_variables: dict[str, str] = {}
+    state_reads: dict[str, str] = {}
+    for index, ((formal, tensor_type), memref_type) in enumerate(
+        zip(parsed_args, input_memrefs, strict=True)
+    ):
+        feed_name = feed_names[index]
+        source = formal
+        if feed_name in states:
+            variable = f"%kst_state_var_{index}"
+            read = f"%kst_state_read_{index}"
+            outer_lines.extend((
+                f'    {variable} = "mps.variable_from_tensor"({formal}) : '
+                f'({tensor_type}) -> {tensor_type}',
+                f'    {read} = "mps.read_variable"({variable}) : '
+                f'({tensor_type}) -> {tensor_type}',
+            ))
+            state_variables[feed_name] = variable
+            state_reads[feed_name] = read
+            source = read
+        outer_lines.append(
+            f'    %kst_outer_input_{index} = "placement.tensor_to_memref"('
+            f'{source}) : ({tensor_type}) -> {memref_type}')
+    call_count = len(return_values)
+    call_lhs = "%kst_call" if call_count == 1 else f"%kst_call:{call_count}"
+    outer_operands = ", ".join(
+        f"%kst_outer_input_{index}" for index in range(len(parsed_args)))
+    outer_lines.append(
+        f'    {call_lhs} = "placement.region_call"({outer_operands}) '
+        f'{{callee = @{symbol}, mps.regionSHA = "KINO_MPSX_{function}", '
+        'region_type = #placement.region_type<ANE>} : '
+        f' ({", ".join(input_memrefs)}) -> '
+        f'{_formatted_result_types(result_memrefs)}')
+    outer_results = []
+    for index, (memref_type, tensor_type) in enumerate(
+        zip(result_memrefs, return_types, strict=True)):
+        source = "%kst_call" if call_count == 1 else f"%kst_call#{index}"
+        result = f"%kst_result_{index}"
+        outer_results.append(result)
+        outer_lines.append(
+            f'    {result} = "placement.memref_to_tensor"({source}) : '
+            f' ({memref_type}) -> {tensor_type}')
+    for position, state_name in sorted(result_positions.items()):
+        input_type = parsed_args[state_positions[state_name]][1]
+        updated = f"%kst_state_update_{position}"
+        outer_lines.extend((
+            f'    {updated} = "mps.strided_slice_update"('
+            f'{state_reads[state_name]}, {outer_results[position]}, '
+            '%kst_zero, %kst_zero, %kst_one) '
+            '<{begin_mask = 14 : ui32, end_mask = 15 : ui32, '
+            'shrink_axis_mask = 0 : ui32}> : '
+            f'({input_type}, {input_type}, tensor<4xsi32>, '
+            f'tensor<4xsi32>, tensor<4xsi32>) -> {input_type}',
+            f'    "mps.assign_variable"({state_variables[state_name]}, '
+            f'{updated}) : ({input_type}, {input_type}) -> ()',
+        ))
+    visible_results = [outer_results[index] for index in visible_positions]
+    outer_lines.append(
+        f'    return {", ".join(visible_results)} : '
+        f'{", ".join(visible_types)}')
+    state_indices = [
+        index for index, name in enumerate(feed_names) if name in states]
+    outer_header = (
+        f"  func.func @{function}({', '.join(declarations)}) -> "
+        f"{_formatted_result_types(visible_types)} attributes "
+        f"{{{_state_attrs(state_indices)}}} {{"
+    )
+    replacement = "\n".join((
+        *region_lines,
+        outer_header,
+        *outer_lines,
+        "  }",
+    ))
+    transformed = body[:function_at] + replacement + body[function_end + 1:]
+    return (
+        transformed,
+        tuple(feed_names),
+        tuple(target_names[index] for index in visible_positions),
+    )
 
 
 def _transform_placed_body(
@@ -1219,9 +1534,16 @@ def _module_bounds(path: Path) -> _ModuleBounds:
             and view[marker:marker + len(_RESOURCE_HEADER)] != _RESOURCE_HEADER
         ):
             raise RuntimeError(f"{path}: unexpected MPSGraph resources")
-        module_start = view.find(_MODULE_MARKER)
-        if module_start < 0:
-            raise RuntimeError(f"{path}: attributed module is missing")
+        starts = [
+            value for value in (
+                view.find(_MODULE_MARKER),
+                view.find(_PLAIN_MODULE_MARKER),
+            )
+            if value >= 0
+        ]
+        if not starts:
+            raise RuntimeError(f"{path}: module is missing")
+        module_start = min(starts)
         body_start = view.find(b" {\n", module_start)
         if body_start < 0 or (marker >= 0 and body_start > marker):
             raise RuntimeError(f"{path}: module body is missing")
@@ -1299,6 +1621,62 @@ def _write_transformed_module(
                 source_path.stat().st_size,
             )
     return tuple(ane_input_order), tuple(ane_output_order)
+
+
+def _write_multiprocedure_module(
+    raw_path: Path,
+    placed_path: Path,
+    output_path: Path,
+    *,
+    function: str,
+    order: Sequence[tuple[str, tuple[int, ...]]],
+    targets: Sequence[tuple[str, tuple[int, ...]]],
+    states: Mapping[str, StateTensorSpec],
+    state_results: Mapping[str, str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Wrap raw graph IR using the placed module's runtime attributes."""
+    raw_bounds = _module_bounds(raw_path)
+    placed_bounds = _module_bounds(placed_path)
+    with raw_path.open("rb") as raw:
+        raw.seek(raw_bounds.body_start)
+        raw_body = raw.read(
+            raw_bounds.body_end - raw_bounds.body_start).decode("utf-8")
+    with placed_path.open("rb") as placed:
+        placed.seek(placed_bounds.body_start)
+        placed_body = placed.read(
+            placed_bounds.body_end - placed_bounds.body_start
+        ).decode("utf-8")
+        placed.seek(placed_bounds.module_header_start)
+        header = placed.read(
+            placed_bounds.module_header_end
+            - placed_bounds.module_header_start)
+    families = set(re.findall(
+        r"\banec\.([A-Za-z0-9_]+)\s+@", placed_body))
+    if len(families) != 1:
+        raise RuntimeError(
+            f"{function}: expected one placed ANE family, got "
+            f"{sorted(families)}")
+    transformed, ane_inputs, ane_outputs = _transform_multiprocedure_body(
+        raw_body,
+        function=function,
+        family=next(iter(families)),
+        order=order,
+        targets=targets,
+        states=states,
+        state_results=state_results,
+    )
+    with output_path.open("wb") as output, raw_path.open("rb") as raw:
+        _copy_range(raw, output, 0, raw_bounds.module_header_start)
+        output.write(header)
+        output.write(transformed.encode("utf-8"))
+        output.write(b"}\n")
+        _copy_range(
+            raw,
+            output,
+            raw_bounds.body_end + 1,
+            raw_path.stat().st_size,
+        )
+    return ane_inputs, ane_outputs
 
 
 def _resources(path: Path, bounds: _ModuleBounds) -> list[_Resource]:
@@ -1412,9 +1790,33 @@ def _merge_modules(sources: Mapping[str, Path], output_path: Path) -> None:
         source.seek(bounds[first].module_header_start)
         header = source.read(
             bounds[first].module_header_end - bounds[first].module_header_start)
+    identity = hashlib.sha256(b"KINO_STATE_COMBINED_V2\0")
+    neutral_header = re.sub(
+        rb'mps\.aneRegionsSHA = "[^"]+"',
+        b'mps.aneRegionsSHA = ""',
+        header,
+    )
+    identity.update(struct.pack("<Q", len(neutral_header)))
+    identity.update(neutral_header)
+    for entry in sources:
+        for value in (entry, *renamed[entry]):
+            payload = value.encode("utf-8")
+            identity.update(struct.pack("<Q", len(payload)))
+            identity.update(payload)
+    for canonical_name, record in canonical.values():
+        for value in (
+            canonical_name,
+            record.digest,
+            str(record.payload_end - record.payload_start),
+        ):
+            payload = value.encode("ascii")
+            identity.update(struct.pack("<Q", len(payload)))
+            identity.update(payload)
+    combined_identity = (
+        "KINO_STATE_COMBINED_" + identity.hexdigest().upper())
     header = re.sub(
         rb'mps\.aneRegionsSHA = "[^"]+"',
-        b'mps.aneRegionsSHA = "KINO_STATE_COMBINED"',
+        f'mps.aneRegionsSHA = "{combined_identity}"'.encode("ascii"),
         header,
     )
     with output_path.open("wb") as output:
@@ -1463,6 +1865,27 @@ def _source_descriptor(fw: Mapping[str, Any]) -> tuple[Any, Any]:
     compilation.setOptimizationLevel_(0)
     compilation.setPreferredDevice_(mg.DEVICE_GPU)
     compilation.setWaitForCompilationCompletion_(True)
+    descriptor = fw["objc"].lookUpClass(
+        "MPSGraphExecutableDescriptor").alloc().init()
+    descriptor.setCompilationDescriptor_(compilation)
+    return compilation, descriptor
+
+
+def _ane_source_descriptor(
+    fw: Mapping[str, Any],
+    *,
+    ane_fw_to_fw_signal: bool,
+    ane_late_latch: bool,
+) -> tuple[Any, Any]:
+    compilation = fw["MPSGraphCompilationDescriptor"].alloc().init()
+    compilation.setOptimizationLevel_(1)
+    compilation.setPreferredDevice_(mg.DEVICE_ANE)
+    compilation.setWaitForCompilationCompletion_(True)
+    compilation.setEnableMLIRDiagnostics_(True)
+    if ane_fw_to_fw_signal:
+        compilation.setEnableANEFWToFWSignal_(True)
+    if ane_late_latch:
+        compilation.setEnableANELateLatch_(True)
     descriptor = fw["objc"].lookUpClass(
         "MPSGraphExecutableDescriptor").alloc().init()
     descriptor.setCompilationDescriptor_(compilation)
@@ -1760,14 +2183,39 @@ def stateful_cache_ready(cache_directory: str | Path) -> bool:
     )
 
 
+def multiprocedure_cache_ready(cache_directory: str | Path) -> bool:
+    """Whether a grouped cache has its source module and ABI contract."""
+    root = Path(cache_directory) / _system_cache_key()
+    contract = root / "contract.json"
+    module = root / "model.mlir"
+    if not contract.is_file() or not module.is_file():
+        return False
+    try:
+        _dtype, _states, entries = _parse_contract(
+            json.loads(contract.read_text()),
+            expected_format=_MULTIPROCEDURE_CACHE_FORMAT,
+        )
+    except (
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return False
+    return bool(entries) and all(not entry.product for entry in entries)
+
+
 def _contract_json(
     *,
     dtype: int,
     states: Sequence[StateTensorSpec],
     entries: Sequence[_EntryContract],
+    format_version: int = _CACHE_FORMAT,
 ) -> dict[str, Any]:
     return {
-        "format": _CACHE_FORMAT,
+        "format": format_version,
         "dtype": dtype,
         "system": _system_cache_key(),
         "states": [
@@ -1797,10 +2245,12 @@ def _contract_json(
     }
 
 
-def _parse_contract(record: Mapping[str, Any]) -> tuple[
+def _parse_contract(
+    record: Mapping[str, Any], *, expected_format: int = _CACHE_FORMAT
+) -> tuple[
     int, tuple[StateTensorSpec, ...], tuple[_EntryContract, ...]
 ]:
-    if record.get("format") != _CACHE_FORMAT:
+    if record.get("format") != expected_format:
         raise RuntimeError("MPSGraph state cache format changed")
     if record.get("system") != _system_cache_key():
         raise RuntimeError("MPSGraph state cache belongs to another OS runtime")
@@ -1956,15 +2406,11 @@ def _build_cache(
             del executable, source, program
             gc.collect()
 
-        compilation = fw["MPSGraphCompilationDescriptor"].alloc().init()
-        compilation.setOptimizationLevel_(1)
-        compilation.setPreferredDevice_(mg.DEVICE_ANE)
-        compilation.setWaitForCompilationCompletion_(True)
-        compilation.setEnableMLIRDiagnostics_(True)
-        if ane_fw_to_fw_signal:
-            compilation.setEnableANEFWToFWSignal_(True)
-        if ane_late_latch:
-            compilation.setEnableANELateLatch_(True)
+        compilation, _descriptor = _ane_source_descriptor(
+            fw,
+            ane_fw_to_fw_signal=ane_fw_to_fw_signal,
+            ane_late_latch=ane_late_latch,
+        )
         transformed_paths = {}
         entry_contracts = []
         for name, contract in captured.items():
@@ -2057,6 +2503,119 @@ def _build_cache(
             shutil.rmtree(staging)
 
 
+def _build_multiprocedure_cache(
+    cache_directory: Path,
+    factories: Mapping[str, Callable[[], Program]],
+    states: Sequence[StateTensorSpec],
+    *,
+    dtype: int,
+    ane_fw_to_fw_signal: bool,
+    ane_late_latch: bool,
+) -> None:
+    """Publish high-level inline-state procedures for one grouped model."""
+    fw = mg._fw()
+    metal = fw["Metal"].MTLCreateSystemDefaultDevice()
+    graph_device = fw["MPSGraphDevice"].deviceWithMTLDevice_(metal)
+    compilation, _descriptor = _ane_source_descriptor(
+        fw,
+        ane_fw_to_fw_signal=ane_fw_to_fw_signal,
+        ane_late_latch=ane_late_latch,
+    )
+    parent = cache_directory.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(
+        prefix=f".{cache_directory.name}.partial-", dir=parent))
+    build = staging / "build"
+    build.mkdir()
+    state_by_name = {state.name: state for state in states}
+    transformed_paths: dict[str, Path] = {}
+    entry_contracts = []
+    try:
+        EntryPoint = fw["objc"].lookUpClass(
+            "MPSGraphExecutableShapedEntryPoint")
+        for name, factory in factories.items():
+            program = factory()
+            if program.name != name:
+                raise ValueError(
+                    f"MPSGraph program factory {name!r} returned "
+                    f"{program.name!r}")
+            if program.builder.dtype != dtype:
+                raise ValueError(f"{name}: MPSGraph state dtype changed")
+            _validate_program(program, state_by_name)
+            executable, order, source = _capture_program(
+                program, fw=fw, graph_device=graph_device)
+            raw_path = build / f"{name}.raw.mlir"
+            placed_path = build / f"{name}.placed.mlir"
+            transformed_path = build / f"{name}.mpsx.mlir"
+            raw_path.write_text(source)
+            input_types = [
+                fw["MPSGraphShapedType"].alloc().initWithShape_dataType_(
+                    list(shape), dtype)
+                for _feed_name, shape in order
+            ]
+            entry_point = EntryPoint.alloc(
+            ).initWithEntryFunctionName_inputTypes_(name, input_types)
+            placed_path.write_text(_extract_placed_source(
+                executable,
+                entry_point,
+                fw=fw,
+                graph_device=graph_device,
+                compilation=compilation,
+            ))
+            targets = [
+                (target_name, tuple(int(value) for value in shape))
+                for target_name, _tensor, shape in program.targets
+            ]
+            state_results = dict(program.state_results)
+            ane_input_order, ane_output_order = _write_multiprocedure_module(
+                raw_path,
+                placed_path,
+                transformed_path,
+                function=name,
+                order=order,
+                targets=targets,
+                states=state_by_name,
+                state_results=state_results,
+            )
+            entry_contracts.append(_EntryContract(
+                name=name,
+                function=name,
+                region=f"{name}_ANE_region_0_0",
+                order=tuple(order),
+                targets=tuple(targets),
+                state_results=tuple(state_results.items()),
+                ane_input_order=ane_input_order,
+                ane_output_order=ane_output_order,
+                dynamic=frozenset(program.dynamic),
+                product="",
+            ))
+            transformed_paths[name] = transformed_path
+            raw_path.unlink()
+            placed_path.unlink()
+            del executable, entry_point, source, program
+            gc.collect()
+
+        _merge_modules(transformed_paths, staging / "model.mlir")
+        (staging / "contract.json").write_text(json.dumps(
+            _contract_json(
+                dtype=dtype,
+                states=states,
+                entries=entry_contracts,
+                format_version=_MULTIPROCEDURE_CACHE_FORMAT,
+            ),
+            indent=2,
+        ))
+        shutil.rmtree(build)
+        try:
+            staging.replace(cache_directory)
+        except OSError:
+            if not cache_directory.is_dir():
+                raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+
 def _read_cache_contract(
     cache_directory: Path,
     *,
@@ -2086,6 +2645,34 @@ def _read_cache_contract(
             raise RuntimeError(
                 f"{entry.function}: cached ANE product is incomplete"
             )
+    return entries
+
+
+def _read_multiprocedure_contract(
+    cache_directory: Path,
+    *,
+    expected_entries: Sequence[str],
+    expected_states: Sequence[StateTensorSpec],
+    expected_dtype: int,
+) -> tuple[_EntryContract, ...] | None:
+    contract_path = cache_directory / "contract.json"
+    module_path = cache_directory / "model.mlir"
+    if not contract_path.is_file() or not module_path.is_file():
+        return None
+    dtype, states, entries = _parse_contract(
+        json.loads(contract_path.read_text()),
+        expected_format=_MULTIPROCEDURE_CACHE_FORMAT,
+    )
+    if dtype != expected_dtype or states != tuple(expected_states):
+        raise RuntimeError(
+            f"MPSGraph multiprocedure cache contract changed at "
+            f"{cache_directory}")
+    if [entry.name for entry in entries] != list(expected_entries):
+        raise RuntimeError(
+            f"MPSGraph multiprocedure entries changed at {cache_directory}")
+    if any(entry.function != entry.name or entry.product for entry in entries):
+        raise RuntimeError(
+            f"MPSGraph multiprocedure cache ABI changed at {cache_directory}")
     return entries
 
 
@@ -2172,6 +2759,113 @@ def _load_cache(
     return result
 
 
+def _load_multiprocedure_cache(
+    cache_directory: Path,
+    *,
+    expected_entries: Sequence[str],
+    expected_states: Sequence[StateTensorSpec],
+    expected_dtype: int,
+    ane_fw_to_fw_signal: bool,
+    ane_late_latch: bool,
+) -> StatefulExecutable | None:
+    entries = _read_multiprocedure_contract(
+        cache_directory,
+        expected_entries=expected_entries,
+        expected_states=expected_states,
+        expected_dtype=expected_dtype,
+    )
+    if entries is None:
+        return None
+
+    fw = mg._fw()
+    compilation, descriptor = _ane_source_descriptor(
+        fw,
+        ane_fw_to_fw_signal=ane_fw_to_fw_signal,
+        ane_late_latch=ane_late_latch,
+    )
+    source = _load_mlir_source(cache_directory / "model.mlir", fw)
+    executable = fw["MPSGraphExecutable"].alloc(
+    ).initWithMLIRSource_executableDescriptor_(source, descriptor)
+    if executable is None:
+        raise RuntimeError("MPSGraph could not import the multiprocedure module")
+    executable.setOptions_(0)
+    functions = [str(value) for value in executable.functionNames()]
+    if set(functions) != {entry.function for entry in entries}:
+        raise RuntimeError(
+            f"MPSGraph multiprocedure functions changed at {cache_directory}")
+
+    metal = fw["Metal"].MTLCreateSystemDefaultDevice()
+    graph_device = fw["MPSGraphDevice"].deviceWithMTLDevice_(metal)
+    archive = Path(str(executable.getMutableWeightsFilePath())).parent
+    if not (
+        archive.name.startswith(f"mpsgraph-{os.getpid()}-")
+        and archive.parent.name == "com.apple.MetalPerformanceShadersGraph"
+    ):
+        raise RuntimeError(
+            f"MPSGraph returned an unexpected product directory: {archive}")
+
+    # Import compiles one provisional bytecode product.  Remove only that
+    # exact product and its derived options before registering every shaped
+    # entry at once; the all-entry specialization is what records all
+    # procedures under a single ANE model identity.
+    provisional = sorted(archive.glob("*.bc.mlir"))
+    if len(provisional) != 1:
+        raise RuntimeError(
+            f"MPSGraph emitted {len(provisional)} provisional grouped "
+            f"products at {archive}")
+    base = provisional[0].name.removesuffix(".bc.mlir")
+    provisional_options = archive / f"compiler_options_{base}.plist"
+    if not provisional_options.is_file():
+        raise RuntimeError(
+            f"MPSGraph omitted grouped compiler options for {base}")
+    provisional[0].unlink()
+    provisional_options.unlink()
+
+    EntryPoint = fw["objc"].lookUpClass(
+        "MPSGraphExecutableShapedEntryPoint")
+    points = []
+    state_names = {state.name for state in expected_states}
+    for entry in entries:
+        input_types = [
+            fw["MPSGraphShapedType"].alloc().initWithShape_dataType_(
+                list(shape), expected_dtype)
+            for _name, shape in entry.order
+        ]
+        point = EntryPoint.alloc().initWithEntryFunctionName_inputTypes_(
+            entry.function, input_types)
+        points.append(point)
+        positions = list(
+            executable.getStateInputPositionsWithEntryFunctionName_(
+                entry.function))
+        expected_positions = [
+            index for index, (name, _shape) in enumerate(entry.order)
+            if name in state_names
+        ]
+        if positions != expected_positions:
+            raise RuntimeError(
+                f"{entry.function}: grouped state positions changed to "
+                f"{positions}")
+    executable.specializeWithDevice_shapedEntryPoints_compilationDescriptor_error_(
+        graph_device, points, compilation, None)
+    grouped_products = sorted(archive.glob("*.bc.mlir"))
+    if len(grouped_products) != 1:
+        raise RuntimeError(
+            "MPSGraph did not specialize the procedures as one grouped "
+            f"product: {grouped_products}")
+
+    result = StatefulExecutable(
+        executable,
+        metal,
+        expected_dtype,
+        expected_states,
+        entries,
+        None,
+    )
+    result._entry_points = tuple(points)
+    result._grouped_product = grouped_products[0]
+    return result
+
+
 def _stateful_request(
     factories: Mapping[str, Callable[[], Program]],
     states: Sequence[StateTensorSpec],
@@ -2229,6 +2923,44 @@ def _ensure_stateful_cache(
     return resolved, state_tuple, entries
 
 
+def _ensure_multiprocedure_cache(
+    factories: Mapping[str, Callable[[], Program]],
+    states: Sequence[StateTensorSpec],
+    *,
+    dtype: int,
+    cache_directory: str | Path,
+    ane_fw_to_fw_signal: bool,
+    ane_late_latch: bool,
+) -> tuple[Path, tuple[StateTensorSpec, ...], tuple[_EntryContract, ...]]:
+    names, state_tuple = _stateful_request(factories, states)
+    resolved = Path(cache_directory) / _system_cache_key()
+    entries = _read_multiprocedure_contract(
+        resolved,
+        expected_entries=names,
+        expected_states=state_tuple,
+        expected_dtype=dtype,
+    )
+    if entries is None:
+        _build_multiprocedure_cache(
+            resolved,
+            factories,
+            state_tuple,
+            dtype=dtype,
+            ane_fw_to_fw_signal=ane_fw_to_fw_signal,
+            ane_late_latch=ane_late_latch,
+        )
+        entries = _read_multiprocedure_contract(
+            resolved,
+            expected_entries=names,
+            expected_states=state_tuple,
+            expected_dtype=dtype,
+        )
+    if entries is None:
+        raise RuntimeError(
+            f"MPSGraph multiprocedure cache was not published at {resolved}")
+    return resolved, state_tuple, entries
+
+
 def compile_stateful(
     factories: Mapping[str, Callable[[], Program]],
     states: Sequence[StateTensorSpec],
@@ -2261,6 +2993,45 @@ def compile_stateful(
     )
     if loaded is None:
         raise RuntimeError(f"MPSGraph state cache was not published at {resolved}")
+    return loaded
+
+
+def compile_multiprocedure(
+    factories: Mapping[str, Callable[[], Program]],
+    states: Sequence[StateTensorSpec],
+    *,
+    dtype: int = mg.FLOAT16,
+    cache_directory: str | Path,
+    ane_fw_to_fw_signal: bool = False,
+    ane_late_latch: bool = False,
+) -> StatefulExecutable:
+    """Build or load named procedures sharing one persistent ANE model.
+
+    Each factory remains an ordinary high-level MPSGraph. This layer moves it
+    behind an ``mpsx.ane`` procedure, wraps contracted state results in the
+    canonical outer variable update sequence, and specializes every entry
+    together. Warm loads reuse the transformed source and never rebuild the
+    family graph.
+    """
+    resolved, state_tuple, entries = _ensure_multiprocedure_cache(
+        factories,
+        states,
+        dtype=dtype,
+        cache_directory=cache_directory,
+        ane_fw_to_fw_signal=ane_fw_to_fw_signal,
+        ane_late_latch=ane_late_latch,
+    )
+    loaded = _load_multiprocedure_cache(
+        resolved,
+        expected_entries=[entry.name for entry in entries],
+        expected_states=state_tuple,
+        expected_dtype=dtype,
+        ane_fw_to_fw_signal=ane_fw_to_fw_signal,
+        ane_late_latch=ane_late_latch,
+    )
+    if loaded is None:
+        raise RuntimeError(
+            f"MPSGraph multiprocedure cache was not published at {resolved}")
     return loaded
 
 
@@ -2302,8 +3073,10 @@ __all__ = [
     "StatefulEntry",
     "StatefulExecutable",
     "TensorBinding",
+    "compile_multiprocedure",
     "compile_stateful",
     "compile_stateful_direct",
+    "multiprocedure_cache_ready",
     "safe_storage_shape",
     "stateful_cache_ready",
     "state_placeholders",

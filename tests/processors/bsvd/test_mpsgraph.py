@@ -97,9 +97,40 @@ class TestBackendSelection:
         assert result is executable
         assert captured["entries"] == ("generic1",)
         assert captured["cache"] == (
-            "scheduled-stateful-generic1-direct-v1", 480, 640)
+            "scheduled-stateful-generic1-direct-v2", 480, 640)
         assert captured["states"] is states
         assert captured["kwargs"]["cache_directory"] == tmp_path
+
+    def test_packed_state_storage_uses_four_balanced_ane_ports(self):
+        from kinovsr.processors.bsvd.mps import _net_keys
+
+        prefixes = ("first", "second")
+        weights = {}
+        for prefix in prefixes:
+            keys = _net_keys(prefix)
+            for local, name in enumerate(mps_phases._UNIT_KEYS):
+                channels = 128 if local < 2 or local > 5 else 256
+                weights[keys[name] + ".weight"] = SimpleNamespace(
+                    shape=(channels,)
+                )
+        states = mps_phases._state_specs(
+            SimpleNamespace(_prefixes=prefixes, _weights=weights),
+            480,
+            640,
+        )
+
+        assert tuple(state.name for state in states) == (
+            "state_group_0",
+            "state_group_1",
+            "state_group_2",
+            "state_group_3",
+        )
+        assert tuple(state.storage_shape for state in states) == (
+            (8, 144, 240, 160),
+            (4, 144, 240, 160),
+            (8, 144, 240, 160),
+            (4, 144, 240, 160),
+        )
 
     def test_window_reset_keeps_concrete_tensor_data_views(self):
         resets = []

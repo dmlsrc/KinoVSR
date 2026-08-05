@@ -1,10 +1,11 @@
 """One-step BSVD windows executed by one direct MPSGraph ANECIR program.
 
 One schedule-generic ANE entry handles fill, steady state, and drain. Its
-sixteen recurrent tensors use persistent ``anec.state`` IOSurfaces, so no
-state crosses through Python, MLX, or a Core ML prediction. Keeping one
-concrete program and stable request maps resident avoids raw-runtime phase
-re-entry while the one-step cadence preserves downstream GPU overlap.
+sixteen logical recurrent tensors are packed into four persistent
+``anec.state`` IOSurfaces, so no state crosses through Python, MLX, or a Core
+ML prediction. Keeping one concrete program and stable request maps resident
+avoids raw-runtime phase re-entry while the one-step cadence preserves
+downstream GPU overlap.
 
 The six skip rings remain reusable IOSurface bindings shared with that entry.
 Both state and delayed features therefore cross dispatch boundaries without
@@ -28,7 +29,7 @@ from .schedule import NoneFlowNet
 
 _STEPS = 1
 _DRAIN_STEPS = 16
-_STATEFUL_CACHE_LABEL = "scheduled-stateful-generic1-direct-v1"
+_STATEFUL_CACHE_LABEL = "scheduled-stateful-generic1-direct-v2"
 _UNIT_KEYS = ("u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7")
 
 
@@ -110,26 +111,82 @@ def _line_shapes(
 def _state_specs(
     net: Any, height: int, width: int
 ) -> tuple[mgs.StateTensorSpec, ...]:
-    """The sixteen BiBuffer cells as independent persistent state ports."""
+    """Pack shape-compatible BiBuffer cells into four persistent ports."""
+    from .mps import _STATE_GROUPS
+
+    unit_shapes = _unit_state_shapes(net, height, width)
+    states = []
+    for group, units in enumerate(_STATE_GROUPS):
+        member = unit_shapes[units[0]]
+        if any(unit_shapes[unit] != member for unit in units[1:]):
+            raise RuntimeError(
+                f"BSVD state group {group} mixes incompatible unit shapes")
+        logical = (
+            member[0],
+            member[1] * len(units),
+            member[2],
+            member[3],
+        )
+        states.append(mgs.StateTensorSpec(
+            f"state_group_{group}",
+            logical,
+            _packed_storage_shape(logical),
+        ))
+    return tuple(states)
+
+
+def _unit_state_shapes(
+    net: Any, height: int, width: int
+) -> tuple[tuple[int, ...], ...]:
+    """Return the sixteen logical BiBuffer cell shapes in execution order."""
     from .mps import _net_keys
 
     keys_by_net = tuple(_net_keys(prefix) for prefix in net._prefixes)
-    states = []
+    shapes = []
     for unit in range(16):
         local = unit % 8
         key = keys_by_net[unit // 8][_UNIT_KEYS[local]]
         channels = int(net._weights[key + ".weight"].shape[0])
         divisor = 2 if local < 2 or local > 5 else 4
-        states.append(mgs.StateTensorSpec.create(
-            f"state_{unit}",
-            (
-                1,
-                channels + channels // 8,
-                height // divisor,
-                width // divisor,
-            ),
+        shapes.append((
+            1,
+            channels + channels // 8,
+            height // divisor,
+            width // divisor,
         ))
-    return tuple(states)
+    return tuple(shapes)
+
+
+def _packed_storage_shape(
+    logical_shape: tuple[int, ...], *, limit: int = 255
+) -> tuple[int, ...]:
+    """Balance a packed slab's ANE-safe storage away from its leading axis.
+
+    ``safe_storage_shape`` first folds oversized logical axes into N. Packed
+    groups can leave several factors there; move those factors back into a
+    spatial axis when it remains under the ANE dimension limit. This preserves
+    the ordinary cell layout while minimizing the physical leading dimension.
+    """
+    storage = list(mgs.safe_storage_shape(logical_shape, limit=limit))
+    for axis in (2, 3, 1):
+        while storage[0] > 1:
+            factor = next(
+                (
+                    candidate
+                    for candidate in range(2, storage[0] + 1)
+                    if storage[0] % candidate == 0
+                    and storage[axis] * candidate <= limit
+                ),
+                None,
+            )
+            if factor is None:
+                break
+            storage[0] //= factor
+            storage[axis] *= factor
+    result = tuple(storage)
+    if prod(result) != prod(logical_shape):
+        raise AssertionError("packed state storage changed element count")
+    return result
 
 
 def _build_chunk(net: Any, height: int, width: int) -> _Chunk:
@@ -137,6 +194,7 @@ def _build_chunk(net: Any, height: int, width: int) -> _Chunk:
     from .mps import (
         _LINES,
         _PUSH_OUTPUTS,
+        _STATE_GROUPS,
         _net_keys,
     )
 
@@ -181,13 +239,26 @@ def _build_chunk(net: Any, height: int, width: int) -> _Chunk:
     # State ports trail every ordinary/dynamic port. This is the large-model
     # ABI exercised by MPSGraph's own mapped-product runtime.
     logical_states = mgs.state_placeholders(builder, state_specs)
-    state_values = {
-        unit: logical_states[state.name]
-        for unit, state in enumerate(state_specs)
-    }
-    state_shapes = {
-        unit: state.logical_shape for unit, state in enumerate(state_specs)
-    }
+    unit_shapes = _unit_state_shapes(net, height, width)
+    state_values = {}
+    state_shapes = {}
+    for group, (state, units) in enumerate(
+        zip(state_specs, _STATE_GROUPS, strict=True)
+    ):
+        slab = logical_states[state.name]
+        member = unit_shapes[units[0]]
+        channels = member[1]
+        for slot, unit in enumerate(units):
+            if unit_shapes[unit] != member:
+                raise RuntimeError(
+                    f"BSVD state group {group} mixes incompatible unit shapes")
+            state_values[unit] = builder.slice_channels(
+                slab,
+                slot * channels,
+                channels,
+                f"state_group_{group}.unit_{unit}",
+            )
+            state_shapes[unit] = member
 
     def bibuffer(
         current: Any,
@@ -403,8 +474,12 @@ def _build_chunk(net: Any, height: int, width: int) -> _Chunk:
         push_names.append(tuple(step_push_names))
 
     state_results = {}
-    for unit, state in enumerate(state_specs):
-        result = mgs.state_result(builder, state, state_values[unit])
+    for state, units in zip(state_specs, _STATE_GROUPS, strict=True):
+        update = builder.concat_channels(
+            [state_values[unit] for unit in units],
+            state.name + ".pack",
+        )
+        result = mgs.state_result(builder, state, update)
         targets.append(result)
         state_results[result[0]] = state.name
 

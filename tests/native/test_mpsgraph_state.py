@@ -169,10 +169,65 @@ def test_structural_lowering_records_pruned_state_reinsertion_order():
     assert ane_input_order == ["value", "second", "first"]
 
 
+def test_multiprocedure_lowering_uses_canonical_outer_state_updates():
+    tensor = "tensor<1x8x32x32xf16>"
+    body = (
+        f"  func.func @entry(%memory: {tensor}, %value: {tensor}, "
+        f"%second: {tensor}) -> ({tensor}, {tensor}, {tensor}) {{\n"
+        f'    %sum = "mps.add"(%memory, %value) : '
+        f'({tensor}, {tensor}) -> {tensor}\n'
+        f'    %product = "mps.multiply"(%second, %value) : '
+        f'({tensor}, {tensor}) -> {tensor}\n'
+        f"    return %sum, %sum, %product : {tensor}, {tensor}, {tensor}\n"
+        "  }\n"
+    )
+    memory = state.StateTensorSpec.create("memory", (1, 8, 32, 32))
+    second = state.StateTensorSpec.create("second", (1, 8, 32, 32))
+
+    lowered, inputs, outputs = state._transform_multiprocedure_body(
+        body,
+        function="entry",
+        family="A14",
+        order=(
+            ("memory", memory.storage_shape),
+            ("value", memory.storage_shape),
+            ("second", second.storage_shape),
+        ),
+        targets=(
+            ("memory.next", memory.storage_shape),
+            ("visible", memory.storage_shape),
+            ("second.next", second.storage_shape),
+        ),
+        states={"memory": memory, "second": second},
+        state_results={
+            "memory.next": "memory",
+            "second.next": "second",
+        },
+    )
+
+    assert inputs == ("memory", "value", "second")
+    assert outputs == ("visible",)
+    assert lowered.count('"mpsx.ane"') == 1
+    region, outer = lowered.split("  func.func @entry", 1)
+    assert "mps.variable_from_tensor" not in region
+    assert "mps.read_variable" not in region
+    assert "mps.strided_slice_update" not in region
+    assert "mps.assign_variable" not in region
+    assert outer.count('"mps.variable_from_tensor"') == 2
+    assert outer.count('"mps.read_variable"') == 2
+    assert outer.count('"mps.strided_slice_update"') == 2
+    assert outer.count('"mps.assign_variable"') == 2
+    assert "mps.stateInputIndices = array<i64: 0, 2>" in lowered
+    assert 'sym_name = "entry_ANE_region_0_0"' in lowered
+    assert "func.func @entry" in lowered
+    assert "%kst_call:3" in lowered
+    assert "anec." not in lowered
+
+
 def test_module_merge_deduplicates_resources_and_namespaces_aliases(tmp_path):
     payload = "0x0011223344556677"
 
-    def source(entry: str, resource: str) -> str:
+    def source(entry: str, resource: str, value: str = payload) -> str:
         return (
             "#map = affine_map<(d0) -> (d0)>\n"
             'module attributes {mps.aneRegionsSHA = "old"} {\n'
@@ -186,7 +241,7 @@ def test_module_merge_deduplicates_resources_and_namespaces_aliases(tmp_path):
             "{-#\n"
             "  dialect_resources: {\n"
             "    mps: {\n"
-            f'      {resource}: "{payload}"\n'
+            f'      {resource}: "{value}"\n'
             "    }\n"
             "  }\n"
             "#-}\n"
@@ -207,6 +262,17 @@ def test_module_merge_deduplicates_resources_and_namespaces_aliases(tmp_path):
     assert "#second_map" in result
     assert "@first_0" in result
     assert "@second_0" in result
+    assert 'mps.aneRegionsSHA = "KINO_STATE_COMBINED_' in result
+
+    changed = tmp_path / "changed.mlir"
+    changed_merged = tmp_path / "changed-merged.mlir"
+    changed.write_text(source("first", "first_blob", "0x8899AABB"))
+    state._merge_modules({"first": changed}, changed_merged)
+
+    def identity(value: str) -> str:
+        return value.split('mps.aneRegionsSHA = "', 1)[1].split('"', 1)[0]
+
+    assert identity(changed_merged.read_text()) != identity(result)
 
 
 def test_program_validation_rejects_ambiguous_or_unknown_ports():
@@ -265,6 +331,37 @@ def test_stateful_cache_ready_requires_every_published_product(tmp_path):
     assert state.stateful_cache_ready(tmp_path)
 
 
+def test_multiprocedure_cache_ready_needs_only_source_and_contract(tmp_path):
+    root = tmp_path / state._system_cache_key()
+    root.mkdir()
+    spec = state.StateTensorSpec.create("memory", (1, 8, 32, 32))
+    entry = state._EntryContract(
+        name="entry",
+        function="entry",
+        region="entry_ANE_region_0_0",
+        order=(("memory", spec.storage_shape),),
+        targets=(
+            ("visible", spec.storage_shape),
+            ("memory.next", spec.storage_shape),
+        ),
+        state_results=(("memory.next", "memory"),),
+        ane_input_order=("memory",),
+        ane_output_order=("visible",),
+        dynamic=frozenset(),
+        product="",
+    )
+    (root / "contract.json").write_text(json.dumps(state._contract_json(
+        dtype=0,
+        states=(spec,),
+        entries=(entry,),
+        format_version=state._MULTIPROCEDURE_CACHE_FORMAT,
+    )))
+
+    assert not state.multiprocedure_cache_ready(tmp_path)
+    (root / "model.mlir").write_text("module {}\n")
+    assert state.multiprocedure_cache_ready(tmp_path)
+
+
 def test_prepare_attaches_cached_products_only_once(monkeypatch):
     calls = []
 
@@ -314,6 +411,20 @@ def test_prepare_attaches_cached_products_only_once(monkeypatch):
 
     assert owner._prepared
     assert len(calls) == 1
+
+
+def test_prepare_is_a_noop_after_grouped_specialization():
+    owner = SimpleNamespace(
+        _prepare_lock=threading.Lock(),
+        _closed=False,
+        _prepared=False,
+        _entry_map=None,
+    )
+
+    state.StatefulExecutable.prepare(owner)
+    state.StatefulExecutable.prepare(owner)
+
+    assert owner._prepared
 
 
 def _write_probes(*buffers: bytearray):
