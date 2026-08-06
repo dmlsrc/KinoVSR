@@ -215,8 +215,10 @@ def pad_spynet_gates(p: dict) -> None:
     (in place, same key). C=8 fails MLX's implicit-GEMM gate (C<=4 or C%16==0,
     mlx conv.cpp) so the finest-level 7x7 conv ran on the ~2.5x-slower general
     kernel. spynet_flow appends matching zero channels to the module input, so the
-    math is exact (zero columns x zero channels). Call after load_params; a no-op
-    when the keys are absent or already padded."""
+    math is exact (zero columns x zero channels). The ANE emitter slices this pad
+    back off when building its fixed 8-channel graphs (spynet_ane._emit_level);
+    a padded dict once failed CoreML compile there and silently fell back to MLX.
+    Call after load_params; a no-op when the keys are absent or already padded."""
     for lvl in range(6):
         k = f"spynet.basic_module.{lvl}.basic_module.0.conv.weight"
         if k in p and p[k].shape[-1] == 8:
@@ -303,10 +305,11 @@ def compiled_spynet_flow(p: dict, ref: Any, supp: Any) -> Any:
     engine = spynet_ane.engine_for(p, ref.shape)
     if engine is None:
         if backend == "ane":
+            reason = (spynet_ane.unavailable_reason()
+                      or spynet_ane.last_failure() or "unsupported input")
             raise RuntimeError(
                 f"spynet_backend='ane' but the Neural Engine path is "
-                f"unavailable: "
-                f"{spynet_ane.unavailable_reason() or 'unsupported input'}")
+                f"unavailable: {reason}")
         return mlx_spynet_flow(p, ref, supp)
     return engine.flow(ref, supp).astype(ref.dtype)
 

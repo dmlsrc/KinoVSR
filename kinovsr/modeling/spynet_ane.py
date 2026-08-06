@@ -69,6 +69,11 @@ _MLMULTIARRAY_FLOAT16 = 0x10000 | 16  # MLMultiArrayDataTypeFloat16
 # Engines are keyed by (weights identity, padded geometry, level count) and
 # reused across frames; a run touches one or two geometries at most.
 _ENGINES: dict[tuple, Any] = {}
+# Setup failures are remembered per engine key so a broken conversion is not
+# retried every frame, while other checkpoints and geometries stay live.
+# _UNAVAILABLE is reserved for environment-level problems (missing bindings
+# or schema) that no key can recover from.
+_FAILED: dict[tuple, str] = {}
 _UNAVAILABLE: str | None = None
 
 
@@ -133,10 +138,24 @@ def _emit_level(params: dict, lvl: int, levels: int, h: int, w: int):
 
     t = "x"
     for j in range(5):
+        weight = params[f"{base}.{j}.conv.weight"]
+        # pad_spynet_gates widens the first conv's input channels for MLX's
+        # implicit-gemm gate; this graph's input keeps the checkpoint's own
+        # channel count, so emit only the channels the incoming tensor
+        # carries. The pad is all zeros, which makes the slice exact -
+        # anything else means the weight and the graph genuinely disagree.
+        in_c = g.shape[t][1]
+        if weight.shape[-1] > in_c:
+            if bool(mx.any(weight[..., in_c:] != 0)):
+                raise ValueError(
+                    f"SpyNet level {lvl} conv {j} carries "
+                    f"{weight.shape[-1]} input channels against a "
+                    f"{in_c}-channel tensor, and the extra channels are "
+                    f"not zero padding")
+            weight = weight[..., :in_c]
         # Repo weights are MLX OHWI (O, kH, kW, I); MIL conv wants OIHW.
         weight = mx.contiguous(mx.transpose(
-            params[f"{base}.{j}.conv.weight"].astype(mx.float32),
-            (0, 3, 1, 2)))
+            weight.astype(mx.float32), (0, 3, 1, 2)))
         bias = params[f"{base}.{j}.conv.bias"].astype(mx.float32)
         t = g.conv2d(t, weight, bias, tag=f"c{j}", pad=3)
         if j < 4:
@@ -423,8 +442,8 @@ def engine_for(params: dict, shape: tuple) -> AneSpyNet | None:
     """Engine for this batch/geometry, or ``None`` to stay on pure MLX.
 
     Conversion happens once per geometry and is cached on disk; a failure
-    anywhere here is reported once and then remembered as unavailable, so a
-    run never pays a broken path twice.
+    is remembered for its (weights, geometry) key, so a run never pays a
+    broken path twice while other checkpoints and geometries stay live.
     """
     global _UNAVAILABLE
     if unavailable_reason() is not None:
@@ -441,6 +460,8 @@ def engine_for(params: dict, shape: tuple) -> AneSpyNet | None:
     engine = _ENGINES.get(key)
     if engine is not None:
         return engine
+    if key in _FAILED:
+        return None
     directory = cache_root() / "spynet-ane" / f"{key[0]}-{w_up}x{h_up}"
     packages = [directory / f"level{i}.mlpackage" for i in range(levels)]
     # Load the vendored Core ML schema ONLY when something actually has to
@@ -460,18 +481,27 @@ def engine_for(params: dict, shape: tuple) -> AneSpyNet | None:
             _convert_models(params, levels, h_up, w_up, directory)
         engine = AneSpyNet(params, packages, levels, h_up, w_up)
     except Exception as exc:  # noqa: BLE001 - any failure falls back
-        _UNAVAILABLE = f"ANE SpyNet setup failed ({type(exc).__name__}: {exc})"
+        _FAILED[key] = f"ANE SpyNet setup failed ({type(exc).__name__}: {exc})"
         return None
     _ENGINES[key] = engine
     return engine
 
 
+def last_failure() -> str | None:
+    """The most recent per-engine setup failure, for error reporting."""
+    if not _FAILED:
+        return None
+    return next(reversed(_FAILED.values()))
+
+
 def reset_cache() -> None:
-    """Drop live engines and the availability verdict (tests)."""
+    """Drop live engines, per-key failures, and the availability verdict
+    (tests)."""
     global _UNAVAILABLE
     _ENGINES.clear()
+    _FAILED.clear()
     _UNAVAILABLE = None
 
 
 __all__ = ["AneSpyNet", "engine_for", "padded_geometry", "cache_root",
-           "reset_cache", "unavailable_reason"]
+           "last_failure", "reset_cache", "unavailable_reason"]
