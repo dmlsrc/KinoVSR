@@ -57,7 +57,6 @@ dev = [
     "opencv-python-headless>=5.0",
     "pytest>=9.1.0",
     "ruff>=0.15.17",
-    "rumdl>=0.2.44",
     # Torch is the checkpoint-reading oracle: test fixtures save .pth files,
     # the family-local layout converters read them, and
     # scripts/dev/pth_to_safetensors.py cross-checks the torch-free

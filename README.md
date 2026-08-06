@@ -101,7 +101,10 @@ including frame ownership and lifetime rules.
 
 ## Development
 
-Install the `[dev]` extra with `uv pip install -e '.[dev]'`, then use the
+Install the `[dev]` extra with `uv pip install -e '.[dev]'`. The Markdown
+linter is a standalone Rust tool installed outside the venv (`brew install
+rumdl`, or `cargo install rumdl`); its rules live in `[tool.rumdl]` in
+`pyproject.toml` so every install checks the same way. Then use the
 lightweight runner for the common feedback loops:
 
 ```bash
