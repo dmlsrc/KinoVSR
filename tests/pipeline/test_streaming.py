@@ -593,8 +593,17 @@ def test_source_decode_and_bridge_have_distinct_owners() -> None:
         <= source_events
 
 
-def test_terminal_mlx_value_is_rebuilt_on_the_host_stream() -> None:
+def test_terminal_mlx_value_is_rebuilt_on_the_host_stream(monkeypatch) -> None:
     import mlx.core as mx
+
+    asarray = mx.asarray
+    copy_modes = []
+
+    def track_asarray(value, *args, **kwargs):
+        copy_modes.append(kwargs.get("copy"))
+        return asarray(value, *args, **kwargs)
+
+    monkeypatch.setattr(mx, "asarray", track_asarray)
 
     class AddOne(_Pass):
         def process(self, unit, context):
@@ -625,6 +634,7 @@ def test_terminal_mlx_value_is_rebuilt_on_the_host_stream() -> None:
     assert output.payload.shape == (2, 2, 3)
     assert output.payload.dtype == mx.float32
     assert output.payload.tolist() == (source + 1).tolist()
+    assert copy_modes == [False]
 
 
 def test_shared_affinity_prefers_ready_downstream_work() -> None:

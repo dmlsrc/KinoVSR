@@ -25,7 +25,6 @@ from kinovsr.modeling.vsr_blocks import (
     flow_warp,
     history_improve_gate,
     lrelu,
-    pad_spynet_gates,
     resize,
 )
 from kinovsr.modeling.weights import resolve_weights as _resolve_weights
@@ -56,14 +55,10 @@ def _compiled_fwd(p: dict):
 
     def make():
         def step(frame, feat_prop, backward_feat):
-            parts = [frame, feat_prop]
-            fpad = p["basicvsr.forward_resblocks.main.0.weight"].shape[-1] - sum(
-                t.shape[-1] for t in parts
-            )
-            if fpad:  # gate-padded weight (_pad_backbone_gates)
-                parts.append(mx.zeros((*feat_prop.shape[:3], fpad), dtype=feat_prop.dtype))
             fp = _resblocks_with_input(
-                mx.concatenate(parts, axis=-1), p, "basicvsr.forward_resblocks"
+                mx.concatenate([frame, feat_prop], axis=-1),
+                p,
+                "basicvsr.forward_resblocks",
             )
             out = mx.concatenate([backward_feat, fp], axis=-1)
             out = lrelu(conv(out, p, "basicvsr.fusion", pad=0))
@@ -146,24 +141,7 @@ def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict
     missing = [k for k in required if k not in p]
     if missing:
         raise ValueError(f"{src} is not a RealBasicVSR generator checkpoint; missing {missing}")
-    pad_spynet_gates(p)  # SPyNet first convs 8->16 (see vsr_blocks)
-    _pad_backbone_gates(p)
     return p
-
-
-def _pad_backbone_gates(p: dict) -> None:
-    """Zero-pad the two propagation backbones' input convs from 67 to 80 channels (in
-    place, same key). Their input is concat(frame 3, feat_prop 64) = 67, and 67%16 != 0
-    fails MLX's implicit-GEMM gate -- the conv ran on the ~1.55x-slower general kernel
-    twice per frame. _basicvsr appends matching zero channels, so the math is exact."""
-    for prefix in ("basicvsr.backward_resblocks", "basicvsr.forward_resblocks"):
-        k = f"{prefix}.main.0.weight"
-        if k in p:
-            w = p[k]
-            cin = w.shape[-1]
-            if cin > 4 and cin % 16:
-                pad = 16 - cin % 16
-                p[k] = mx.concatenate([w, mx.zeros((*w.shape[:3], pad), dtype=w.dtype)], axis=-1)
 
 
 def _clean(frames: list, p: dict, dynamic_refine_thres: float, max_iters: int) -> list:
@@ -283,14 +261,8 @@ def _basicvsr(
                 feat_prop = feat_prop * gate_b[i]
             elif use_scalar:
                 feat_prop = feat_prop * float(history_strength)
-        parts = [frames[i], feat_prop]
-        bpad = p["basicvsr.backward_resblocks.main.0.weight"].shape[-1] - sum(
-            t.shape[-1] for t in parts
-        )
-        if bpad:  # gate-padded weight (_pad_backbone_gates)
-            parts.append(mx.zeros((*feat_prop.shape[:3], bpad), dtype=feat_prop.dtype))
         feat_prop = compiled_resblocks(
-            mx.concatenate(parts, axis=-1),
+            mx.concatenate([frames[i], feat_prop], axis=-1),
             p,
             "basicvsr.backward_resblocks",
         )

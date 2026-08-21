@@ -29,28 +29,35 @@ slower. The gates, as of the MLX version in use:
 | grouped implicit GEMM | (C_per_group<=4 or %16==0) and (O_per_group<=16 or %16==0) | fine for small group counts |
 | winograd | 3x3, stride 1, no dilation/flip, C%32==0, O%32==0, **C+O>=256**, input >= 4096 px | fastest for mid-size 3x3 convs |
 | implicit GEMM (specialized) | (C<=4 or C%16==0) and (O<=16 or O%16==0) | the good default |
+| implicit GEMM (automatic input pad) | groups=1, stride/input-dilation=1, kernel area>=9, N*OH*OW>=256, O aligned | MLX 0.32.1 pads C and the weight to %16 internally |
 | implicit GEMM (general) | everything else | the 2-4x-slower fallback |
 
 Practical rules:
 
 - **Audit every conv's (C, O) against these gates when porting a net.** A `%16`
-  miss is invisible in the code and costs 2-4x. Found and fixed in this codebase:
-  STDF `offset_mask` (32->189, its FLOP-heaviest conv, 1.9x), STDF `in_conv`
-  (7->32, 2.0x), FastDVDnet `inc0` (30 outputs/group on the explicit-grouped
-  fallback, 4.1x), SPyNet's first conv (8->32 7x7, 2.5x), BasicVSR++
-  `conv_offset.0` (196->64, 1.45x), RealBasicVSR backbone `main.0` (67->64, 1.55x).
-- **Audit runtime concat widths, not just weight files.** The last two misses
-  above only exist at runtime (`concat(cond, flow1, flow2)` = 196 channels); a
-  weights-only shape sweep cannot see them.
-- **The fix is zero-padding, and it is exact.** Pad weight columns/filters with
-  zeros to the next %16 boundary (and append matching zero channels to the input,
-  or slice junk output channels off). Zero weights contribute nothing; only the
-  kernel changes. Most of these fixes measured bit-exact end to end.
+  miss is invisible in the model code. MLX 0.32.1 now repairs the common
+  ungrouped input-width case internally: that supersedes KinoVSR's former manual
+  pads for STDF `in_conv` (7->32), SPyNet's first conv (8->32), BasicVSR++
+  `conv_offset.0` (196->64), and RealBasicVSR `main.0` (67->64). A compiled
+  Metal A/B was bit-identical; the automatic/manual timing ratio ranged
+  0.944x-1.039x.
+- **Manual padding is still required for misses outside that narrow gate.** Keep
+  STDF `offset_mask` (189 output channels), FastDVDnet `inc0` (30 outputs/group),
+  BSVD c32's 30-channel intermediate, and RealViformer's 1x1/grouped/output-width
+  GDFN pads. MLX does not automatically pad output channels or grouped convs,
+  and the automatic path excludes 1x1 kernels.
+- **Audit runtime concat widths, not just weight files.** They determine whether
+  the automatic input path is eligible, even though the application no longer
+  has to materialize matching zero channels for eligible convolutions.
 - **Padding is not automatically a win.** FastDVDnet `inc3` (90->32) on the
   general path *beat* the specialized path at 96->32 (thin-N inefficiency), and
   padding toward the winograd gate costs real FLOPs (zero-padded weights still
   multiply) -- 64->64 at C+O=128 cannot be pushed to 256 profitably. Measure the
   exact shapes before and after; never assume.
+- **Keep the direct slice/concatenate reflection pads.** MLX 0.32.1's native
+  `reflect`/`symmetric` modes are exact and cleaner, but production-geometry A/Bs
+  measured them 1.08x-1.62x slower (0.03-0.20 ms absolute) than KinoVSR's current
+  compiled helpers.
 
 ## 2. Kernel-shape pathologies (and their exact-math fixes)
 
@@ -875,7 +882,8 @@ state_dicts; NAFNet ships `params` only.
   reference geometry.
 - Reuse the shared blocks: a checkpoint's SpyNet is usually BasicSR's or
   mmagic's -- semantically identical to `vsr_blocks.spynet_flow`; remap key
-  names at load and the compiled + gate-padded implementation comes free.
+  names at load and the compiled implementation comes free. MLX 0.32.1 performs
+  the eligible first-convolution input padding inside its Metal dispatch.
 - Fractional FFN expansion factors produce gate-missing widths: RealViformer's
   2.66 makes hidden dims 127/255/510, putting all 75 GDFN convs on the general
   path. The per-half zero-pad (project_in/dwconv rows become [first_h, zeros,

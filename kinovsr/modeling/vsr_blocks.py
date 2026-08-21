@@ -210,22 +210,6 @@ def _replicate_pad_to(x: Any, oh: int, ow: int) -> Any:
 
 
 # ---- SPyNet ----------------------------------------------------------------
-def pad_spynet_gates(p: dict) -> None:
-    """Zero-pad each SPyNet basic module's FIRST conv from 8 to 16 input channels
-    (in place, same key). C=8 fails MLX's implicit-GEMM gate (C<=4 or C%16==0,
-    mlx conv.cpp) so the finest-level 7x7 conv ran on the ~2.5x-slower general
-    kernel. spynet_flow appends matching zero channels to the module input, so the
-    math is exact (zero columns x zero channels). The ANE emitter slices this pad
-    back off when building its fixed 8-channel graphs (spynet_ane._emit_level);
-    a padded dict once failed CoreML compile there and silently fell back to MLX.
-    Call after load_params; a no-op when the keys are absent or already padded."""
-    for lvl in range(6):
-        k = f"spynet.basic_module.{lvl}.basic_module.0.conv.weight"
-        if k in p and p[k].shape[-1] == 8:
-            w = p[k]
-            p[k] = mx.concatenate([w, mx.zeros((*w.shape[:3], 8), dtype=w.dtype)], axis=-1)
-
-
 def _spynet_basic_module(x: Any, p: dict, lvl: int) -> Any:
     base = f"spynet.basic_module.{lvl}.basic_module"
     for j in (0, 1, 2, 3):
@@ -253,16 +237,11 @@ def spynet_flow(p: dict, ref: Any, supp: Any) -> Any:
     # coarsest pyramid level, then every level starts with 2x upsampling and
     # replicate bottom/right padding if the coarsest level is odd.
     flow = mx.zeros((n, refs[0].shape[1] // 2, refs[0].shape[2] // 2, 2), dtype=ref.dtype)
-    # Gate-padded first conv (pad_spynet_gates): append zero channels to match.
-    inp_pad = p["spynet.basic_module.0.basic_module.0.conv.weight"].shape[-1] - 8
     for lvl in range(levels):
         flow_up = resize(flow, flow.shape[1] * 2, flow.shape[2] * 2, True) * 2.0
         flow_up = _replicate_pad_to(flow_up, refs[lvl].shape[1], refs[lvl].shape[2])
         warped = flow_warp(supps[lvl], flow_up, "border")
-        parts = [refs[lvl], warped, flow_up]  # (N,h,w,8)
-        if inp_pad:
-            parts.append(mx.zeros((*refs[lvl].shape[:3], inp_pad), dtype=ref.dtype))
-        inp = mx.concatenate(parts, axis=-1)
+        inp = mx.concatenate([refs[lvl], warped, flow_up], axis=-1)  # (N,h,w,8)
         flow = flow_up + _spynet_basic_module(inp, p, lvl)
     flow = resize(flow, h, w, False)
     return mx.stack([flow[..., 0] * (w / w_up), flow[..., 1] * (h / h_up)], axis=-1)

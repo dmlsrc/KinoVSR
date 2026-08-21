@@ -21,7 +21,7 @@ The SpyNet inside is BasicSR's (keys 'spynet.basic_module.N.basic_module.{0,2,..
 its semantics (resize-up to ceil-32, avg-pool pyramid, border-warp, align-corners
 flow upsampling, resize-back with scale correction) match vsr_blocks.spynet_flow
 exactly, so the keys are remapped to the mmagic naming at load and the shared
-compiled + gate-padded implementation is reused.
+compiled implementation is reused.
 
 fp16 with fp32 islands where reductions span the full spatial extent: the q/k
 L2-normalization over H*W tokens (a fp16 sum of ~400k squares overflows 65504 --
@@ -37,7 +37,7 @@ from typing import Any
 import mlx.core as mx
 
 from kinovsr.modeling.compile_cache import cached as _cached
-from kinovsr.modeling.vsr_blocks import compiled_spynet_flow, flow_warp, pad_spynet_gates, resize
+from kinovsr.modeling.vsr_blocks import compiled_spynet_flow, flow_warp, resize
 from kinovsr.modeling.weights import resolve_weights as _resolve_weights
 from kinovsr.settings import default_settings
 
@@ -71,7 +71,7 @@ def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict
     """Load + lay out the checkpoint. Conv weights -> NHWC; Linear weights stay
     (out,in); the vestigial attn_merge masktemp is dropped; BasicSR SpyNet keys are
     remapped to the mmagic naming so vsr_blocks.spynet_flow drives them; SpyNet
-    mean/std -> NHWC broadcast shape; the SpyNet first-conv gate pad is applied."""
+    mean/std -> NHWC broadcast shape."""
     w = mx.load(str(resolve_weights(path)))
     p: dict = {}
     for k, v in w.items():
@@ -88,7 +88,6 @@ def load_params(path: str | Path | None = None, dtype: Any = mx.float16) -> dict
         p[k] = a.astype(dtype)
     if "shallow_extraction.0.weight" not in p:
         raise ValueError("not a RealViformer checkpoint")
-    pad_spynet_gates(p)
     _pad_gdfn_gates(p)
     return p
 

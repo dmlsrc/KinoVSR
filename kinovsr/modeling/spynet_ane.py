@@ -139,20 +139,12 @@ def _emit_level(params: dict, lvl: int, levels: int, h: int, w: int):
     t = "x"
     for j in range(5):
         weight = params[f"{base}.{j}.conv.weight"]
-        # pad_spynet_gates widens the first conv's input channels for MLX's
-        # implicit-gemm gate; this graph's input keeps the checkpoint's own
-        # channel count, so emit only the channels the incoming tensor
-        # carries. The pad is all zeros, which makes the slice exact -
-        # anything else means the weight and the graph genuinely disagree.
         in_c = g.shape[t][1]
-        if weight.shape[-1] > in_c:
-            if bool(mx.any(weight[..., in_c:] != 0)):
-                raise ValueError(
-                    f"SpyNet level {lvl} conv {j} carries "
-                    f"{weight.shape[-1]} input channels against a "
-                    f"{in_c}-channel tensor, and the extra channels are "
-                    f"not zero padding")
-            weight = weight[..., :in_c]
+        if weight.shape[-1] != in_c:
+            raise ValueError(
+                f"SpyNet level {lvl} conv {j} expected {in_c} input "
+                f"channels, got {weight.shape[-1]}; reload the canonical "
+                "checkpoint weights")
         # Repo weights are MLX OHWI (O, kH, kW, I); MIL conv wants OIHW.
         weight = mx.contiguous(mx.transpose(
             weight.astype(mx.float32), (0, 3, 1, 2)))

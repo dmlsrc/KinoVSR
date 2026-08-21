@@ -10,7 +10,6 @@ from kinovsr.modeling import spynet_ane
 from kinovsr.modeling.vsr_blocks import (
     compiled_spynet_flow,
     mlx_spynet_flow,
-    pad_spynet_gates,
     spynet_flow,
 )
 
@@ -41,14 +40,13 @@ def _isolate_cache(tmp_path, monkeypatch):
     reset_settings()
 
 
-def _broken_pad(params):
-    """A dict whose first conv carries extra NON-zero input channels, so its
-    conversion must fail (the emitter refuses to slice non-padding away)."""
+def _wrong_input_width(params):
+    """A noncanonical dict whose first convolution was padded from 8 to 16."""
     bad = dict(params)
     k = "spynet.basic_module.0.basic_module.0.conv.weight"
     w = bad[k]
     bad[k] = mx.concatenate(
-        [w, mx.ones((*w.shape[:3], 8), dtype=w.dtype)], axis=-1)
+        [w, mx.zeros((*w.shape[:3], 8), dtype=w.dtype)], axis=-1)
     return bad
 
 
@@ -77,16 +75,16 @@ class TestGeometry:
 
 class TestFailureScoping:
     """A failed conversion is remembered for its own key only. This
-    regressed: gate-padded weights broke conversion, and the then-global
-    verdict blacklisted every engine for the rest of the process."""
+    regressed when one malformed weight dictionary made the then-global
+    verdict blacklist every engine for the rest of the process."""
 
     def test_a_broken_key_does_not_poison_the_availability_verdict(
             self, params):
         if spynet_ane.unavailable_reason():
             pytest.skip(spynet_ane.unavailable_reason())
-        assert spynet_ane.engine_for(_broken_pad(params), (1, 96, 128, 3)) is None
+        assert spynet_ane.engine_for(_wrong_input_width(params), (1, 96, 128, 3)) is None
         assert spynet_ane.unavailable_reason() is None
-        assert "not zero padding" in (spynet_ane.last_failure() or "")
+        assert "expected 8 input channels, got 16" in (spynet_ane.last_failure() or "")
 
 
 class TestBackendSelection:
@@ -171,30 +169,10 @@ class TestAneParity:
             mx.eval(again)
             assert float(mx.max(mx.abs(first - again))) == 0.0
 
-    def test_gate_padded_weights_still_reach_the_ane(self, params):
-        """basicvsrpp/realbasicvsr/realviformer hand engine_for a dict whose
-        first convs pad_spynet_gates widened to 16 input channels; the
-        emitted graph must slice back to the checkpoint's 8. This regressed:
-        'KernelChannels (16) != InputChannels (8)' at CoreML compile, and
-        those families silently fell back to the pure-MLX flow."""
-        a, b = _pair()
-        self._engine(params, a.shape)   # skip only when the ANE is absent
-        padded = dict(params)
-        pad_spynet_gates(padded)
-        first = "spynet.basic_module.0.basic_module.0.conv.weight"
-        assert padded[first].shape[-1] == 16
-        engine = spynet_ane.engine_for(padded, a.shape)
-        assert engine is not None, spynet_ane.last_failure()
-        got = engine.flow(a, b)
-        want = spynet_flow(params, a, b)
-        mx.eval(got, want)
-        epe = mx.sqrt(mx.sum((got - want) ** 2, axis=-1))
-        assert float(mx.mean(epe)) < 0.02, float(mx.mean(epe))
-
     def test_one_broken_key_leaves_other_engines_live(self, params):
         a, b = _pair()
         engine = self._engine(params, a.shape)
-        assert spynet_ane.engine_for(_broken_pad(params), a.shape) is None
+        assert spynet_ane.engine_for(_wrong_input_width(params), a.shape) is None
         assert spynet_ane.engine_for(params, a.shape) is engine
 
     def test_conversion_is_cached_on_disk(self, params, tmp_path):
