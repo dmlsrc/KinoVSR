@@ -29,7 +29,12 @@ the Rich-backed implementation from `kinovsr.ui`.
 
 from __future__ import annotations
 
+import atexit as _atexit
 from typing import TYPE_CHECKING, Any
+
+from .modeling.mlx_runtime import (
+    clear_mlx_thread_state as _clear_mlx_thread_state,
+)
 
 if TYPE_CHECKING:
     from .media.audio import AudioTrack
@@ -38,6 +43,11 @@ if TYPE_CHECKING:
     from .native.vsr import VsrSession
     from .native.writer import AVWriter
     from .processors.cut_detect import CutDetector
+
+# MLX 0.32.1 clears its Python-bearing compile cache through clear_streams().
+# Register while the interpreter is healthy, but keep the callback lazy so a
+# lightweight KinoVSR import still does not import MLX or initialize Metal.
+_atexit.register(_clear_mlx_thread_state)
 
 # Re-exports resolve lazily (PEP 562): importing the package loads no
 # PyObjC framework and no MLX, so `import kinovsr` / `kinovsr.api` stay

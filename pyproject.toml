@@ -30,33 +30,33 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "mlx>=0.32.0",
+    "mlx>=0.32.1",
     # Serializes first-party Core ML model conversions (kinovsr.native.anemil);
     # abi3 wheels, imported lazily and only when a conversion actually runs.
-    "protobuf>=4.25",
-    "rich>=15.0",
-    "pyobjc-core>=12.2",
-    "pyobjc-framework-AVFoundation>=12.2",
-    "pyobjc-framework-CoreAudio>=12.2",
-    "pyobjc-framework-CoreMedia>=12.2",
-    "pyobjc-framework-Cocoa>=12.2",
-    "pyobjc-framework-libdispatch>=12.2",
-    "pyobjc-framework-Metal>=12.2",
-    "pyobjc-framework-MetalFX>=12.2",
-    "pyobjc-framework-MetalPerformanceShaders>=12.2",
-    "pyobjc-framework-Quartz>=12.2",
-    "pyobjc-framework-VideoToolbox>=12.2",
-    "pyobjc-framework-Vision>=12.2",
+    "protobuf>=7.36.0",
+    "rich>=15.0.0",
+    "pyobjc-core>=12.2.2",
+    "pyobjc-framework-AVFoundation>=12.2.2",
+    "pyobjc-framework-CoreAudio>=12.2.2",
+    "pyobjc-framework-CoreMedia>=12.2.2",
+    "pyobjc-framework-Cocoa>=12.2.2",
+    "pyobjc-framework-libdispatch>=12.2.2",
+    "pyobjc-framework-Metal>=12.2.2",
+    "pyobjc-framework-MetalFX>=12.2.2",
+    "pyobjc-framework-MetalPerformanceShaders>=12.2.2",
+    "pyobjc-framework-Quartz>=12.2.2",
+    "pyobjc-framework-VideoToolbox>=12.2.2",
+    "pyobjc-framework-Vision>=12.2.2",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "av>=18.0",
+    "av>=18.1.0",
     # NumPy is a dev/test/diagnostic oracle, not a core runtime dependency.
-    "numpy>=2.4.6",
-    "opencv-python-headless>=5.0",
-    "pytest>=9.1.0",
-    "ruff>=0.15.17",
+    "numpy>=2.5.2",
+    "opencv-python-headless>=5.0.0.93",
+    "pytest>=9.1.1",
+    "ruff>=0.16.4",
     # Torch is the checkpoint-reading oracle: test fixtures save .pth files,
     # the family-local layout converters read them, and
     # scripts/dev/pth_to_safetensors.py cross-checks the torch-free
@@ -64,16 +64,16 @@ dev = [
     # of torch) is that oracle's writer. Neither is ever a runtime
     # dependency: the product reads and writes safetensors through
     # mlx.core.
-    "safetensors>=0.7",
-    "torch>=2.13",
+    "safetensors>=0.8.0",
+    "torch>=2.13.0",
 ]
 ffmpeg = [
-    "av>=18.0",
+    "av>=18.1.0",
 ]
 eval = [
-    "av>=18.0",
-    "numpy>=2.4.6",
-    "opencv-python-headless>=5.0",
+    "av>=18.1.0",
+    "numpy>=2.5.2",
+    "opencv-python-headless>=5.0.0.93",
 ]
 
 [project.urls]

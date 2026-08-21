@@ -649,6 +649,20 @@ def test_shared_affinity_prefers_ready_downstream_work() -> None:
     assert order == ["downstream", "upstream"]
 
 
+def test_affinity_lane_clears_loaded_mlx_state_before_thread_exit(
+    monkeypatch,
+) -> None:
+    import sys
+
+    calls = []
+    fake_mx = SimpleNamespace(clear_streams=lambda: calls.append(threading.get_ident()))
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
+    lane = _AffinityLane("mlx-cleanup-test")
+    owner = lane.call(threading.get_ident)
+    lane.stop()
+    assert calls == [owner]
+
+
 def test_terminal_consumption_releases_a_pre_boundary_payload() -> None:
     resets = []
 

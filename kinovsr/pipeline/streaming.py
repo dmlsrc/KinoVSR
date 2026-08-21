@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from kinovsr.modeling.mlx_runtime import clear_mlx_thread_state
 from kinovsr.processors import (
     Boundary,
     BoundaryKind,
@@ -85,11 +86,19 @@ class _AffinityLane:
 
     def _run(self) -> None:
         self._thread_id = threading.get_ident()
-        while True:
-            future, callback = self._take_ready()
-            if callback is _LANE_STOP:
-                return
-            self._execute(future, callback)
+        try:
+            while True:
+                future, callback = self._take_ready()
+                if callback is _LANE_STOP:
+                    return
+                self._execute(future, callback)
+        finally:
+            # MLX 0.32.1 stores compiled output structures in a native
+            # thread-local cache.  Clear it while this Python thread is still
+            # valid; its later pthread TLS destructor cannot safely decref
+            # those objects.  The helper is a no-op for lanes that never
+            # loaded MLX.
+            clear_mlx_thread_state()
 
     def _take_ready(self) -> tuple[Future[Any] | None, Any]:
         with self._condition:
@@ -1070,7 +1079,10 @@ class _StreamingGraph:
         if stream is None:
             raise RuntimeError("host MLX stream is unavailable")
         with mx.stream(stream):
-            raw = mx.array(memoryview(value.data))
+            # MLX 0.32.1 can retain an owned host buffer directly.  The bytes
+            # snapshot remains the stream-safe ownership boundary, while the
+            # native zero-copy import avoids copying it a second time here.
+            raw = mx.asarray(memoryview(value.data), copy=False)
             payload = raw.view(value.dtype).reshape(value.shape)
             mx.eval(payload)
         return unit.with_payload(payload)
