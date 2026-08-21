@@ -126,7 +126,17 @@ ignore = [
 [tool.rumdl]
 line-length = 100
 respect-gitignore = true
+# Workspace plain-ASCII convention: MD084 (invisible Unicode) and MD088
+# (Unicode quotes/dashes) are opt-in rules; extend-enable adds them without
+# replacing the default rule set.
+extend-enable = ["MD084", "MD088"]
 
 [tool.rumdl.MD013]
 code-blocks = false
 tables = false
+
+[tool.rumdl.MD084]
+strict = true
+
+[tool.rumdl.MD088]
+normalize-dashes = true
