@@ -1,0 +1,159 @@
+"""Real-ESRGAN's processor factory: a stateless per-frame upscaler family.
+
+Profiles resolve from the family manifest with per-profile scales
+(x2plus is the 2x checkpoint). ``denoise_strength`` is the dni dial of
+the general profile only - it blends against the wdn companion weight
+the loader locates by filename.
+"""
+
+import dataclasses
+import functools
+from collections.abc import Mapping
+from typing import ClassVar
+
+from kinovsr.config.helpers import reject_unknown_keys, typed_value
+from kinovsr.modeling.weights import load_registered
+from kinovsr.processors.capabilities import Capability, CapabilitySpec
+from kinovsr.processors.feed_driver import FeedFlushProcessor
+from kinovsr.processors.protocol import PipelineContext
+from kinovsr.processors.specs import (
+    Domain,
+    DType,
+    Layout,
+    StreamConstraint,
+    StreamSpec,
+)
+from kinovsr.settings import Settings
+
+from .upscaler import RealEsrganUpscaler
+
+_PROFILES = (
+    "general",
+    "x4plus",
+    "realesrnet",
+    "bsrgan",
+    "bsrnet",
+    "x2plus",
+    "anime",
+    "animevideo",
+    "esrgan",
+)
+_DEFAULT_PROFILE = "general"
+
+
+@functools.cache
+def _profile_scales() -> dict[str, int]:
+
+    manifest = load_registered("realesrgan")
+    return {name: int(profile.defaults["scale"]) for name, profile in manifest.profiles.items()}
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RealEsrganStageConfig:
+    weights_spec: str
+    scale: int
+    denoise_strength: float
+
+
+def _produces(spec: StreamSpec, config: object) -> StreamSpec:
+    assert isinstance(config, RealEsrganStageConfig)
+    frame = dataclasses.replace(spec.frame, geometry=spec.frame.geometry.scaled(config.scale))
+    return dataclasses.replace(spec, frame=frame)
+
+
+class RealEsrganFactory:
+    name = "realesrgan"
+
+    capabilities: ClassVar[dict[Capability, CapabilitySpec]] = {
+        Capability.UPSCALE: CapabilitySpec(
+            capability=Capability.UPSCALE,
+            profiles=_PROFILES,
+            accepts=StreamConstraint(
+                layouts=(Layout.MLX_RGB_HWC,),
+                dtypes=(DType.FLOAT32, DType.FLOAT16),
+                domains=(Domain.UNIT, Domain.UNIT_SANITIZED),
+            ),
+            produces=_produces,
+        ),
+    }
+
+    def parse_config(
+        self,
+        raw: Mapping[str, object],
+        *,
+        capability: Capability,  # noqa: ARG002 - protocol signature
+        profile: str | None,
+        settings: Settings,
+    ) -> RealEsrganStageConfig:
+        reject_unknown_keys(raw, ("weights", "scale", "denoise_strength"))
+        weights = typed_value(raw, "weights", str) or settings.realesrgan_weights
+        denoise_strength = typed_value(raw, "denoise_strength", float, 1.0)
+        if not 0.0 <= denoise_strength <= 1.0:
+            raise ValueError("denoise_strength must be in [0, 1]")
+        if denoise_strength < 1.0:
+            token = weights or profile or _DEFAULT_PROFILE
+            if token != "general" and "general_x4v3" not in str(token):
+                raise ValueError(
+                    "denoise_strength is the dni dial of the general "
+                    "profile only (it blends against the wdn companion "
+                    "weight); other checkpoints have none"
+                )
+        scale = typed_value(raw, "scale", int)
+        scales = _profile_scales()
+        # Every scale-bearing selector must agree: the profile, a
+        # profile-named weights token, and an explicit scale. Validating only
+        # one let profile='x4plus' + weights='x2plus' pass open and then fail
+        # when the runtime loaded the 2x checkpoint against the advertised 4x.
+        implied: dict[str, int] = {}
+        if profile in scales:
+            implied["profile"] = scales[profile]
+        if weights in scales:
+            implied["weights"] = scales[weights]
+        if scale is not None:
+            if scale <= 0:
+                raise ValueError("scale must be a positive integer")
+            implied["scale"] = scale
+        distinct = set(implied.values())
+        if len(distinct) > 1:
+            parts = ", ".join(f"{k}={v}x" for k, v in sorted(implied.items()))
+            raise ValueError(
+                f"contradictory scales ({parts}); the profile, weights, and "
+                f"scale that resolve must agree on one"
+            )
+        if scale is None:
+            if distinct:
+                scale = distinct.pop()
+            elif weights is not None:
+                raise ValueError(
+                    "state scale when weights is an explicit path (profiles declare it)"
+                )
+            else:
+                scale = scales[_DEFAULT_PROFILE]
+        return RealEsrganStageConfig(
+            weights_spec=weights or profile or _DEFAULT_PROFILE,
+            scale=scale,
+            denoise_strength=denoise_strength,
+        )
+
+    def build(
+        self,
+        config: RealEsrganStageConfig,
+        *,
+        context: PipelineContext,  # noqa: ARG002 - protocol signature
+    ) -> FeedFlushProcessor:
+        def make_driver() -> RealEsrganUpscaler:
+
+            driver = RealEsrganUpscaler(
+                config.weights_spec, denoise_strength=config.denoise_strength
+            )
+            if driver.scale != config.scale:
+                raise ValueError(
+                    f"checkpoint scale {driver.scale}x does not match the "
+                    f"declared scale {config.scale}x"
+                )
+            return driver
+
+        return FeedFlushProcessor(make_driver)
+
+
+FACTORY = RealEsrganFactory()

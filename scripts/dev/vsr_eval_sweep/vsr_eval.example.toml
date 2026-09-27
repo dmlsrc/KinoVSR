@@ -1,0 +1,105 @@
+# Copy to scripts/dev/vsr_eval_sweep/vsr_eval.local.toml and adjust paths for your
+# machine. Relative paths are resolved from this config file's directory.
+
+[sweep]
+# Defaults to the current interpreter when omitted.
+# python = "/path/to/python"
+
+# Defaults to $SHARED_TEMP_DIR/vsr_denoise_sweep_<timestamp>.
+# output_root = "../../path/to/sweep-output"
+
+base_flags = [
+  "--reader", "ffmpeg",
+  "--upscale", "none",
+  "--start", "0",
+  "--end", "5s",
+]
+baseline = "none"
+evaluate_faces = true
+skip_existing = false
+
+[[sweep.clips]]
+label = "old_video_people"
+video = "../../path/to/old-video.mp4"
+
+[[sweep.clips]]
+label = "xiph_face_case"
+video = "../../path/to/xiph-face.y4m"
+
+[[sweep.variants]]
+name = "none"
+flags = []
+
+[[sweep.variants]]
+name = "bsvd_f05_l65"
+flags = [
+  "--denoise", "bsvd",
+  "--noise-map", "auto",
+  "--noise-map-gain", "2.0",
+  "--noise-map-motion-cap", "loose",
+  "--noise-map-masking", "1",
+  "--noise-map-floor", "0.05",
+  "--noise-map-pulse",
+  "--denoise-luma-strength", "0.65",
+  "--denoise-chroma-strength", "1.0",
+]
+
+[[sweep.variants]]
+name = "bsvd_f07_l50"
+flags = [
+  "--denoise", "bsvd",
+  "--noise-map", "auto",
+  "--noise-map-gain", "2.0",
+  "--noise-map-motion-cap", "loose",
+  "--noise-map-masking", "1",
+  "--noise-map-floor", "0.07",
+  "--noise-map-pulse",
+  "--denoise-luma-strength", "0.50",
+  "--denoise-chroma-strength", "1.0",
+]
+
+[[sweep.variants]]
+name = "fastdvd_f05_l45"
+flags = [
+  "--denoise", "fastdvdnet",
+  "--noise-map", "auto",
+  "--noise-map-gain", "1.5",
+  "--noise-map-motion-cap", "loose",
+  "--noise-map-masking", "1",
+  "--noise-map-floor", "0.05",
+  "--noise-map-pulse",
+  "--denoise-luma-strength", "0.45",
+  "--denoise-chroma-strength", "1.0",
+]
+
+# Perceptual metric columns per variant (perceptual_metrics.py):
+# MUSIQ (per-frame opinion), DOVER-Mobile tech/aes/fused (temporal-aware
+# opinion), NIQE (over-smoothing tripwire only), flicker vs source-static
+# pixels plus moving-content deviation (content-erasure guard), VMAF vs
+# source (fidelity anchor). Metrics whose weights or tools are missing
+# leave null columns instead of failing the sweep.
+[perceptual]
+enabled = true
+max_frames = 400
+musiq_every = 10
+metrics = "musiq,dover,niqe,flicker,vmaf"
+
+[face_eval]
+enabled = true
+# The repo includes this small MIT-licensed YuNet model by default.
+# model = "weights/face_detection_yunet_2023mar.onnx"
+max_frames = 150
+threshold = 0.25
+min_side = 20
+# Useful for clips with one-frame false positives on hands/clothes.
+min_track_frames = 1
+contact_sheet = true
+
+# For standalone face scoring without running a sweep, either provide a
+# variants JSON:
+# variants_json = "../../path/to/variants.json"
+#
+# Or inline local variant paths:
+# [face_eval.variants]
+# none = "../../path/to/baseline.mp4"
+# candidate = "../../path/to/candidate.mp4"

@@ -1,0 +1,20 @@
+schema_version = 1
+
+[owner]
+kind = "processor"
+name = "realviformer"
+
+[profiles.x4]
+capabilities = ["upscale"]
+weights = ["x4"]
+
+# Google Drive is the only published source (no direct URL). Convert with
+# --param-key params: the checkpoint carries both params and params_ema
+# and the reference inference loads params (see weights/README.md).
+
+[weights.x4]
+path = "weights/realviformer_x4.safetensors"
+distribution = "external"
+source = "https://drive.google.com/drive/folders/1UzDfFSy5oELl7Z-umF_QhMQhUbUU378y (weights.pth)"
+source_sha256 = "25d49a0128b1ecf218d8717b8a4041748b7fde25d8defb4ce82e53f120de9804"
+license = "MIT"

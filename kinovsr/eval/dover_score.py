@@ -1,0 +1,64 @@
+"""DOVER-Mobile video scorer -- human-opinion-trained *video* quality.
+
+Prints technical (fragments), aesthetic (resize), and fused scores per
+video; higher is better, fused is in (0, 1).  Unlike per-frame metrics
+(MUSIQ, NIQE) the clips pass through the network 32 frames at a time,
+so temporal artifacts -- flicker, pumping, warping -- move the score.
+
+Usage: dover_score.py <video> [...] [--max-frames N] [--weights PATH]
+"""
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+
+import mlx.core as mx
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import av
+
+from kinovsr.eval.models.dover import DoverMobile
+from kinovsr.media.buffer import mlx_array_from_buffer
+from kinovsr.ui.logging import configure_machine_output
+
+_log = logging.getLogger(__name__)
+
+
+def _read_video(path: Path, max_frames: int) -> mx.array:
+
+    out = []
+    with av.open(str(path)) as c:
+        for f in c.decode(c.streams.video[0]):
+            r = f.reformat(format="rgb24")
+            plane = r.planes[0]
+            h, w, stride = r.height, r.width, plane.line_size
+            raw = mlx_array_from_buffer(memoryview(plane)).reshape(h, stride)[:, : w * 3]
+            out.append(raw.reshape(h, w, 3))
+            if max_frames and len(out) >= max_frames:
+                break
+    return mx.stack(out)
+
+
+def run_dover(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="kinovsr metrics dover", description=__doc__)
+    ap.add_argument("videos", nargs="+", type=Path)
+    ap.add_argument(
+        "--max-frames", type=int, default=0, help="cap decoded frames (0 = whole video)"
+    )
+    ap.add_argument("--weights", type=Path, default=None)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    model = DoverMobile(weights=args.weights)
+    results = {}
+    for vp in args.videos:
+        s = model.score(_read_video(vp, args.max_frames))
+        results[str(vp)] = s
+        if not args.json:
+            _log.info(f"tech {s['tech']:8.4f}  aes {s['aes']:8.4f}  fused {s['fused']:6.4f}  {vp}")
+    if args.json:
+        output = configure_machine_output("kinovsr.eval.dover_score.result")
+        output.info("%s", json.dumps(results, indent=2))
+    return 0

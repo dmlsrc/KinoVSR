@@ -1,0 +1,105 @@
+"""Depth-one dispatch pipelining shared by the accelerator backends."""
+
+import contextlib
+import ctypes
+import os
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import NotRequired, TypedDict
+
+QOS_CLASS_USER_INITIATED = 0x19
+
+
+def _set_thread_qos(qos_class: int) -> None:
+    """Assign an explicit Darwin QoS class to an accelerator worker."""
+
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    setter = libc.pthread_set_qos_class_self_np
+    setter.argtypes = [ctypes.c_uint, ctypes.c_int]
+    setter.restype = ctypes.c_int
+    status = int(setter(int(qos_class), 0))
+    if status:
+        raise OSError(
+            status,
+            f"could not set accelerator thread QoS: {os.strerror(status)}",
+        )
+
+
+class _ExecutorOptions(TypedDict):
+    initializer: NotRequired[Callable[[int], None]]
+    initargs: NotRequired[tuple[int]]
+
+
+class DispatchPipeline:
+    """One accelerator dispatch in flight on a dedicated worker thread.
+
+    The reusable overlap primitive for every ANE processor: submit a
+    zero-argument job - a prediction plus its host-side buffer
+    bookkeeping, pure Core ML / MPSGraph and Python, NEVER MLX, which
+    stays on the caller's thread - keep working, and join before touching
+    anything the job writes. One slot is deliberate: depth-one pipelining
+    bounds memory and latency, keeps dispatches back to back (an ANE
+    dispatch issued after 10 ms or more of host idleness pays a 15-23 ms
+    power-state ramp no host-side warm-up avoids), and is all the
+    concurrency a synchronous pull pipeline can put to use.
+    """
+
+    def __init__(
+        self,
+        name: str = "ane-dispatch",
+        *,
+        qos_class: int | None = None,
+    ):
+        self._name = name
+        self._qos_class = qos_class
+        self._executor: ThreadPoolExecutor | None = None
+        self._future: Future[object] | None = None
+
+    @property
+    def in_flight(self) -> bool:
+        return self._future is not None
+
+    def idle(self) -> bool:
+        """True when a join would not block (nothing pending, or done)."""
+        return self._future is None or self._future.done()
+
+    def submit(self, job: Callable[[], object]) -> None:
+        if self._future is not None:
+            raise RuntimeError("a dispatch is already in flight; join first")
+        if self._executor is None:
+            executor_options: _ExecutorOptions = {}
+            if self._qos_class is not None:
+                executor_options = {
+                    "initializer": _set_thread_qos,
+                    "initargs": (self._qos_class,),
+                }
+            self._executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=self._name,
+                **executor_options,
+            )
+        self._future = self._executor.submit(job)
+
+    def join(self) -> None:
+        """Wait out the in-flight job; re-raises what it raised."""
+        future, self._future = self._future, None
+        if future is not None:
+            future.result()
+
+    def drain(self) -> None:
+        """Absorb the in-flight job on an error path (its own error is
+        suppressed so the primary error wins)."""
+
+        future, self._future = self._future, None
+        if future is not None:
+            with contextlib.suppress(BaseException):
+                future.result()
+
+    def close(self) -> None:
+        self.drain()
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+
+
+__all__ = ["QOS_CLASS_USER_INITIATED", "DispatchPipeline"]

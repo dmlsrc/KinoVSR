@@ -1,0 +1,276 @@
+"""The host session: an opened, validated pipeline over caller units.
+
+:func:`open_pipeline` resolves a pipeline config against a concrete
+input :class:`~kinovsr.processors.specs.StreamSpec` and preflight-
+validates every edge before any processing - typed errors surface at
+open time, not mid-stream. The returned :class:`PipelineSession` is
+bound to that spec: :meth:`~PipelineSession.process` feeds the caller's
+frame units into a bounded streaming graph, weights load lazily at the
+first pull, and closing the iterator (or the session, or leaving the
+``with`` block) cancels the run and releases every stage exactly once -
+the :class:`~kinovsr.pipeline.scheduler.ChainRun` semantics, which also
+fix the exception-precedence rules.
+
+A session runs once: stage instances are stateful, so a consumed
+session refuses a second ``process`` instead of silently reusing state.
+Opening a pipeline is cheap (pure resolution; no weights, no Metal
+sessions) - open another for the next stream.
+"""
+
+import dataclasses
+from collections.abc import Iterable, Iterator, Mapping
+from types import TracebackType
+
+import mlx.core as mx
+
+from kinovsr.media.pixel_buffers import ci_cache_owner
+from kinovsr.processors import (
+    FrameUnit,
+    GopWindowPolicy,
+    PipelineContext,
+    PipelineError,
+    Processor,
+    StreamSpec,
+)
+from kinovsr.reporting import Reporter
+from kinovsr.settings import Settings
+
+from .builder import BuildPlan, ResolvedStage, build_processors, resolve_pipeline
+from .ownership import retain_safe_outputs
+from .scheduler import ChainRun, _close_after_failure, run_chain
+from .streaming import SourceBridge, TerminalConsumer
+
+
+class PipelineSession:
+    """One validated pipeline, bound to an input spec, run at most once."""
+
+    def __init__(self, plan: BuildPlan, context: PipelineContext) -> None:
+        self._plan = plan
+        self._context = context
+        self._run: ChainRun | None = None
+        self._consumed = False
+        self._built: tuple[tuple[ResolvedStage, Processor], ...] = ()
+        self._terminal_pool_binding: tuple[object, int, int, int] | None = None
+
+    @property
+    def plan(self) -> BuildPlan:
+        return self._plan
+
+    @property
+    def input_spec(self) -> StreamSpec:
+        return self._plan.input_spec
+
+    @property
+    def output_spec(self) -> StreamSpec:
+        """The validated spec of the units :meth:`process` yields."""
+        return self._plan.output_spec
+
+    def _bind_terminal_output_pool(
+        self,
+        pool: object,
+        pixel_format: int,
+        width: int,
+        height: int,
+    ) -> None:
+        """Offer a file writer pool to a compatible terminal native stage."""
+        if self._consumed:
+            raise PipelineError("output pool must be bound before processing")
+        self._terminal_pool_binding = (pool, int(pixel_format), int(width), int(height))
+
+    def process(
+        self, units: Iterable[FrameUnit], *, retain_outputs: bool = True
+    ) -> Iterator[FrameUnit]:
+        """Stream ``units`` through a bounded graph; yield output FrameUnits.
+
+        Returns an owning iterator: close it (or this session) to cancel
+        at any point, including before the first pull. Stage instances
+        are built now; weights and native sessions materialize at the
+        first pull (each stage's ``prepare``).
+
+        Output ownership (matters only for CVPixelBuffer layouts; MLX
+        payloads are immutable values either way):
+
+        - ``retain_outputs=True`` (default): each output CVPixelBuffer is a
+          fresh, host-owned deep copy - safe to keep indefinitely, even
+          after you feed or recycle the next input.
+        - ``retain_outputs=False``: outputs are yielded as produced, so a
+          payload may alias a borrowed input or a stage's reused buffer and
+          is valid only until the next pull. Copy or hand it off before
+          advancing. The file endpoint attaches its writer as an internal
+          terminal actor instead of exposing these borrowed values.
+        """
+        if self._consumed:
+            raise PipelineError(
+                "this session was already consumed; open_pipeline again "
+                "for the next stream (stage state is never reused)"
+            )
+        self._consumed = True
+        binding, self._terminal_pool_binding = (
+            self._terminal_pool_binding,
+            None,
+        )
+
+        lease = ci_cache_owner()
+        run: ChainRun | None = None
+        active: BaseException | None = None
+        try:
+            built = build_processors(self._plan, self._context)
+            self._built = built
+            run = run_chain(
+                built,
+                units,
+                self._context,
+                finalizers=(lease.close,),
+                input_spec=self._plan.input_spec,
+            )
+            self._run = run
+            if binding is not None and built:
+                hook = getattr(built[-1][1], "_bind_output_pool", None)
+                if callable(hook):
+                    hook(*binding)
+            return retain_safe_outputs(
+                run,
+                self._plan.output_spec,
+                retain_outputs=retain_outputs,
+            )
+        except BaseException as exc:  # broad: cleanup precedence below
+            active = exc
+        self._run = None
+        winner = _close_after_failure(
+            active,
+            run.close if run is not None else lease.close,
+        )
+        raise winner
+
+    def _consume(
+        self,
+        units: Iterable[FrameUnit],
+        consumer: TerminalConsumer,
+        *,
+        source_bridge: SourceBridge | None = None,
+    ) -> ChainRun:
+        """Run the file endpoint as the graph's bounded terminal actor."""
+        if self._consumed:
+            raise PipelineError(
+                "this session was already consumed; open_pipeline again "
+                "for the next stream (stage state is never reused)"
+            )
+        self._consumed = True
+        binding, self._terminal_pool_binding = (
+            self._terminal_pool_binding,
+            None,
+        )
+
+        lease = ci_cache_owner()
+        run: ChainRun | None = None
+        active: BaseException | None = None
+        try:
+            built = build_processors(self._plan, self._context)
+            self._built = built
+            run = run_chain(
+                built,
+                units,
+                self._context,
+                finalizers=(lease.close,),
+                input_spec=self._plan.input_spec,
+                source_bridge=source_bridge,
+                terminal_consumer=consumer,
+            )
+            self._run = run
+            if binding is not None and built:
+                hook = getattr(built[-1][1], "_bind_output_pool", None)
+                if callable(hook):
+                    hook(*binding)
+            return run
+        except BaseException as exc:  # broad: cleanup precedence below
+            active = exc
+        self._run = None
+        winner = _close_after_failure(
+            active,
+            run.close if run is not None else lease.close,
+        )
+        raise winner
+
+    def stage_diagnostics(self) -> list[str]:
+        """End-of-run diagnostic lines from the stages that ran.
+
+        Each stage may expose ``run_diagnostics() -> list[str]`` (the
+        family owns its own reporting - noise-map stats, gate openness,
+        auto-QF reports - exactly the lines the inherited harness printed
+        at end of run); stages without the hook contribute nothing. Call
+        after draining :meth:`process`: the run's iterator closes stages
+        on exhaustion, so hook-bearing stages stash their final report at
+        close and keep answering afterward.
+        """
+        lines: list[str] = []
+        for _stage, processor in self._built:
+            hook = getattr(processor, "run_diagnostics", None)
+            if callable(hook):
+                lines.extend(hook())
+        return lines
+
+    def stage_debug_images(self) -> dict[str, mx.array]:
+        """End-of-run debug maps (suffix -> [0,1] (H,W) array) from stages
+        exposing ``debug_images()``; same lifecycle window as
+        :meth:`stage_diagnostics`. Later stages win a suffix collision
+        (one map of each kind per run, like the harness's single dump)."""
+        images: dict[str, mx.array] = {}
+        for _stage, processor in self._built:
+            hook = getattr(processor, "debug_images", None)
+            if callable(hook):
+                images.update(hook())
+        return images
+
+    def close(self) -> None:
+        """Cancel the active run (if any); safe to call repeatedly."""
+        run, self._run = self._run, None
+        self._terminal_pool_binding = None
+        self._consumed = True
+        if run is not None:
+            run.close()
+
+    def __enter__(self) -> PipelineSession:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+
+def open_pipeline(
+    config: Mapping[str, object],
+    input_spec: StreamSpec,
+    *,
+    settings: Settings | None = None,
+    reporter: Reporter | None = None,
+    gop: GopWindowPolicy | None = None,
+    publication_origin_pts: int | None = None,
+) -> PipelineSession:
+    """Resolve and validate ``config`` against ``input_spec``; return a
+    session ready to process units.
+
+    Every stage edge is validated here (typed errors: unknown families,
+    stage-config problems, stream-contract violations), so a session
+    that opens will not fail preflight mid-stream. ``settings`` defaults
+    to the environment-resolved product settings; ``reporter`` receives
+    phase progress (default: none). ``gop`` is the optional internal
+    reactive-window policy carried through :class:`PipelineContext`.
+    """
+    if settings is None:
+        settings = Settings.from_env()
+    plan = resolve_pipeline(config, input_spec=input_spec, settings=settings)
+    context = PipelineContext(settings=settings)
+    if reporter is not None:
+        context = dataclasses.replace(context, reporter=reporter)
+    if gop is not None:
+        context = dataclasses.replace(context, gop=gop)
+    if publication_origin_pts is not None:
+        context = dataclasses.replace(context, publication_origin_pts=int(publication_origin_pts))
+    return PipelineSession(plan, context)
+
+
+__all__ = ["PipelineSession", "open_pipeline"]

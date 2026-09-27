@@ -1,0 +1,105 @@
+"""Streaming windowed wrapper around the recurrent BasicVSR++ net so it fits a
+frame-at-a-time pipeline. feed()/flush() mirror the FastDVDnet delay-line, but
+every emitted frame is 4x upscaled.
+
+BasicVSR++ is bidirectional + second-order recurrent over the whole clip, so a
+single frame can't be upscaled in isolation. We slide a window of `window`
+frames, emit its interior, and trim `trim` warm-up frames at each window join
+(the propagation's transient edge). Interior frames match the full-clip result
+to ~50 dB; only the clip ends use one-sided context, exactly as the reference.
+
+The sliding-window feed()/flush() machinery lives in ../upscaler_base; this
+wrapper only loads the BasicVSR++ weights and upscales each window.
+"""
+
+import logging
+from collections.abc import Iterator
+from pathlib import Path
+
+import mlx.core as mx
+
+from kinovsr.modeling.upscaler_base import WindowedUpscaler
+
+from . import net
+
+
+class BasicVsrUpscaler(WindowedUpscaler):
+    """Windowed feed()/flush() driver for net.upscale. Each call to feed(rgb)
+    buffers a frame and returns a list of (upscaled_rgb_4x, token) tuples once
+    enough lookahead has arrived; flush() drains the tail. Memory is bounded to
+    ~`window` buffered LR frames regardless of clip length."""
+
+    def __init__(
+        self,
+        weights: str | Path | None = None,
+        window: int = 14,
+        trim: int = 2,
+        flow_mode: str = "spynet",
+        history_strength: float = 1.0,
+        history_gate: str = "off",
+        ensemble: bool = False,
+    ) -> None:
+        if flow_mode not in ("spynet", "zero", "vision"):
+            raise ValueError(
+                f"BasicVSR++ flow_mode must be 'spynet', 'zero', or 'vision'; got {flow_mode!r}"
+            )
+        if history_gate not in ("off", "improve"):
+            raise ValueError(
+                f"BasicVSR++ history_gate must be 'off' or 'improve'; got {history_gate!r}"
+            )
+        if history_strength < 0.0:
+            raise ValueError(f"BasicVSR++ history_strength must be >= 0; got {history_strength!r}")
+        self._p = net.load_params(net.resolve_weights(weights))
+        self._flow_mode = flow_mode
+        self._history_strength = float(history_strength)
+        self._history_gate = history_gate
+        self._ensemble = bool(ensemble)
+        # Window must span both trim edges plus >=1 interior frame to emit.
+        super().__init__(
+            window=max(int(window), 2 * int(trim) + 1),
+            trim=trim,
+            vision_flow_geometries=((2 if ensemble else 1) if flow_mode == "vision" else 0),
+        )
+
+    def _upscale_window(self, frames: list[mx.array]) -> Iterator[mx.array]:
+        fn = net.upscale_ensemble if self._ensemble else net.upscale
+        yield from fn(
+            frames,
+            self._p,
+            flow_mode=self._flow_mode,
+            history_strength=self._history_strength,
+            history_gate=self._history_gate,
+            vision_flow_services=self._vision_flow_services,
+        )
+
+
+_log = logging.getLogger(__name__)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    import math
+
+    def psnr(a: mx.array, b: mx.array) -> float:
+        mse = float(mx.mean((a - b) ** 2))
+        return 99.0 if mse <= 0 else 10.0 * math.log10(1.0 / mse)
+
+    up = BasicVsrUpscaler(window=14, trim=2)
+    N = 18
+    mx.random.seed(0)
+    frames = [mx.random.uniform(shape=(1, 40, 56, 3)) for _ in range(N)]
+    mx.eval(*frames)
+    full = list(net.upscale(frames, up._p))  # full-clip reference
+    mx.eval(*full)
+
+    emitted: list[tuple[mx.array, object]] = []
+    for i, f in enumerate(frames):
+        emitted.extend(up.feed(f[0], token=i))
+    emitted.extend(up.flush())
+    toks = [t for _, t in emitted]
+    _log.info(f"emitted {len(emitted)}/{N} frames, order ok: {toks == list(range(N))}")
+    for idx in (3, N // 2, N - 4):
+        _log.info(
+            f"  interior frame {idx}: windowed-vs-fullclip PSNR = "
+            f"{psnr(emitted[idx][0], full[idx][0]):.1f} dB"
+        )

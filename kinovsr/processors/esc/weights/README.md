@@ -1,0 +1,29 @@
+# ESC-Real weights
+
+Not bundled -- download + convert; the `.safetensors` are gitignored. These are
+`--esc-weights <token>` tokens (default `gan`). sha256 is of the source `.pth`:
+
+| token | download | sha256 |
+| --- | --- | --- |
+| gan (perceptual, Real-ESRGAN-style degradation) | <https://github.com/dslisleedh/ESC/releases/download/1.0.0/ESC_Real_X4_GAN.pth> | `d6932bd01e29c9335f5f678b0e9b31ede906a42244887ab8888b1d39a8667f2d` |
+| mse (fidelity twin) | <https://github.com/dslisleedh/ESC/releases/download/1.0.0/ESC_Real_X4_MSE.pth> | `ba22ae75b5f77382b1046e68634f58a53fc7ff5ffa46714133bfba30811ad943` |
+
+Convert -- the output name must match [`net.py`](../net.py)'s `_VARIANTS`:
+
+```bash
+curl -L -O https://github.com/dslisleedh/ESC/releases/download/1.0.0/ESC_Real_X4_GAN.pth
+kinovsr weights convert ESC_Real_X4_GAN.pth --param-key params_ema \
+  -o kinovsr/processors/esc/weights/esc_real_x4_gan.safetensors
+```
+
+`--param-key params_ema` matters: the checkpoints carry BOTH `params` and
+`params_ema` and they differ; ESC's reference `scripts/inference.py` loads
+`['params_ema']` for these models (unlike SAFMN and RealViformer, whose
+references load `['params']` -- check per model, never assume).
+
+The release's other checkpoints are not video-appropriate: DIV2K/DF2K/DFLIP/light/FP/XL
+are bicubic-benchmark models, FB_R48 is a torch-only FlashBias attention variant, and
+the ATD/HiTSRF/SRFormer files are other architectures (the author's retrained
+comparison baselines).
+
+Source: <https://github.com/dslisleedh/ESC>

@@ -1,0 +1,38 @@
+"""Per-frame driver for the MLX RRDBNet upscaler.
+
+Real-ESRGAN / ESRGAN are single-image networks, so unlike the BasicVSR wrappers
+there is no sliding window, trim, or recurrent state -- each frame is upscaled
+independently and emitted immediately. The feed()/flush() shape mirrors the other
+upscalers so the harness wiring stays parallel.
+"""
+
+from pathlib import Path
+
+import mlx.core as mx
+
+from kinovsr.modeling.upscaler_base import to_rgb_batch
+
+from . import net
+
+
+class RealEsrganUpscaler:
+    """feed()/flush() driver for the per-frame RRDBNet upscaler."""
+
+    def __init__(self, weights: str | Path | None = None, denoise_strength: float = 1.0) -> None:
+        weights = net.resolve_weights(weights)  # variant token or path -> file
+        wdn = net.wdn_path_for(weights) if float(denoise_strength) < 1.0 else None
+        self._p = net.load_params(weights, wdn_path=wdn, denoise_strength=denoise_strength)
+        self.scale = net.scale_of(self._p)
+        self.reset()
+
+    def reset(self) -> None:
+        pass
+
+    def feed(self, rgb: mx.array, token: object = None) -> list[tuple[mx.array, object]]:
+        # net.upscale already mx.eval's each output frame (see net.py:249), so sr is
+        # materialized here -- the second barrier was redundant.
+        sr = net.upscale([to_rgb_batch(rgb)], self._p)[0]
+        return [(sr[0], token)]
+
+    def flush(self) -> list[tuple[mx.array, object]]:
+        return []

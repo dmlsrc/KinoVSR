@@ -1,0 +1,241 @@
+"""MLX port of STDF (Spatio-Temporal Deformable Fusion) for compressed-video
+artifact removal -- the MFVQE network of Deng et al. (AAAI 2020).
+
+Reimplemented from the reference net_stdf.py as a spec; this is clean MLX code, not
+a wrapper. A U-Net regresses a per-frame deformable offset + modulation mask, then a
+modulated deform-conv (DCNv2, the shared videotoolbox deform_conv2d -- verified
+against torchvision) fuses a 2*radius+1 frame window; a plain-CNN head predicts a
+residual added onto the center frame. Operates on the luma (Y) channel (in_nc=1).
+
+Layout: MLX-native NHWC. Conv weights -> (O,kH,kW,I) at load; ConvTranspose weights
+-> (O,kH,kW,I) from torch's (I,O,kH,kW); the deform-conv weight stays torch NCHW
+(O,I,kH,kW) for deform_conv2d.
+"""
+
+import logging
+from collections.abc import Callable
+from pathlib import Path
+from typing import cast
+
+import mlx.core as mx
+
+from kinovsr.modeling.compile_cache import cached as _cached
+from kinovsr.modeling.deform_conv import deform_conv2d
+from kinovsr.modeling.weights import resolve_weights as _resolve_weights
+
+_WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
+# Both bundled checkpoints are R3 (7-frame), Y-only; they differ only in training data.
+_VARIANTS = {
+    "mfqev2": "stdf_mfqev2_r3.safetensors",  # HEVC MFQEv2, multi-QP (general)
+    "vimeo90k": "stdf_vimeo90k_r3.safetensors",  # Vimeo90K, HEVC All-Intra QP37
+}
+_DEFAULT_VARIANT = "mfqev2"
+
+
+def default_weights_path(variant: str = _DEFAULT_VARIANT) -> Path:
+    return _WEIGHTS_DIR / _VARIANTS[variant]
+
+
+def resolve_weights(spec: str | Path | None = None) -> Path:
+    """Bundled variant token (mfqev2 / vimeo90k) or a path."""
+    return _resolve_weights(spec, _VARIANTS, _WEIGHTS_DIR, _DEFAULT_VARIANT)
+
+
+def load_params(
+    path: str | Path | None = None, dtype: mx.Dtype = mx.float16
+) -> dict[str, mx.array]:
+    """Load + lay out the checkpoint: Conv weights -> NHWC (O,kH,kW,I); ConvTranspose
+    (the 4x4 upsamplers) -> (O,kH,kW,I) from torch (I,O,kH,kW); the deform-conv weight
+    stays torch NCHW for deform_conv2d. All cast to `dtype` (default fp16)."""
+    w = cast(dict[str, mx.array], mx.load(str(resolve_weights(path))))
+    p: dict[str, mx.array] = {}
+    for k, v in w.items():
+        if k == "ffnet.deform_conv.weight":
+            a = v  # keep torch NCHW (O,I,kH,kW)
+        elif v.ndim == 4 and tuple(v.shape[-2:]) == (4, 4):
+            a = mx.transpose(v, (1, 2, 3, 0))  # ConvTranspose (I,O,4,4) -> (O,4,4,I)
+        elif v.ndim == 4:
+            a = mx.transpose(v, (0, 2, 3, 1))  # Conv (O,I,kH,kW) -> (O,kH,kW,I)
+        else:
+            a = v
+        p[k] = a.astype(dtype)
+    _pad_offset_mask_gate(p)
+    return p
+
+
+def _pad_offset_mask_gate(p: dict[str, mx.array]) -> None:
+    """Pad the offset-mask conv's output onto MLX's specialized kernel.
+
+    The bundled R3 models produce ``in_nc_total * 27 == 189`` channels. MLX
+    0.32.1 automatically pads eligible *input* channels, but deliberately does
+    not pad outputs because slicing them back can cost more than it saves. Zero
+    filters and bias extend this output to 192; the consumer slices the junk.
+    The original tensors stay in ``p`` for configuration and introspection.
+    """
+    wm, bm = p["ffnet.offset_mask.weight"], p["ffnet.offset_mask.bias"]
+    o = wm.shape[0]
+    if o > 16 and o % 16:
+        pad = 16 - o % 16
+        p["ffnet.offset_mask.weight_gp"] = mx.concatenate(
+            [wm, mx.zeros((pad, *wm.shape[1:]), dtype=wm.dtype)], axis=0
+        )
+        p["ffnet.offset_mask.bias_gp"] = mx.concatenate(
+            [bm, mx.zeros((pad,), dtype=bm.dtype)], axis=0
+        )
+
+
+def _config(p: dict[str, mx.array]) -> tuple[int, int, int]:
+    """(in_nc color count, input_len = 2*radius+1, nb) inferred from the weights."""
+    in_nc_total = int(p["ffnet.in_conv.0.weight"].shape[-1])  # NHWC Cin
+    in_nc = int(p["qenet.out_conv.weight"].shape[0])  # NHWC Cout
+    nb = 1 + sum(1 for k in p if k.startswith("ffnet.dn_conv") and k.endswith(".0.weight"))
+    return in_nc, in_nc_total // in_nc, nb
+
+
+def _relu(x: mx.array) -> mx.array:
+    return mx.maximum(x, 0)
+
+
+def _conv(x: mx.array, p: dict[str, mx.array], key: str, stride: int = 1, pad: int = 1) -> mx.array:
+    return mx.conv2d(x, p[f"{key}.weight"], stride=stride, padding=pad) + p[f"{key}.bias"]
+
+
+def _convt(x: mx.array, p: dict[str, mx.array], key: str) -> mx.array:
+    """ConvTranspose 4x4 stride 2 pad 1 (exact 2x upsample) + bias."""
+    return mx.conv_transpose2d(x, p[f"{key}.weight"], stride=2, padding=1) + p[f"{key}.bias"]
+
+
+def _reflect_pad_to(x: mx.array, m: int) -> mx.array:
+    """Reflect-pad NHWC x on bottom/right so H,W are multiples of m. The U-Net has
+    three /2 stages, so it needs a multiple of 8. [::-1] mirrors (MLX has no flip)."""
+    _, h, w, _ = x.shape
+    ph, pw = (-h) % m, (-w) % m
+    if ph:
+        x = mx.concatenate([x, x[:, h - 1 - ph : h - 1, :, :][:, ::-1, :, :]], axis=1)
+    if pw:
+        x = mx.concatenate([x, x[:, :, w - 1 - pw : w - 1, :][:, :, ::-1, :]], axis=2)
+    return x
+
+
+def _stdf(x: mx.array, p: dict[str, mx.array], nb: int) -> mx.array:
+    """Spatio-temporal deformable fusion. x: (N,H,W,in_nc_total) stacked frames; the
+    U-Net regresses offsets+mask, the deform-conv fuses the stacked frames -> features."""
+    in_nc_total = x.shape[-1]
+    feats = [_relu(_conv(x, p, "ffnet.in_conv.0"))]
+    for i in range(1, nb):
+        d = _relu(_conv(feats[-1], p, f"ffnet.dn_conv{i}.0", stride=2))
+        feats.append(_relu(_conv(d, p, f"ffnet.dn_conv{i}.2")))
+    out = _relu(_conv(feats[-1], p, "ffnet.tr_conv.0", stride=2))
+    out = _relu(_conv(out, p, "ffnet.tr_conv.2"))
+    out = _relu(_convt(out, p, "ffnet.tr_conv.4"))
+    for i in range(nb - 1, 0, -1):
+        out = _relu(_conv(mx.concatenate([out, feats[i]], axis=-1), p, f"ffnet.up_conv{i}.0"))
+        out = _relu(_convt(out, p, f"ffnet.up_conv{i}.2"))
+    out = _relu(_conv(out, p, "ffnet.out_conv.0"))
+    wom = p.get("ffnet.offset_mask.weight_gp", p["ffnet.offset_mask.weight"])
+    bom = p.get("ffnet.offset_mask.bias_gp", p["ffnet.offset_mask.bias"])
+    off_msk = mx.conv2d(out, wom, padding=1) + bom  # (N,H,W, >=in_nc_total*3*9)
+    n_off = in_nc_total * 2 * 9
+    off = off_msk[..., :n_off]
+    msk = mx.sigmoid(off_msk[..., n_off : n_off + in_nc_total * 9])  # gate-pad junk cut here
+    fused = deform_conv2d(  # NHWC -> NCHW for the kernel
+        mx.transpose(x, (0, 3, 1, 2)),
+        mx.transpose(off, (0, 3, 1, 2)),
+        p["ffnet.deform_conv.weight"],
+        p.get("ffnet.deform_conv.bias"),
+        mx.transpose(msk, (0, 3, 1, 2)),
+        stride=1,
+        padding=1,
+        deform_groups=in_nc_total,
+    )
+    return _relu(mx.transpose(fused, (0, 2, 3, 1)))
+
+
+def _qe(x: mx.array, p: dict[str, mx.array]) -> mx.array:
+    """Plain-CNN quality-enhancement head -> residual map."""
+    out = _relu(_conv(x, p, "qenet.in_conv.0"))
+    i = 0
+    while f"qenet.hid_conv.{i}.weight" in p:
+        out = _relu(_conv(out, p, f"qenet.hid_conv.{i}"))
+        i += 2
+    return _conv(out, p, "qenet.out_conv")
+
+
+def deblock(
+    frames: list[mx.array],
+    p: dict[str, mx.array],
+    strength: float = 1.0,
+    cfg: tuple[int, int, int] | None = None,
+) -> mx.array:
+    """Deblock the center of a (2*radius+1)-frame window. `frames` is a list of
+    (N,H,W,in_nc) arrays in [0,1] (in_nc=1 for the bundled Y-only models); returns the
+    deblocked center frame (N,H,W,in_nc). The net predicts a residual onto the center;
+    `strength` scales that residual (1.0 = full deblock, 0.0 = passthrough) to trade
+    artifact removal against softening of fine texture. `cfg` (the _config tuple) can be
+    passed to hoist shape inference out of the compiled per-frame path."""
+    in_nc, input_len, nb = cfg if cfg is not None else _config(p)
+    radius = (input_len - 1) // 2
+    if len(frames) != input_len:
+        raise ValueError(f"STDF needs {input_len} frames (radius {radius}); got {len(frames)}")
+    dt = next(iter(p.values())).dtype
+    # Channel layout matches the reference: all frames of channel 0, then channel 1, ...
+    x = (
+        mx.concatenate([f.astype(dt) for f in frames], axis=-1)
+        if in_nc == 1
+        else mx.concatenate(
+            [f[..., c : c + 1].astype(dt) for c in range(in_nc) for f in frames], axis=-1
+        )
+    )
+    h, w = x.shape[1], x.shape[2]
+    xp = _reflect_pad_to(x, 8)
+    res = _qe(_stdf(xp, p, nb), p)
+    centers = mx.concatenate(
+        [xp[..., radius + c * input_len : radius + c * input_len + 1] for c in range(in_nc)],
+        axis=-1,
+    )
+    return (centers + float(strength) * res)[:, :h, :w, :]
+
+
+_COMPILE_CACHE: dict[
+    tuple[int, float, tuple[int, int, int]], Callable[[list[mx.array]], mx.array]
+] = {}
+
+
+def make_forward(
+    p: dict[str, mx.array],
+    strength: float = 1.0,
+    cfg: tuple[int, int, int] | None = None,
+    compile: bool = True,
+) -> Callable[[list[mx.array]], mx.array]:
+    """Window (list of input_len frames) -> deblocked center frame for a fixed strength,
+    mx.compiled once per checkpoint + strength and reused across frames (pair with a capped
+    MLX cache, which the harness sets). STDF was the one harness net still running its raw
+    ~20-conv op graph every frame; the deform-conv fuses fine inside the compiled graph."""
+    if cfg is None:
+        cfg = _config(p)
+
+    def run(frames: list[mx.array]) -> mx.array:
+        return deblock(frames, p, strength=strength, cfg=cfg)
+
+    if not compile:
+        return run
+    return _cached(_COMPILE_CACHE, (id(p), float(strength), cfg), lambda: mx.compile(run))
+
+
+_log = logging.getLogger(__name__)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    p = load_params()
+    in_nc, input_len, nb = _config(p)
+    _log.info(f"loaded STDF: in_nc={in_nc}, frames={input_len} (radius {input_len // 2}), nb={nb}")
+    mx.random.seed(0)
+    frames = [mx.clip(mx.random.uniform(shape=(1, 64, 96, in_nc)), 0, 1) for _ in range(input_len)]
+    mx.eval(*frames)
+    out = deblock(frames, p)
+    mx.eval(out)
+    _log.info(
+        f"deblock: {input_len}x{tuple(frames[0].shape)} -> {tuple(out.shape)}, "
+        f"residual mean={float(mx.mean(mx.abs(out - frames[input_len // 2]))):.4f}"
+    )

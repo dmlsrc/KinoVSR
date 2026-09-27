@@ -1,0 +1,556 @@
+"""MLX BasicVSR++ x4 net (port of OpenMMLab mmagic basicvsr_plusplus_net).
+
+The shared BasicVSR backbone (conv/activation helpers, bilinear sample / flow_warp
+/ resize, SPyNet, residual blocks, pixel-shuffle) lives in ../vsr_blocks; this
+module adds the BasicVSR++-specific pieces: the weight loader, the second-order
+deformable alignment, and the bidirectional recurrent forward.
+
+Convention: MLX-native NHWC throughout. Conv weights are transposed to MLX's
+(O,kH,kW,I) at load; the deformable-conv weight stays torch NCHW (O,I,kH,kW) for
+deform_conv2d. Flow is (N,H,W,2) = (x-offset, y-offset), matching flow_warp.
+"""
+
+import logging
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import nullcontext
+from pathlib import Path
+from typing import cast
+
+import mlx.core as mx
+
+from kinovsr.modeling.compile_cache import cached as _cached
+from kinovsr.modeling.deform_conv import deform_conv2d
+from kinovsr.modeling.flow_sources import compute_flows
+from kinovsr.modeling.resample import resize
+from kinovsr.modeling.vision_flow_services import VisionFlowServices, vision_flow_services_scope
+from kinovsr.modeling.vsr_blocks import (
+    compiled_resblocks,
+    conv,
+    flow_warp,
+    history_improve_gate,
+    lrelu,
+    pixelshuffle_pack,
+    resblocks_with_input,
+)
+from kinovsr.modeling.weights import resolve_weights as _resolve_weights
+
+# Per-checkpoint compiled reconstruction/upsample tail (keyed by id(p)).
+_UPSAMPLE_COMPILE_CACHE: dict[int, Callable[[mx.array], mx.array]] = {}
+
+
+def _compiled_upsample(p: dict[str, mx.array]) -> Callable[[mx.array], mx.array]:
+    """Compiled reconstruction resblocks + pixel-shuffle upsample tail -> HR residual.
+    The cheap base resize + clip stay in the loop. Pure, byte-identical (profiled)."""
+
+    def make() -> Callable[[mx.array], mx.array]:
+        def step(hr: mx.array) -> mx.array:
+            hr = resblocks_with_input(hr, p, "reconstruction")
+            hr = lrelu(pixelshuffle_pack(hr, p, "upsample1"))
+            hr = lrelu(pixelshuffle_pack(hr, p, "upsample2"))
+            hr = lrelu(conv(hr, p, "conv_hr"))
+            return conv(hr, p, "conv_last")
+
+        return mx.compile(step)
+
+    return _cached(_UPSAMPLE_COMPILE_CACHE, id(p), make)
+
+
+_WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
+
+# Bundled 4x-SR checkpoints (all is_low_res_input=True). reds4/vimeo90k_bi are
+# c64n7 (7.3M); ntire_vsr is c128n25 (44M, NTIRE'21). Block counts auto-detect.
+_VARIANTS = {
+    "reds4": "basicvsrpp_reds4.safetensors",
+    "vimeo90k_bi": "basicvsrpp_vimeo90k_bi.safetensors",
+    "vimeo90k_bd": "basicvsrpp_vimeo90k_bd.safetensors",
+    "ntire_vsr": "basicvsrpp_ntire_vsr.safetensors",
+}
+
+
+# 1x restoration checkpoints (is_low_res_input=False: the net downsamples the
+# input 4x, propagates cheap at 1/4 res, upsamples back to the SAME size). Same
+# architecture as the SR variants apart from the feature-extractor stem and the
+# terminal residual; auto-detected at load. Not bundled (large; download +
+# convert -- see weights/README.md).
+_RESTORE_VARIANTS = {
+    "decompress_track1": "basicvsrpp_decompress_track1.safetensors",  # NTIRE'21 compressed-video, fixed-QP fidelity
+    "decompress_track2": "basicvsrpp_decompress_track2.safetensors",  # heavier compression
+    "decompress_track3": "basicvsrpp_decompress_track3.safetensors",  # fixed bit-rate
+    "denoise": "basicvsrpp_denoise.safetensors",  # temporal video denoise
+    "deblur_dvd": "basicvsrpp_deblur_dvd.safetensors",  # real handheld-video deblur
+    "deblur_gopro": "basicvsrpp_deblur_gopro.safetensors",  # synthetic GoPro deblur
+}
+
+
+def default_weights_path(variant: str = "reds4") -> Path:
+    if variant not in _VARIANTS:
+        raise ValueError(f"unknown basicvsrpp variant {variant!r}; choose from {list(_VARIANTS)}")
+    return _WEIGHTS_DIR / _VARIANTS[variant]
+
+
+def resolve_weights(spec: str | Path | None = None) -> Path:
+    """Bundled variant token (reds4/vimeo90k_bi/vimeo90k_bd/ntire_vsr) or a path."""
+    return _resolve_weights(spec, _VARIANTS, _WEIGHTS_DIR, "reds4")
+
+
+def resolve_restore_weights(spec: str | Path | None = None) -> Path:
+    """1x-restoration variant token (decompress_track*/denoise/deblur_*) or a path."""
+    return _resolve_weights(spec, _RESTORE_VARIANTS, _WEIGHTS_DIR, "decompress_track1")
+
+
+def is_low_res_input(p: dict[str, mx.array]) -> bool:
+    """True for the 4x-SR checkpoints (feat_extract is a bare ResidualBlocksWithInputConv),
+    False for the 1x-restoration checkpoints (feat_extract is a strided downsampling stem
+    feat_extract.0/.2/.4). The two differ only in this stem and the terminal residual."""
+    return "feat_extract.main.0.weight" in p
+
+
+def load_params(
+    path: str | Path | None = None, dtype: mx.Dtype = mx.float16
+) -> dict[str, mx.array]:
+    """Load + lay out the checkpoint: conv weights -> NHWC, DCN weight kept NCHW,
+    SPyNet mean/std -> NHWC, step_counter dropped, all cast to `dtype`.
+
+    Default fp16 halves activation memory and is ~1.5x faster; the deformable
+    conv follows the input dtype (fp16 sampling/columns/GEMM with fp32
+    accumulation -- see deform_conv2d; ~3.8x on the op, SR shift 58 dB). Pass
+    dtype=mx.float32 for the full-fp32 validation reference."""
+    src = Path(path or default_weights_path())
+    w = cast(dict[str, mx.array], mx.load(str(src)))
+    p: dict[str, mx.array] = {}
+    for k, v in w.items():
+        if k == "step_counter":
+            continue
+        if k in ("spynet.mean", "spynet.std"):
+            a = v.reshape(1, 1, 1, 3)
+        elif v.ndim == 4 and not (
+            k.startswith("deform_align.") and k.endswith(".weight") and "conv_offset" not in k
+        ):
+            a = mx.transpose(v, (0, 2, 3, 1))  # (O,I,kH,kW) torch -> (O,kH,kW,I) MLX
+        else:
+            a = v
+        p[k] = a.astype(dtype)
+    return p
+
+
+# ---- second-order deformable alignment -------------------------------------
+def _flow_yx_tiled(flow: mx.array, reps: int) -> mx.array:
+    """flow (N,H,W,2)=[x,y] -> [y,x] tiled `reps` times along the channel axis."""
+    return mx.tile(mx.concatenate([flow[..., 1:2], flow[..., 0:1]], axis=-1), (1, 1, 1, reps))
+
+
+def _deform_align(
+    feat_cat: mx.array,
+    cond: mx.array,
+    flow1: mx.array,
+    flow2: mx.array,
+    p: dict[str, mx.array],
+    key: str,
+    max_res: float = 10.0,
+) -> mx.array:
+    """SecondOrderDeformableAlignment: predict offsets/mask from cond+flows, add
+    the flows (the deformable offset is relative to the optical flow), then a
+    modulated deform conv on feat_cat (NHWC <-> NCHW only at the DCN call)."""
+    extra = mx.concatenate([cond, flow1, flow2], axis=-1)
+    o = lrelu(conv(extra, p, f"{key}.conv_offset.0"))
+    o = lrelu(conv(o, p, f"{key}.conv_offset.2"))
+    o = lrelu(conv(o, p, f"{key}.conv_offset.4"))
+    o = conv(o, p, f"{key}.conv_offset.6")  # (N,H,W,27*dg)
+    o1, o2, mask = mx.split(o, 3, axis=-1)  # dg*K*K each
+    off = max_res * mx.tanh(mx.concatenate([o1, o2], axis=-1))
+    off1, off2 = mx.split(off, 2, axis=-1)
+    off1 = off1 + _flow_yx_tiled(flow1, off1.shape[-1] // 2)
+    off2 = off2 + _flow_yx_tiled(flow2, off2.shape[-1] // 2)
+    offset = mx.concatenate([off1, off2], axis=-1)  # (N,H,W,dg*2*K*K)
+    mask = mx.sigmoid(mask)
+    dg = o.shape[-1] // 27
+    out = deform_conv2d(
+        mx.transpose(feat_cat, (0, 3, 1, 2)),
+        mx.transpose(offset, (0, 3, 1, 2)),
+        p[f"{key}.weight"],
+        p.get(f"{key}.bias"),
+        mx.transpose(mask, (0, 3, 1, 2)),
+        stride=1,
+        padding=1,
+        dilation=1,
+        deform_groups=dg,
+    )
+    return mx.transpose(out, (0, 2, 3, 1)).astype(feat_cat.dtype)  # DCN follows input dtype
+
+
+_DEFORM_COMPILE_CACHE: dict[
+    tuple[int, str], Callable[[mx.array, mx.array, mx.array, mx.array], mx.array]
+] = {}
+
+
+def _compiled_deform_align(
+    p: dict[str, mx.array], key: str
+) -> Callable[[mx.array, mx.array, mx.array, mx.array], mx.array]:
+    """_deform_align (offset convs + the deform_conv kernel), compiled + cached per
+    (checkpoint, module). ~1.02x byte-identical: the custom kernel is one big dispatch
+    with nothing to fuse, but the offset conv stack around it fuses. Keyed by (id(p), key)."""
+    return _cached(
+        _DEFORM_COMPILE_CACHE,
+        (id(p), key),
+        lambda: mx.compile(lambda fc, c, f1, f2: _deform_align(fc, c, f1, f2, p, key)),
+    )
+
+
+# ---- recurrent forward -----------------------------------------------------
+def _propagate(
+    feats: dict[str, list[mx.array]],
+    flows: list[mx.array],
+    module: str,
+    p: dict[str, mx.array],
+    frames: list[mx.array] | None = None,
+    history_strength: float = 1.0,
+    history_gate: str = "off",
+) -> dict[str, list[mx.array]]:
+    nf = len(feats["spatial"])
+    frame_idx = list(range(nf))
+    flow_idx = list(range(-1, nf - 1))
+    if "backward" in module:
+        frame_idx.reverse()
+        flow_idx = frame_idx
+    n, h, w, mid = feats["spatial"][0].shape
+    dt = feats["spatial"][0].dtype
+    # History admission (see vsr_blocks.history_improve_gate): the aligned
+    # history bundle is multiplied per pixel by how much the warp actually
+    # explains the current frame. Second-order alignment can draw from either
+    # source, so the two per-source gates combine with max. A zero gate equals
+    # the branch's window-start zero features (in-distribution). The scalar
+    # history_strength path scales history unconditionally; the default
+    # (1.0, gate off) leaves the reference math untouched.
+    use_gate = history_gate == "improve" and frames is not None
+    use_scalar = (not use_gate) and history_strength != 1.0
+    feat_prop = mx.zeros((n, h, w, mid), dtype=dt)
+    out: list[mx.array] = []
+    for i, idx in enumerate(frame_idx):
+        feat_current = feats["spatial"][idx]
+        if i > 0:
+            flow_n1 = flows[flow_idx[i]]
+            cond_n1 = flow_warp(feat_prop, flow_n1)
+            feat_n2 = mx.zeros_like(feat_prop)
+            flow_n2 = mx.zeros_like(flow_n1)
+            cond_n2 = mx.zeros_like(cond_n1)
+            if i > 1:
+                feat_n2 = out[-2]
+                flow_n2 = flow_n1 + flow_warp(flows[flow_idx[i - 1]], flow_n1)
+                cond_n2 = flow_warp(feat_n2, flow_n2)
+            cond = mx.concatenate([cond_n1, feat_current, cond_n2], axis=-1)
+            feat_prop = _compiled_deform_align(p, f"deform_align.{module}")(
+                mx.concatenate([feat_prop, feat_n2], axis=-1), cond, flow_n1, flow_n2
+            )
+            if use_gate and frames is not None:
+                gate = history_improve_gate(
+                    frames[idx], frames[frame_idx[i - 1]], flow_n1, dt, history_strength
+                )
+                if i > 1:
+                    gate = mx.maximum(
+                        gate,
+                        history_improve_gate(
+                            frames[idx], frames[frame_idx[i - 2]], flow_n2, dt, history_strength
+                        ),
+                    )
+                feat_prop = feat_prop * gate
+            elif use_scalar:
+                feat_prop = feat_prop * float(history_strength)
+        feat = (
+            [feat_current]
+            + [feats[k][idx] for k in feats if k not in ("spatial", module)]
+            + [feat_prop]
+        )
+        feat_prop = feat_prop + compiled_resblocks(
+            mx.concatenate(feat, axis=-1), p, f"backbone.{module}"
+        )
+        # Materialize each step so the recurrent graph (and the large transient
+        # DCN im2col columns) frees per frame instead of accumulating the whole
+        # clip's forward into one lazy graph - that peaks memory catastrophically.
+        mx.eval(feat_prop)
+        out.append(feat_prop)
+    if "backward" in module:
+        out.reverse()
+    feats[module] = out
+    return feats
+
+
+def _upsample(
+    frames: list[mx.array], feats: dict[str, list[mx.array]], p: dict[str, mx.array]
+) -> Iterator[mx.array]:
+    released = mx.zeros((0,))  # replaces each frame's features once upsampled
+    for i in range(len(feats["spatial"])):
+        hr = [feats["spatial"][i]] + [feats[k][i] for k in feats if k != "spatial"]
+        residual = _compiled_upsample(p)(mx.concatenate(hr, axis=-1))
+        _, fh, fw, _ = frames[i].shape
+        # Clip the terminal SR to [0,1]: the residual overshoots slightly at edges
+        # (ringing) and this frame goes straight to the encoder. Not fed back into
+        # the recurrence, so clipping here is safe.
+        out_frame = mx.clip(residual + resize(frames[i], fh * 4, fw * 4, False), 0.0, 1.0)
+        mx.eval(out_frame)  # free each frame's upsample graph before the next
+        for values in feats.values():
+            values[i] = released
+        yield out_frame
+
+
+def upscale(
+    frames: list[mx.array],
+    p: dict[str, mx.array],
+    flow_mode: str = "spynet",
+    history_strength: float = 1.0,
+    history_gate: str = "off",
+    vision_flow_services: VisionFlowServices | None = None,
+) -> Iterable[mx.array]:
+    """Upscale an LR clip 4x. frames: list of (N,H,W,3) f32 [0,1]; out: same len,
+    each (N,4H,4W,3). Bidirectional + second-order, so the whole clip is needed.
+    ``history_gate="improve"`` admits aligned history per pixel only where the
+    flow warp measurably improves the photometric residual; ``history_strength``
+    scales the aligned history (1.0 = reference)."""
+    dt = p["conv_last.weight"].dtype
+    # Clip to [0,1] - the model trained on uint8-derived [0,1] LR, but the
+    # RGBAHalf decode can overshoot (~[-0.07, 1.04]); keep input in-distribution.
+    frames = [mx.clip(f, 0.0, 1.0).astype(dt) for f in frames]
+    spatial = []
+    for f in frames:
+        s = compiled_resblocks(f, p, "feat_extract")
+        mx.eval(s)  # materialize per frame, not all at once
+        spatial.append(s)
+    feats: dict[str, list[mx.array]] = {"spatial": spatial}
+    ff, fb = compute_flows(
+        frames,
+        p,
+        flow_mode=flow_mode,
+        vision_flow_services=vision_flow_services,
+    )
+    for it in (1, 2):
+        for direction in ("backward", "forward"):
+            mod = f"{direction}_{it}"
+            feats = _propagate(
+                feats,
+                fb if direction == "backward" else ff,
+                mod,
+                p,
+                frames=frames,
+                history_strength=history_strength,
+                history_gate=history_gate,
+            )
+            # _propagate already mx.eval's each step internally (see net.py:176), so every
+            # element of feats[mod] is materialized here -- no extra sync barrier needed.
+    return _upsample(frames, feats, p)
+
+
+# ---- 1x restoration path (is_low_res_input=False) --------------------------
+# torch F.interpolate(scale_factor=0.25, mode='bicubic', align_corners=False):
+# because the factor is an exact 4, every output pixel maps to input coord 4j+1.5
+# with the SAME fractional offset 0.5, so the cubic (A=-0.75) weights are constant
+# -- a fixed 4-tap [w(-1),w(0),w(1),w(2)] over input taps [4j,4j+1,4j+2,4j+3].
+_BICUBIC_DOWN4 = (-0.09375, 0.59375, 0.59375, -0.09375)
+
+
+def _bicubic_down4(x: mx.array) -> mx.array:
+    """Separable bicubic 1/4 downsample, exact for H,W multiples of 4 (taps never
+    leave the image so no edge clamp is needed). Matches torch's flow-input downsample."""
+    w0, w1, w2, w3 = _BICUBIC_DOWN4
+    n, h, wd, c = x.shape
+    r = x.reshape(n, h // 4, 4, wd, c)
+    y = w0 * r[:, :, 0] + w1 * r[:, :, 1] + w2 * r[:, :, 2] + w3 * r[:, :, 3]
+    cc = y.reshape(n, h // 4, wd // 4, 4, c)
+    return w0 * cc[:, :, :, 0] + w1 * cc[:, :, :, 1] + w2 * cc[:, :, :, 2] + w3 * cc[:, :, :, 3]
+
+
+def _feat_extract_1x(f: mx.array, p: dict[str, mx.array]) -> mx.array:
+    """Downsampling feature-extractor stem (is_low_res_input=False): two stride-2
+    convs (4x down) then the ResidualBlocksWithInputConv at feat_extract.4."""
+    x = lrelu(conv(f, p, "feat_extract.0", stride=2, pad=1))
+    x = lrelu(conv(x, p, "feat_extract.2", stride=2, pad=1))
+    return compiled_resblocks(x, p, "feat_extract.4")
+
+
+def _pad_mult4(f: mx.array) -> mx.array:
+    """Replicate-pad bottom/right so H, W are multiples of 4 (the downsample factor)."""
+    _, h, w, _ = f.shape
+    ph, pw = (-h) % 4, (-w) % 4
+    if ph:
+        f = mx.concatenate(
+            [f, mx.broadcast_to(f[:, h - 1 : h], (f.shape[0], ph, f.shape[2], f.shape[3]))], axis=1
+        )
+    if pw:
+        f = mx.concatenate(
+            [f, mx.broadcast_to(f[:, :, w - 1 : w], (f.shape[0], f.shape[1], pw, f.shape[3]))],
+            axis=2,
+        )
+    return f
+
+
+def restore(
+    frames: list[mx.array],
+    p: dict[str, mx.array],
+    flow_mode: str = "spynet",
+    vision_flow_services: VisionFlowServices | None = None,
+) -> Iterable[mx.array]:
+    """1x recurrent restoration (decompress / denoise / deblur checkpoints). frames:
+    list of (N,H,W,3) f32 [0,1]; out: same length and SAME size, restored. The net
+    downsamples the input 4x, runs bidirectional second-order propagation at 1/4 res,
+    upsamples back, and adds the original frame as the global residual (no bicubic
+    upscale, unlike the SR path). Input is padded to a multiple of 4 and cropped back."""
+    dt = p["conv_last.weight"].dtype
+    orig = [(f.shape[1], f.shape[2]) for f in frames]
+    padded = [_pad_mult4(mx.clip(f, 0.0, 1.0).astype(dt)) for f in frames]
+    # Optical flow is computed on a bicubic-1/4 downsample of the input (reference).
+    down = [_bicubic_down4(f) for f in padded]
+    spatial = []
+    for f in padded:
+        s = _feat_extract_1x(f, p)
+        mx.eval(s)  # materialize per frame, not all at once
+        spatial.append(s)
+    feats: dict[str, list[mx.array]] = {"spatial": spatial}
+    ff, fb = compute_flows(
+        down,
+        p,
+        flow_mode=flow_mode,
+        vision_flow_services=vision_flow_services,
+    )
+    for it in (1, 2):
+        for direction in ("backward", "forward"):
+            mod = f"{direction}_{it}"
+            feats = _propagate(feats, fb if direction == "backward" else ff, mod, p)
+    released = mx.zeros((0,))  # replaces each frame's features once upsampled
+    for i in range(len(spatial)):
+        hr = [feats["spatial"][i]] + [feats[k][i] for k in feats if k != "spatial"]
+        residual = _compiled_upsample(p)(mx.concatenate(hr, axis=-1))
+        oh, ow = orig[i]
+        out = mx.clip(residual + padded[i], 0.0, 1.0)[:, :oh, :ow, :]
+        mx.eval(out)
+        for values in feats.values():
+            values[i] = released
+        yield out
+
+
+# ---- spatial self-ensemble (the reference's inference-time trick) -----------
+# The NTIRE decompress + ntire-vsr configs run BasicVSR++ through an 8-way
+# geometric self-ensemble (SpatialTemporalEnsemble, is_temporal_ensemble=False)
+# and average -- how the challenge leaderboard numbers were reached. The original
+# repo applies it in forward_test; mmagic's re-port left it as dead config. It is
+# a genuine artifact-reducer: averaging 8 orientations cancels orientation-specific
+# hallucinated texture (the aggressive checkpoints' flat-region "alligator skin")
+# while keeping the orientation-consistent real signal -- measured ~2.5x less
+# hallucination + ~1.7x less temporal crawl on track2, at 8x the compute.
+def _flip(f: mx.array, ax: int) -> mx.array:
+    return mx.take(f, (f.shape[ax] - 1) - mx.arange(f.shape[ax]), axis=ax)
+
+
+def _geo_tf(f: mx.array, mode: str) -> mx.array:
+    if mode == "v":
+        return _flip(f, 1)  # flip H
+    if mode == "h":
+        return _flip(f, 2)  # flip W
+    if mode == "t":
+        return mx.transpose(f, (0, 2, 1, 3))  # swap H,W
+    return f
+
+
+def _spatial_ensemble(
+    frames: list[mx.array], run_fn: Callable[[list[mx.array]], Iterable[mx.array]]
+) -> Iterator[mx.array]:
+    """8-way geometric self-ensemble, exact scheme from the reference
+    mmedit/models/common/ensemble.py: apply vertical/horizontal/transpose,
+    run each variant, invert the transforms, and average. Only one transformed
+    input window and one new output frame exist at a time; the accumulator is
+    released progressively during the eighth pass.
+    """
+    acc: list[mx.array | None] = []
+    transforms = ((1, "v"), (2, "h"), (4, "t"))
+    for variant in range(8):
+        transformed = frames
+        for bit, mode in transforms:
+            if variant & bit:
+                transformed = [_geo_tf(frame, mode) for frame in transformed]
+        for index, output in enumerate(run_fn(transformed)):
+            for bit, mode in reversed(transforms):
+                if variant & bit:
+                    output = _geo_tf(output, mode)
+            if variant == 0:
+                acc.append(output)
+            else:
+                previous = acc[index]
+                assert previous is not None
+                output = previous + output
+                del previous
+                acc[index] = output
+            if variant == 7:
+                output = mx.clip(output * 0.125, 0.0, 1.0)
+                acc[index] = None
+            mx.eval(output)
+            if variant == 7:
+                yield output
+
+
+def restore_ensemble(
+    frames: list[mx.array],
+    p: dict[str, mx.array],
+    flow_mode: str = "spynet",
+    vision_flow_services: VisionFlowServices | None = None,
+) -> Iterable[mx.array]:
+    """1x restoration under the reference's 8-way spatial self-ensemble (8x the
+    cost of restore()). See _spatial_ensemble."""
+    scope = (
+        vision_flow_services_scope(vision_flow_services, max_geometries=2)
+        if flow_mode == "vision"
+        else nullcontext(None)
+    )
+    with scope as services:
+        yield from _spatial_ensemble(
+            frames,
+            lambda fl: restore(
+                fl,
+                p,
+                flow_mode=flow_mode,
+                vision_flow_services=services,
+            ),
+        )
+
+
+def upscale_ensemble(
+    frames: list[mx.array],
+    p: dict[str, mx.array],
+    flow_mode: str = "spynet",
+    history_strength: float = 1.0,
+    history_gate: str = "off",
+    vision_flow_services: VisionFlowServices | None = None,
+) -> Iterable[mx.array]:
+    """4x SR under the reference's 8-way spatial self-ensemble -- the NTIRE
+    ntire_vsr config declares it (the small reds4/vimeo SR configs do not). 8x the
+    cost of upscale(). See _spatial_ensemble."""
+    scope = (
+        vision_flow_services_scope(vision_flow_services, max_geometries=2)
+        if flow_mode == "vision"
+        else nullcontext(None)
+    )
+    with scope as services:
+        yield from _spatial_ensemble(
+            frames,
+            lambda fl: upscale(
+                fl,
+                p,
+                flow_mode=flow_mode,
+                history_strength=history_strength,
+                history_gate=history_gate,
+                vision_flow_services=services,
+            ),
+        )
+
+
+_log = logging.getLogger(__name__)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    p = load_params()
+    mx.random.seed(0)
+    frames = [mx.clip(mx.random.uniform(shape=(1, 48, 64, 3)), 0, 1) for _ in range(5)]
+    mx.eval(*frames)
+    outs = list(upscale(frames, p))
+    mx.eval(*outs)
+    _log.info(
+        f"upscale: {len(outs)} frames, 48x64 -> {outs[0].shape[1]}x{outs[0].shape[2]}, "
+        f"center range [{float(mx.min(outs[2])):.3f}, {float(mx.max(outs[2])):.3f}]"
+    )

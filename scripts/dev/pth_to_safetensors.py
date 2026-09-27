@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Torch-based .pth -> safetensors converter (dev-only reference oracle).
+
+The installed, torch-free converter is `kinovsr weights convert`; this
+script is its predecessor, kept as an ad-hoc sanity check - convert the
+same checkpoint with both and compare, so torch.load's reference
+behavior stays one command away. Needs the dev extras (torch).
+
+Safe by construction - nothing in the checkpoint is executed:
+
+1. A static pickle scan (pure pickletools, no unpickling) lists every global the
+   file would invoke and refuses anything outside the tensor-rebuild / container
+   allowlist (no os/subprocess/eval/exec/import machinery).
+2. torch.load(weights_only=True) loads it with PyTorch's restricted unpickler,
+   which only runs that same allowlist of tensor rebuilders - it does NOT execute
+   the pickle's __reduce__, so a malicious checkpoint raises instead of running.
+
+Then it makes the weights MLX-friendly: strips DataParallel 'module.' prefixes,
+demotes float64 -> float32, drops non-tensor entries, and verifies the output
+loads with mlx.core.load().
+
+    scripts/dev/pth_to_safetensors.py model.pth                  # -> model.safetensors
+    scripts/dev/pth_to_safetensors.py model.pth -o weights.safetensors
+    scripts/dev/pth_to_safetensors.py ckpt.pth --strip-prefix "" --keep-fp64
+    scripts/dev/pth_to_safetensors.py ckpt.pth --only-prefix generator_ema. --strip-prefix generator_ema.
+"""
+
+import argparse
+import logging
+from pathlib import Path
+
+import mlx.core as mx
+import torch
+from safetensors.torch import save_file
+
+from kinovsr.modeling.pickle_scan import (
+    PickleScanError,
+    scan_checkpoint_globals,
+    suspicious_globals,
+)
+from kinovsr.ui.logging import configure_logging
+
+_log = logging.getLogger("kinovsr.dev.pth_to_safetensors")
+
+
+def main() -> int:
+
+    configure_logging()
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("input", help="Path to the .pth / .pt checkpoint.")
+    ap.add_argument(
+        "-o", "--output", help="Output .safetensors (default: input with .safetensors)."
+    )
+    ap.add_argument(
+        "--strip-prefix",
+        default="module.",
+        help="Key prefix to strip from every weight (default 'module.'; '' to keep).",
+    )
+    ap.add_argument(
+        "--only-prefix",
+        default="",
+        help="Keep only tensor keys with this prefix before applying --strip-prefix.",
+    )
+    ap.add_argument(
+        "--keep-fp64",
+        action="store_true",
+        help="Keep float64 tensors as-is (default: demote to float32).",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Convert even if the static scan flags non-tensor globals.",
+    )
+    ap.add_argument(
+        "--param-key",
+        default=None,
+        help="Nested checkpoint dict to extract (e.g. 'params' or 'params_ema'). "
+        "Checkpoints often carry BOTH; pick the one the model's reference "
+        "inference loads -- they are different weights. If a checkpoint has "
+        "both params and params_ema, the converter refuses to guess.",
+    )
+    args = ap.parse_args()
+
+    src = Path(args.input)
+    if not src.is_file():
+        ap.error(f"no such file: {src}")
+    out = Path(args.output) if args.output else src.with_suffix(".safetensors")
+
+    # ---- 1. static safety scan (no execution) ------------------------------
+    try:
+        refs = scan_checkpoint_globals(src)
+    except PickleScanError as exc:
+        _log.error("cannot statically scan checkpoint: %s", exc)
+        return 1
+    _log.info("pickle scan found %s global reference(s)", len(refs))
+    for r in sorted(refs):
+        _log.debug("pickle global: %s", r)
+    bad = suspicious_globals(refs)
+    if bad:
+        _log.warning("pickle globals outside tensor-rebuild allowlist: %s", bad)
+        if not args.force:
+            _log.error(
+                "refusing to load; rerun with --force only if you trust this "
+                "file (weights_only=True still gates the load)"
+            )
+            return 2
+    else:
+        _log.info("pickle scan clean: only tensor-rebuild/container globals")
+
+    # ---- 2. safe load (restricted unpickler, no code execution) ------------
+    try:
+        obj = torch.load(str(src), map_location="cpu", weights_only=True)
+    except Exception as e:
+        _log.error(
+            "torch.load(weights_only=True) refused: %s; the checkpoint contains "
+            "objects the safe loader will not run; extract just the weights first",
+            e,
+        )
+        return 1
+
+    # ---- 3. find the state_dict (handle common nesting) --------------------
+    sd = obj
+    if args.param_key:
+        if not (
+            isinstance(obj, dict)
+            and args.param_key in obj
+            and hasattr(obj[args.param_key], "items")
+        ):
+            have = list(obj.keys()) if isinstance(obj, dict) else type(obj).__name__
+            _log.error("--param-key %r not in checkpoint (has: %s)", args.param_key, have)
+            return 1
+        sd = obj[args.param_key]
+        _log.info("using explicit nested checkpoint key %r", args.param_key)
+    elif not (hasattr(sd, "items") and any(torch.is_tensor(v) for v in sd.values())):
+        if (
+            isinstance(obj, dict)
+            and "params" in obj
+            and "params_ema" in obj
+            and hasattr(obj["params"], "items")
+            and hasattr(obj["params_ema"], "items")
+        ):
+            _log.error(
+                "checkpoint carries BOTH 'params' and 'params_ema'; pass "
+                "--param-key params or --param-key params_ema to match the "
+                "model's reference inference"
+            )
+            return 1
+        for key in ("state_dict", "model", "net", "weights", "params", "params_ema"):
+            if isinstance(obj, dict) and key in obj and hasattr(obj[key], "items"):
+                sd = obj[key]
+                _log.info("using nested checkpoint key %r", key)
+                break
+
+    # ---- 4. make MLX-friendly: strip prefix, demote fp64, drop non-tensors -
+    prefix = args.strip_prefix
+    only_prefix = args.only_prefix
+    tensors, dropped, stripped, filtered = {}, [], 0, 0
+    for k, v in sd.items():
+        if not torch.is_tensor(v):
+            dropped.append(k)
+            continue
+        if only_prefix and not k.startswith(only_prefix):
+            filtered += 1
+            continue
+        nk = k[len(prefix) :] if prefix and k.startswith(prefix) else k
+        stripped += nk != k
+        t = v.detach().cpu().contiguous()
+        if t.dtype == torch.float64 and not args.keep_fp64:
+            t = t.float()
+        tensors[nk] = t.clone()
+    if not tensors:
+        _log.error("no tensors found in the checkpoint")
+        return 1
+    n_params = sum(t.numel() for t in tensors.values())
+    _log.info(
+        "converted %s tensors, %.3fM params, dtypes=%s",
+        len(tensors),
+        n_params / 1e6,
+        sorted({str(t.dtype) for t in tensors.values()}),
+    )
+    if stripped:
+        _log.info("stripped prefix %r from %s keys", prefix, stripped)
+    if filtered:
+        _log.info("filtered out %s tensor keys outside %r", filtered, only_prefix)
+    if dropped:
+        _log.warning(
+            "dropped %s non-tensor entries: %s%s",
+            len(dropped),
+            dropped[:6],
+            "..." if len(dropped) > 6 else "",
+        )
+
+    # ---- 5. save + verify it loads in MLX ----------------------------------
+    out.parent.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(out))
+    loaded = mx.load(str(out))
+    ok = len(loaded) == len(tensors)
+    sample = next(iter(loaded.items()))
+    _log.info(
+        "mlx.core.load verified %s arrays (for example %s %s %s); match=%s",
+        len(loaded),
+        sample[0],
+        tuple(sample[1].shape),
+        sample[1].dtype,
+        ok,
+    )
+    _log.info("wrote %s", out)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

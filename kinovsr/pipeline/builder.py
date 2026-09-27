@@ -1,0 +1,470 @@
+"""Chain resolution and preflight validation.
+
+``resolve_pipeline`` turns a composed user config (one ordered ``pipeline``
+list plus named stage tables) into a :class:`BuildPlan`: every stage
+resolved to its family factory, capability, profile, and typed config, and
+the :class:`~kinovsr.processors.StreamSpec` threaded from the input
+endpoint through every stage to the output endpoint. Any ordering that
+cannot run fails HERE, before a single frame moves, with an error naming
+the offending stage - and for edge mismatches, both sides and every
+mismatched field.
+
+Resolution is pure: it reads values and returns values (the effectful
+``factory.build`` calls happen later, in :func:`build_processors`).
+"""
+
+import itertools
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, replace
+from typing import cast
+
+from kinovsr.config import validate_config
+from kinovsr.config.merge import merge_configs, split_stage_table
+from kinovsr.processors import (
+    BoundaryKind,
+    BracketFactory,
+    Capability,
+    CapabilitySpec,
+    Cardinality,
+    CompanionSpec,
+    FieldViolation,
+    Layout,
+    PipelineContext,
+    PipelineError,
+    PipelineRuntimeError,
+    Processor,
+    ProcessorFactory,
+    StageConfigError,
+    StreamConstraint,
+    StreamEdgeError,
+    StreamSpec,
+    UnknownFamilyError,
+    UnknownStageError,
+    coherence_violations,
+    get_factory,
+)
+from kinovsr.settings import Settings
+
+INPUT_ENDPOINT = "input"
+OUTPUT_ENDPOINT = "output"
+
+
+@dataclass(frozen=True, slots=True)
+class OutputEndpointSpec:
+    """What the output endpoint can represent (the last edge's consumer)."""
+
+    accepts: StreamConstraint = StreamConstraint()
+    name: str = OUTPUT_ENDPOINT
+
+
+# The default output endpoint accepts anything (in-memory consumption).
+_ACCEPT_ANYTHING_OUTPUT = OutputEndpointSpec()
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedStage:
+    """One pipeline entry, fully resolved and edge-validated."""
+
+    name: str  # stage-table name (the instance id)
+    position: int  # index in the pipeline list
+    family: str
+    factory: ProcessorFactory
+    capability: Capability
+    capability_spec: CapabilitySpec
+    profile: str | None
+    config: object  # the family's typed config
+    input_spec: StreamSpec
+    output_spec: StreamSpec
+    # Set on the synthetic post-stage the builder appends for a bracketing
+    # stage: the name of the pre-stage it pairs with (whose build_bracket
+    # produced it). None for ordinary stages.
+    companion_of: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BuildPlan:
+    stages: tuple[ResolvedStage, ...]
+    input_spec: StreamSpec
+    output_spec: StreamSpec  # what reaches the output endpoint
+
+
+def resolve_capability(
+    stage: str,
+    factory: ProcessorFactory,
+    capability_token: str | None,
+    profile: str | None,
+) -> Capability:
+    """Pick the capability per the documented rules: explicit token wins;
+    else an unambiguous profile selects; else a single-capability family
+    is unambiguous; anything else is an explicit-selector error."""
+    advertised = factory.capabilities
+    if capability_token is not None:
+        try:
+            capability = Capability(capability_token)
+        except ValueError:
+            valid = ", ".join(c.value for c in Capability)
+            raise UnknownStageError(
+                stage, f"unknown capability {capability_token!r} (valid: {valid})"
+            ) from None
+        if capability not in advertised:
+            offered = ", ".join(sorted(c.value for c in advertised))
+            raise UnknownStageError(
+                stage,
+                f"family {factory.name!r} does not offer capability "
+                f"{capability.value!r} (offers: {offered})",
+            )
+        return capability
+
+    if profile is not None:
+        matches = [c for c, spec in advertised.items() if profile in spec.profiles]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            names = ", ".join(sorted(c.value for c in matches))
+            raise UnknownStageError(
+                stage,
+                f"profile {profile!r} exists under several "
+                f"capabilities ({names}); state capability explicitly",
+            )
+        # fall through: unknown profile is reported against the resolved
+        # capability below when unambiguous, or here when it is not
+
+    if len(advertised) == 1:
+        return next(iter(advertised))
+    offered = ", ".join(sorted(c.value for c in advertised))
+    raise UnknownStageError(
+        stage,
+        f"family {factory.name!r} offers several capabilities "
+        f"({offered}); state capability (or a profile that selects one)",
+    )
+
+
+def _resolve_stage(
+    stage: str,
+    table: Mapping[str, object],
+    settings: Settings,
+) -> tuple[ProcessorFactory, Capability, CapabilitySpec, str | None, object]:
+    selector, family_settings = split_stage_table(table)
+    family = selector["processor"]  # presence guaranteed by validate_config
+    assert isinstance(family, str)  # validate_config requires a string processor
+    try:
+        factory = get_factory(family)
+    except UnknownFamilyError as exc:
+        raise UnknownStageError(stage, str(exc)) from exc
+
+    profile = selector.get("profile")
+    if profile is not None and not isinstance(profile, str):
+        raise StageConfigError(stage, "profile must be a string")
+    capability_token = selector.get("capability")
+    assert capability_token is None or isinstance(capability_token, str)  # validate_config
+    capability = resolve_capability(stage, factory, capability_token, profile)
+    capability_spec = factory.capabilities[capability]
+
+    if profile is not None and profile not in capability_spec.profiles:
+        offered = ", ".join(capability_spec.profiles) or "(none)"
+        raise UnknownStageError(
+            stage,
+            f"family {factory.name!r} capability "
+            f"{capability.value!r} has no profile {profile!r} "
+            f"(profiles: {offered})",
+        )
+
+    # Profile presets: family-declared in M3 (moving onto manifests); the
+    # hook is optional so contract-only fakes stay tiny.
+    preset: Mapping[str, object] | None = None
+    profile_defaults = getattr(factory, "profile_defaults", None)
+    if profile is not None and callable(profile_defaults):
+        preset = profile_defaults(capability=capability, profile=profile)
+    resolved = merge_configs(preset or {}, family_settings)
+
+    try:
+        config = factory.parse_config(
+            resolved, capability=capability, profile=profile, settings=settings
+        )
+    except StageConfigError:
+        raise
+    except (TypeError, ValueError, KeyError) as exc:
+        raise StageConfigError(stage, str(exc)) from exc
+    return factory, capability, capability_spec, profile, config
+
+
+def resolve_pipeline(
+    config: Mapping[str, object],
+    *,
+    input_spec: StreamSpec,
+    settings: Settings,
+    output: OutputEndpointSpec | None = None,
+) -> BuildPlan:
+    """Resolve and preflight-validate the whole chain; raise typed errors
+    before any processing on the first problem found."""
+    if output is None:
+        output = _ACCEPT_ANYTHING_OUTPUT
+    validate_config(dict(config))
+    # validate_config guarantees a list of stage names, each naming a table.
+    pipeline: list[str] = list(cast(list[str], config.get("pipeline", [])))
+
+    stages: list[ResolvedStage] = []
+    companions: list[tuple[ResolvedStage, CompanionSpec]] = []
+    current = input_spec
+    upstream = INPUT_ENDPOINT
+    provided_boundaries: set[BoundaryKind] = {BoundaryKind.STREAM_START}
+
+    for position, stage_name in enumerate(pipeline):
+        table = config[stage_name]
+        assert isinstance(table, Mapping)
+        factory, capability, cap_spec, profile, cfg = _resolve_stage(stage_name, table, settings)
+
+        broken = coherence_violations(current)
+        if broken:
+            raise StreamEdgeError(upstream, stage_name, broken, produced=current)
+        violations = list(cap_spec.accepts.violations(current))
+        missing = [k for k in cap_spec.requires_boundaries if k not in provided_boundaries]
+        violations.extend(_boundary_violation(kind) for kind in missing)
+        if violations:
+            raise StreamEdgeError(upstream, stage_name, tuple(violations), produced=current)
+
+        try:
+            produced = cap_spec.produces(current, cfg)
+        except (TypeError, ValueError, KeyError) as exc:
+            # produces raises plain ValueError for open-time checks a
+            # StreamConstraint cannot express (size caps, mode<->layout
+            # pairings); surface it as the documented typed error instead
+            # of letting it escape raw.
+            raise StageConfigError(stage_name, str(exc)) from exc
+        if cap_spec.is_tap and produced != current:
+            raise StageConfigError(
+                stage_name,
+                f"family {factory.name!r} declares a tap but "
+                f"its produces transform rewrites the stream contract",
+            )
+        provided_boundaries.update(cap_spec.emits_boundaries)
+
+        stages.append(
+            ResolvedStage(
+                name=stage_name,
+                position=position,
+                family=factory.name,
+                factory=factory,
+                capability=capability,
+                capability_spec=cap_spec,
+                profile=profile,
+                config=cfg,
+                input_spec=current,
+                output_spec=produced,
+            )
+        )
+        companion = cap_spec.companion(cfg)
+        if companion is not None:
+            companions.append((stages[-1], companion))
+        current = produced
+        upstream = stage_name
+
+    # Place each bracketing stage's companion post-pass at the last point its
+    # payload is still MLX: right before the first stage that produces a
+    # non-MLX (native CV) frame, or at the chain end when every stage stays
+    # MLX. That mirrors the inherited harness, which composites restore on
+    # the last MLX frame before a native upscale - the companion's MLX
+    # compute cannot run on a CV buffer, and restore_borders wants whatever
+    # (possibly upscaled) geometry the chain produced up to that point. The
+    # post-pass is identity on the stream, so splicing it in changes no
+    # downstream spec. It pairs its output back to the pre-pass input by PTS,
+    # which only holds on a 1:1 timeline, so a cardinality change upstream of
+    # the placement point (nothing to pair against) is rejected there.
+    for pre_stage, companion in companions:
+        insert_at = next(
+            (
+                i
+                for i, s in enumerate(stages)
+                if s.output_spec.frame.layout is not Layout.MLX_RGB_HWC
+            ),
+            len(stages),
+        )
+        boundary = stages[insert_at].input_spec if insert_at < len(stages) else current
+        post_name = f"{pre_stage.name}:post"
+        up_name = stages[insert_at - 1].name if insert_at > 0 else INPUT_ENDPOINT
+        if boundary.timeline.cardinality is not Cardinality.ONE_TO_ONE:
+            raise StreamEdgeError(
+                up_name,
+                post_name,
+                (
+                    FieldViolation(
+                        "timeline.cardinality",
+                        Cardinality.ONE_TO_ONE.value,
+                        boundary.timeline.cardinality.value,
+                    ),
+                ),
+                produced=boundary,
+            )
+        edge_violations = companion.accepts.violations(boundary)
+        if edge_violations:
+            raise StreamEdgeError(up_name, post_name, edge_violations, produced=boundary)
+        stages.insert(
+            insert_at,
+            ResolvedStage(
+                name=post_name,
+                position=insert_at,
+                family=pre_stage.family,
+                factory=pre_stage.factory,
+                capability=pre_stage.capability,
+                capability_spec=CapabilitySpec(
+                    capability=pre_stage.capability,
+                    profiles=(),
+                    accepts=companion.accepts,
+                    produces=companion.produces,
+                ),
+                profile=pre_stage.profile,
+                config=pre_stage.config,
+                input_spec=boundary,
+                output_spec=companion.produces(boundary, pre_stage.config),
+                companion_of=pre_stage.name,
+            ),
+        )
+    # Renumber to the final list order after any splices (position is
+    # informational, but keep it contiguous).
+    stages = [replace(s, position=i) for i, s in enumerate(stages)]
+
+    broken = coherence_violations(current)
+    if broken:
+        raise StreamEdgeError(upstream, output.name, broken, produced=current)
+    final_violations = output.accepts.violations(current)
+    if final_violations:
+        raise StreamEdgeError(upstream, output.name, final_violations, produced=current)
+
+    return BuildPlan(stages=tuple(stages), input_spec=input_spec, output_spec=current)
+
+
+def _boundary_violation(kind: BoundaryKind) -> FieldViolation:
+    return FieldViolation(
+        "boundaries",
+        f"an upstream provider of {kind.value}",
+        "not provided by the input endpoint or any earlier stage",
+    )
+
+
+# Programmer errors propagate unwrapped so their tracebacks stay raw; this
+# tuple is the single definition every boundary shares.
+_PROGRAMMER_ERRORS = (AssertionError, TypeError)
+
+
+def _wrap_named_error(stage_name: str, exc: Exception) -> Exception:
+    """Name the offending stage on a raw processor error, leaving programmer
+    errors and already-typed PipelineErrors untouched."""
+    if isinstance(exc, (*_PROGRAMMER_ERRORS, PipelineError)):
+        return exc
+    return PipelineRuntimeError(stage_name, f"{type(exc).__name__}: {exc}")
+
+
+def _wrap_stage_error(stage: ResolvedStage, exc: Exception) -> Exception:
+    return _wrap_named_error(stage.name, exc)
+
+
+def _append_context(winner: BaseException, losers: Iterable[BaseException | None]) -> None:
+    """Relink the winner and every outranked error into ONE strict, acyclic
+    ``__context__`` chain: winner first, then its existing context nodes,
+    then each loser and its context nodes - each object exactly once.
+
+    Collecting by identity and relinking linearly is what guarantees no
+    cycle. A loser's existing chain can already point back at the winner
+    (Python auto-sets ``__context__`` to the exception being handled when an
+    error is raised mid-handling), which a naive append would close into a
+    loop; flattening by id and terminating at ``None`` breaks it. The winner
+    keeps its documented precedence; every outranked error stays reachable,
+    none silently dropped.
+    """
+    ordered: list[BaseException] = []
+    seen: set[int] = set()
+
+    def collect(exc: BaseException | None) -> None:
+        node = exc
+        while node is not None and id(node) not in seen:
+            seen.add(id(node))
+            ordered.append(node)
+            node = node.__context__
+
+    collect(winner)
+    for loser in losers:
+        collect(loser)
+    # Pairwise adjacent (n-1 pairs); the lengths differ by one by design.
+    for earlier, later in itertools.pairwise(ordered):
+        earlier.__context__ = later
+    ordered[-1].__context__ = None
+
+
+def build_processors(
+    plan: BuildPlan,
+    context: PipelineContext,
+) -> tuple[tuple[ResolvedStage, Processor], ...]:
+    """The effectful step: construct every stage instance from the plan.
+
+    Instances come back paired with their resolved stage, in chain order,
+    each built with a per-stage context. Duplicate pipeline entries get
+    independent instances (state is never shared; immutable weights may be
+    cached underneath by the family).
+
+    Construction is transactional: if a later stage's build raises, every
+    already-built instance is closed before the original error propagates,
+    so a failing chain never leaks native sessions or weights."""
+    built: list[tuple[ResolvedStage, Processor]] = []
+    # A bracketing stage's build_bracket returns both halves at once; the
+    # post half waits here (keyed by the pre-stage name) until the loop
+    # reaches its synthetic companion stage at the chain end.
+    pending_posts: dict[str, Processor] = {}
+    to_raise: BaseException | None = None
+    try:
+        for stage in plan.stages:
+            stage_context = context.for_stage(stage.name)
+            if stage.companion_of is not None:
+                processor = pending_posts.pop(stage.companion_of)
+            elif stage.capability_spec.companion(stage.config) is not None:
+                if not isinstance(stage.factory, BracketFactory):
+                    raise PipelineError(
+                        f"family {stage.family!r} declares a companion but "
+                        f"provides no build_bracket"
+                    )
+                pre, post = stage.factory.build_bracket(stage.config, context=stage_context)
+                pending_posts[stage.name] = post
+                processor = pre
+            else:
+                processor = stage.factory.build(stage.config, context=stage_context)
+            built.append((stage, processor))
+    except BaseException as build_error:
+        interrupts: list[BaseException] = []
+        close_errors: list[BaseException] = []
+        # Close built stages AND any post half not yet placed, so a failure
+        # between a bracket's two halves leaks neither.
+        closables = [(s.name, p) for s, p in built]
+        closables += [(f"{n}:post", p) for n, p in pending_posts.items()]
+        for stage_name, processor in reversed(closables):
+            try:
+                processor.close(context.for_stage(stage_name))
+            except Exception as exc:  # broad: collected, chained below
+                # Ordinary close failures lose to the build error but ride its
+                # context chain so a leaked-resource failure is still visible.
+                close_errors.append(_wrap_named_error(stage_name, exc))
+            except BaseException as exc:  # broad: collected like _close_all
+                # KeyboardInterrupt/SystemExit during rollback: keep closing
+                # the remaining stages, then deliver EVERY one (first wins).
+                interrupts.append(exc)
+        if interrupts:
+            to_raise = interrupts[0]
+            _append_context(to_raise, [build_error, *close_errors, *interrupts[1:]])
+        else:
+            _append_context(build_error, close_errors)
+            to_raise = build_error
+    # Raise OUTSIDE the except so Python does not clobber the winner's
+    # __context__ chain with the build error just handled.
+    if to_raise is not None:
+        raise to_raise
+    return tuple(built)
+
+
+__all__ = [
+    "INPUT_ENDPOINT",
+    "OUTPUT_ENDPOINT",
+    "BuildPlan",
+    "OutputEndpointSpec",
+    "ResolvedStage",
+    "build_processors",
+    "resolve_capability",
+    "resolve_pipeline",
+]

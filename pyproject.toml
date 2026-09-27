@@ -1,0 +1,215 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kinovsr"
+version = "0.1.0"
+description = "MLX-native video super-resolution and restoration for Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.14"
+license = {text = "MIT"}
+authors = [
+    {name = "KinoVSR Contributors"}
+]
+keywords = [
+    "apple silicon",
+    "mlx",
+    "video restoration",
+    "video super-resolution",
+    "vsr",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mlx>=0.32.2",
+    # Serializes first-party Core ML model conversions (kinovsr.native.anemil);
+    # abi3 wheels, loaded with the modules that build or read those models.
+    "protobuf>=7.36.0",
+    "rich>=15.0.0",
+    "pyobjc-core>=12.2.2",
+    "pyobjc-framework-AVFoundation>=12.2.2",
+    "pyobjc-framework-CoreAudio>=12.2.2",
+    "pyobjc-framework-CoreMedia>=12.2.2",
+    # Imported directly by the Neural Engine runtime and SpyNet; Vision also
+    # requires it, but the direct use is declared here.
+    "pyobjc-framework-CoreML>=12.2.2",
+    "pyobjc-framework-Cocoa>=12.2.2",
+    "pyobjc-framework-libdispatch>=12.2.2",
+    "pyobjc-framework-Metal>=12.2.2",
+    "pyobjc-framework-MetalFX>=12.2.2",
+    "pyobjc-framework-MetalPerformanceShaders>=12.2.2",
+    "pyobjc-framework-Quartz>=12.2.2",
+    "pyobjc-framework-VideoToolbox>=12.2.2",
+    "pyobjc-framework-Vision>=12.2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "av>=18.1.0",
+    "mypy>=2.3.1",
+    # NumPy is a dev/test/diagnostic oracle, not a core runtime dependency.
+    "numpy>=2.5.2",
+    "opencv-python-headless>=5.0.0.93",
+    "pytest>=9.1.1",
+    "ruff>=0.16.4",
+    # Torch is the checkpoint-reading oracle: test fixtures save .pth files,
+    # the family-local layout converters read them, and
+    # scripts/dev/pth_to_safetensors.py cross-checks the torch-free
+    # `kinovsr weights convert`. safetensors (a separate package, not part
+    # of torch) is that oracle's writer. Neither is ever a runtime
+    # dependency: the product reads and writes safetensors through
+    # mlx.core.
+    "safetensors>=0.8.0",
+    "torch>=2.13.0",
+]
+ffmpeg = [
+    "av>=18.1.0",
+]
+eval = [
+    "av>=18.1.0",
+    "numpy>=2.5.2",
+    "opencv-python-headless>=5.0.0.93",
+]
+
+[project.urls]
+Homepage = "https://github.com/dmlsrc/KinoVSR"
+Repository = "https://github.com/dmlsrc/KinoVSR"
+Issues = "https://github.com/dmlsrc/KinoVSR/issues"
+
+[project.scripts]
+kinovsr = "kinovsr.cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kinovsr"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q --strict-markers --strict-config --import-mode=importlib"
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "requires_weights: marks tests that require model weights",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+    "solo: compares VideoToolbox output bits across runs; needs an otherwise idle machine",
+]
+pythonpath = "."
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+# Match KinoMLX's stricter lint posture: core pycodestyle/pyflakes/import
+# checks, bugbear, pyupgrade, simplification, pathlib, pytest style, no bare
+# package prints, ASCII-only source text, unused arguments (ARG), refurb
+# (FURB), perflint (PERF), and the Ruff-specific rules (RUF). An unused
+# argument is either an interface obligation, which says so with a noqa and a
+# reason, or an input the code silently ignores, which is a defect.
+# TID251: keep Python 3.14's native deferred annotations and one runtime/type
+# import graph; the banned-API table below rejects the two obsolete shortcuts.
+# PLC0415: imports live at module scope. The one exception is a choice point
+# that loads an optional extra (ffmpeg or eval) only on the path that needs
+# it; it carries `# noqa: PLC0415 - <extra> extra`, and
+# tests/cli/test_runtime_only.py checks both the marker and the startup
+# boundary. Tests may import inside test functions.
+select = [
+    "E", "W", "F", "I", "B", "C4", "UP", "SIM", "PTH", "RET", "PIE", "PT", "T20",
+    "TID251", "PLC0415", "RUF001", "RUF002", "RUF003", "PLC2401", "PLC2403", "ARG",
+    "FURB", "PERF", "RUF",
+]
+# E501: the formatter wraps where it matters.
+# RUF043: measured against this suite, all 15 `match=` patterns are either a
+# deliberate regex or a literal name whose unescaped dot is harmless.
+ignore = [
+    "E501",
+    "RUF043",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# Frozen records and the stateless NullReporter are safe to evaluate once as a
+# shared default; RUF009 and B008 treat these as immutable so the rules still
+# catch a genuinely mutable default.
+extend-immutable-calls = [
+    "kinovsr.pipeline.leases.StorageDescriptor",
+    "kinovsr.processors.StreamConstraint",
+    "kinovsr.reporting.NullReporter",
+]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"__future__.annotations".msg = "Use Python 3.14 native deferred annotations, not PEP 563 stringization."
+"typing.TYPE_CHECKING".msg = "Import annotation dependencies normally and keep one import graph."
+"typing_extensions.TYPE_CHECKING".msg = "Import annotation dependencies normally and keep one import graph."
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+# PLC0415: tests import inside test functions deliberately (isolation, fixtures).
+# ARG: test doubles conform to real signatures while ignoring most arguments.
+# PERF: assertion-building loops are written to be read, not to be fast.
+"tests/**" = ["PLC0415", "ARG", "PERF"]
+
+[tool.mypy]
+# KinoMLX's type gate: strict, and no explicit Any.
+python_version = "3.14"
+strict = true
+disallow_any_explicit = true
+follow_imports = "normal"
+pretty = true
+show_error_codes = true
+files = ["kinovsr"]
+
+[[tool.mypy.overrides]]
+# PyObjC frameworks ship no stubs; their values are typed as object or through
+# small Protocols where they are used. protobuf's stub package is not installed.
+module = [
+    "AppKit",
+    "AVFoundation",
+    "CoreAudio",
+    "CoreML",
+    "CoreMedia",
+    "Foundation",
+    "Metal",
+    "MetalFX",
+    "MetalPerformanceShaders",
+    "Quartz",
+    "VideoToolbox",
+    "Vision",
+    "google.*",
+    "libdispatch",
+    "objc",
+]
+ignore_missing_imports = true
+
+[tool.rumdl]
+line-length = 100
+respect-gitignore = true
+# Workspace plain-ASCII convention: MD084 (invisible Unicode) and MD088
+# (Unicode quotes/dashes) are opt-in rules; extend-enable adds them without
+# replacing the default rule set.
+extend-enable = ["MD084", "MD088"]
+
+[tool.rumdl.MD013]
+code-blocks = false
+tables = false
+
+[tool.rumdl.MD033]
+# Processor argument tables use rowspans to keep each option with its flag.
+allowed-elements = ["table", "thead", "tbody", "tr", "th", "td", "code", "em", "a"]
+
+[tool.rumdl.MD084]
+strict = true
+
+[tool.rumdl.MD088]
+normalize-dashes = true

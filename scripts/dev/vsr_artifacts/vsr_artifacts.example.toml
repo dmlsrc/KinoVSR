@@ -1,0 +1,172 @@
+# Copy to scripts/dev/vsr_artifacts/vsr_artifacts.local.toml and adjust paths for
+# your machine. Relative paths are resolved from this config file's directory.
+
+[fixtures]
+sources = [
+  "../../path/to/source-1.y4m",
+  "../../path/to/source-2.mp4",
+]
+output_dir = "../../path/to/generated-fixtures"
+seconds = 5.0
+modes = "all"
+seed = 20260705
+codec = "libx264"
+crf = 34
+gop = 30
+preset = "veryfast"
+pix_fmt = "yuv420p"
+overwrite = false
+
+# Optional per-mode artifact tuning. The defaults preserve the original
+# compression-heavy stress corpus. For an analog-focused corpus, use lower CRF
+# and stronger/lighter-weight analog settings like these:
+#
+# [fixtures.mode_params.mild_high_iso]
+# sigma = 0.060
+# row_sigma = 0.012
+#
+# [fixtures.mode_params.jumping_scanlines]
+# period = 11
+# line_width = 1
+# amp = 0.030
+# row_jitter = 0.006
+# dropout = 0.25
+#
+# [fixtures.mode_params.mosquito_edges]
+# # Default method: per-frame JPEG re-quantization at a cycling quality with a
+# # small pre-encode dither. Both real-world flicker mechanisms are present
+# # (source noise flipping quantized DCT coefficients, and the quantizer
+# # breathing frame to frame), so the halo flickers even on static shots.
+# method = "jpeg_cycle"
+# jpeg_quality_lo = 28
+# jpeg_quality_hi = 45
+# pre_dither_sigma = 0.012
+# # Alternate method: residual of a low-quality inter-codec proxy encode.
+# # Freezes on static content (deadzone/skip); use only for moving sources.
+# # method = "codec_residual"
+# # proxy_codec = "libx264"
+# # proxy_crf = 44
+# # proxy_preset = "ultrafast"
+# # proxy_pix_fmt = "yuv420p"
+# residual_gain = 1.45
+# residual_highpass_radius = 2
+# residual_lowpass_reject = 0.85
+# edge_quantile = 0.88
+# halo_radius = 4
+# core_radius = 0
+# texture_quantile = 0.65
+# texture_radius = 4
+# texture_max = 0.55
+# texture_softness = 0.18
+# mask_blur_radius = 1
+#
+# [fixtures.mode_params.mixed_analog_h264]
+# high_iso_sigma = 0.055
+# high_iso_row_sigma = 0.010
+# scanline_period = 13
+# scanline_line_width = 1
+# scanline_amp = 0.024
+# scanline_row_jitter = 0.005
+# scanline_dropout = 0.35
+# pulse_peak_sigma = 0.020
+# pulse_floor_sigma = 0.002
+# mosquito_method = "jpeg_cycle"
+# mosquito_jpeg_quality_lo = 30
+# mosquito_jpeg_quality_hi = 44
+# mosquito_pre_dither_sigma = 0.0
+# # or: mosquito_method = "codec_residual" with the mosquito_proxy_* keys
+# mosquito_proxy_codec = "libx264"
+# mosquito_proxy_crf = 42
+# mosquito_proxy_preset = "ultrafast"
+# mosquito_proxy_pix_fmt = "yuv420p"
+# mosquito_residual_gain = 1.20
+# mosquito_residual_highpass_radius = 2
+# mosquito_residual_lowpass_reject = 0.85
+# mosquito_edge_quantile = 0.88
+# mosquito_halo_radius = 4
+# mosquito_core_radius = 0
+# mosquito_texture_quantile = 0.65
+# mosquito_texture_radius = 4
+# mosquito_texture_max = 0.55
+# mosquito_texture_softness = 0.18
+# mosquito_mask_blur_radius = 1
+# include_block_grid = false
+#
+# [fixtures.encode.mild_high_iso]
+# crf = 16
+# preset = "slow"
+#
+# [fixtures.encode.jumping_scanlines]
+# crf = 16
+# preset = "slow"
+#
+# [fixtures.encode.mixed_analog_h264]
+# crf = 18
+# preset = "slow"
+
+[tests]
+# Defaults to the current interpreter when omitted.
+# python = "/path/to/python"
+
+# Defaults to fixtures.output_dir when omitted.
+# fixture_dir = "../../path/to/generated-fixtures"
+
+# Defaults to $SHARED_TEMP_DIR/vsr_fixture_tests_<timestamp> when omitted.
+# output_root = "../../path/to/test-output"
+
+base_flags = [
+  "--upscale", "none",
+  "--gop-align",
+  "--snap-start",
+  "--start", "0",
+  "--end", "2s",
+]
+manual_flags = [
+  "--denoise", "bsvd",
+  "--denoise-strength", "0.05",
+  "--deblock", "stdf",
+  "--deblock-strength", "0.25",
+]
+auto_flags = [
+  "--denoise", "bsvd",
+  "--noise-map", "auto",
+  "--noise-map-pulse",
+  "--noise-map-motion-cap", "strict",
+  "--noise-map-masking", "1",
+  "--noise-map-debug",
+  "--deblock", "stdf",
+  "--deblock-map", "auto",
+]
+compare_max_frames = 60
+compare_progress = 0
+# When a generated fixture has a matching source__reencode_only__... clip,
+# score each output against that clean/reencoded baseline too. This helps
+# distinguish "auto differs from manual" from "auto is closer to clean".
+clean_compare = true
+
+[[tests.cases]]
+label = "block_grid_case"
+video = "generated-block-grid.mp4"
+
+[[tests.cases]]
+label = "scanline_case"
+video = "generated-scanlines.mp4"
+
+[analysis]
+# Defaults to tests.fixture_dir, then fixtures.output_dir.
+# fixture_dir = "../../path/to/generated-fixtures"
+
+# Defaults to fixture_dir/manifest.json. When videos is omitted, all manifest
+# outputs are analyzed.
+# manifest = "../../path/to/generated-fixtures/manifest.json"
+# videos = ["generated-block-grid.mp4", "generated-scanlines.mp4"]
+
+# Defaults to $SHARED_TEMP_DIR/vsr_artifact_map_sweep_<timestamp>.
+# output_root = "../../path/to/analysis-output"
+
+seconds = 2.0
+window_frames = 12
+windows = [0.1, 0.5, 0.9]
+motion_caps = ["strict", "loose", "off"]
+masking = 1.0
+pulse_robust = true

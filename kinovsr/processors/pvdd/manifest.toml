@@ -1,0 +1,75 @@
+schema_version = 1
+
+[owner]
+kind = "processor"
+name = "pvdd"
+
+# One Google Drive archive holds all six checkpoints as
+# <subdir>/g_net_100000.pth; no direct URLs exist. source_sha256 is the
+# member .pth. The raw variants expect packed Bayer input, not sRGB video.
+
+[profiles.pvdd]
+capabilities = ["denoise"]
+weights = ["pvdd"]
+
+[profiles.crvd]
+capabilities = ["denoise"]
+weights = ["crvd"]
+
+[profiles.davis]
+capabilities = ["denoise"]
+weights = ["davis"]
+
+[profiles.pvdd_level]
+capabilities = ["denoise"]
+weights = ["pvdd_level"]
+
+[profiles.pvdd_raw]
+capabilities = ["denoise"]
+weights = ["pvdd_raw"]
+
+[profiles.pvdd_raw_level]
+capabilities = ["denoise"]
+weights = ["pvdd_raw_level"]
+
+[weights.pvdd]
+path = "weights/pvdd_srgb_nolevel.safetensors"
+distribution = "external"
+source = "https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (pvdd_srgb_nolevel/g_net_100000.pth)"
+source_sha256 = "c76b91c66a6e923e03a8f4847af61968b889c34911ee964a2894506d169d0eff"
+license = "MIT"
+
+[weights.crvd]
+path = "weights/crvd_srgb_nolevel.safetensors"
+distribution = "external"
+source = "https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (crvd_srgb_nolevel/g_net_100000.pth)"
+source_sha256 = "a327de3ba8c6b82f6deb78c4930ff077954b920c9258e7ba7f71c7cba68cd9af"
+license = "MIT"
+
+[weights.davis]
+path = "weights/davis_srgb_nolevel.safetensors"
+distribution = "external"
+source = "https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (davis_srgb_nolevel/g_net_100000.pth)"
+source_sha256 = "410065f431b36ceb1328ea5d58a7c09838a81e09ea5b14d516070a3a8c6c2b94"
+license = "MIT"
+
+[weights.pvdd_level]
+path = "weights/pvdd_srgb_level.safetensors"
+distribution = "external"
+source = "https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (pvdd_srgb_level/g_net_100000.pth)"
+source_sha256 = "fae9ba86080df49f2182079b4ac8efce89b537dcbb8b3db6f54b41f2674773df"
+license = "MIT"
+
+[weights.pvdd_raw]
+path = "weights/pvdd_raw_nolevel.safetensors"
+distribution = "external"
+source = "https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (pvdd_raw_nolevel/g_net_100000.pth)"
+source_sha256 = "12cabfbfb807a1dbae74a5d5d11e3cc89e8d3a1795bd84a4ef62c553d6116fe4"
+license = "MIT"
+
+[weights.pvdd_raw_level]
+path = "weights/pvdd_raw_level.safetensors"
+distribution = "external"
+source = "https://drive.google.com/drive/folders/1qEmupCR4JcaPNky3B5ldRN88t8K6CGaG (pvdd_raw_level/g_net_100000.pth)"
+source_sha256 = "b4bfbb04176feff5e4e3cf99556c992d28244e63b060c92239ad1cd68ce6b703"
+license = "MIT"

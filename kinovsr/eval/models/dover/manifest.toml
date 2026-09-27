@@ -1,0 +1,18 @@
+schema_version = 1
+
+[owner]
+kind = "evaluator"
+name = "dover"
+
+# Eval-only video-quality scorer; no runtime profiles. Both hashes are
+# documented: source is the upstream DOVER-Mobile.pth, artifact is the
+# converted safetensors (conversion must go through convert_dover.py,
+# not the generic re-serializer).
+
+[weights.dover_mobile]
+path = "weights/dover_mobile.safetensors"
+distribution = "external"
+source = "https://github.com/QualityAssessment/DOVER/releases/download/v0.5.0/DOVER-Mobile.pth"
+source_sha256 = "81b487be2aa4b3dd6920afa2e92294ed8fdd46a306911f75ecc8e6938a670884"
+artifact_sha256 = "9d8f65fd9f2810cb0f31897e187d2094c888c90c2c90a1e0b5fc8c4243fc2ff2"
+license = "NTU S-Lab License 1.0 (non-commercial)"
