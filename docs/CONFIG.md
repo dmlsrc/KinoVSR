@@ -26,8 +26,8 @@ Everything after them is concrete data you can see with `--print-config`.
 compositional flag - the stage selectors (`--denoise`, `--deblock`,
 `--restore`, `--upscale`, `--nafnet`, `--level`, `--deflicker`), the
 geometry selectors (`--crop-*`, `--sanitize-edges`, `--square-pixels`),
-`--target-fps`, `--conform-cfr`, `--preprocess-order`, and
-`--denoise-first` - is refused with an error naming the conflict.
+`--target-fps`, `--conform-cfr`, and `--preprocess-order` - is refused
+with an error naming the conflict.
 Everything else still applies.
 
 **Dials merge onto stages by target, not by path.** A family dial such

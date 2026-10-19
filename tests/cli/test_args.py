@@ -561,7 +561,6 @@ class TestPipelineOwnedFlags:
             "vt_sr_flow": "internal",
             "conform_cfr": None,
             "preprocess_order": None,
-            "denoise_first": False,
         }
         base.update(overrides)
         return _pipeline_owned_flags(SimpleNamespace(**base))
@@ -602,9 +601,8 @@ class TestPipelineOwnedFlags:
     def test_conform_cfr_is_rejected_with_an_explicit_pipeline(self):
         assert "conform_cfr" in self._flags(conform_cfr=30.0)
 
-    def test_ordering_flags_are_rejected_with_an_explicit_pipeline(self):
+    def test_preprocess_order_is_rejected_with_an_explicit_pipeline(self):
         assert "preprocess_order" in self._flags(preprocess_order=["denoise"])
-        assert "denoise_first" in self._flags(denoise_first=True)
 
     def test_typed_command_returns_config_error_for_target_fps(self):
         from types import SimpleNamespace

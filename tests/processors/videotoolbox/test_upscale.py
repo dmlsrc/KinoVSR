@@ -175,7 +175,7 @@ class TestParseAndSpec:
         ],
     )
     def test_uint8_mlx_input_is_refused_at_open(self, stage):
-        # CU-03: a host changing only the dtype keeps the UNIT domain; the
+        # A host changing only the dtype keeps the UNIT domain; the
         # uploads would convert the 0..255 values unscaled and saturate.
         import dataclasses
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Scheduler overhead microbenchmark (planning 06 runtime gate).
+"""Scheduler overhead microbenchmark (the runtime overhead gate).
 
 In-memory source and sink, no MLX work: measures pure framework cost per
 stage per frame across no-op chains of 1, 4, and 8 stages. Gate values
-live in MEDIAN_GATE_MS / P95_GATE_MS (ratcheted per planning 06);
+live in MEDIAN_GATE_MS / P95_GATE_MS (ratcheted);
 scaling in stage count should stay roughly linear.
 
 Parent mode spawns fresh child processes (one per run) and aggregates;

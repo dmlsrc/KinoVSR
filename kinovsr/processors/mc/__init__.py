@@ -211,8 +211,8 @@ class McTemporalDenoiser:
         # the fraction of the possible temporal denoise the flow actually
         # unlocked (flow-limited clips read low). Accumulated as a RESIDENT
         # MLX scalar and read once at end of run: a per-frame float() here
-        # forces an extra mid-frame host/device sync (doc 06 forbids that
-        # for diagnostics).
+        # forces an extra mid-frame host/device sync (diagnostics must not add
+        # one).
         self._w_sum: mx.array | None = None
         self._w_n = 0
         self._warp_grid: tuple[mx.array, mx.array] | None = _grid(self.h, self.w)

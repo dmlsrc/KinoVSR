@@ -80,6 +80,39 @@ def pixel_format(full_range: bool) -> int:
     return PIX_422YCBCR10_FULL if full_range else PIX_422YCBCR10_VIDEO
 
 
+def _planes(rgb: mx.array, Kr: float, Kb: float, full_range: bool) -> tuple[mx.array, mx.array]:
+    """The (luma, chroma) planes of `rgb` (H,W,3 float in [0,1]): matrix, range, co-sited 4:2:2
+    decimation, 10-bit quantization, left-justified packing."""
+    Kg = 1.0 - Kr - Kb
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    Y = Kr * R + Kg * G + Kb * B
+    Cb = (B - Y) / (2.0 * (1.0 - Kb))  # [-0.5, 0.5]
+    Cr = (R - Y) / (2.0 * (1.0 - Kr))
+    H, W = rgb.shape[0], rgb.shape[1]
+    if full_range:
+        Y10 = Y * 1023.0
+        Cb10c, Cr10c = Cb * 1023.0 + 512.0, Cr * 1023.0 + 512.0
+    else:  # video range 10-bit: Y 64..940, chroma 64..960 (mid 512)
+        Y10 = Y * 876.0 + 64.0
+        Cb10c, Cr10c = Cb * 896.0 + 512.0, Cr * 896.0 + 512.0
+
+    # Co-sited (left) [1,2,1]/4 filter centered on the even columns: the
+    # 4:2:2 siting every decoder assumes. HEVC VUI cannot signal any
+    # other siting for 4:2:2 (chroma_sample_loc_type is 4:2:0-only), so
+    # a centered box-average ships unsignaled and decodes ~0.5 px left.
+    def cosited(c: mx.array) -> mx.array:
+        left = mx.concatenate([c[:, :1], c[:, 1:-1:2]], axis=1)
+        return (left + 2.0 * c[:, 0::2] + c[:, 1::2]) * 0.25
+
+    Cb_s = cosited(Cb10c)
+    Cr_s = cosited(Cr10c)
+    luma = (mx.clip(mx.round(Y10), 0, 1023).astype(mx.uint16)) << 6
+    cb = mx.clip(mx.round(Cb_s), 0, 1023).astype(mx.uint16)
+    cr = mx.clip(mx.round(Cr_s), 0, 1023).astype(mx.uint16)
+    chroma = (mx.stack([cb, cr], axis=-1).reshape(H, W)) << 6  # Cb,Cr interleaved
+    return luma, chroma
+
+
 # Pure RGB -> (luma, chroma) compute, compiled once per (Kr, Kb, full_range) and
 # reused for every frame of a run (the frame shape is stable, so no recompile
 # thrash). Kept separate from the impure plane memcpy in rgb_to_yuv422_10 so the
@@ -87,47 +120,46 @@ def pixel_format(full_range: bool) -> int:
 _COMPUTE_CACHE: dict[
     tuple[float, float, bool], Callable[[mx.array], tuple[mx.array, mx.array]]
 ] = {}
+# The same, from a model's frame, with its conditioning in the one graph.
+_FRAME_CACHE: dict[
+    tuple[float, float, bool, bool], Callable[[mx.array], tuple[mx.array, mx.array]]
+] = {}
 
 
 def _compiled_planes(
     Kr: float, Kb: float, full_range: bool
 ) -> Callable[[mx.array], tuple[mx.array, mx.array]]:
-    Kg = 1.0 - Kr - Kb
-
-    def _compute(rgb: mx.array) -> tuple[mx.array, mx.array]:
-        R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-        Y = Kr * R + Kg * G + Kb * B
-        Cb = (B - Y) / (2.0 * (1.0 - Kb))  # [-0.5, 0.5]
-        Cr = (R - Y) / (2.0 * (1.0 - Kr))
-        H, W = rgb.shape[0], rgb.shape[1]
-        if full_range:
-            Y10 = Y * 1023.0
-            Cb10c, Cr10c = Cb * 1023.0 + 512.0, Cr * 1023.0 + 512.0
-        else:  # video range 10-bit: Y 64..940, chroma 64..960 (mid 512)
-            Y10 = Y * 876.0 + 64.0
-            Cb10c, Cr10c = Cb * 896.0 + 512.0, Cr * 896.0 + 512.0
-
-        # Co-sited (left) [1,2,1]/4 filter centered on the even columns: the
-        # 4:2:2 siting every decoder assumes. HEVC VUI cannot signal any
-        # other siting for 4:2:2 (chroma_sample_loc_type is 4:2:0-only), so
-        # a centered box-average ships unsignaled and decodes ~0.5 px left.
-        def cosited(c: mx.array) -> mx.array:
-            left = mx.concatenate([c[:, :1], c[:, 1:-1:2]], axis=1)
-            return (left + 2.0 * c[:, 0::2] + c[:, 1::2]) * 0.25
-
-        Cb_s = cosited(Cb10c)
-        Cr_s = cosited(Cr10c)
-        luma = (mx.clip(mx.round(Y10), 0, 1023).astype(mx.uint16)) << 6
-        cb = mx.clip(mx.round(Cb_s), 0, 1023).astype(mx.uint16)
-        cr = mx.clip(mx.round(Cr_s), 0, 1023).astype(mx.uint16)
-        chroma = (mx.stack([cb, cr], axis=-1).reshape(H, W)) << 6  # Cb,Cr interleaved
-        return luma, chroma
-
     key = (Kr, Kb, full_range)
     fn = _COMPUTE_CACHE.get(key)
     if fn is None:
+
+        def _compute(rgb: mx.array) -> tuple[mx.array, mx.array]:
+            return _planes(rgb, Kr, Kb, full_range)
+
         fn = mx.compile(_compute)
         _COMPUTE_CACHE[key] = fn
+    return fn
+
+
+def _compiled_frame_planes(
+    Kr: float, Kb: float, full_range: bool, signed: bool
+) -> Callable[[mx.array], tuple[mx.array, mx.array]]:
+    key = (Kr, Kb, full_range, signed)
+    fn = _FRAME_CACHE.get(key)
+    if fn is None:
+
+        def _compute(frame: mx.array) -> tuple[mx.array, mx.array]:
+            if signed:
+                # [-1, 1] model output to [0, 1], in float32, as its sinks mapped it.
+                rgb = mx.clip((frame[..., :3].astype(mx.float32) + 1) * 0.5, 0, 1)
+            else:
+                rgb = frame[..., :3]
+            # The legacy RGBAHalf path's numeric boundary: FileSink wrote FP16 and read it
+            # back as float32 before YUV quantization.
+            return _planes(rgb.astype(mx.float16).astype(mx.float32), Kr, Kb, full_range)
+
+        fn = mx.compile(_compute)
+        _FRAME_CACHE[key] = fn
     return fn
 
 
@@ -145,6 +177,24 @@ def rgb_to_yuv422_10(
     """
     Kr, Kb = coef_for_matrix(matrix)
     luma, chroma = _compiled_planes(Kr, Kb, full_range)(rgb)
+    _write_planes(dst_buffer, (luma, chroma))
+
+
+def frame_to_yuv422_10(
+    frame: mx.array,
+    dst_buffer: object,
+    matrix: object,
+    full_range: bool = False,
+    *,
+    signed: bool = False,
+) -> None:
+    """Convert a model's output frame (H,W,C>=3 float, gamma-encoded; [0, 1], or [-1, 1] with
+    `signed`) to 10-bit 4:2:2 YUV in `dst_buffer`, as `rgb_to_yuv422_10` of the frame mapped to
+    [0, 1] and rounded through FP16, with the mapping and rounding inside the same compiled
+    graph: the frame is read once, and no float32 RGB copy of it is made.
+    """
+    Kr, Kb = coef_for_matrix(matrix)
+    luma, chroma = _compiled_frame_planes(Kr, Kb, full_range, signed)(frame)
     _write_planes(dst_buffer, (luma, chroma))
 
 

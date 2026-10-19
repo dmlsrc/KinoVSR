@@ -5,8 +5,8 @@ TOML expresses, encoding the harness's semantics:
 
 - the frame-loop stage order: crop -> sanitize fill -> square-pixels ->
   cut detection -> preprocess slots -> upscale -> frame-rate conversion;
-- the preprocess slot order (planning C5): restore and deflicker first,
-  deblock before denoise (``--denoise-first`` swaps them), nafnet last;
+- the preprocess slot order: restore and deflicker first,
+  deblock before denoise, nafnet last;
   ``--preprocess-order`` sets an explicit order and any enabled stage it
   omits is appended in the default order;
 - comma-chained selectors (``--denoise mc,bsvd``) as one stage each, in
@@ -56,6 +56,7 @@ _NAFNET = {
     "sidd32": ("denoise", "sidd32"),
     "reds": ("restore", "reds"),
 }
+_RESTORE_FAMILIES = {"deh264": "realplksr"}
 
 # Denoise-slot families whose stage tables accept the noise-map
 # conditioning keys (processors/conditioning.py consumers).
@@ -441,11 +442,10 @@ def assemble_pipeline(
     if options.preprocess_order:
         order = list(options.preprocess_order)
     else:
-        order = ["denoise", "deblock"] if options.denoise_first else ["deblock", "denoise"]
         # level runs first: a stable exposure improves every temporal
         # stage after it (deflicker's static verification, mc's gate,
         # the noise map, learned temporal denoisers).
-        order = ["level", "restore", "deflicker", *order]
+        order = ["level", "restore", "deflicker", "deblock", "denoise"]
     for slot in PP_STAGE_NAMES:  # append any slot not listed
         if slot not in order:
             order.append(slot)
@@ -458,7 +458,11 @@ def assemble_pipeline(
             for variant in chain(options.restore):
                 add(
                     f"restore_{variant}",
-                    {"processor": "basicvsrpp", "capability": "restore", "profile": variant},
+                    {
+                        "processor": _RESTORE_FAMILIES.get(variant, "basicvsrpp"),
+                        "capability": "restore",
+                        "profile": variant,
+                    },
                 )
         elif slot == "level" and options.level != "off":
             add("level", {"processor": "level"})

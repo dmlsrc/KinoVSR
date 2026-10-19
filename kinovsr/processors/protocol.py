@@ -1,6 +1,6 @@
 """The processor contract: lifecycle protocol, factory, and context.
 
-Pure core, effectful edges (planning 05): a family's MLX math is a pure
+Pure core, effectful edges: a family's MLX math is a pure
 function ``(params, inputs, state) -> (outputs, state)`` - anything
 ``mx.compile``d must not mutate attributes, read hidden mutable state, or
 perform I/O. The lifecycle methods below are the deliberately impure

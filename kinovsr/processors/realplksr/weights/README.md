@@ -1,16 +1,18 @@
 # RealPLKSR weights
 
 Not bundled -- download; the `.safetensors` are gitignored. These are
-`--realplksr-weights <token>` tokens (default `public2x`). The scale (2x/4x),
+`--realplksr-weights <token>` tokens (default `public2x` for upscaling and
+`deh264` for restoration). The scale (1x/2x/4x),
 width, block count, LayerNorm/GroupNorm variant, and DySample vs PixelShuffle head
 are all auto-detected from the checkpoint at load.
 
-All three are trained by Philip Hofmann (Phhofm) and published as `.safetensors`
+All four are trained by Philip Hofmann (Phhofm) and published as `.safetensors`
 directly on his releases, so no `.pth` conversion is needed -- download the
 `.safetensors` asset and rename it to the token filename below.
 
 | token | scale | variant | download | license |
 | --- | --- | --- | --- | --- |
+| deh264 | 1x | GroupNorm + PixelShuffle, H.264 artifact restoration | <https://github.com/Phhofm/models/releases/download/1xDeH264_realplksr/1xDeH264_realplksr.safetensors> | CC-BY-4.0 |
 | public2x (default) | 2x | LayerNorm + DySample, real-world photo/JPEG | <https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.safetensors> | Apache-2.0 |
 | public2x-nn | 2x | same, trained without noise (cleaner sources) | <https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real_nn/2xPublic_realplksr_dysample_layernorm_real_nn.safetensors> | Apache-2.0 |
 | nomos4x | 4x | GroupNorm + PixelShuffle, photo restoration | <https://github.com/Phhofm/models/releases/download/4xNomosWebPhoto_RealPLKSR/4xNomosWebPhoto_RealPLKSR.safetensors> | CC-BY-4.0 |
@@ -20,10 +22,19 @@ Download -- the output name must match [`net.py`](../net.py)'s `_VARIANTS`:
 ```bash
 curl -L -o kinovsr/processors/realplksr/weights/2xpublic_realplksr_dysample_layernorm_real.safetensors \
   https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.safetensors
+
+curl -L -o kinovsr/processors/realplksr/weights/1xdeh264_realplksr.safetensors \
+  https://github.com/Phhofm/models/releases/download/1xDeH264_realplksr/1xDeH264_realplksr.safetensors
 ```
 
-`nomos4x` -> `4xnomoswebphoto_realplksr.safetensors`, `public2x-nn` ->
+`deh264` -> `1xdeh264_realplksr.safetensors`, `nomos4x` ->
+`4xnomoswebphoto_realplksr.safetensors`, and `public2x-nn` ->
 `2xpublic_realplksr_dysample_layernorm_real_nn.safetensors`, likewise.
+
+The deh264 source file's SHA-256 is
+`91f054af6308e37b81c261ecf775a58be5fa1d37a816709db5d0fea6fceb24b8`.
+The GitHub release body says `CC-BY-0.4`; the author's Hugging Face model card
+declares `cc-by-4.0` in its license metadata. The manifest uses CC-BY-4.0.
 
 If you point `--realplksr-weights` at another RealPLKSR checkpoint that ships only
 as `.pth` (a plain BasicSR/neosr/traiNNer state dict, not nested under `params`),
@@ -43,6 +54,10 @@ port runs just the GroupNorm/LayerNorm reductions in fp32 (the `--realplksr-dtyp
 float16` default), which fixes exactly that -- measured visually lossless (~72 dB
 vs fp32) while keeping the convs and activations in fp16. Use `--realplksr-dtype
 float32` to force a full single-precision run.
+
+`deh264` is also a GroupNorm checkpoint. The 4x precision measurement does not
+establish its numerical or visual behavior; compare float16 and float32 on
+representative H.264 footage before choosing the faster mode for a full clip.
 
 ## Architecture
 

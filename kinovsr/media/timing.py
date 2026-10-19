@@ -102,6 +102,15 @@ class SampleTable:
     # lands inside a later epoch would start the decode-side unwrapper
     # without the history that maps raw stamps onto this clock.
     epoch_resets: int = 0
+    # The stream reorders pictures (B frames), yet every packet's stamp keeps
+    # one offset from its decode time: the stamps follow decode order, not
+    # display order, so a decoder's pictures arrive carrying each other's.
+    decode_order_stamps: bool = False
+    # The container's stamps cannot identify pictures: a raw elementary
+    # stream carries none, or two pictures share one. Samples are then the
+    # coded pictures in decode order on a constant grid, and a decode path
+    # numbers each packet by that position instead of reading its stamp.
+    positional_stamps: bool = False
 
     @property
     def sample_count(self) -> int:
@@ -422,6 +431,8 @@ def analyze_sample_table(
     nominal_cadence: Fraction | int | float | str | None,
     source_tick: Fraction,
     epoch_resets: int = 0,
+    decode_order_stamps: bool = False,
+    positional_stamps: bool = False,
 ) -> SampleTable:
     """Classify exact display timing records as one grid, gapped, or VFR.
 
@@ -491,6 +502,8 @@ def analyze_sample_table(
         source_tick=source_tick,
         keyframe_indices=tuple(index for index, sample in enumerate(ordered) if sample.is_sync),
         epoch_resets=int(epoch_resets),
+        decode_order_stamps=decode_order_stamps,
+        positional_stamps=positional_stamps,
     )
 
 

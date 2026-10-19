@@ -37,25 +37,29 @@ def stream() -> StreamSpec:
 @pytest.mark.integration
 def test_auto_quality_refreshes_on_the_runtime_lane():
     from kinovsr.pipeline import resolve_pipeline, run_plan
+    from kinovsr.processors.fbcnn.net import resolve_weights
 
-    count = FbcnnDeblocker.QF_MIN_FRAMES + 2  # past the first QF refresh
+    # Resolve before running: the runtime reports a stage's missing weights as a
+    # PipelineRuntimeError, so a FileNotFoundError never reaches this frame.
     try:
-        plan = resolve_pipeline(
-            {"pipeline": ["d"], "d": {"processor": "fbcnn"}},
-            input_spec=stream(),
-            settings=SETTINGS,
-        )
-        mx.random.seed(7)
-        units = [
-            FrameUnit(
-                payload=mx.random.uniform(shape=(H, W, 3)).astype(mx.float32),
-                pts=i * 960,
-                duration=960,
-            )
-            for i in range(count)
-        ]
-        out = list(run_plan(plan, units, PipelineContext(settings=SETTINGS)))
+        resolve_weights()
     except FileNotFoundError as exc:
         pytest.skip(f"fbcnn weights not available: {exc}")
+    count = FbcnnDeblocker.QF_MIN_FRAMES + 2  # past the first QF refresh
+    plan = resolve_pipeline(
+        {"pipeline": ["d"], "d": {"processor": "fbcnn"}},
+        input_spec=stream(),
+        settings=SETTINGS,
+    )
+    mx.random.seed(7)
+    units = [
+        FrameUnit(
+            payload=mx.random.uniform(shape=(H, W, 3)).astype(mx.float32),
+            pts=i * 960,
+            duration=960,
+        )
+        for i in range(count)
+    ]
+    out = list(run_plan(plan, units, PipelineContext(settings=SETTINGS)))
     assert len(out) == count
     assert all(tuple(unit.payload.shape) == (H, W, 3) for unit in out)

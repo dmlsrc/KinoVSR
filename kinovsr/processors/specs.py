@@ -137,7 +137,7 @@ class FrameSpec:
 
 class VariableCadence(Enum):
     """Sentinel for VFR sources; a concrete rounding policy is an open
-    planning question and arrives with real VFR footage."""
+    design question and arrives with real VFR footage."""
 
     VFR = "vfr"
 

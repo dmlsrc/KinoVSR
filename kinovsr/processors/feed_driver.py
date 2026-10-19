@@ -27,7 +27,7 @@ from .protocol import PipelineContext
 from .specs import StreamSpec, luma_coefficients
 from .units import FrameUnit, SourceFrameInfo
 
-# The shared denoise luma/chroma blend keys (planning 07). A denoise family
+# The shared denoise luma/chroma blend keys. A denoise family
 # adds these to its accepted keys and threads the parsed strengths into
 # FeedFlushProcessor, which owns the recombination.
 LUMA_CHROMA_KEYS = ("luma_strength", "chroma_strength")
@@ -543,7 +543,7 @@ class FeedFlushProcessor:
     Optional luma/chroma split: when a denoise family passes
     ``luma_strength``/``chroma_strength`` other than 1.0, each output is
     recombined against the input it was computed from with separate blend
-    strengths per channel group (planning 07's shared keys). The token
+    strengths per channel group (the shared luma/chroma keys). The token
     threading is exactly what makes this correct through a delay line -
     ``token`` is the input unit each output emerged from, so the blend
     pairs a delayed output with its own source frame, not the frame

@@ -29,6 +29,12 @@ Trained and released by Philip Hofmann (Phhofm), <https://github.com/Phhofm/mode
   Apache License 2.0 (SPDX: Apache-2.0).
 - `nomos4x` (4xNomosWebPhoto_RealPLKSR): Creative Commons Attribution 4.0
   International (SPDX: CC-BY-4.0). Attribution: Philip Hofmann.
+- `deh264` (1xDeH264_realplksr): Creative Commons Attribution 4.0
+  International (SPDX: CC-BY-4.0). Attribution: Philip Hofmann. The
+  [GitHub release](https://github.com/Phhofm/models/releases/tag/1xDeH264_realplksr)
+  body spells the version `CC-BY-0.4`; the author's
+  [Hugging Face model card](https://huggingface.co/Phips/1xDeH264_realplksr)
+  sets its license metadata to `cc-by-4.0`.
 
 The weights are downloaded, not bundled (see [README.md](README.md) beside this file). Both licenses
 permit commercial use with attribution; retain this file and the upstream credit.

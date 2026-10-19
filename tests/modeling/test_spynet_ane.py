@@ -174,7 +174,76 @@ class TestAneParity:
         self._engine(params, a.shape)
         cached = list((tmp_path / "cache" / "spynet-ane").glob("*/level*.mlpackage"))
         assert len(cached) >= 5
-        assert not list((tmp_path / "cache").rglob("*.partial.mlpackage"))
+        assert not list((tmp_path / "cache").rglob("*.partial*"))
+
+
+def _temporary_level_models():
+    """SpyNet's compiled levels in the user's temporary directory.
+
+    Core ML compiles a package there, whatever TMPDIR says, as
+    ``<stem>.mlmodelc``, or ``<stem>_<UUID>.mlmodelc`` when that name is
+    taken. Only the level names count, so another process compiling its own
+    models meanwhile cannot fail a check.
+    """
+    import subprocess
+    from pathlib import Path
+
+    temporary = subprocess.run(
+        ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    return {path.name for path in Path(temporary).glob("level*.mlmodelc")}
+
+
+@pytest.mark.integration
+class TestCompiledModelsLeaveNothingBehind:
+    """Core ML leaves each compiled level in the user's temporary directory
+    for its caller. Copying it into the cache left the original there: one
+    compiled model per level on every cache miss."""
+
+    def _engine(self, params, shape):
+        engine = spynet_ane.engine_for(params, shape)
+        if engine is None and spynet_ane.unavailable_reason():
+            pytest.skip(spynet_ane.unavailable_reason())
+        assert engine is not None, spynet_ane.last_failure()
+        return engine
+
+    def test_a_cache_miss_moves_the_compiled_models_into_the_cache(self, params, tmp_path):
+        a, _ = _pair()
+        levels = spynet_ane.padded_geometry(a.shape[1], a.shape[2])[2]
+        before = _temporary_level_models()
+        self._engine(params, a.shape)
+        assert _temporary_level_models() - before == set()
+        # Each level's package and compiled model, and no staging directory.
+        geometry = next((tmp_path / "cache" / "spynet-ane").iterdir())
+        assert sorted(path.name for path in geometry.iterdir()) == sorted(
+            f"level{i}.{kind}" for i in range(levels) for kind in ("mlmodelc", "mlpackage")
+        )
+
+    def test_an_unwritable_cache_costs_startup_time_not_correctness(self, params, tmp_path):
+        import shutil
+        import stat
+
+        a, b = _pair()
+        self._engine(params, a.shape)
+        geometry = next((tmp_path / "cache" / "spynet-ane").iterdir())
+        for compiled in geometry.glob("*.mlmodelc"):
+            shutil.rmtree(compiled)
+        spynet_ane.reset_cache()
+        before = _temporary_level_models()
+        mode = stat.S_IMODE(geometry.stat().st_mode)
+        geometry.chmod(0o555)
+        try:
+            engine = self._engine(params, a.shape)
+        finally:
+            geometry.chmod(mode)
+        # Every level loaded from Core ML's own output, which is gone again.
+        assert not list(geometry.glob("*.mlmodelc"))
+        assert _temporary_level_models() - before == set()
+        got = engine.flow(a, b)
+        want = spynet_flow(params, a, b)
+        mx.eval(got, want)
+        epe = mx.sqrt(mx.sum((got - want) ** 2, axis=-1))
+        assert float(mx.mean(epe)) < 0.02, float(mx.mean(epe))
 
 
 class TestCliOverrideReachesTheBackend:

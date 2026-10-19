@@ -68,6 +68,36 @@ def clip_with_audio(tmp_path_factory):
     return path
 
 
+@pytest.fixture(scope="module")
+def short_program_stream(tmp_path_factory):
+    """24 small MPEG-2 pictures in a video-only MPEG program stream.
+
+    AVFoundation's program-stream demuxer stops short of the last frames of
+    this layout (20 of 24 on macOS 27), which the ffmpeg reader does not.
+    """
+    path = tmp_path_factory.mktemp("api_program_stream") / "short.mpg"
+    out = av.open(str(path), "w", format="mpeg")
+    vs = out.add_stream("mpeg2video", rate=FPS)
+    vs.width, vs.height = 64, 48
+    vs.pix_fmt = "yuv420p"
+    vs.options = {
+        "g": "12",
+        "bf": "2",
+        "qscale": "2",
+        "flags": "+cgop",
+        "sc_threshold": "1000000000",
+    }
+    for t in range(N):
+        frame = av.VideoFrame(64, 48, "gray")
+        frame.planes[0].update(bytes((x * 3 + t * 5) % 256 for x in range(64)) * 48)
+        for pkt in vs.encode(frame.reformat(format="yuv420p")):
+            out.mux(pkt)
+    for pkt in vs.encode():
+        out.mux(pkt)
+    out.close()
+    return path
+
+
 def _output_streams(path):
     with av.open(str(path)) as container:
         video = container.streams.video
@@ -135,3 +165,33 @@ def test_main_runs_canonical_spellings_end_to_end(clip_with_audio, tmp_path):
     frames, _, n_audio = _output_streams(outputs[0])
     assert frames == 6
     assert n_audio == 0  # explicit --no-audio: silent output
+
+
+def test_auto_reader_keeps_every_frame_of_an_mpeg_program_stream(short_program_stream, tmp_path):
+    rc = main(
+        [
+            "--video",
+            str(short_program_stream),
+            "--output-dir",
+            str(tmp_path),
+            "--upscale",
+            "none",
+            "--mlx-cache-limit-gb",
+            "0.25",
+        ]
+    )
+    assert rc == 0
+    (output,) = tmp_path.glob("vsr_short_*.mp4")
+    frames, _, _ = _output_streams(output)
+    assert frames == N
+
+
+def test_library_default_reader_keeps_every_frame_of_an_mpeg_program_stream(
+    short_program_stream, tmp_path
+):
+    from kinovsr.api import process_video_file
+
+    output = tmp_path / "out.mp4"
+    process_video_file({"pipeline": []}, video=short_program_stream, output=output)
+    frames, _, _ = _output_streams(output)
+    assert frames == N

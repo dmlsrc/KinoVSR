@@ -132,6 +132,12 @@ class _AffinityLane:
     def _run(self) -> None:
         self._thread_id = threading.get_ident()
         try:
+            if self._mlx_stream is not None:
+                # Bind the stream to this thread once.  mx.stream() would also
+                # set MLX's default device, one value for the whole process:
+                # a callback that outlived another thread's CPU stream context
+                # could end that context early or leave every thread on the CPU.
+                mx.set_default_stream(self._mlx_stream)
             while True:
                 future, callback = self._take_ready()
                 if callback is _LANE_STOP:
@@ -177,10 +183,7 @@ class _AffinityLane:
         if not future.set_running_or_notify_cancel():
             return
         try:
-            stream_scope: contextlib.AbstractContextManager[None, None] = contextlib.nullcontext()
-            if self._mlx_stream is not None:
-                stream_scope = mx.stream(self._mlx_stream)
-            with autorelease_pool(), stream_scope:
+            with autorelease_pool():
                 result = callback()
         except BaseException as exc:  # broad: delivered through Future
             future.set_exception(exc)
@@ -1085,13 +1088,15 @@ class _StreamingGraph:
         stream = self._host_default_stream
         if stream is None:
             raise RuntimeError("host MLX stream is unavailable")
-        with mx.stream(stream):
-            # MLX 0.32.1 can retain an owned host buffer directly.  The bytes
-            # snapshot remains the stream-safe ownership boundary, while the
-            # native zero-copy import avoids copying it a second time here.
-            raw = mx.asarray(memoryview(value.data), copy=False)
-            payload = raw.view(value.dtype).reshape(value.shape)
-            mx.eval(payload)
+        # MLX 0.32.1 can retain an owned host buffer directly.  The bytes
+        # snapshot remains the stream-safe ownership boundary, while the
+        # native zero-copy import avoids copying it a second time here.
+        raw = mx.asarray(memoryview(value.data), copy=False)
+        # Each op names the host stream; mx.stream() would also set MLX's
+        # process-wide default device under other threads' MLX work.
+        viewed = mx.view(raw, value.dtype, stream=stream)
+        payload = mx.reshape(viewed, value.shape, stream=stream)
+        mx.eval(payload)
         return unit.with_payload(payload)
 
     def wait(self) -> object:
@@ -1158,7 +1163,7 @@ class _StreamingGraph:
                         bind_background: _BindBackground = bind_background,
                     ) -> object:
                         completion = self._completion_executor
-                        assert completion is not None  # shut down only by _finish_graph
+                        assert completion is not None  # shut down after processor close
                         return bind_background(
                             self._progress_submit(operation, index),
                             completion.submit,
@@ -1880,9 +1885,6 @@ class _StreamingGraph:
         for thread in self._publisher_threads:
             if thread is not threading.current_thread():
                 thread.join()
-        completion, self._completion_executor = self._completion_executor, None
-        if completion is not None:
-            completion.shutdown(wait=True, cancel_futures=False)
         for channel in (*self._channels, *self._pending_channels):
             channel.close()
             channel.drain()
@@ -1941,6 +1943,17 @@ class _StreamingGraph:
         for finalizer in reversed(finalizers):
             try:
                 finalizer()
+            except Exception as exc:  # broad: collected below
+                close_errors.append(exc)
+            except BaseException as exc:
+                interrupts.append(exc)
+        # A wavefront's owner-lane Future callback can submit a native wait
+        # while the stage is closing. Keep both queues alive until processors
+        # abandon their handles, then drain completion callbacks before lanes.
+        completion, self._completion_executor = self._completion_executor, None
+        if completion is not None:
+            try:
+                completion.shutdown(wait=True, cancel_futures=False)
             except Exception as exc:  # broad: collected below
                 close_errors.append(exc)
             except BaseException as exc:

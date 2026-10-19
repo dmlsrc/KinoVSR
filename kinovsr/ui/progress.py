@@ -41,6 +41,15 @@ from .console import get_console
 _log = logging.getLogger(__name__)
 
 
+def _run_seconds(task: Task) -> float | None:
+    """A task's running time, stopped when it finished, as the RUN column shows it.
+
+    Rich's ``Task.elapsed`` keeps counting after a task completes until
+    something calls ``stop_task``; ``finished_time`` is when it completed.
+    """
+    return task.finished_time if task.finished_time is not None else task.elapsed
+
+
 class WallClockPaceColumn(ProgressColumn):
     """Pace as ``X.X s/<unit>`` (slow) or ``X.X <unit>/s`` (fast).
 
@@ -48,15 +57,18 @@ class WallClockPaceColumn(ProgressColumn):
     math-consistent with the ``elapsed`` and ``count`` columns -
     ``pace x elapsed`` reproduces ``completed`` exactly. Rich's built-in
     speed column uses a sliding window, which does not have this property.
+    A finished task's pace stays at its value when it finished, while other
+    bars keep running.
 
     The ``unit`` (``"frame"``, ``"step"``, ...) is read from the task's
     ``fields`` dict; defaults to ``"it"`` if unset.
     """
 
     def render(self, task: Task) -> Text:
-        if task.elapsed is None or task.completed == 0:
+        elapsed = _run_seconds(task)
+        if elapsed is None or task.completed == 0:
             return Text("measuring", style="dim")
-        sec_per_unit = task.elapsed / task.completed
+        sec_per_unit = elapsed / task.completed
         unit = task.fields.get("unit", "it")
         if sec_per_unit >= 1.0:
             return Text(f"{sec_per_unit:>6.1f} s/{unit}")
@@ -123,10 +135,10 @@ def log_phase_summary(
 ) -> None:
     """Log a one-line summary of a task: total time, count, time per unit.
 
-    Reads the finished task's ``elapsed`` and ``completed`` straight from
-    rich, so the numbers match the live :class:`WallClockPaceColumn`. A
-    no-op if the task id is unknown; logs a short note if the task never
-    advanced.
+    Reads the task's running time (until it finished) and ``completed``
+    straight from rich, so the numbers match the live
+    :class:`WallClockPaceColumn`. A no-op if the task id is unknown; logs a
+    short note if the task never advanced.
     """
     task = next((t for t in progress.tasks if t.id == task_id), None)
     if task is None:
@@ -137,7 +149,7 @@ def log_phase_summary(
     if iters <= 0:
         out.info(f"{task.description}: no iterations recorded")
         return
-    elapsed = task.elapsed or 0.0
+    elapsed = _run_seconds(task) or 0.0
     out.info(
         f"{task.description}: {iters} {unit} in {elapsed:.1f}s ({elapsed / iters:.3f}s/{unit})"
     )

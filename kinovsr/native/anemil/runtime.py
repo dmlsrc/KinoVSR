@@ -1,23 +1,26 @@
 """Native Core ML compile / placement / prediction plumbing, pyobjc only.
 
-Shared by every anemil processor: compile an .mlpackage and persist the
-.mlmodelc, refuse models with any non-ANE-preferred operation (native
-MLComputePlan - the same API coremltools wraps), and drive predictions with
-MLX-backed buffers on both sides of the fence (memoryview in, output
-backings out, optional MLState). Features can opt out of fixed binding
-(`dynamic=` prefixes) and be bound per dispatch via `predict_with` - the
-copy-free path BSVD's skip rings ride.
+Shared by every anemil processor: publish cache entries that concurrent runs
+share, compile an .mlpackage and persist the .mlmodelc, refuse models with
+any non-ANE-preferred operation (native MLComputePlan - the same API
+coremltools wraps), and drive predictions with MLX-backed buffers on both
+sides of the fence (memoryview in, output backings out, optional MLState).
+Features can opt out of fixed binding (`dynamic=` prefixes) and be bound per
+dispatch via `predict_with` - the copy-free path BSVD's skip rings ride.
 """
 
 import shutil
+import tempfile
 import threading
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, cast
 
 import CoreML
 import mlx.core as mx
 from Foundation import NSURL
+
+from . import builder
 
 _MLMULTIARRAY_FLOAT16 = 0x10000 | 16  # MLMultiArrayDataTypeFloat16
 
@@ -91,8 +94,46 @@ def bind_array(shape: Sequence[int]) -> _Binding:
     return array, memoryview(array).cast("B"), multi
 
 
+def publish(target: Path, fill: Callable[[Path], object]) -> Path:
+    """Build a cache directory beside ``target`` and rename it into place.
+
+    ``fill`` writes the directory at the path it is given. Runs that build the
+    same entry at once each fill a staging directory of their own, so none can
+    delete or write into another's, and only a complete directory becomes
+    visible. A run that finds ``target`` already published keeps that copy
+    and discards its own.
+    """
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.partial-", dir=target.parent))
+    try:
+        staged = staging / target.name
+        fill(staged)
+        try:
+            staged.replace(target)
+        except OSError:
+            # Another run published the same entry first; its copy is equivalent.
+            if not target.is_dir():
+                raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return target
+
+
+def publish_package(package: Path, model_bytes: bytes, blob: builder.BlobFile) -> Path:
+    """Write an .mlpackage into a cache through :func:`publish`."""
+    return publish(package, lambda staged: builder.write_package(staged, model_bytes, blob))
+
+
 def compile_package(package: Path) -> Path:
-    """Compile an .mlpackage and persist the .mlmodelc beside it."""
+    """Compile an .mlpackage and persist the .mlmodelc beside it.
+
+    Core ML compiles into a directory of its own under the user's temporary
+    directory and leaves it to the caller, so the result is moved, not
+    copied: a copy left one compiled model behind per compile (6.5 GB after
+    a day of Core ML program builds). The move goes through :func:`publish`,
+    so runs that compile the same package at once share the first one's model.
+    """
 
     compiled_dir = package.with_suffix(".mlmodelc")
     if compiled_dir.is_dir():
@@ -102,11 +143,12 @@ def compile_package(package: Path) -> Path:
     )
     if compiled is None:
         raise RuntimeError(f"Core ML compile failed: {error}")
-    staging = package.with_suffix(".partial.mlmodelc")
-    shutil.rmtree(staging, ignore_errors=True)
-    shutil.copytree(str(compiled.path()), staging)
-    staging.replace(compiled_dir)
-    return compiled_dir
+    output = Path(compiled.path())
+    try:
+        return publish(compiled_dir, lambda staged: shutil.move(output, staged))
+    finally:
+        # Gone already, unless publishing failed before the move.
+        shutil.rmtree(output, ignore_errors=True)
 
 
 def _plan_operations(
@@ -215,6 +257,7 @@ class ModelRunner:
         dynamic: tuple[str, ...] = (),
         function_name: str | None = None,
         state: object | None = None,
+        ane_compiler_options: str | None = None,
     ):
 
         self._CoreML = CoreML
@@ -226,6 +269,11 @@ class ModelRunner:
         )
         if function_name is not None:
             config.setFunctionName_(function_name)
+        if ane_compiler_options is not None:
+            # Core ML's private setter for the ANE compiler's flag dictionary, in the
+            # form Apple's own builds pass with `espressoc --ane-options`:
+            # "KEY=VALUE,KEY=VALUE" (a dictionary value crashes the load).
+            config.setE5rtCustomANECompilerOptions_(ane_compiler_options)
         if fast_prediction:
             # MLSpecializationStrategyFastPrediction: spend more at load
             # specializing the plan for faster predictions afterward.

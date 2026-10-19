@@ -262,11 +262,12 @@ def probe_video_timing(path: Path) -> VideoTiming:
 
 
 def probe_audio_timing(path: Path) -> AudioTiming | None:
-    """Return the first edit-adjusted audio PTS without decoding audio.
+    """Return the first edit-adjusted audio PTS, or None for absent/empty audio.
 
     Audio carry currently owns PCM samples but not their source timestamps.
     The file endpoint uses this metadata probe to reject staggered track
     origins before it would silently place both tracks at output time zero.
+    Samples without a usable presentation timestamp are an error.
     """
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
@@ -284,6 +285,7 @@ def probe_audio_timing(path: Path) -> AudioTiming | None:
     if not reader.startReading():
         raise RuntimeError(f"AVAssetReader.startReading failed: {reader.error()}")
 
+    saw_samples = False
     while True:
         sample = output.copyNextSampleBuffer()
         if sample is None:
@@ -291,6 +293,7 @@ def probe_audio_timing(path: Path) -> AudioTiming | None:
         if CoreMedia.CMSampleBufferGetNumSamples(sample) < 1:
             del sample
             continue
+        saw_samples = True
         pts_time = CoreMedia.CMSampleBufferGetOutputPresentationTimeStamp(sample)
         pts = _cm_time_fraction(pts_time)
         timescale = int(pts_time.timescale)
@@ -304,6 +307,8 @@ def probe_audio_timing(path: Path) -> AudioTiming | None:
 
     if reader.error() is not None:
         raise RuntimeError(f"AVAssetReader audio timing scan failed: {reader.error()}")
+    if saw_samples:
+        raise RuntimeError(f"audio track in {path} has no usable presentation origin")
     return None
 
 
@@ -562,7 +567,10 @@ def iter_video_buffer_chunks(
     timeRange is seeked just before start_frame so the bulk of a long clip
     before the window is never decoded; the exact window boundary is then
     enforced per frame by presentation timestamp, so trimming is frame-exact
-    even though the seek is approximate.
+    even though the seek is approximate. When the range's first frame lies
+    past start_frame, or the range delivers no frame at all (AVFoundation's
+    MPEG demuxer can do either), the read starts over from the head without
+    a range; nothing has been yielded by then.
 
     With a `table` (the sample-table walk), window indexing bisects the real
     display timestamps - exact for jittered, gapped, and variable clocks -
@@ -575,6 +583,45 @@ def iter_video_buffer_chunks(
     image buffer stays valid until the consumer drops its reference.
     """
     chunk_size = validate_decode_chunk_size(chunk_size)
+    try:
+        yield from _read_window(
+            path, src_format, chunk_size, start_frame, end_frame, timing, table, ranged=True
+        )
+        return
+    except _LateRange as late:
+        # Keep only the frame number: the retry must run outside this block,
+        # whose traceback would otherwise hold the first reader alive.
+        landed = late.landed
+    _log.info(
+        "%s: the time range toward frame %d first delivered %s; reading from the head instead",
+        path.name,
+        start_frame,
+        "no frame" if landed is None else f"frame {landed}",
+    )
+    yield from _read_window(
+        path, src_format, chunk_size, start_frame, end_frame, timing, table, ranged=False
+    )
+
+
+class _LateRange(Exception):
+    """A reader time range's first frame lies past the window's start."""
+
+    def __init__(self, landed: int | None) -> None:
+        super().__init__(landed)
+        self.landed = landed
+
+
+def _read_window(
+    path: Path,
+    src_format: int,
+    chunk_size: int,
+    start_frame: int,
+    end_frame: int | None,
+    timing: VideoTiming | None,
+    table: SampleTable | None,
+    *,
+    ranged: bool,
+) -> Iterator[list[object]]:
     url = Foundation.NSURL.fileURLWithPath_(str(path))
     asset = av.AVURLAsset.alloc().initWithURL_options_(url, None)
     track = _first_video_track(asset)
@@ -601,11 +648,15 @@ def iter_video_buffer_chunks(
     # later epoch would start the decode-side unwrapper without the
     # history that maps its raw stamps onto the table's monotonic clock.
     seekable_clock = table is None or table.epoch_resets == 0
-    if trimming and seekable_clock and (keys is not None or fps > 0):
+    # The first frame a time range delivers must lie at or before the start;
+    # None once checked, or for a read from the head.
+    verify: int | None = None
+    if ranged and trimming and seekable_clock and (keys is not None or fps > 0):
         # Seek the reader's timeRange to just before the window so the head of a
         # long clip isn't decoded. Back off one frame; the per-frame PTS check
-        # below enforces the exact start. Compute the end from the asset
-        # duration when the window is open-ended.
+        # below enforces the exact start. An open-ended window leaves the range
+        # open: AVFoundation's duration for an MPEG program stream can end
+        # before its last frames start.
         ts = 24000
         if keys is not None:
             back = min(max(start_frame - 1, 0), len(keys) - 1)
@@ -618,19 +669,18 @@ def iter_video_buffer_chunks(
         if start_seconds >= 0:
             start_t = CoreMedia.CMTimeMake(round(start_seconds * ts), ts)
             if end_frame is None:
-                dur_seconds = max(
-                    0.0,
-                    CoreMedia.CMTimeGetSeconds(asset.duration()) - start_seconds,
-                )
-            elif keys is not None:
-                # Cover through the first excluded stamp plus slack; the
-                # per-frame trim below is what enforces exactness.
-                stop = min(end_frame, len(keys) - 1)
-                dur_seconds = max(float(keys[stop]) - start_seconds, 0.0) + 1.0
+                dur_t = CoreMedia.kCMTimePositiveInfinity
             else:
-                dur_seconds = (end_frame - start_frame + 2) / fps
-            dur_t = CoreMedia.CMTimeMake(round(dur_seconds * ts), ts)
+                if keys is not None:
+                    # Cover through the first excluded stamp plus slack; the
+                    # per-frame trim below is what enforces exactness.
+                    stop = min(end_frame, len(keys) - 1)
+                    dur_seconds = max(float(keys[stop]) - start_seconds, 0.0) + 1.0
+                else:
+                    dur_seconds = (end_frame - start_frame + 2) / fps
+                dur_t = CoreMedia.CMTimeMake(round(dur_seconds * ts), ts)
             reader.setTimeRange_(CoreMedia.CMTimeRangeMake(start_t, dur_t))
+            verify = start_frame
 
     # Request IOSurface-backed, Metal-compatible buffers. Feeding the decoded
     # buffer straight to VSR bypasses the VSR source pool's attributes, so we
@@ -662,49 +712,62 @@ def iter_video_buffer_chunks(
         raise RuntimeError(f"AVAssetReader.startReading failed: {reader.error()}")
 
     chunk: list[object] = []
-    # The table's stamps are on the unwrapped monotonic clock; decoded
-    # samples arrive with raw stamps, so the decode path runs the same
-    # streaming mapping. Every sample pushes (kept or not) to keep the
-    # two mappings aligned. With a table, each kept buffer is yielded as
-    # a (buffer, table_index) pair so the consumer labels frames by
-    # SAMPLE IDENTITY instead of arrival ordinal - a decoder that drops
-    # or multiplies frames can then no longer shift every later label.
-    trim_unwrapper = EpochUnwrapper() if keys is not None else None
-    while True:
-        sample_buf = output.copyNextSampleBuffer()
-        if sample_buf is None:
-            break
-        image_buf = CoreMedia.CMSampleBufferGetImageBuffer(sample_buf)
-        keep = image_buf is not None
-        idx: int | None = None
-        if keys is not None or (trimming and fps > 0):
-            # Frame-exact window enforcement by presentation timestamp.
-            pts = _cm_time_fraction(
-                CoreMedia.CMSampleBufferGetOutputPresentationTimeStamp(sample_buf)
-            )
-            if pts is not None and trim_unwrapper is not None:
-                pts = trim_unwrapper.push(pts)
-            if pts is None:
-                idx = 0
-            elif keys is not None:
-                idx = bisect.bisect_right(keys, pts) - 1
-            else:
-                assert cadence is not None  # without keys, a None cadence raised above
-                idx = round((pts - origin) * cadence)
-            if trimming and keep and idx < start_frame:
-                keep = False
-            elif trimming and keep and end_frame is not None and idx >= end_frame:
-                del sample_buf
+    # A read abandoned or failed mid-stream stops its decoder here rather than
+    # at the reader's deallocation, which a held traceback can postpone.
+    try:
+        # The table's stamps are on the unwrapped monotonic clock; decoded
+        # samples arrive with raw stamps, so the decode path runs the same
+        # streaming mapping. Every sample pushes (kept or not) to keep the
+        # two mappings aligned. With a table, each kept buffer is yielded as
+        # a (buffer, table_index) pair so the consumer labels frames by
+        # SAMPLE IDENTITY instead of arrival ordinal - a decoder that drops
+        # or multiplies frames can then no longer shift every later label.
+        trim_unwrapper = EpochUnwrapper() if keys is not None else None
+        while True:
+            sample_buf = output.copyNextSampleBuffer()
+            if sample_buf is None:
                 break
-        # Release the owning sample buffer now; the image buffer outlives it.
-        del sample_buf
-        if keep:
-            chunk.append((image_buf, idx) if keys is not None else image_buf)
-            if len(chunk) >= chunk_size:
-                yield chunk
-                chunk = []
+            image_buf = CoreMedia.CMSampleBufferGetImageBuffer(sample_buf)
+            keep = image_buf is not None
+            idx: int | None = None
+            if keys is not None or (trimming and fps > 0):
+                # Frame-exact window enforcement by presentation timestamp.
+                pts = _cm_time_fraction(
+                    CoreMedia.CMSampleBufferGetOutputPresentationTimeStamp(sample_buf)
+                )
+                if pts is not None and trim_unwrapper is not None:
+                    pts = trim_unwrapper.push(pts)
+                if pts is None:
+                    idx = 0
+                elif keys is not None:
+                    idx = bisect.bisect_right(keys, pts) - 1
+                else:
+                    assert cadence is not None  # without keys, a None cadence raised above
+                    idx = round((pts - origin) * cadence)
+                if verify is not None and keep:
+                    if idx > verify:
+                        del sample_buf
+                        raise _LateRange(idx)
+                    verify = None
+                if trimming and keep and idx < start_frame:
+                    keep = False
+                elif trimming and keep and end_frame is not None and idx >= end_frame:
+                    del sample_buf
+                    break
+            # Release the owning sample buffer now; the image buffer outlives it.
+            del sample_buf
+            if keep:
+                chunk.append((image_buf, idx) if keys is not None else image_buf)
+                if len(chunk) >= chunk_size:
+                    yield chunk
+                    chunk = []
 
-    if reader.status() == av.AVAssetReaderStatusFailed:
-        raise RuntimeError(f"AVAssetReader failed: {reader.error()}")
-    if chunk:
-        yield chunk
+        if reader.status() == av.AVAssetReaderStatusFailed:
+            raise RuntimeError(f"AVAssetReader failed: {reader.error()}")
+        if verify is not None and (keys is None or start_frame < len(keys)):
+            raise _LateRange(None)
+        if chunk:
+            yield chunk
+    except BaseException:
+        reader.cancelReading()
+        raise

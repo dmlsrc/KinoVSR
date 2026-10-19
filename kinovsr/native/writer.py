@@ -10,6 +10,8 @@ append loop.
 """
 
 import logging
+import math
+import os
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -36,6 +38,10 @@ from .frameworks import (
 _log = logging.getLogger(__name__)
 
 _MAX_CLEANUP_LAUNCH_ROUNDS = 2
+
+# Seconds of video per movie fragment: at most about this much is lost when a
+# file is never closed, for a few hundred bytes of fragment header each.
+DEFAULT_FRAGMENT_INTERVAL = 1.0
 
 # HEVC profile identifiers (Apple-stable strings; not exposed as PyObjC consts)
 HEVC_PROFILE_MAIN10 = "HEVC_Main10_AutoLevel"  # 4:2:0 10-bit
@@ -241,6 +247,12 @@ class AVWriter:
         writer.append(pb)           # pixel buffer in the configured source format
     Finalize:
         writer.finish()             # waits for audio drain + finishWriting
+
+    The file is written in movie fragments, every `fragment_interval` seconds
+    (None writes a plain file): one that is never closed (a crash, a killed
+    process) plays up to its last complete fragment, and readers can open it
+    while it is written. Closing grows the first mdat over the fragments and
+    appends a whole moov in place, so the finished file is a plain MPEG-4.
     """
 
     READY_TIMEOUT_S = 30.0
@@ -250,6 +262,8 @@ class AVWriter:
     # Class default keeps partially-constructed writers (tests stub the
     # native layer) on the product tick base.
     _time_scale = _pb.VIDEO_TIME_SCALE
+    # Set by an early finish: the audio pump stops at its next chunk.
+    _audio_stop = False
 
     def __init__(
         self,
@@ -271,6 +285,7 @@ class AVWriter:
         cv_color: tuple[object, object, object] | None = None,
         full_range: bool = False,
         time_scale: int | None = None,
+        fragment_interval: float | None = DEFAULT_FRAGMENT_INTERVAL,
     ):
         cadence = rational_cadence(fps)
         # The container tick base for every CMTime this writer stamps.
@@ -281,6 +296,12 @@ class AVWriter:
             time_scale = _pb.VIDEO_TIME_SCALE
         if not isinstance(time_scale, int) or time_scale <= 0:
             raise ValueError(f"time_scale must be a positive int, got {time_scale!r}")
+        if fragment_interval is not None and not (
+            math.isfinite(fragment_interval) and fragment_interval > 0
+        ):
+            raise ValueError(
+                f"fragment_interval must be finite and positive, got {fragment_interval!r}"
+            )
         self._time_scale = time_scale
         self._state_lock = threading.RLock()
         self._audio_pump_lock = threading.Lock()
@@ -302,6 +323,7 @@ class AVWriter:
         self._audio_done = threading.Event()
         self._audio_progress = [0]
         self._audio_complete = False
+        self._audio_stop = False
         self.writer: _AssetWriter | None = None
         self.audio_input: _WriterInput | None = None
         self.audio_track: AudioTrack | None = None
@@ -331,6 +353,7 @@ class AVWriter:
                     pixel_aspect=pixel_aspect,
                     cv_color=cv_color,
                     full_range=full_range,
+                    fragment_interval=fragment_interval,
                 )
             with self._state_lock:
                 if self._failure is not None:
@@ -363,6 +386,7 @@ class AVWriter:
         pixel_aspect: tuple[int, int] | None,
         cv_color: tuple[object, object, object] | None,
         full_range: bool,
+        fragment_interval: float | None,
     ) -> None:
         if audio_track is not None:
             # File-backed tracks own a mutable decoder cursor. A post writer
@@ -474,6 +498,11 @@ class AVWriter:
 
         # Start the writer ---------------------------------------------------
         writer.setMovieTimeScale_(self._time_scale)
+        if fragment_interval is not None:
+            # Only settable before startWriting.
+            writer.setMovieFragmentInterval_(
+                CoreMedia.CMTimeMakeWithSeconds(fragment_interval, self._time_scale)
+            )
         if not writer.startWriting():
             raise RuntimeError(f"AVAssetWriter.startWriting failed: {writer.error()}")
         writer.startSessionAtSourceTime_(CoreMedia.CMTimeMake(0, self._time_scale))
@@ -492,20 +521,23 @@ class AVWriter:
         self.audio_track = audio_track
 
         audio_desc = f", audio={audio_codec}" if audio_input is not None else ""
+        fragment_desc = f", fragments {fragment_interval:g} s" if fragment_interval else ""
         _log.info(
-            "[%s] AVAssetWriter -> %s (HEVC %s %s q=%s%s)",
+            "[%s] AVAssetWriter -> %s (HEVC %s %s q=%s%s%s)",
             label,
             output_path,
             profile,
             _color_label(color_props),
             quality,
             audio_desc,
+            fragment_desc,
         )
 
         # Audio pump (GCD pull pattern) --------------------------------------
         self._audio_done.clear()
         self._audio_progress[0] = 0
         self._audio_complete = False
+        self._audio_stop = False
         if audio_track is not None:
             self._audio_queue = libdispatch.dispatch_queue_create(
                 f"kinovsr.audio.{label}".encode(),
@@ -699,6 +731,7 @@ class AVWriter:
                                 "finishing",
                             )
                             or self._audio_complete
+                            or self._audio_stop
                         ):
                             return
                         audio_input = self.audio_input
@@ -715,6 +748,7 @@ class AVWriter:
                                 "finishing",
                             )
                             or self._audio_complete
+                            or self._audio_stop
                         ):
                             return
                         pos = self._audio_progress[0]
@@ -801,6 +835,26 @@ class AVWriter:
         finally:
             self._end_audio_callback(n_samples)
 
+    def _finish_audio_now(self) -> None:
+        """Mark the audio finished where the pump has reached, for an early close."""
+        audio_input = self.audio_input
+        if audio_input is None:
+            return
+        with self._state_lock:
+            self._audio_stop = True
+        # The pump returns at its next chunk and holds this lock until then;
+        # markAsFinished must not race an append on the same input.
+        with self._audio_pump_lock:
+            with self._state_lock:
+                if self._audio_complete:
+                    return
+            called, _ = self._run_native_mutation(audio_input.markAsFinished, states=("finishing",))
+            if called:
+                with self._state_lock:
+                    if self._state == "finishing":
+                        self._audio_complete = True
+        self._audio_done.set()
+
     def _check_native_status(self, what: str) -> None:
         self._raise_if_failed()
         with self._state_lock:
@@ -880,6 +934,13 @@ class AVWriter:
         _yuv.rgb_to_yuv422_10(rgb, ybuf, self._yuv_matrix, self._yuv_full)
         return ybuf
 
+    def _frame_to_yuv_buffer(self, frame: mx.array, *, signed: bool) -> object:
+        ybuf = _pb.pool_create_buffer(self.adaptor.pixelBufferPool())
+        if ybuf is None:
+            raise RuntimeError(f"[{self.label}] YUV pool buffer allocation failed")
+        _yuv.frame_to_yuv422_10(frame, ybuf, self._yuv_matrix, self._yuv_full, signed=signed)
+        return ybuf
+
     def _index_grid_pts(self, frame_index: int) -> object:
         """The index-grid CMTime for legacy callers that pass no ticks."""
         if self._time_scale == _pb.VIDEO_TIME_SCALE:
@@ -894,6 +955,7 @@ class AVWriter:
         *,
         direct_mlx_rgb: bool,
         prepared_yuv: bool = False,
+        signed: bool = False,
         pts_ticks: int | None,
         duration_ticks: int | None,
     ) -> None:
@@ -923,7 +985,7 @@ class AVWriter:
                     pb = payload
                 elif direct_mlx_rgb:
                     assert isinstance(payload, mx.array)  # only append_mlx_rgb passes this flag
-                    pb = self._rgb_to_yuv_buffer(payload)
+                    pb = self._frame_to_yuv_buffer(payload, signed=signed)
                 elif self._yuv_feed:
                     pb = self._rgb_to_yuv_buffer(_pb.read_rgbahalf_rgb(payload))
                 else:
@@ -992,35 +1054,35 @@ class AVWriter:
         self,
         rgb: mx.array,
         *,
+        signed: bool = False,
         pts_ticks: int | None = None,
         duration_ticks: int | None = None,
     ) -> None:
-        """Convert typed MLX RGB directly into the pooled encoder YUV feed."""
+        """Convert typed MLX RGB directly into the pooled encoder YUV feed.
+
+        ``rgb`` is in [0, 1], or in [-1, 1] with ``signed`` (a model's raw output). The
+        conversion keeps the corrected legacy path's numeric boundary, rounding through FP16
+        as FileSink's RGBAHalf write and float32 read did, and does that rounding and the
+        signed map inside the compiled YUV graph (``yuv.frame_to_yuv422_10``), so the frame
+        is read once and no float32 RGB copy of it is made. (The graph builds lazily for
+        every dtype MLX accepts, so there is no eager conversion failure to classify
+        separately - verified by probing every payload class the shape gate admits.)
+        """
         if not self.accepts_mlx_rgb:
             raise RuntimeError(f"[{self.label}] direct MLX RGB input requires the YUV feed")
-
-        # Preserve the corrected legacy path's numeric boundary: FileSink
-        # wrote fp16 RGBAHalf and read it back as float32 before YUV
-        # quantization. Keep that rounding in the lazy MLX graph while
-        # removing both CoreVideo copies and their synchronization points.
-        # (The graph builds lazily for every dtype MLX accepts, so there is
-        # no eager conversion failure to classify separately - verified by
-        # probing every payload class the shape gate admits.)
-        equivalent = rgb[..., :3].astype(mx.float16).astype(mx.float32)
         self._append_payload(
-            equivalent,
+            rgb,
             direct_mlx_rgb=True,
+            signed=signed,
             pts_ticks=pts_ticks,
             duration_ticks=duration_ticks,
         )
 
-    def prepare_mlx_rgb(self, rgb: mx.array) -> object:
+    def prepare_mlx_rgb(self, rgb: mx.array, *, signed: bool = False) -> object:
         """Convert MLX RGB into a pooled YUV buffer without appending it."""
         if not self.accepts_mlx_rgb:
             raise RuntimeError(f"[{self.label}] direct MLX RGB input requires the YUV feed")
-
-        equivalent = rgb[..., :3].astype(mx.float16).astype(mx.float32)
-        return self._rgb_to_yuv_buffer(equivalent)
+        return self._frame_to_yuv_buffer(rgb, signed=signed)
 
     def append_prepared_yuv(
         self,
@@ -1038,8 +1100,14 @@ class AVWriter:
             duration_ticks=duration_ticks,
         )
 
-    def finish(self) -> None:
-        """Finalize once, with bounded audio and native completion waits."""
+    def finish(self, *, early: bool = False) -> None:
+        """Finalize once, with bounded audio and native completion waits.
+
+        ``early`` closes a file before its end, for a run that failed or was
+        interrupted: the audio stops where the pump has reached instead of
+        draining the rest of the source track, and the session ends with the
+        last video frame, which trims any audio appended past it.
+        """
         failure_to_raise: BaseException | None = None
         with self._state_lock:
             if self._state == "finished":
@@ -1091,6 +1159,8 @@ class AVWriter:
                         self._raise_if_failed()
                         raise RuntimeError(f"[{self.label}] writer was cancelled")
                 self._check_native_status("video input finish")
+                if early:
+                    self._finish_audio_now()
                 if self.audio_input is not None and not self._wait_for_event(
                     self._audio_done,
                     timeout=self.AUDIO_TIMEOUT_S,
@@ -1194,6 +1264,7 @@ class AVWriter:
                 # same way microseconds later. The useful retry is a fresh
                 # attempt on the next explicit cancel(), which
                 # _ensure_cancel_worker provides.
+                kept = self._link_before_cancel()
                 try:
                     writer.cancelWriting()
                 except BaseException as exc:  # broad: recorded below
@@ -1205,6 +1276,8 @@ class AVWriter:
                 else:
                     with self._state_lock:
                         self._native_cancelled = True
+                finally:
+                    self._restore_after_cancel(kept)
         except BaseException as exc:  # broad: published below
             if failure is None:
                 failure = exc
@@ -1215,6 +1288,45 @@ class AVWriter:
             if failure is not None:
                 with self._state_lock:
                     _merge_attempt_failure(generation, failure, "cancel coordinator failure")
+
+    def _link_before_cancel(self) -> Path | None:
+        """Give a file with frames in it a second name before cancelWriting.
+
+        cancelWriting deletes the output file before it returns. The frames
+        are the run's work, playable up to the last fragment, so the file
+        survives the cancellation and its caller decides what becomes of it.
+        """
+        path: Path | None = getattr(self, "path", None)
+        if path is None or not getattr(self, "frame_count", 0):
+            return None
+        for attempt in range(1, 101):
+            counter = "" if attempt == 1 else f"-{attempt}"
+            link = path.with_name(f"{path.stem}.cancelling{counter}{path.suffix}")
+            try:
+                os.link(path, link)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                _log.warning("[%s] cannot keep %s through cancellation: %s", self.label, path, exc)
+                return None
+            return link
+        return None
+
+    def _restore_after_cancel(self, link: Path | None) -> None:
+        """Put the kept file back under its own name once cancelWriting returned."""
+        if link is None:
+            return
+        path = self.path
+        try:
+            if os.path.lexists(path):
+                # Cancelling a writer that already failed leaves its file.
+                link.unlink()
+            else:
+                link.rename(path)
+        except OSError as exc:
+            _log.warning(
+                "[%s] the cancelled writer's file is kept as %s: %s", self.label, link, exc
+            )
 
     def _ensure_cancel_worker(self) -> _AsyncAttempt | None:
         with self._state_lock:

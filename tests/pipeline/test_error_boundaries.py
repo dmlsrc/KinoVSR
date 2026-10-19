@@ -88,7 +88,7 @@ def test_writer_setup_normalizes_operational_failure(monkeypatch, tmp_path, fail
         FileSink(output, _spec())
     assert caught.value.__cause__ is failure
     assert str(output) in str(caught.value)
-    assert not list(tmp_path.glob(".output.mp4.*.partial"))
+    assert not (tmp_path / "output.partial.mp4").exists()
 
 
 @pytest.mark.parametrize(
@@ -107,69 +107,20 @@ def test_writer_setup_preserves_non_operational_failure(monkeypatch, tmp_path, f
     with pytest.raises(failure_type) as caught:
         FileSink(tmp_path / "output.mp4", _spec())
     assert caught.value is failure
-    assert not list(tmp_path.glob(".output.mp4.*.partial"))
+    assert not (tmp_path / "output.partial.mp4").exists()
 
 
-def test_writer_temporary_failure_is_typed_and_chained(monkeypatch, tmp_path):
+def test_partial_output_failure_is_typed_and_chained(monkeypatch, tmp_path):
     failure = OSError("injected ENOSPC")
 
     def fail(*args, **kwargs):
         raise failure
 
-    monkeypatch.setattr(run_module.tempfile, "mkstemp", fail)
+    monkeypatch.setattr(run_module, "create_partial_output", fail)
     with pytest.raises(MediaError) as caught:
         FileSink(tmp_path / "output.mp4", _spec())
     assert caught.value.__cause__ is failure
-    assert "writer temporary" in str(caught.value)
-
-
-@pytest.mark.parametrize(
-    "failure_type",
-    [TypeError, AssertionError, KeyboardInterrupt, SystemExit],
-)
-def test_writer_temporary_path_conversion_failure_cleans_partial(
-    monkeypatch, tmp_path, failure_type
-):
-    failure = failure_type("injected writer Path conversion failure")
-    original_path = run_module.Path
-
-    def fail_partial(raw):
-        if isinstance(raw, str) and raw.endswith(".partial"):
-            raise failure
-        return original_path(raw)
-
-    monkeypatch.setattr(run_module, "Path", fail_partial)
-    with pytest.raises(failure_type) as caught:
-        FileSink(tmp_path / "output.mp4", _spec())
-
-    assert caught.value is failure
-    assert not list(tmp_path.glob(".output.mp4.*.partial"))
-
-
-@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
-def test_writer_temporary_interrupt_does_not_retry_ambiguous_close(
-    monkeypatch, tmp_path, failure_type
-):
-    failure = failure_type("injected close interruption")
-    original_close = run_module.os.close
-    close_calls = []
-    acquired_fd = None
-
-    def interrupt_before_close(fd):
-        nonlocal acquired_fd
-        acquired_fd = fd
-        close_calls.append(fd)
-        raise failure
-
-    monkeypatch.setattr(run_module, "_close_created_fd", interrupt_before_close)
-    with pytest.raises(failure_type) as caught:
-        FileSink(tmp_path / "output.mp4", _spec())
-    assert caught.value is failure
-    assert acquired_fd is not None
-    assert close_calls == [acquired_fd]
-    run_module.os.fstat(acquired_fd)
-    original_close(acquired_fd)
-    assert not list(tmp_path.glob(".output.mp4.*.partial"))
+    assert "cannot create partial output" in str(caught.value)
 
 
 def _bare_sink(tmp_path: Path, failure: BaseException, method: str) -> FileSink:
@@ -177,7 +128,7 @@ def _bare_sink(tmp_path: Path, failure: BaseException, method: str) -> FileSink:
     sink.spec = _spec()
     sink._is_mlx = False
     sink._final_path = tmp_path / "output.mp4"
-    sink._temp_path = tmp_path / ".output.mp4.partial"
+    sink._temp_path = tmp_path / "output.partial.mp4"
     sink._published = False
     sink._finalized = False
     sink._discarded = False
@@ -189,7 +140,7 @@ def _bare_sink(tmp_path: Path, failure: BaseException, method: str) -> FileSink:
             if method == "append":
                 raise failure
 
-        def finish(self):
+        def finish(self, early=False):
             if method == "finalize":
                 raise failure
 
@@ -453,7 +404,7 @@ def test_writer_setup_normalizes_objc_error(monkeypatch, tmp_path):
     with pytest.raises(MediaError) as caught:
         FileSink(tmp_path / "output.mp4", _spec())
     assert caught.value.__cause__ is failure
-    assert not list(tmp_path.glob(".output.mp4.*.partial"))
+    assert not (tmp_path / "output.partial.mp4").exists()
 
 
 @pytest.mark.parametrize("failure_type", [TypeError, AssertionError])

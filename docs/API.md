@@ -193,6 +193,6 @@ encode-with-audio means `process_video_file`.
 ## Compatibility policy
 
 Pre-1.0: additions land freely; breaking changes to exported names or
-their semantics are called out in the commit that makes them, and the
+their semantics are listed in [CHANGELOG.md](../CHANGELOG.md), and the
 surface is pinned by
 [`tests/api/test_public_surface.py`](../tests/api/test_public_surface.py).

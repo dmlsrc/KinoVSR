@@ -1,7 +1,7 @@
 """Shared torch-parity bicubic upsampling.
 
 Promoted from the SAFMN net once toflow became a second consumer
-(planning 05: shared code moves to modeling/ only on demonstrated
+(shared code moves to modeling/ only on demonstrated
 reuse). SAFMN uses it as its checkpoint-faithful upsampler; TOFlow SR
 uses it to build the bicubic-upsampled base its residual is trained
 against. Both need exact torch ``F.interpolate(mode="bicubic",

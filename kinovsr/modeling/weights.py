@@ -1,7 +1,7 @@
 """Weight manifests: parsing, resolution, and verification.
 
 Every weights owner - processor family, shared component, evaluator -
-carries a package-data ``manifest.toml`` (planning schema, version 1).
+carries a package-data ``manifest.toml`` (schema version 1).
 This module loads and validates that schema and implements the two
 read-only operations the CLI exposes:
 

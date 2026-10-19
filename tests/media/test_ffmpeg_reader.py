@@ -23,8 +23,11 @@ from kinovsr.media import video_reader
 from kinovsr.media.pixel_buffers import (
     PIX_BGRA,
     PIX_RGBAHALF,
+    VIDEO_TIME_SCALE,
+    make_pixel_buffer_from_attrs,
     read_buffer_rgb_f32,
 )
+from kinovsr.native.writer import HEVC_PROFILE_MAIN422_10, AVWriter
 
 W, H, N, FPS, GOP = 160, 128, 24, 25, 8
 
@@ -83,6 +86,49 @@ def test_probe_video_shape(clip):
     assert n == N
     assert par is None  # square pixels
     assert transform is not None  # identity CGAffineTransform
+
+
+# Display matrices (a, b, c, d, tx, ty) as AVFoundation writes them: each quarter
+# turn carries the translation that keeps the picture in the positive quadrant.
+_ORIENTATIONS = {
+    "rotated 90": (0.0, 1.0, -1.0, 0.0, float(H), 0.0),
+    "rotated 180": (-1.0, 0.0, 0.0, -1.0, float(W), float(H)),
+    "rotated 270": (0.0, -1.0, 1.0, 0.0, 0.0, float(W)),
+    "mirrored": (-1.0, 0.0, 0.0, 1.0, float(W), 0.0),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("case", sorted(_ORIENTATIONS))
+def test_probe_carries_rotation_and_mirroring_like_the_native_probe(tmp_path, case):
+    # PyAV 19 iterates a frame's side data by type key, which the display
+    # matrix read did not expect: every rotated or mirrored file probed as
+    # upright, and its output lost the orientation.
+    path = tmp_path / "oriented.mp4"
+    writer = AVWriter(
+        path,
+        width=W,
+        height=H,
+        fps=FPS,
+        source_pixel_format=PIX_RGBAHALF,
+        profile=HEVC_PROFILE_MAIN422_10,
+        label="probe",
+        transform=Quartz.CGAffineTransformMake(*_ORIENTATIONS[case]),
+    )
+    frame = make_pixel_buffer_from_attrs(
+        W, H, {"PixelFormatType": PIX_RGBAHALF, "IOSurfaceProperties": {}}
+    )
+    ticks = VIDEO_TIME_SCALE // FPS
+    for index in range(3):
+        writer.append(frame, pts_ticks=ticks * index, duration_ticks=ticks)
+    writer.finish()
+
+    def parts(transform):
+        return (transform.a, transform.b, transform.c, transform.d, transform.tx, transform.ty)
+
+    native = parts(video_reader.probe_video(path)[4])
+    assert native == _ORIENTATIONS[case]
+    assert parts(fr.probe_video(path)[4]) == native
 
 
 def test_keyframes_match_decoded_positions(clip):
@@ -482,6 +528,33 @@ def test_missing_file_keeps_oserror_typing(tmp_path):
         fr.probe_video(tmp_path / "absent.mp4")
 
 
+def test_non_utf8_metadata_tag_does_not_reject_the_file(tmp_path):
+    # Old QuickTime writers store tag text as raw Mac Roman, so a copyright
+    # sign arrives as the lone byte 0xa9, which is not valid UTF-8.
+    marker = b"KINOVSR-TAG"
+    source = tmp_path / "tagged.mp4"
+    out = av.open(str(source), "w")
+    out.metadata["comment"] = marker.decode()
+    vs = out.add_stream("mpeg4", rate=FPS)
+    vs.width, vs.height = W, H
+    vs.pix_fmt = "yuv420p"
+    for _ in range(3):
+        for pkt in vs.encode(av.VideoFrame(W, H, "yuv420p")):
+            out.mux(pkt)
+    for pkt in vs.encode():
+        out.mux(pkt)
+    out.close()
+    data = source.read_bytes()
+    assert data.count(marker) == 1
+    path = tmp_path / "mac-roman-tag.mp4"
+    path.write_bytes(data.replace(marker, b"\xa9" + marker[1:]))
+
+    w, h, _fps, n, _transform, _par = fr.probe_video(path)
+    assert (w, h, n) == (W, H, 3)
+    frames = [b for chunk in fr.iter_video_buffer_chunks(path, PIX_BGRA) for b in chunk]
+    assert len(frames) == 3
+
+
 # ------------------------------------------------- zero-byte repeat markers
 
 
@@ -582,9 +655,264 @@ def test_sample_table_records_zero_byte_slots(clip, monkeypatch):
 
 
 def test_a_stream_without_a_time_base_is_an_operational_error():
-    # PyAV reports a zero time base as None, which used to escape as a
-    # TypeError, a programmer error to the media boundary.
-    stream = SimpleNamespace(time_base=None, type="video", index=0)
+    # PyAV reports an unset time base as the falsy AVRational(0, 1); a guard
+    # that tested for None let it through as a zero Fraction.
+    stream = SimpleNamespace(time_base=av.AVRational(0, 1), type="video", index=0)
     with pytest.raises(RuntimeError, match="video stream #0 has no time base"):
         fr._time_base(stream)
-    assert fr._time_base(SimpleNamespace(time_base=Fraction(1, 90000))) == Fraction(1, 90000)
+    stamped = SimpleNamespace(time_base=av.AVRational(1, 90000))
+    assert fr._time_base(stamped) == Fraction(1, 90000)
+
+
+# ------------------------------------------------- packed-bitstream AVI
+
+_VOP = b"\x00\x00\x01\xb6"
+# DivX 5.01's user data; the trailing "p" declares a packed bitstream.
+_DIVX_PACKED = b"\x00\x00\x01\xb2DivX501b484p"
+_PACKED_FRAMES = 30
+# Slot s of the packed AVI below shows this frame.
+_PACKED_SLOTS = [0, *range(_PACKED_FRAMES), _PACKED_FRAMES - 1]
+_X264_B_PYRAMID = {"bf": "2", "g": "12", "crf": "10", "x264-params": "b-pyramid=normal:scenecut=0"}
+
+
+def _n_vop(increment: int) -> bytes:
+    """A not-coded P-VOP (5-bit time increment at 25 fps) with DivX's stuffing byte."""
+    bits = value = 0
+    for field, width in ((0b01, 2), (0, 1), (1, 1), (increment, 5), (1, 1), (0, 1)):
+        value, bits = (value << width) | field, bits + width
+    pad = 8 - bits % 8
+    value, bits = (value << pad) | ((1 << (pad - 1)) - 1), bits + pad
+    return _VOP + value.to_bytes(bits // 8, "big") + b"\x7f"
+
+
+def _write_gray(path, codec, options):
+    """Encode ``_PACKED_FRAMES`` frames, frame t flat gray 8t + 4."""
+    out = av.open(str(path), "w")
+    vs = out.add_stream(codec, rate=FPS)
+    vs.width, vs.height = W, H
+    vs.pix_fmt = "yuv420p"
+    vs.options = options
+    for t in range(_PACKED_FRAMES):
+        frame = av.VideoFrame(W, H, "gray")
+        frame.planes[0].update(bytes([8 * t + 4]) * (W * H))
+        for pkt in vs.encode(frame.reformat(format="yuv420p")):
+            out.mux(pkt)
+    for pkt in vs.encode():
+        out.mux(pkt)
+    out.close()
+
+
+@pytest.fixture(scope="module")
+def packed_avi(tmp_path_factory):
+    """A DivX-style packed-bitstream AVI whose frame t is flat gray 8t + 4.
+
+    FFmpeg writes B frames unpacked, so its encode (one B frame, closed GOPs)
+    is repacked as DivX 5 writes it: the I frame alone, a one-byte delay
+    frame, each reference picture with the B frame that follows it in decode
+    order in one packet and an N-VOP placeholder in the B frame's slot, and
+    the packed-bitstream user data in the extradata and the first packet. A
+    one-byte drop frame ends the file. In VfW terms slot 0 shows frame 0, the
+    delay slot repeats it, slot s shows frame s - 1, and the last slot
+    repeats the frame before it (``_PACKED_SLOTS``).
+    """
+    folder = tmp_path_factory.mktemp("packed")
+    source = folder / "unpacked.avi"
+    # Closed GOPs need scene-cut detection off in FFmpeg's encoder.
+    options = {
+        "g": str(GOP),
+        "bf": "1",
+        "qscale": "2",
+        "flags": "+cgop",
+        "sc_threshold": "1000000000",
+    }
+    _write_gray(source, "mpeg4", options)
+    c = av.open(str(source))
+    s = next(x for x in c.streams if x.type == "video")
+    coded = [(bytes(p), p.is_keyframe) for p in c.demux(s) if p.size]
+    path = folder / "packed.avi"
+    out = av.open(str(path), "w", format="avi")
+    target = out.add_stream_from_template(s)
+    first = coded[0][0]
+    headers = first[: first.find(_VOP)] + _DIVX_PACKED
+    target.codec_context.extradata = headers
+    slots: list[tuple[bytes, bool]] = []
+    i = 0
+    while i < len(coded):
+        data, key = coded[i]
+        j = i + 1
+        while j < len(coded) and coded[j][0][coded[j][0].find(_VOP) + 4] >> 6 == 2:  # a B-VOP
+            j += 1
+        if i == 0:
+            data = headers + data[data.find(_VOP) :]
+        slots.append((data + b"".join(d for d, _ in coded[i + 1 : j]), key))
+        if i == 0:
+            slots.append((b"\x7f", False))
+        slots.extend((_n_vop(len(slots) % FPS), False) for _ in range(j - i - 1))
+        i = j
+    slots.append((b"\x7f", False))
+    for index, (data, key) in enumerate(slots):
+        pkt = av.Packet(data)
+        pkt.pts = pkt.dts = index
+        pkt.time_base = target.time_base
+        pkt.is_keyframe = key
+        pkt.stream = target
+        out.mux(pkt)
+    out.close()
+    c.close()
+    assert len(slots) == len(_PACKED_SLOTS)
+    return path
+
+
+def _gray_frames(path, start=0, end=None):
+    """Each delivered (label, frame), the frame read back from its gray level."""
+    table = fr.read_sample_table(path)
+    read = []
+    for chunk in fr.iter_video_buffer_chunks(
+        path, PIX_RGBAHALF, chunk_size=3, start_frame=start, end_frame=end, table=table
+    ):
+        assert len(chunk) <= 3
+        for buffer, label in chunk:
+            level = float(read_buffer_rgb_f32(buffer)[0, 0, 0]) * 255
+            read.append((label, round((level - 4) / 8)))
+    return read
+
+
+def test_packed_avi_reads_every_slot_in_display_order(packed_avi, caplog):
+    import logging
+
+    # libavcodec stamps each packed pair's pictures with each other's slots
+    # and leaves the drop frames without a picture.
+    caplog.set_level(logging.INFO, logger="kinovsr.media.ffmpeg_reader")
+    assert fr.read_sample_table(packed_avi).decode_order_stamps
+    assert _gray_frames(packed_avi) == list(enumerate(_PACKED_SLOTS))
+    assert "2 slot(s) without a picture" in caplog.text
+
+
+@pytest.mark.parametrize("start", [1, 2, 5, 8, 9, 16, 28])
+def test_packed_avi_window_after_a_seek(packed_avi, start):
+    end = min(start + 5, len(_PACKED_SLOTS))
+    expected = [(slot, _PACKED_SLOTS[slot]) for slot in range(start, end)]
+    assert _gray_frames(packed_avi, start, end) == expected
+
+
+def test_unpacked_mpeg4_avi_reads_as_before(packed_avi):
+    # FFmpeg's AVI demuxer stamps unpacked B frames with display times.
+    unpacked = packed_avi.parent / "unpacked.avi"
+    assert not fr.read_sample_table(unpacked).decode_order_stamps
+    assert _gray_frames(unpacked) == [(t, t) for t in range(_PACKED_FRAMES)]
+
+
+def test_h264_avi_reads_in_display_order(tmp_path):
+    # AVI keeps no display times and FFmpeg cannot derive H.264's, so its
+    # B-frame pyramids arrive with permuted stamps. With open GOPs, the B
+    # frames shown before each keyframe cannot decode after a seek to it,
+    # so a window starting there must be read from further back.
+    if "libx264" not in av.codecs_available:
+        pytest.skip("this PyAV build has no libx264")
+    path = tmp_path / "h264.avi"
+    options = {**_X264_B_PYRAMID, "x264-params": "b-pyramid=normal:open-gop=1:scenecut=0"}
+    _write_gray(path, "libx264", options)
+    assert fr.read_sample_table(path).decode_order_stamps
+    assert _gray_frames(path) == [(t, t) for t in range(_PACKED_FRAMES)]
+    for start in range(1, _PACKED_FRAMES - 3):
+        assert _gray_frames(path, start, start + 3) == [(t, t) for t in range(start, start + 3)]
+
+
+def test_flv_with_zeroed_composition_offsets_reads_in_display_order(tmp_path):
+    # FLV carries H.264's composition offsets; a muxer that zeroes them
+    # leaves decode-order stamps, which permute like AVI's.
+    if "libx264" not in av.codecs_available:
+        pytest.skip("this PyAV build has no libx264")
+    source, zeroed = tmp_path / "h264.flv", tmp_path / "zeroed.flv"
+    _write_gray(source, "libx264", _X264_B_PYRAMID)
+    c = av.open(str(source))
+    s = next(x for x in c.streams if x.type == "video")
+    out = av.open(str(zeroed), "w", format="flv")
+    target = out.add_stream_from_template(s)
+    for pkt in c.demux(s):
+        if pkt.size:
+            pkt.pts = pkt.dts
+            pkt.stream = target
+            out.mux(pkt)
+    out.close()
+    c.close()
+    assert not fr.read_sample_table(source).decode_order_stamps
+    assert fr.read_sample_table(zeroed).decode_order_stamps
+    for path in (source, zeroed):
+        assert _gray_frames(path) == [(t, t) for t in range(_PACKED_FRAMES)]
+
+
+# ---------------------------------------------------------- coded pictures
+
+
+def _decoded_kinds(path):
+    """Each picture's type in the decoder's output order, which is display order."""
+    c = av.open(str(path))
+    s = next(x for x in c.streams if x.type == "video")
+    kinds = [fr._PICTURE_KINDS.get(int(f.pict_type), "?") for f in c.decode(s)]
+    c.close()
+    return kinds
+
+
+def _pictures(path, start=0, end=None):
+    return list(fr.iter_coded_pictures(path, start_frame=start, end_frame=end))
+
+
+def test_coded_pictures_follow_the_frames(clip):
+    pictures = _pictures(clip)
+    assert [index for index, _ in pictures] == list(range(N))
+    kinds = [picture.kind for _, picture in pictures]
+    assert kinds == _decoded_kinds(clip)
+    assert [i for i, kind in enumerate(kinds) if kind == "I"] == fr.keyframe_display_indices(clip)
+    assert all(picture.reference for _, picture in pictures)  # the clip has no B frames
+    assert _pictures(clip, 10, 14) == pictures[10:14]
+
+
+def test_packed_avi_slots_report_the_picture_they_show(packed_avi):
+    # Slot s shows frame _PACKED_SLOTS[s] of the encode the file was repacked from; the slot
+    # of a drop frame reports the picture it repeats.
+    shown = _decoded_kinds(packed_avi.parent / "unpacked.avi")
+    assert {"I", "P", "B"} <= set(shown)
+    pictures = _pictures(packed_avi)
+    assert [index for index, _ in pictures] == list(range(len(_PACKED_SLOTS)))
+    assert [picture.kind for _, picture in pictures] == [shown[f] for f in _PACKED_SLOTS]
+    for start in (1, 2, 5, 8, 9, 16, 28):
+        end = min(start + 5, len(_PACKED_SLOTS))
+        assert _pictures(packed_avi, start, end) == pictures[start:end]
+
+
+def test_h264_avi_coded_pictures_follow_display_order(tmp_path):
+    if "libx264" not in av.codecs_available:
+        pytest.skip("this PyAV build has no libx264")
+    path = tmp_path / "h264.avi"
+    options = {**_X264_B_PYRAMID, "x264-params": "b-pyramid=normal:open-gop=1:scenecut=0"}
+    _write_gray(path, "libx264", options)
+    pictures = _pictures(path)
+    kinds = [picture.kind for _, picture in pictures]
+    assert kinds == _decoded_kinds(path)
+    assert {"B", "P"} <= set(kinds)
+    for start in range(1, _PACKED_FRAMES - 3):
+        assert _pictures(path, start, start + 3) == pictures[start : start + 3]
+
+
+def test_coded_pictures_carry_their_quantizers(packed_avi):
+    pictures = [picture for _, picture in _pictures(packed_avi.parent / "unpacked.avi")]
+    # libavcodec exports no parameters for a picture it drains at the end of the stream.
+    missing = [i for i, picture in enumerate(pictures) if picture.quantizer is None]
+    assert missing in ([], [len(pictures) - 1])
+    exported = [p for p in pictures if p.quantizer is not None]
+    assert all(p.quantizer > 0 for p in exported)
+
+    def mean(kind):
+        values = [p.quantizer for p in exported if p.kind == kind]
+        return sum(values) / len(values)
+
+    # FFmpeg's MPEG-4 encoder quantizes B pictures more coarsely than P pictures.
+    assert mean("B") > mean("P")
+
+
+def test_a_repeat_marker_reports_the_picture_it_repeats(clip, monkeypatch):
+    _patched_open(monkeypatch, "tail")
+    pictures = _pictures(clip)
+    assert [index for index, _ in pictures] == list(range(N + 1))
+    assert pictures[N][1] == pictures[N - 1][1]

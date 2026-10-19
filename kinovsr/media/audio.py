@@ -19,6 +19,10 @@ AUDIO_FORMAT_LPCM = 1819304813  # 'lpcm' kAudioFormatLinearPCM
 AUDIO_FORMAT_AAC = 1633772320  # 'aac ' kAudioFormatMPEG4AAC
 AUDIO_FORMAT_ALAC = 1634492771  # 'alac' kAudioFormatAppleLossless
 
+# AudioToolbox's kAudioFileEndOfFileError (AudioFile.h, the classic eofErr);
+# PyObjC's CoreAudio bindings do not carry AudioToolbox's constants.
+_AUDIO_FILE_END_OF_FILE = -39
+
 _log = logging.getLogger(__name__)
 
 _SIDECAR_PCM_BUDGET = 4 * 1024 * 1024
@@ -45,6 +49,14 @@ class _PCMSource(Protocol):
     def read_frames(self, start_frame: int, end_frame: int, /) -> bytes: ...
 
     def close(self) -> None: ...
+
+
+class _NSError(Protocol):
+    """The part of an NSError a failed AVAudioFile read is classified by."""
+
+    def domain(self) -> str: ...
+
+    def code(self) -> int: ...
 
 
 def _audio_format_description(sample_rate: int, channels: int) -> object:
@@ -322,6 +334,17 @@ class StreamingAudioTrack(AudioTrack):
             source.close()
 
 
+def _is_end_of_file(err: _NSError | None) -> bool:
+    """Whether an AVAudioFile read that returned NO started at or past the end.
+
+    macOS 27.0 returned NO there without an error; 27.0.1 returns
+    kAudioFileEndOfFileError. Any other error is a real read failure.
+    """
+    return err is None or (
+        err.domain() == Foundation.NSOSStatusErrorDomain and err.code() == _AUDIO_FILE_END_OF_FILE
+    )
+
+
 class _AVAudioFileSource:
     """Seekable bounded PCM reader backed by AVAudioFile."""
 
@@ -355,15 +378,16 @@ class _AVAudioFileSource:
             self._audio_file.setFramePosition_(start_frame)
         buf = av.AVAudioPCMBuffer.alloc().initWithPCMFormat_frameCapacity_(self._format, n)
         ok, err = self._audio_file.readIntoBuffer_frameCount_error_(buf, n, None)
-        if not ok and err is not None:
+        if not ok and not _is_end_of_file(err):
             raise RuntimeError(
                 f"AVAudioFile could not read {self._path} at frame {start_frame}: {err}"
             )
         # AVAudioFile.length can over-report a compressed track (an ALAC
         # track in MP4 counts whole 4096-frame packets), so a read comes back
-        # short at the real end, or returns NO without an error once there.
-        # Return that short final pull, as the ffmpeg source does, and let
-        # the writer or sidecar close the track at the actual end.
+        # short at the real end, and a read from there returns NO with the
+        # end-of-file status. Return that short final pull, and nothing at or
+        # past the end, as the ffmpeg source does, and let the writer or
+        # sidecar close the track at the actual end.
         frames = int(buf.frameLength()) if ok else 0
         if frames == 0:
             self._cursor = start_frame

@@ -50,6 +50,7 @@ NEURAL_ENGINE = (
     "tests/modeling/test_vsr_blocks.py",
     "tests/native/test_anecir.py",
     "tests/native/test_anemil_builder.py",
+    "tests/native/test_anemil_compile.py",
     "tests/native/test_anemil_runtime.py",
     "tests/native/test_mpsgraph.py",
     "tests/native/test_mpsgraph_state.py",

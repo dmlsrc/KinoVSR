@@ -35,6 +35,12 @@ units and availability are all chip specific:
   whole machine. Units are also mixed within the one group (mJ for
   CPU/GPU/ANE/DRAM, uJ for PCIe, nJ for the duplicate GPU channel), so the
   unit label is read per channel.
+* Counters update at different rates (2026-10-07, macOS 27, read every ~15 ms
+  under stepped load): `GPU Energy` (nJ) and the `GPU Stats` residencies
+  (P-states and `PWRCTRL` reasons, 24 MHz ticks) move at every sample, while
+  `GPU0` (mJ), the CPU, DRAM, DCS and AMCC counters, and every SMC power key
+  change about once a second. GPU power therefore comes from `GPU Energy`, and
+  a GPU limit is visible within a sample, not a second.
 * CPU and GPU utilization both work, by two independent routes that agree:
   performance-state residency (86 percent on a saturated GPU) and
   `PerformanceStatistics` (99 percent on the same load). The latter must be
@@ -60,7 +66,10 @@ units and availability are all chip specific:
 
 A sample costs about 34 ms of CPU, nearly all of it IPC round trips rather
 than work. Polled at one hertz from a background thread it measured 1.0002x on
-a GPU-bound frame loop, because it runs on a core the loop was not using.
+a GPU-bound frame loop, because it runs on a core the loop was not using. A
+sampler limited to `GPU Stats` without the accelerator or SMC reads is far
+cheaper (`groups`, `utilization`), and `SystemPower` reads the system rail
+alone in about 0.3 ms.
 """
 
 import ctypes
@@ -119,9 +128,11 @@ class Reading:
     total_w: float = 0.0
     #: Whole-machine power off the SMC system rail - the figure a hardware
     #: monitor shows as "Total Power". Unlike every other power field this is
-    #: an INSTANTANEOUS reading, not an average over `interval_s`, so a single
-    #: one taken just after a burst catches the rail mid-decay and can land
-    #: below `total_w`. Compare medians over a sustained load, not samples.
+    #: not an average over `interval_s`: the SMC updates it once a second,
+    #: each value about the previous second's average, so it trails a load
+    #: change by one to two seconds (after a step, 80 percent of it showed at
+    #: 1.8 s and all of it at 2.8 s) and a single reading can land below
+    #: `total_w`. Compare medians over a sustained load, not samples.
     system_w: float | None = None
     #: Power drawn from the adapter, same instantaneous caveat.
     dc_in_w: float | None = None
@@ -133,6 +144,15 @@ class Reading:
     gpu_util_accelerator: float | None = None
     #: There is deliberately no ANE utilization field: nothing reports one.
     #: Use `ane_w`.
+    #: The GPU power controller's reason for its clock (IOReport `GPU Stats`
+    #: `PWRCTRL`), as shares of the interval the GPU was not idle: `PERF` and
+    #: `PRFBOOST` while it runs as fast as its load asks, `PPMTARGE`,
+    #: `PPMLIMIT`, `POWER`, `PWR_ZONE` and others while the power or thermal
+    #: controller holds it below that. Measured on M1 Max with a video
+    #: diffusion transformer on the GPU: 0 percent `PPMTARGE` alone at 97 W,
+    #: 60 percent (and 22 percent of the time one state below the top) with
+    #: an AMX decoder adding 15 W.
+    gpu_power_reasons: dict[str, float] = field(default_factory=dict)
     cpu_temp_c: float | None = None
     gpu_temp_c: float | None = None
     fan_rpm: tuple[float, ...] = ()
@@ -272,9 +292,14 @@ def _pystr(ref: _Ref) -> str:
 # same watts. "GPU Energy" (nJ) likewise duplicates "GPU0" (mJ). Summing the
 # channels therefore multiply counts; only these roots are taken, and every
 # channel matching `_CHILD` is a descendant of one and deliberately skipped.
+# Of the two GPU channels "GPU Energy" is taken: they agreed to 0.02% over a
+# 30 s probe, but "GPU Energy" moves at every sample while "GPU0" changes about
+# once a second, which made one-second GPU readings alternate high and low.
+# "GPU0" stands in only where "GPU Energy" is missing (`gpu_parts`).
 _ROOTS = (
     (re.compile(r"^CPU Energy$"), "cpu"),
-    (re.compile(r"^GPU\d+$"), "gpu"),
+    (re.compile(r"^GPU Energy$"), "gpu"),
+    (re.compile(r"^GPU\d+$"), "gpu_parts"),
     (re.compile(r"^ANE\d+$"), "ane"),
     # Memory is a tree too: "AMCC0" 11.42 W is the parent of "DRAM0" 6.59 plus
     # "DCS0" 4.85. Adding all three put the SoC sum at 65.9 W against an SMC
@@ -283,10 +308,22 @@ _ROOTS = (
     (re.compile(r"^(DRAM|DCS)\d+$"), "dram"),
     (re.compile(r"^(PCIe|apciec)"), "pci"),
 )
-_CHILD = re.compile(r"^(PACC|EACC|PCPU|ECPU|AMCC)|^GPU Energy$")
+_CHILD = re.compile(r"^(PACC|EACC|PCPU|ECPU|AMCC)")
 #: Cluster aggregates, summed only as a fallback where no "CPU Energy" root
 #: exists. Their sum matched the root to within 1 percent here.
 _CPU_CLUSTER = re.compile(r"^(PACC\d*_CPU|EACC_CPU)$")
+
+
+def power_reason_shares(residency: dict[str, int]) -> dict[str, float]:
+    """`PWRCTRL` state residencies as shares of the time outside `IDLE_OFF`."""
+    active = sum(value for name, value in residency.items() if name != "IDLE_OFF")
+    if active <= 0:
+        return {}
+    return {
+        name: value / active
+        for name, value in residency.items()
+        if name != "IDLE_OFF" and value > 0
+    }
 
 
 def _engine(channel: str) -> str | None:
@@ -591,21 +628,34 @@ class SensorSampler:
     """
 
     def __init__(
-        self, *, temperatures: bool = True, fans: bool = True, named_sensors: bool = False
+        self,
+        *,
+        temperatures: bool = True,
+        fans: bool = True,
+        named_sensors: bool = False,
+        groups: tuple[str, ...] = _GROUPS,
+        utilization: bool = True,
     ) -> None:
         """`named_sensors` fills `Reading.temps` from the HID sensor page. It
         is off by default because it costs about 70 ms a sample - one IPC
         round trip per sensor, 64 of them - against 9 ms for the SMC pair that
         `cpu_temp_c` and `gpu_temp_c` come from. Turn it on to inspect a chip,
         not to poll one.
+
+        `groups` limits the IOReport subscription (a governor polling the GPU's
+        power-controller reasons many times a second needs only `GPU Stats`),
+        and `utilization=False` skips the IOAccelerator read; with neither
+        `temperatures` nor `fans` there is no SMC read either.
         """
+        if not groups:
+            raise ValueError("SensorSampler needs at least one IOReport group")
         core, report, _ = _libs()
         self._core, self._report = core, report
         # Scoped to the groups actually read. Subscribing to every channel on
         # the system instead costs about 140 ms a sample, since each one is
         # walked and its name marshalled back out of CoreFoundation.
         self._channels = None
-        for group in _GROUPS:
+        for group in groups:
             channels = report.IOReportCopyChannelsInGroup(_cfstr(group), None, 0, 0, 0)
             if not channels:
                 continue
@@ -626,6 +676,7 @@ class SensorSampler:
         self._previous = report.IOReportCreateSamples(self._subscription, self._subscribed, None)
         self._stamp = time.perf_counter()
         self._temperatures = temperatures
+        self._utilization = utilization
         self._smc = _SMC() if (fans or temperatures) else None
         self._hid = _HIDTemperatures() if named_sensors else None
 
@@ -638,7 +689,16 @@ class SensorSampler:
         self._previous, self._stamp = current, time.perf_counter()
 
         reading = Reading(interval_s=elapsed)
-        watts = {"cpu": 0.0, "gpu": 0.0, "ane": 0.0, "dram": 0.0, "pci": 0.0, "other": 0.0}
+        watts = {
+            "cpu": 0.0,
+            "gpu": 0.0,
+            "gpu_parts": 0.0,
+            "ane": 0.0,
+            "dram": 0.0,
+            "pci": 0.0,
+            "other": 0.0,
+        }
+        gpu_energy = False
         cpu_busy = cpu_total = 0
         cpu_clusters = 0.0
 
@@ -659,6 +719,7 @@ class SensorSampler:
                 bucket = _engine(channel)
                 if bucket is not None:
                     watts[bucket] += joules / elapsed
+                    gpu_energy = gpu_energy or bucket == "gpu"
                 continue
 
             if report.IOReportChannelGetFormat(item) != _STATE_FORMAT:
@@ -675,6 +736,8 @@ class SensorSampler:
 
             if group == "GPU Stats" and channel == "GPUPH":
                 reading.gpu_util = 100.0 * (total - states.get("OFF", 0)) / total
+            elif group == "GPU Stats" and channel == "PWRCTRL":
+                reading.gpu_power_reasons = power_reason_shares(states)
             elif group == "CPU Stats" and "IDLE" in states:
                 # Per-core channels only. Cluster channels carry no IDLE state,
                 # so this cannot double count them.
@@ -693,9 +756,13 @@ class SensorSampler:
         core.CFRelease(delta)
         if cpu_total > 0:
             reading.cpu_util = 100.0 * cpu_busy / cpu_total
-        reading.gpu_util_accelerator = _accelerator_utilization()
+        if self._utilization:
+            reading.gpu_util_accelerator = _accelerator_utilization()
         if watts["cpu"] == 0.0:
             watts["cpu"] = cpu_clusters
+        gpu_parts = watts.pop("gpu_parts")
+        if not gpu_energy:
+            watts["gpu"] = gpu_parts
         reading.cpu_w = watts["cpu"]
         reading.gpu_w = watts["gpu"]
         reading.ane_w = watts["ane"]
@@ -724,3 +791,19 @@ class SensorSampler:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+
+class SystemPower:
+    """Whole-machine power off the SMC system rail (`PSTR`, what a hardware monitor shows as
+    "Total Power"), alone: about 0.3 ms a read.
+
+    The SMC updates it once a second, each value about the previous second's average (see
+    `Reading.system_w`), so reading it more often than once a second returns the same value.
+    """
+
+    def __init__(self) -> None:
+        self._smc = _SMC()
+
+    def read(self) -> float | None:
+        """Watts, or None where the key cannot be read."""
+        return self._smc.read(_SMC_SYSTEM_POWER)

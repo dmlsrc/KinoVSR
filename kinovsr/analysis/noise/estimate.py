@@ -1,6 +1,6 @@
 """Sigma-map estimation and flat-pixel floors.
 
-Split of the noise_map module (planning 04); the method rationale lives
+Split of the noise_map module; the method rationale lives
 in the package docstring. This module owns the per-block tail-RMS
 sigma-map estimator and its luma/blur/motion-cap helpers.
 """

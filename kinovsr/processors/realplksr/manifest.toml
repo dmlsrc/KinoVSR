@@ -4,6 +4,13 @@ schema_version = 1
 kind = "processor"
 name = "realplksr"
 
+[profiles.deh264]
+capabilities = ["restore"]
+weights = ["deh264"]
+
+[profiles.deh264.defaults]
+scale = 1
+
 [profiles.public2x]
 capabilities = ["upscale"]
 weights = ["public2x"]
@@ -24,6 +31,13 @@ weights = ["nomos4x"]
 
 [profiles.nomos4x.defaults]
 scale = 4
+
+[weights.deh264]
+path = "weights/1xdeh264_realplksr.safetensors"
+distribution = "external"
+source = "https://github.com/Phhofm/models/releases/download/1xDeH264_realplksr/1xDeH264_realplksr.safetensors"
+source_sha256 = "91f054af6308e37b81c261ecf775a58be5fa1d37a816709db5d0fea6fceb24b8"
+license = "CC-BY-4.0"
 
 [weights.public2x]
 path = "weights/2xpublic_realplksr_dysample_layernorm_real.safetensors"

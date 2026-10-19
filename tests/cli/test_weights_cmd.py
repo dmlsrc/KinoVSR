@@ -48,7 +48,10 @@ def test_factory_profiles_match_their_manifests():
     bsvd_profiles = bsvd_factory.capabilities[Capability.DENOISE].profiles
     assert set(bsvd_profiles) == set(load_registered("bsvd").profiles)
 
-    plksr_profiles = realplksr_factory.capabilities[Capability.UPSCALE].profiles
+    plksr_profiles = (
+        *realplksr_factory.capabilities[Capability.RESTORE].profiles,
+        *realplksr_factory.capabilities[Capability.UPSCALE].profiles,
+    )
     assert set(plksr_profiles) == set(load_registered("realplksr").profiles)
 
 

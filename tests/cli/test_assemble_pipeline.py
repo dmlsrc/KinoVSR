@@ -82,11 +82,25 @@ class TestDefaultsAndOrder:
             "upscale",
         ]
 
-    def test_denoise_first_swaps_the_pair(self):
-        config = asm(
-            "--deblock", "stdf", "--denoise", "mc", "--denoise-first", "--upscale", "balanced"
-        )
-        assert config["pipeline"] == ["denoise_mc", "deblock_stdf", "upscale"]
+    def test_deh264_restore_uses_realplksr_at_source_size(self):
+        config = asm("--restore", "deh264", "--restore-strength", "0.5")
+        assert config["pipeline"] == ["restore_deh264"]
+        assert config["restore_deh264"] == {
+            "processor": "realplksr",
+            "capability": "restore",
+            "profile": "deh264",
+            "strength": 0.5,
+        }
+        plan = resolve_pipeline(config, input_spec=spec(), settings=Settings())
+        assert plan.output_spec.frame.geometry == spec().frame.geometry
+
+    def test_restore_chain_routes_each_profile_to_its_family(self):
+        config = asm("--restore", "deh264,decompress_track1", "--restore-strength", "0.25,0.75")
+        assert config["pipeline"] == ["restore_deh264", "restore_decompress_track1"]
+        assert config["restore_deh264"]["processor"] == "realplksr"
+        assert config["restore_deh264"]["strength"] == 0.25
+        assert config["restore_decompress_track1"]["processor"] == "basicvsrpp"
+        assert config["restore_decompress_track1"]["strength"] == 0.75
 
     def test_explicit_order_appends_omitted_in_default_order(self):
         config = asm(

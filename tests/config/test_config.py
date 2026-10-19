@@ -25,8 +25,8 @@ from kinovsr.processors import (
 )
 from kinovsr.settings import Settings
 
-# The documented example pair from the planning target structure: a base
-# config with a stage library and a clip overlay that restates the list.
+# An example pair: a base config with a stage library and a clip overlay
+# that restates the list.
 BASE_TOML = """\
 pipeline = ["denoise", "deblock", "restore", "upscale"]
 

@@ -32,6 +32,7 @@ from kinovsr.media.chunks import (
     budgeted_decode_chunk_size,
     validate_decode_chunk_size,
 )
+from kinovsr.media.reader import auto_reader
 from kinovsr.media.timespec import resolve_trim
 
 _log = logging.getLogger(__name__)
@@ -55,9 +56,14 @@ def probe_noise(
         vr = ffmpeg_reader
         _log.info("[reader] ffmpeg compatibility reader (forced)")
     elif reader == "auto":
+        vr = cast(ModuleType, auto_reader(video))  # one of the two reader modules
+        if vr is not _native_vr:
+            _log.info("[reader] MPEG program stream; using the ffmpeg compatibility reader")
         try:
             vr.probe_video(video)
         except Exception as e:
+            if vr is not _native_vr:
+                raise
             from kinovsr.media import ffmpeg_reader  # noqa: PLC0415 - ffmpeg extra
 
             vr = ffmpeg_reader

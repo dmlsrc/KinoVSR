@@ -5,7 +5,7 @@ endpoint that turns a video file into a concrete ``StreamSpec`` plus a
 stream of ``FrameUnit``s, an output endpoint that consumes units into
 the native AVAssetWriter with the audio carry/mux policy, and
 ``run_file`` connecting endpoint -> scheduler -> endpoint. Endpoints
-are foundations, not processors (planning 05): they never appear in a
+are foundations, not processors: they never appear in a
 pipeline, and payload conversion between CVPixelBuffers and MLX arrays
 happens only at these edges.
 
@@ -48,10 +48,10 @@ from kinovsr.media.chunks import (
 )
 from kinovsr.media.errors import is_native_operation_error
 from kinovsr.media.errors import media_operation as _media_operation
-from kinovsr.media.filesystem import rename_exclusive
+from kinovsr.media.filesystem import create_partial_output, rename_exclusive
 from kinovsr.media.images import save_image
 from kinovsr.media.pixel_buffers import ci_cache_owner
-from kinovsr.media.reader import VideoReader
+from kinovsr.media.reader import VideoReader, auto_reader
 from kinovsr.media.timing import (
     SampleTable,
     VideoTiming,
@@ -813,8 +813,9 @@ class FileSource:
         if probe is not None:
             with _media_operation("failed to inspect source audio timing for", self.path):
                 audio_timing = probe(self.path)
-            if audio_timing is not None:
-                audio_first = audio_timing.first_pts
+            if audio_timing is None:
+                return None
+            audio_first = audio_timing.first_pts
         slice_start = max(Fraction(0), win0 - audio_first)
         slice_end = win1 - audio_first
         place = max(Fraction(0), audio_first - win0)
@@ -904,7 +905,7 @@ class _PreparedWriterPayload:
 class FileSink:
     """Output endpoint: consume ``FrameUnit``s into the native writer.
 
-    Audio carry/mux policy lives here (planning 04): a supplied audio
+    Audio carry/mux policy lives here: a supplied audio
     track is muxed only when the chain preserved clip duration, which is
     exactly what keeps it synchronized. Each appended unit's PTS is
     verified against the writer's cadence grid - or, for a carried
@@ -996,11 +997,11 @@ class FileSink:
                     geometry.pixel_aspect.denominator,
                 )
 
-        # Publish atomically: encode into a unique temp sibling and only
-        # rename it over the requested output when finish() succeeds. A
-        # failure mid-run (e.g. weights that fail to load at the first pull,
-        # after the writer already opened) then leaves any pre-existing
-        # output file untouched instead of destroying it.
+        # Publish atomically: encode into the visible <stem>.partial sibling
+        # and only rename it over the requested output when finish()
+        # succeeds. A failure mid-run leaves any pre-existing output file
+        # untouched, and keeps the partial file with the frames written so
+        # far: the writer closes it early, or a crash leaves its fragments.
         self._final_path = Path(path)
         self._overwrite = overwrite
         if self._final_path.exists() and not overwrite:
@@ -1011,7 +1012,10 @@ class FileSink:
             self._final_path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise MediaError(f"cannot create writer parent for {self._final_path}: {exc}") from exc
-        self._temp_path = _create_private_temp(self._final_path, "writer")
+        try:
+            self._temp_path = create_partial_output(self._final_path)
+        except OSError as exc:
+            raise MediaError(f"cannot create partial output for {self._final_path}: {exc}") from exc
         self._published = False
         self._finalized = False
         self._discarded = False
@@ -1283,19 +1287,36 @@ class FileSink:
     def _mark_published(self) -> None:
         self._published = True
 
-    def discard(self) -> None:
-        """Abandon the run: release the writer and delete the partial temp
-        file WITHOUT publishing, leaving any pre-existing output untouched.
-        Safe to call after a failure at any point, and a no-op once finish()
-        has already published.
+    def _holds_frames(self) -> bool:
+        """Whether the partial file holds frames, and so outlives a failed run."""
+        return bool(getattr(getattr(self, "writer", None), "frame_count", 0))
 
-        Cleanup is BaseException-safe and never raises: native writing is
-        cancelled (never finalized), and the temp is unlinked even if native
-        cancellation is interrupted, so cleanup cannot mask the original
-        processing failure the caller re-raises."""
+    def discard(self) -> None:
+        """Abandon the run WITHOUT publishing, leaving any pre-existing output
+        untouched. Safe to call after a failure at any point, and a no-op once
+        finish() has already published.
+
+        A partial file that holds frames is the run's work and is kept: the
+        writer closes it early where it is (and a writer that cannot close
+        keeps its file through cancellation). A partial file without frames
+        is cancelled and unlinked.
+
+        Cleanup is BaseException-safe and never raises, so it cannot mask the
+        original processing failure the caller re-raises."""
         if self._published or self._discarded:
             return
         self._discarded = True
+        if self._holds_frames():
+            # Broad: best-effort; must not mask the original.
+            with contextlib.suppress(BaseException):
+                self.writer.finish(early=True)
+            with contextlib.suppress(BaseException):
+                _log.warning(
+                    "kept the %d frame(s) written before the run stopped as %s",
+                    self.writer.frame_count,
+                    self._temp_path,
+                )
+            return
         try:
             self.writer.cancel()
         except BaseException:  # broad: best-effort; must not mask the original
@@ -1637,7 +1658,7 @@ class _TransactionEntry:
     Rename atomicity is the oracle: ``publishing`` is set before the
     publish rename and ``published`` after it returns, so rollback can
     decide "landed" from the flags plus plain existence.  The cooperative
-    threat model (doc 15) assumes no other actor mutates our temp, backup,
+    threat model assumes no other actor mutates our temp, backup,
     or destination paths mid-transaction; inode-identity verification and
     quarantine machinery were removed with it.
     """
@@ -1792,7 +1813,16 @@ class _OutputTransaction:
         )
         if landed:
             try:
-                self._remove(final)
+                if entry.sink is not None:
+                    # A video is never deleted: it returns to its partial name.
+                    self._replace(final, entry.temp_path)
+                    _log.warning(
+                        "kept %s as %s: the run's other outputs failed to publish",
+                        final,
+                        entry.temp_path,
+                    )
+                else:
+                    self._remove(final)
             except BaseException as exc:
                 # Flags stay set: a later rollback pass (exit discard after a
                 # commit failure) makes one more attempt.
@@ -1832,6 +1862,9 @@ class _OutputTransaction:
 
     def _remove_temporary(self, entry: _TransactionEntry) -> list[str]:
         if entry.published:
+            return []
+        if entry.sink is not None and entry.sink._holds_frames():
+            # The partial video is the run's work; it stays where it is.
             return []
         try:
             self._remove(entry.temp_path)
@@ -2461,8 +2494,11 @@ def run_file(
     any frame decodes, and the sink verifies the declared output
     timeline as units arrive. ``max_frames`` windows the INPUT;
     ``max_output_frames`` caps what the sink writes (the distinction
-    matters for cadence-changing chains).
+    matters for cadence-changing chains). Without a ``reader``, the
+    file is read by :func:`~kinovsr.media.reader.auto_reader`'s choice.
     """
+    if reader is None:
+        reader = auto_reader(video)
 
     # One pool for the endpoint's complete span. The writer drains each of
     # its own phases, but objects autoreleased on this thread between those

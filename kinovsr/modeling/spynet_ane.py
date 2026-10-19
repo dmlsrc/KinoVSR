@@ -54,6 +54,7 @@ Anything unavailable or unsupported returns ``None`` from :func:`engine_for`
 and the caller stays on the pure-MLX path.
 """
 
+import contextlib
 import hashlib
 import math
 import shutil
@@ -66,7 +67,7 @@ import mlx.core as mx
 from Foundation import NSURL
 
 from kinovsr.modeling.resample import resize
-from kinovsr.native.anemil import builder, schema
+from kinovsr.native.anemil import builder, runtime, schema
 from kinovsr.settings import default_settings
 
 _MLMULTIARRAY_FLOAT16 = 0x10000 | 16  # MLMultiArrayDataTypeFloat16
@@ -189,14 +190,10 @@ def _convert_models(
         h = h_up >> (levels - 1 - lvl)
         w = w_up >> (levels - 1 - lvl)
         model_bytes, blob = _emit_level(params, lvl, levels, h, w)
-        # Write beside the target and rename, so a crashed or concurrent
-        # conversion cannot leave a half-written package in the cache. The
-        # staging name keeps the .mlpackage suffix for tooling that keys
-        # on the extension.
-        staging = directory / f"level{lvl}.partial.mlpackage"
-        shutil.rmtree(staging, ignore_errors=True)
-        builder.write_package(staging, model_bytes, blob)
-        staging.replace(package)
+        # Published through a staging directory of this run's own, so a
+        # crashed or concurrent conversion cannot leave a half-written
+        # package in the cache, and runs converting at once share one.
+        runtime.publish_package(package, model_bytes, blob)
 
 
 # ------------------------------------------------------------------- runtime
@@ -255,6 +252,14 @@ class _LevelRunner:
         compiled form takes engine construction from ~655 ms to ~57 ms for
         the six levels. Compiled models are tied to the OS and hardware, so
         a stale one that fails to load is rebuilt rather than trusted.
+
+        Core ML compiles into the user's temporary directory, whatever
+        TMPDIR says, and leaves the result to the caller, so it is moved
+        into the cache, not copied: a copy left one compiled model per level
+        behind on every cache miss. The model then loads from the cache too,
+        because Core ML keys its ANE build by the path a model loads from: at
+        640x352 the first warm start after a miss took 0.55 s when the miss
+        had loaded from the temporary directory, and takes 0.09 s now.
         """
 
         compiled_dir = package.with_suffix(".mlmodelc")
@@ -271,18 +276,21 @@ class _LevelRunner:
         )
         if compiled is None:
             raise RuntimeError(f"CoreML compile failed: {err}")
+        output = Path(compiled.path())
+        location = output
+        # A cache that cannot be written costs startup time, not correctness:
+        # the model loads from Core ML's output instead.
+        with contextlib.suppress(OSError):
+            location = runtime.publish(compiled_dir, lambda staged: shutil.move(output, staged))
         try:
-            staging = package.with_suffix(".partial.mlmodelc")
-            shutil.rmtree(staging, ignore_errors=True)
-            shutil.copytree(compiled.path(), staging)
-            staging.replace(compiled_dir)
-        except OSError:
-            # A cache that cannot be written costs startup time, not
-            # correctness; the freshly compiled model is still usable.
-            pass
-        model, err = CoreML.MLModel.modelWithContentsOfURL_configuration_error_(
-            compiled, config, None
-        )
+            model, err = CoreML.MLModel.modelWithContentsOfURL_configuration_error_(
+                NSURL.fileURLWithPath_(str(location)), config, None
+            )
+        finally:
+            # A loaded model keeps nothing open in its compiled directory and
+            # predicts identically once it is gone (checked on macOS 27, on
+            # the ANE and the CPU), so output the cache did not take goes now.
+            shutil.rmtree(output, ignore_errors=True)
         if model is None:
             raise RuntimeError(f"CoreML load failed: {err}")
         return cast(_LevelModel, model)  # a loaded Core ML MLModel

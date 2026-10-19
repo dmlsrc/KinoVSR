@@ -3,7 +3,7 @@
 The map-conditioned denoisers (bsvd, fastdvdnet, mc, and pvdd's level
 variants) take an optional per-pixel sigma estimate plus a per-frame GOP
 pulse gain. Both are stateful analysis objects the engine owns and feeds;
-this module only turns the flat ``noise_map*`` stage keys (planning 07's
+this module only turns the flat ``noise_map*`` stage keys (the
 ``--noise-map`` family) into a frozen config and builds those objects, so
 the conditioning math stays in ``analysis.noise`` and the engines.
 

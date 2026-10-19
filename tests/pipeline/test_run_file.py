@@ -15,6 +15,10 @@ from fractions import Fraction
 from pathlib import Path
 
 import av
+import AVFoundation
+import CoreAudio
+import CoreMedia
+import Foundation
 import pytest
 
 from kinovsr.pipeline import FileSource, run_file
@@ -308,11 +312,53 @@ def _stream_seconds(path):
 
 
 def _decoded_audio_samples(path):
-    with av.open(str(path)) as container:
-        return sum(frame.samples for frame in container.decode(audio=0))
+    """The audio samples an output presents, decoded by the framework that wrote it.
+
+    libavformat 63 trims an edit list's tail from a final ALAC packet's
+    table length, so it cuts real samples from a final frame shorter than
+    that and undercounts AVAssetWriter's output.
+    """
+    url = Foundation.NSURL.fileURLWithPath_(str(path))
+    asset = AVFoundation.AVURLAsset.alloc().initWithURL_options_(url, None)
+    (track,) = asset.tracksWithMediaType_(AVFoundation.AVMediaTypeAudio)
+    reader, error = AVFoundation.AVAssetReader.alloc().initWithAsset_error_(asset, None)
+    assert reader is not None, error
+    settings = {AVFoundation.AVFormatIDKey: CoreAudio.kAudioFormatLinearPCM}
+    output = AVFoundation.AVAssetReaderTrackOutput.alloc().initWithTrack_outputSettings_(
+        track, settings
+    )
+    reader.addOutput_(output)
+    assert reader.startReading(), reader.error()
+    samples = 0
+    while (buffer := output.copyNextSampleBuffer()) is not None:
+        samples += CoreMedia.CMSampleBufferGetNumSamples(buffer)
+    assert reader.status() == AVFoundation.AVAssetReaderStatusCompleted, reader.error()
+    return samples
 
 
 class TestFileSource:
+    def test_no_audio_track_skips_audio_reader_open(self, clip, monkeypatch):
+        from kinovsr.media import audio as audio_module
+
+        def unexpected_open(*_args, **_kwargs):
+            raise AssertionError("video-only source must not open an audio reader")
+
+        monkeypatch.setattr(audio_module, "_native_streaming_audio_track", unexpected_open)
+        assert FileSource(clip).audio_track() is None
+
+    def test_audio_track_still_uses_ffmpeg_when_native_open_fails(
+        self, clip_with_audio, monkeypatch
+    ):
+        from kinovsr.media import audio as audio_module
+
+        def cannot_open(*_args, **_kwargs):
+            raise audio_module._NativeAudioOpenError("unsupported audio container")
+
+        monkeypatch.setattr(audio_module, "_native_streaming_audio_track", cannot_open)
+        track = FileSource(clip_with_audio).audio_track()
+        assert track is not None
+        assert track.n_samples > 0
+
     @pytest.mark.parametrize(
         ("layout", "expected"),
         [
@@ -851,7 +897,9 @@ class TestFileSource:
         # writer produces when the audio is a whole number of 4096-frame
         # packets. With the video running longer, a second pass asked for
         # frames past the real end, and the native source refused the short
-        # read ("returned N of M requested frames").
+        # read ("returned N of M requested frames"). Since macOS 27.0.1 the
+        # next read, from the real end, also fails with
+        # kAudioFileEndOfFileError instead of returning NO alone.
         source = tmp_path / "source.mp4"
         _write_offset_tracks(
             source, video_start_frames=0, audio_start_sec=0.0, audio_len_sec=40960 / SAMPLE_RATE
@@ -901,7 +949,7 @@ class TestFileSource:
 
         assert calls == []
         assert not output.exists()
-        assert not list(tmp_path.glob("*.partial"))
+        assert not list(tmp_path.glob("legacy.partial*"))
 
     def test_run_file_refuses_output_over_input(self, clip_with_audio, tmp_path):
         with pytest.raises(MediaError, match="destroy the source"):
@@ -2002,7 +2050,9 @@ def test_comparison_cannot_alias_post_output(clip, tmp_path):
     assert not list(tmp_path.glob(".*.partial"))
 
 
-def test_second_writer_publish_failure_leaves_no_singleton(clip, tmp_path, monkeypatch):
+def test_second_writer_publish_failure_keeps_both_videos_as_partials(clip, tmp_path, monkeypatch):
+    """The set publishes all-or-none, but a video is never deleted: the landed
+    output returns to its partial name and the comparison stays at its own."""
     from kinovsr.pipeline.run import _OutputTransaction
 
     output = tmp_path / "out.mp4"
@@ -2026,13 +2076,16 @@ def test_second_writer_publish_failure_leaves_no_singleton(clip, tmp_path, monke
 
     assert not output.exists()
     assert not comparison.exists()
+    assert (tmp_path / "out.partial.mp4").stat().st_size > 0
+    assert (tmp_path / "comparison.partial.mp4").stat().st_size > 0
     assert not list(tmp_path.glob(".*.partial"))
 
 
 def test_failed_run_preserves_existing_output(clip, tmp_path):
     """Finding #3 atomicity: a run that fails after the writer opened (the
     weights load at the first pull, past open-time validation) must leave a
-    pre-existing output untouched and drop its partial temp file."""
+    pre-existing output untouched, and drops its partial file, which holds no
+    frame."""
     out = tmp_path / "keep.mp4"
     run_file({"pipeline": []}, video=clip, output=out, settings=SETTINGS)
     original = out.read_bytes()
@@ -2051,7 +2104,7 @@ def test_failed_run_preserves_existing_output(clip, tmp_path):
     with pytest.raises(Exception):  # noqa: B017, PT011 - loader error, wrapped
         run_file(config, video=clip, output=out, settings=SETTINGS, max_frames=4, overwrite=True)
     assert out.read_bytes() == original  # original intact
-    assert not list(tmp_path.glob(".keep.mp4.*"))  # no partial temp left
+    assert not list(tmp_path.glob("keep.partial*"))  # no frame, no partial left
 
 
 def test_rename_failure_leaves_no_orphan_temp(clip, tmp_path):
@@ -2063,14 +2116,14 @@ def test_rename_failure_leaves_no_orphan_temp(clip, tmp_path):
     with pytest.raises(Exception):  # noqa: B017, PT011 - IsADirectoryError/OSError
         run_file({"pipeline": []}, video=clip, output=outdir, settings=SETTINGS)
     assert outdir.is_dir()  # the directory is untouched
-    assert not list(tmp_path.glob(".out.mp4.*"))  # no partial temp left
+    assert not list(tmp_path.glob("out.partial*"))  # no frame, no partial left
 
 
 def test_discard_cancels_and_unlinks_even_if_cancel_is_interrupted(tmp_path):
-    """discard() must cancel rather than finish and remain BaseException-safe."""
+    """Without frames, discard() cancels and unlinks, BaseException-safe."""
     from kinovsr.pipeline.run import FileSink
 
-    temp = tmp_path / ".out.mp4.partial"
+    temp = tmp_path / "out.partial.mp4"
     temp.write_bytes(b"partial encode")
     sink = FileSink.__new__(FileSink)  # bypass the heavy native __init__
     sink._published = False
@@ -2084,6 +2137,34 @@ def test_discard_cancels_and_unlinks_even_if_cancel_is_interrupted(tmp_path):
     sink.writer = _InterruptingWriter()
     sink.discard()  # must not raise
     assert not temp.exists()  # temp cleaned despite the interrupt
+
+
+def test_discard_keeps_a_partial_with_frames_and_closes_it_early(tmp_path):
+    """With frames, discard() closes the file early and leaves it in place."""
+    from kinovsr.pipeline.run import FileSink
+
+    temp = tmp_path / "out.partial.mp4"
+    temp.write_bytes(b"partial encode")
+    sink = FileSink.__new__(FileSink)  # bypass the heavy native __init__
+    sink._published = False
+    sink._discarded = False
+    sink._temp_path = temp
+    calls = []
+
+    class _Writer:
+        frame_count = 3
+
+        def finish(self, early=False):
+            calls.append(("finish", early))
+            raise KeyboardInterrupt("during-early-finish")
+
+        def cancel(self):
+            calls.append(("cancel",))
+
+    sink.writer = _Writer()
+    sink.discard()  # must not raise
+    assert calls == [("finish", True)]
+    assert temp.read_bytes() == b"partial encode"
 
 
 _FBCNN_WEIGHTS = Path("kinovsr/processors/fbcnn/weights/fbcnn_color.safetensors")
@@ -2104,6 +2185,7 @@ def test_fbcnn_runs_through_the_typed_pipeline(clip, tmp_path):
     assert result.frames_out == 3
 
 
+@pytest.mark.skipif(not _FBCNN_WEIGHTS.is_file(), reason="fbcnn weights not installed")
 def test_fbcnn_auto_quality_reports_its_estimate_and_block_map(clip, tmp_path, caplog):
     # FBCNN's end-of-run QF report and its blockiness debug map used to stop
     # at the per-frame driver adapter, so neither ever reached the run.

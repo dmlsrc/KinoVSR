@@ -192,7 +192,7 @@ class Settings:
     )
     bsvd_weights: str | None = field(default=None, metadata={"env": "{{BSVD_WEIGHTS}}"})
     esc_weights: str | None = field(default=None, metadata={"env": "{{ESC_WEIGHTS}}"})
-    # Canonical family name is fastdvdnet (planning 07-cli-vocabulary.md);
+    # Canonical family name is fastdvdnet (the CLI vocabulary);
     # the env var keeps its legacy compatibility spelling.
     fastdvdnet_weights: str | None = field(default=None, metadata={"env": "{{FASTDVD_WEIGHTS}}"})
     fbcnn_weights: str | None = field(default=None, metadata={"env": "{{FBCNN_WEIGHTS}}"})

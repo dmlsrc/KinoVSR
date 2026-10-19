@@ -339,8 +339,8 @@ def _writer_type(failure, phase):
                 raise failure
             self.frame_count += 1
 
-        def finish(self):
-            if phase == "finalize":
+        def finish(self, early=False):
+            if phase == "finalize" and not early:
                 raise failure
 
         def cancel(self):
@@ -374,6 +374,8 @@ def test_public_file_path_normalizes_writer_failure(monkeypatch, tmp_path, phase
     assert caught.value.__cause__ is failure
     assert not output.exists()
     assert not list(tmp_path.glob(".*.partial"))
+    # Frames reached the writer only when finalizing failed; they are kept.
+    assert (tmp_path / "output.partial.mp4").exists() == (phase == "finalize")
 
 
 def test_public_file_path_normalizes_objc_writer_failure(monkeypatch, tmp_path):
@@ -438,6 +440,7 @@ def test_public_file_path_normalizes_publication_failure(monkeypatch, tmp_path):
     assert caught.value.__cause__ is failure
     assert not output.exists()
     assert not list(tmp_path.glob(".*.partial"))
+    assert (tmp_path / "output.partial.mp4").exists()
 
 
 @pytest.mark.parametrize("failure_type", [OSError, RuntimeError])

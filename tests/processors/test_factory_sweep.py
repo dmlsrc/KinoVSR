@@ -365,7 +365,7 @@ class TestOpenTimeValidation:
 
 
 # Every family reachable in the --denoise slot carries the shared
-# luma/chroma split keys (planning 07); the harness's LumaChromaDenoiser
+# luma/chroma split keys; the harness's LumaChromaDenoiser
 # wrapping is now typed stage config threaded through FeedFlushProcessor.
 DENOISE_FAMILIES = ("bsvd", "fastdvdnet", "pvdd", "toflow", "mc", "spatial")
 

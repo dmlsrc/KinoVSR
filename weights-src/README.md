@@ -40,7 +40,7 @@ the manifest's recorded upstream hash at collection time.
 | pvdd/ | 6 .pth (renamed from `<subdir>/g_net_100000.pth`) | no flags |
 | realbasicvsr/ | the mmediting c64b20 .pth | `--only-prefix generator_ema. --strip-prefix generator_ema.` |
 | realesrgan/ | 10 .pth (9 profiles + wdn companion) | `--strip-prefix ''` |
-| realplksr/ | 3 upstream .safetensors | none (shipped files are byte-identical renames) |
+| realplksr/ | 4 upstream .safetensors | none (installed files are byte-identical renames) |
 | realviformer/ | weights.pth | `--param-key params` |
 | safmn/ | 3 stock + 3 PureScale .pth | `--param-key params` (stock) / `params_ema` (PureScale) |
 | spynet/ | spynet_20210409-c6c1bd09.pth | [`kinovsr/modeling/spynet/convert_spynet.py`](../kinovsr/modeling/spynet/convert_spynet.py) |

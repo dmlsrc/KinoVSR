@@ -170,12 +170,14 @@ kinovsr weights verify
 
 | profile | capabilities | weights |
 | --- | --- | --- |
+| `deh264` | restore | deh264 |
 | `public2x` | upscale | public2x |
 | `public2x-nn` | upscale | public2x-nn |
 | `nomos4x` | upscale | nomos4x |
 
 | asset | distribution | license | source |
 | --- | --- | --- | --- |
+| `deh264` (1xdeh264_realplksr.safetensors) | external | CC-BY-4.0 | <https://github.com/Phhofm/models/releases/download/1xDeH264_realplksr/1xDeH264_realplksr.safetensors> |
 | `public2x` (2xpublic_realplksr_dysample_layernorm_real.safetensors) | external | Apache-2.0 | <https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.safetensors> |
 | `public2x-nn` (2xpublic_realplksr_dysample_layernorm_real_nn.safetensors) | external | Apache-2.0 | <https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real_nn/2xPublic_realplksr_dysample_layernorm_real_nn.safetensors> |
 | `nomos4x` (4xnomoswebphoto_realplksr.safetensors) | external | CC-BY-4.0 | <https://github.com/Phhofm/models/releases/download/4xNomosWebPhoto_RealPLKSR/4xNomosWebPhoto_RealPLKSR.safetensors> |

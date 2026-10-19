@@ -72,7 +72,7 @@ SHARED_KEYS = frozenset(
 )
 
 # Family-specific keys: concepts no other family shares. Adding a key here
-# is a deliberate vocabulary decision (planning 07-cli-vocabulary.md).
+# is a deliberate vocabulary decision.
 FAMILY_KEYS: dict[str, frozenset[str]] = {
     "mc": frozenset({"sigma", "gate", "clamp", "occlusion", "confidence"}),
     "fbcnn": frozenset({"quality", "quality_fallback", "gop"}),
@@ -82,7 +82,6 @@ FAMILY_KEYS: dict[str, frozenset[str]] = {
     "nafnet": frozenset({"pool"}),
     "deflicker": frozenset({"band", "frac", "max_fix", "jitter", "gop"}),
     "level": frozenset({"deadband"}),
-    "denoise": frozenset({"first"}),
     # Conditioning subsystems and foundation prefixes lock their keys the
     # same way so the whole prefixed surface stays deliberate.
     "noise_map": frozenset(

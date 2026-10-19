@@ -20,8 +20,8 @@ stage exactly once.
 
 Compatibility: this module is the supported import surface
 (``__all__`` below, tested in ``tests/api``). Pre-1.0, additions land
-freely; breaking changes to these names are called out in the commit
-that makes them. Underscore-prefixed names and every other module are
+freely; breaking changes to these names are listed in the changelog,
+CHANGELOG.md. Underscore-prefixed names and every other module are
 internal.
 """
 

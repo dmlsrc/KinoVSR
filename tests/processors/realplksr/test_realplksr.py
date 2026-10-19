@@ -61,7 +61,9 @@ def _synth(path, *, scale, layer_norm, dysample, dim=8, n_blocks=2, ks=3):
     mx.save_safetensors(str(path), d)
 
 
-@pytest.mark.parametrize(("scale", "ln", "dys"), [(4, False, False), (2, True, True)])
+@pytest.mark.parametrize(
+    ("scale", "ln", "dys"), [(1, False, False), (4, False, False), (2, True, True)]
+)
 def test_config_detection_and_geometry(scale, ln, dys):
     with tempfile.TemporaryDirectory() as td:
         ck = Path(td) / "m.safetensors"
@@ -79,6 +81,24 @@ def test_config_detection_and_geometry(scale, ln, dys):
         assert bool(mx.all(mx.isfinite(out)))
         assert float(mx.min(out)) >= 0.0
         assert float(mx.max(out)) <= 1.0
+
+
+def test_1x_restore_strength_blends_with_input():
+    from kinovsr.processors.realplksr.upscaler import RealPlksrUpscaler
+
+    with tempfile.TemporaryDirectory() as td:
+        ck = Path(td) / "m.safetensors"
+        _synth(ck, scale=1, layer_norm=False, dysample=False)
+        source = mx.full((12, 16, 3), 0.25, dtype=mx.float32)
+
+        def run(strength):
+            driver = RealPlksrUpscaler(ck, dtype=mx.float32, compile=False, strength=strength)
+            return driver.feed(source)[0][0]
+
+        original, half, full = run(0.0), run(0.5), run(1.0)
+        assert original.shape == source.shape
+        assert float(mx.max(mx.abs(original - source))) < 1e-6
+        assert float(mx.max(mx.abs(half - (source + full) * 0.5))) < 1e-6
 
 
 def test_dysample_zero_offset_is_nearest_upsample():

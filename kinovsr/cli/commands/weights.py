@@ -1,7 +1,7 @@
 """The ``kinovsr weights`` command: list and verify manifest-covered weights.
 
-Read-only by design (planning: automatic downloading stays disabled until
-the download-policy questions are answered). Output renders through the
+Read-only by design (automatic downloading stays disabled until the
+download-policy questions are answered). Output renders through the
 shared Rich console; exit codes make ``verify`` scriptable:
 
 - 0: everything present that must be (external absences are informational);

@@ -142,7 +142,13 @@ class TestRestore:
         import mlx.core as mx
 
         from kinovsr.pipeline import resolve_pipeline, run_plan
+        from kinovsr.processors.bsvd import default_weights_path
 
+        # Check before running: the runtime reports a stage's missing weights as a
+        # PipelineRuntimeError, so a FileNotFoundError never reaches this frame.
+        weights = default_weights_path("c64")
+        if not weights.is_file():
+            pytest.skip(f"bsvd weights not available at {weights}")
         # each frame's top band carries a distinct value; interiors are noise
         units = []
         for i in range(6):
@@ -153,19 +159,16 @@ class TestRestore:
                     payload=mx.concatenate([top, interior], axis=0), pts=i * 960, duration=960
                 )
             )
-        try:
-            plan = resolve_pipeline(
-                {
-                    "pipeline": ["san", "den"],
-                    "san": {"processor": "sanitize_edges", "edges": "2,0,0,0", "fill": "restore"},
-                    "den": {"processor": "bsvd", "strength": 0.3},
-                },
-                input_spec=stream(),
-                settings=SETTINGS,
-            )
-            out = list(run_plan(plan, list(units), PipelineContext(settings=SETTINGS)))
-        except FileNotFoundError as exc:
-            pytest.skip(f"bsvd weights not available: {exc}")
+        plan = resolve_pipeline(
+            {
+                "pipeline": ["san", "den"],
+                "san": {"processor": "sanitize_edges", "edges": "2,0,0,0", "fill": "restore"},
+                "den": {"processor": "bsvd", "strength": 0.3},
+            },
+            input_spec=stream(),
+            settings=SETTINGS,
+        )
+        out = list(run_plan(plan, list(units), PipelineContext(settings=SETTINGS)))
         assert [u.pts for u in out] == [i * 960 for i in range(6)]
         for i, u in enumerate(out):
             # top band restored to THIS frame's original value

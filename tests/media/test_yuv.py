@@ -150,6 +150,53 @@ def test_direct_yuv_matches_the_legacy_rgbahalf_boundary(matrix, full_range, dty
     assert _active_yuv_bytes(direct, width) == _active_yuv_bytes(legacy, width)
 
 
+def _yuv_buffer(width, height, full_range):
+    attrs = {
+        "PixelFormatType": yuv.pixel_format(full_range),
+        "Width": width,
+        "Height": height,
+        "IOSurfaceProperties": {},
+        "MetalCompatibility": True,
+    }
+    return pb.make_pixel_buffer_from_attrs(width, height, attrs)
+
+
+@pytest.mark.parametrize(
+    "matrix",
+    [
+        Quartz.kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+        Quartz.kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+        Quartz.kCVImageBufferYCbCrMatrix_ITU_R_2020,
+    ],
+)
+@pytest.mark.parametrize("full_range", [False, True])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.float32])
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("channels", [3, 4])
+def test_a_frame_converts_in_one_graph_as_it_did_in_two_steps(
+    matrix, full_range, dtype, signed, channels
+):
+    # The writer used to receive [0, 1] RGB a sink had made from the model's frame in float32,
+    # round it through FP16, then convert it; the fused conversion must give the same bytes.
+    width, height = 64, 24
+    mx.random.seed(11)
+    low, high = (-1.3, 1.3) if signed else (-0.2, 1.2)
+    frame = mx.random.uniform(low, high, (height, width, channels)).astype(dtype)
+    exact = mx.array([-1.0, -0.5, 0.0, 0.25, 0.5, 1.0], dtype=dtype)
+    frame[0, : exact.size, 0] = exact
+    mx.eval(frame)
+
+    rgb = mx.clip((frame.astype(mx.float32) + 1) * 0.5, 0, 1) if signed else frame
+    two_step = _yuv_buffer(width, height, full_range)
+    yuv.rgb_to_yuv422_10(
+        rgb[..., :3].astype(mx.float16).astype(mx.float32), two_step, matrix, full_range
+    )
+    fused = _yuv_buffer(width, height, full_range)
+    yuv.frame_to_yuv422_10(frame, fused, matrix, full_range, signed=signed)
+
+    assert _active_yuv_bytes(fused, width) == _active_yuv_bytes(two_step, width)
+
+
 def test_chroma_decimation_is_cosited_121():
     """4:2:2 chroma must be the left/co-sited [1,2,1]/4 filter: HEVC cannot
     signal any other siting for 4:2:2, and decoders assume co-sited."""

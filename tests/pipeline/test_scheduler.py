@@ -704,7 +704,7 @@ class TestCleanup:
 @pytest.mark.slow
 def test_scheduler_overhead_sanity():
     """A loose in-process guard against gross framework regressions; the
-    real gate protocol is scripts/dev/bench_scheduler.py (planning 06)."""
+    real gate protocol is scripts/dev/bench_scheduler.py."""
     import statistics
     import time
 

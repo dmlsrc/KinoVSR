@@ -37,15 +37,13 @@ section. An input named `My Clip.mov` gets output names beginning
 | Part of the chain | Default order | What can move with flags |
 | --- | --- | --- |
 | Timeline and geometry | `conform` -> `crop` -> `sanitize_edges` -> `square_pixels` -> `cut_detect` | These stay before restoration. Only selected stages appear. |
-| Preprocess | `level` -> `restore` -> `deflicker` -> `deblock` -> `denoise` -> `nafnet` | Use `--denoise-first` or `--preprocess-order`. |
+| Preprocess | `level` -> `restore` -> `deflicker` -> `deblock` -> `denoise` -> `nafnet` | Use `--preprocess-order` to change the order. |
 | Output processing | `upscale` -> frame interpolation | These stay after preprocess. Only selected stages appear. |
 
 <table>
 <thead><tr><th>Argument</th><th>Default</th><th>Value</th><th>What it does</th></tr></thead>
 <tbody>
-<tr><td rowspan="2" valign="top"><code>--denoise-first</code></td><td rowspan="2" valign="top"><code>off</code></td><td><code>off</code></td><td>Keep deblock before denoise.</td></tr>
-<tr><td><code>on</code></td><td>Move denoise before deblock when noise was added after compression.</td></tr>
-<tr><td><code>--preprocess-order</code></td><td>Order above</td><td><code>A,B,...</code></td><td>List enabled preprocess slots in execution order. Overrides <code>--denoise-first</code>; omitted slots follow in default order.</td></tr>
+<tr><td><code>--preprocess-order</code></td><td>Order above</td><td><code>A,B,...</code></td><td>List enabled preprocess slots in execution order; omitted slots follow in default order.</td></tr>
 <tr><td rowspan="5" valign="top"><code>--deblock</code></td><td rowspan="5" valign="top"><code>off</code></td><td><code>off</code></td><td>Skip deblocking.</td></tr>
 <tr><td><code>stdf</code></td><td><a href="processors/stdf.md">STDF</a> uses neighboring frames to remove compression artifacts.</td></tr>
 <tr><td><code>toflow</code></td><td><a href="processors/toflow.md">TOFlow</a> uses a temporal deblock checkpoint.</td></tr>
@@ -59,8 +57,9 @@ section. An input named `My Clip.mov` gets output names beginning
 <tr><td><code>toflow</code></td><td><a href="processors/toflow.md">TOFlow</a> uses its denoise checkpoint.</td></tr>
 <tr><td><code>pvdd</code></td><td><a href="processors/pvdd.md">PVDD</a> offers real-noise and level-conditioned profiles.</td></tr>
 <tr><td><code>NAME,NAME,...</code></td><td>Chain the listed denoisers left to right.</td></tr>
-<tr><td rowspan="2" valign="top"><code>--restore</code></td><td rowspan="2" valign="top"><code>off</code></td><td><code>off</code></td><td>Skip BasicVSR++ restoration.</td></tr>
-<tr><td><code>PROFILE[,PROFILE...]</code></td><td>Run <a href="processors/basicvsrpp.md">BasicVSR++ restore</a> profiles left to right.</td></tr>
+<tr><td rowspan="3" valign="top"><code>--restore</code></td><td rowspan="3" valign="top"><code>off</code></td><td><code>off</code></td><td>Skip restoration.</td></tr>
+<tr><td><code>deh264</code></td><td>Run <a href="processors/realplksr.md">RealPLKSR</a> 1x H.264 artifact restoration per frame.</td></tr>
+<tr><td><code>PROFILE[,PROFILE...]</code></td><td>Run restoration profiles left to right; the other profiles use <a href="processors/basicvsrpp.md">BasicVSR++ temporal restoration</a>.</td></tr>
 <tr><td rowspan="13" valign="top"><code>--upscale</code></td><td rowspan="13" valign="top"><code>none</code></td><td><code>none</code></td><td>Keep the processed picture at source size.</td></tr>
 <tr><td><code>fast</code></td><td><a href="processors/videotoolbox.md">VideoToolbox</a> low-latency 2x.</td></tr>
 <tr><td><code>balanced</code></td><td><a href="processors/videotoolbox.md">VideoToolbox</a> temporal 4x.</td></tr>
@@ -372,8 +371,8 @@ envelopes and memory guidance.
 <thead><tr><th>Input argument</th><th>Default</th><th>Value</th><th>What it does</th></tr></thead>
 <tbody>
 <tr><td><code>--video</code></td><td><em>required unless in config</em></td><td><code>PATH</code></td><td>Select the source file.</td></tr>
-<tr><td rowspan="3" valign="top"><code>--reader</code></td><td rowspan="3" valign="top"><code>auto</code></td><td><code>auto</code></td><td>Try native decoding, then the optional ffmpeg reader for unsupported containers.</td></tr>
-<tr><td><code>native</code></td><td>Require native video decoding; audio may use PyAV if AVAudioFile rejects the container.</td></tr>
+<tr><td rowspan="3" valign="top"><code>--reader</code></td><td rowspan="3" valign="top"><code>auto</code></td><td><code>auto</code></td><td>Native decoding, except MPEG program streams (VCD and DVD <code>.mpg</code>/<code>.vob</code> files, identified by their content), which AVFoundation reads incompletely and the optional ffmpeg reader reads exactly; the ffmpeg reader also takes over when native decoding cannot open a file.</td></tr>
+<tr><td><code>native</code></td><td>Require native video decoding, program streams included; audio may use PyAV if AVAudioFile rejects the container.</td></tr>
 <tr><td><code>ffmpeg</code></td><td>Require the optional PyAV reader.</td></tr>
 <tr><td rowspan="6" valign="top"><code>--start</code></td><td rowspan="6" valign="top"><em>beginning</em></td><td><code>N</code></td><td>Bare integer frame number; for example, <code>120</code>.</td></tr>
 <tr><td><code>Nf</code></td><td>Explicit frame number; for example, <code>120f</code>.</td></tr>
@@ -490,7 +489,7 @@ kinovsr run --video in.mp4 --output-dir out \
 | [pvdd](processors/pvdd.md) | Real-noise temporal denoising. |
 | [realbasicvsr](processors/realbasicvsr.md) | Clean and upscale real-world video 4x. |
 | [realesrgan](processors/realesrgan.md) | Per-frame GAN and fidelity upscaling. |
-| [realplksr](processors/realplksr.md) | Per-frame 2x or 4x upscale. |
+| [realplksr](processors/realplksr.md) | Per-frame 1x H.264 restoration or 2x/4x upscale. |
 | [realviformer](processors/realviformer.md) | Causal recurrent 4x upscale. |
 | [safmn](processors/safmn.md) | Lightweight or perceptual per-frame upscale. |
 | [sanitize_edges](processors/sanitize_edges.md) | Repair edge damage without resizing. |

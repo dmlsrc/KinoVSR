@@ -192,6 +192,7 @@ class TestCoverage:
             "deblur_gopro",
         ):
             assert variant in profiles
+        assert "deh264" in load_registered("realplksr").profiles
 
 
 class TestVerify:

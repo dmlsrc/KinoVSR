@@ -1,6 +1,6 @@
 """Structural conformance of the option registry to the vocabulary.
 
-Planning 07-cli-vocabulary.md: the same key name means the same concept in
+The vocabulary rule: the same key name means the same concept in
 every family, canonical flags are the composition of family and key, and
 settings-backed flags stay None-default so the env/TOML trifecta layers show
 through.
@@ -89,7 +89,6 @@ def test_compositional_flags_are_registry_owned_and_parser_complete():
         "--target-fps",
         "--conform-cfr",
         "--preprocess-order",
-        "--denoise-first",
     }
     owned = {opt.flag for opt in REGISTRY if opt.compositional}
     parsed = {flag for action in build_parser()._actions for flag in action.option_strings}

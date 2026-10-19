@@ -15,10 +15,11 @@ Layers:
   at production scale, the fp16 weights blob writer, and the .mlpackage
   writer. Deterministic serialization: identical emissions produce
   identical packages byte for byte.
-- ``runtime`` - native compile-and-persist, the ``MLComputePlan``
-  placement gate, and an MLX-buffered ``ModelRunner`` (fixed fp16
-  bindings, output backings, optional MLState, and per-dispatch dynamic
-  rebinding via ``predict_with`` for caller-managed buffers).
+- ``runtime`` - cache publication that concurrent runs can share
+  (``publish``, ``publish_package``), native compile-and-persist, the
+  ``MLComputePlan`` placement gate, and an MLX-buffered ``ModelRunner``
+  (fixed fp16 bindings, output backings, optional MLState, and per-dispatch
+  dynamic rebinding via ``predict_with`` for caller-managed buffers).
 
 Consumers: ``kinovsr.modeling.spynet_ane`` (stateless per-level flow
 graphs) and ``kinovsr.processors.bsvd.ane`` (the stateful streaming

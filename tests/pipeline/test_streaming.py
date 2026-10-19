@@ -477,6 +477,47 @@ def test_terminal_consumer_is_a_bounded_graph_actor() -> None:
     assert all(metric.high_water_units <= metric.max_units for metric in run.metrics)
 
 
+def test_completion_executor_stays_live_through_stage_close() -> None:
+    class NeedsCompletionOnClose(_Pass):
+        def __init__(self) -> None:
+            super().__init__()
+            self.completion_submit = None
+            self.completed_close = False
+
+        def bind_background_submit(self, submit, completion_submit, owner_wait):
+            del submit, owner_wait
+            self.completion_submit = completion_submit
+
+        def close(self, context) -> None:
+            assert self.completion_submit is not None
+            assert self.completion_submit(lambda: True).result(timeout=1)
+            self.completed_close = True
+            super().close(context)
+
+    class CappedSink:
+        execution_affinity = "sink-owner"
+
+        def consume(self, unit):
+            del unit
+            return False
+
+        def finish(self):
+            return None
+
+        def close(self):
+            pass
+
+    processor = NeedsCompletionOnClose()
+    run = run_chain(
+        ((_stage(processor, "stage", "stage-owner"), processor),),
+        _units(3),
+        PipelineContext(settings=Settings()),
+        terminal_consumer=CappedSink(),
+    )
+    assert run.wait() is None
+    assert processor.completed_close
+
+
 def test_terminal_input_bridge_and_sink_have_distinct_owners() -> None:
     processor = _Pass()
 
@@ -624,6 +665,129 @@ def test_terminal_mlx_value_is_rebuilt_on_the_host_stream(monkeypatch) -> None:
     assert output.payload.dtype == mx.float32
     assert output.payload.tolist() == (source + 1).tolist()
     assert copy_modes == [False]
+
+
+def test_mlx_lane_leaves_the_default_device_to_other_threads() -> None:
+    """MLX keeps one default device per process; only default streams are per thread.
+
+    A host thread holds a CPU stream context from before a lane callback until
+    while it is still running. The lane must neither move the host to the GPU
+    inside that context nor restore the CPU after the host has left it.
+    """
+    import mlx.core as mx
+
+    previous = mx.default_device()
+    stream = mx.new_thread_unsafe_stream(mx.gpu)
+    lane = _AffinityLane("mlx-device")
+    lane.set_mlx_stream(stream)
+    host_inside = threading.Event()
+    host_checked = threading.Event()
+    host_leave = threading.Event()
+    lane_inside = threading.Event()
+    lane_leave = threading.Event()
+    host_saw = []
+
+    def host() -> None:
+        with mx.stream(mx.new_stream(mx.cpu)):
+            host_inside.set()
+            lane_inside.wait(10)
+            host_saw.append(mx.default_device())
+            host_checked.set()
+            host_leave.wait(10)
+
+    def held() -> None:
+        lane_inside.set()
+        lane_leave.wait(10)
+
+    host_thread = threading.Thread(target=host)
+    try:
+        mx.set_default_device(mx.gpu)
+        # Un-streamed lane work still lands on the lane's stream.
+        assert lane.call(lambda: mx.default_stream(mx.default_device())) == stream
+        host_thread.start()
+        assert host_inside.wait(10)
+        held_call = lane.submit(held)
+        assert host_checked.wait(10)
+        host_leave.set()
+        host_thread.join(10)
+        assert not host_thread.is_alive()
+        lane_leave.set()
+        held_call.result(timeout=10)
+        assert host_saw == [mx.cpu]
+        assert mx.default_device() == mx.gpu
+    finally:
+        host_leave.set()
+        lane_leave.set()
+        if host_thread.ident is not None:
+            host_thread.join(10)
+        lane.stop()
+        mx.set_default_device(previous)
+
+
+def test_terminal_rebuild_leaves_the_default_device_to_other_threads(monkeypatch) -> None:
+    """The host-side rebuild of a terminal MLX value names its stream per op.
+
+    A host thread holds a CPU stream context from before the second frame's
+    rebuild until while it is still running.
+    """
+    import mlx.core as mx
+
+    previous = mx.default_device()
+    consumer = threading.current_thread()
+    asarray = mx.asarray
+    armed = threading.Event()
+    rebuilding = threading.Event()
+    host_inside = threading.Event()
+    host_left = threading.Event()
+    host_saw = []
+
+    def gated_asarray(value, *args, **kwargs):
+        if armed.is_set() and threading.current_thread() is consumer:
+            rebuilding.set()
+            assert host_left.wait(10)
+        return asarray(value, *args, **kwargs)
+
+    monkeypatch.setattr(mx, "asarray", gated_asarray)
+
+    def host() -> None:
+        with mx.stream(mx.new_stream(mx.cpu)):
+            host_inside.set()
+            rebuilding.wait(10)
+            host_saw.append(mx.default_device())
+        host_left.set()
+
+    class AddOne(_Pass):
+        def process(self, unit, context):
+            self._record()
+            yield unit.with_payload(unit.payload + 1)
+
+    host_thread = threading.Thread(target=host)
+    try:
+        mx.set_default_device(mx.gpu)
+        processor = AddOne()
+        source = mx.arange(12, dtype=mx.float32).reshape(2, 2, 3)
+        run = run_chain(
+            ((_stage(processor, "mlx-stage", "mlx", layout=Layout.MLX_RGB_HWC), processor),),
+            [FrameUnit(payload=source, pts=index, duration=1) for index in range(2)],
+            PipelineContext(settings=Settings()),
+        )
+        with run:
+            outputs = [next(run)]
+            armed.set()
+            host_thread.start()
+            assert host_inside.wait(10)
+            outputs.append(next(run))
+            assert rebuilding.is_set()
+            with pytest.raises(StopIteration):
+                next(run)
+        assert host_saw == [mx.cpu]
+        assert mx.default_device() == mx.gpu
+        assert [output.payload.tolist() for output in outputs] == [(source + 1).tolist()] * 2
+    finally:
+        rebuilding.set()
+        if host_thread.ident is not None:
+            host_thread.join(10)
+        mx.set_default_device(previous)
 
 
 def test_shared_affinity_prefers_ready_downstream_work() -> None:

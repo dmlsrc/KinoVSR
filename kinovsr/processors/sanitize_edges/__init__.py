@@ -10,8 +10,8 @@ geometry is untouched.
 ORIGINAL border is composited back over the processed output, feathered
 into the content - the border stays exactly as quiet/static/dark as the
 source. This BRACKETS the chain: the extend pre-pass captures each original
-frame, and a companion post-pass restores it (planning 05's companion
-mechanism). Because the composite runs in MLX, the builder places the
+frame, and a companion post-pass restores it (the processor
+companion mechanism). Because the composite runs in MLX, the builder places the
 companion at the last MLX point - after the learned/native-MLX upscalers
 but before any native-CV stage, or the chain end when every stage stays
 MLX. The two halves share a PTS-keyed buffer, so a windowed stage's delay does

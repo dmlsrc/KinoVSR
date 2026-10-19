@@ -38,13 +38,12 @@ the ``[settings]`` table, or ``KINOVSR_BSVD_DIRECT``.
 
 import json
 import logging
-import shutil
 import struct
 from pathlib import Path
 
 import mlx.core as mx
 
-from kinovsr.native.anemil import builder, direct, runtime
+from kinovsr.native.anemil import direct, runtime
 from kinovsr.settings import default_settings
 
 from . import ane
@@ -117,11 +116,7 @@ def _convert_half(
     )
     assert not states
     model_bytes = graph.finish(inputs, [], outputs, f"KinoVSR BSVD direct {block}")
-    staging = directory / f"{_half_stem(block)}.partial.mlpackage"
-    shutil.rmtree(staging, ignore_errors=True)
-    builder.write_package(staging, model_bytes, graph.blob)
-    staging.replace(package)
-    return package
+    return runtime.publish_package(package, model_bytes, graph.blob)
 
 
 # ----------------------------------------------------------------- runner

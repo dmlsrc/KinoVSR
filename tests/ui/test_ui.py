@@ -5,6 +5,7 @@ import logging
 
 import pytest
 from rich.console import Console
+from rich.progress import Progress
 
 from kinovsr.reporting import NullReporter, RecordingReporter, Reporter
 from kinovsr.settings import Settings
@@ -15,6 +16,7 @@ from kinovsr.ui import (
     configure_logging_from_settings,
     configure_machine_output,
     get_console,
+    log_phase_summary,
     make_progress,
     track_phase,
 )
@@ -120,9 +122,10 @@ def test_get_console_is_a_singleton_on_stderr():
 
 
 class _Task:
-    def __init__(self, elapsed, completed, unit=None):
+    def __init__(self, elapsed, completed, unit=None, finished_time=None):
         self.elapsed = elapsed
         self.completed = completed
+        self.finished_time = finished_time
         self.fields = {} if unit is None else {"unit": unit}
 
 
@@ -146,6 +149,36 @@ def test_pace_column_is_wall_clock_consistent():
     text = WallClockPaceColumn().render(task).plain
     sec_per_unit = float(text.strip().split(" ")[0])
     assert sec_per_unit * task.completed == pytest.approx(task.elapsed)
+
+
+def _clocked_progress():
+    """A Progress on a clock the test sets, rendering into a throwaway buffer."""
+    now = [0.0]
+    progress = Progress(get_time=lambda: now[0], console=Console(file=io.StringIO()))
+    return progress, now
+
+
+def test_pace_column_stops_when_the_task_finishes():
+    progress, now = _clocked_progress()
+    task_id = progress.add_task("frames", total=4, unit="frame")
+    now[0] = 8.0
+    progress.update(task_id, completed=4)
+    # Other bars keep the display running long after this one finished.
+    now[0] = 80.0
+    (task,) = progress.tasks
+    assert task.elapsed == pytest.approx(80.0)
+    assert WallClockPaceColumn().render(task).plain.strip() == "2.0 s/frame"
+
+
+def test_phase_summary_uses_the_time_the_task_finished(caplog):
+    progress, now = _clocked_progress()
+    task_id = progress.add_task("denoise", total=2, unit="frame")
+    now[0] = 6.0
+    progress.advance(task_id, 2)
+    now[0] = 60.0
+    with caplog.at_level(logging.INFO, logger="kinovsr.ui.progress"):
+        log_phase_summary(progress, task_id)
+    assert any("denoise: 2 frame in 6.0s (3.000s/frame)" in r.message for r in caplog.records)
 
 
 # ---- phase tracking and the Rich reporter ------------------------------------------

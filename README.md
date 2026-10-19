@@ -9,7 +9,7 @@ frozen public API in [docs/API.md](docs/API.md).
 
 ## Requirements
 
-Apple Silicon Mac, macOS 27 or later, Python 3.14+. Earlier macOS
+Apple Silicon Mac, macOS 27 or later, Python 3.15+. Earlier macOS
 releases are not tested and not supported. Model weights are mostly not
 bundled; see [Weights](#weights) below.
 
@@ -40,7 +40,11 @@ kinovsr run --video in.mp4 --output-dir out --upscale balanced
 
 File runs carry source audio when present, and output names start with
 `vsr_<input stem>_` (for example, `vsr_in_`). Use `--no-audio` for silent
-output or `--output-prefix NAME` to choose the prefix yourself.
+output or `--output-prefix NAME` to choose the prefix yourself. The video is
+written as `<name>.partial.mp4`, in one-second movie fragments, and renamed to
+its final name when the run finishes; you can open the partial file while the
+run writes it. A run that fails or is interrupted keeps it, closed at its last
+frame, and after a crash it plays up to about its last second.
 
 Native temporal processing - frame-rate conversion to 60 fps with the
 high-quality temporal engine:
@@ -118,7 +122,9 @@ including frame ownership and lifetime rules.
 
 ## Development
 
-Install the `[dev]` extra with `uv pip install -e '.[dev]'`. The Markdown
+Install the `[dev]` extra with
+`uv pip install -e '.[dev]' --torch-backend cpu`; the flag takes torch from
+PyTorch's own index, where its Python 3.15 wheels are published. The Markdown
 linter is a standalone Rust tool installed outside the venv (`brew install
 rumdl`, or `cargo install rumdl`); its rules live in `[tool.rumdl]` in
 `pyproject.toml` so every install checks the same way. Then use the
@@ -158,3 +164,4 @@ lane) need a machine that is otherwise idle.
 - [docs/API.md](docs/API.md) - the public host API contract.
 - [docs/ANE.md](docs/ANE.md) - field guide to the Apple Neural Engine:
   routes, compiler and lifecycle constraints, cadence, and state.
+- [CHANGELOG.md](CHANGELOG.md) - user-facing changes in each release.

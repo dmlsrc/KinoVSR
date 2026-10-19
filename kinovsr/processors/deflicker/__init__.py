@@ -23,8 +23,8 @@ Rule, per pixel, over a +/-K frame window:
     and are vetoed), and the correction is below max_fix (refused, not
     clamped).
 
-Why this shape (measured on ground-truth crushed fixtures; see the v1-v6
-prototype history in the planning evidence):
+Why this shape (measured on ground-truth crushed fixtures over six
+prototypes, v1 to v6):
 
 - Verification-only alignment: samples are admitted RAW or not at all --
   nothing is ever warped, so misalignment cannot poison the mixture and

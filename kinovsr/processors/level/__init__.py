@@ -7,7 +7,7 @@ on verified-static content; a global gain swing fails its photometric
 verification wholesale). The two families compose: level first, then
 deflicker sees a stable exposure.
 
-Mechanism (each choice measured; see the planning record for numbers):
+Mechanism (each choice measured):
 
 - Each frame's luma distribution is matched to the average distribution
   of a CENTERED +-window reference. Averaging happens in the QUANTILE

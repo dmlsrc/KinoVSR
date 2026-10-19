@@ -86,27 +86,30 @@ class TestStreaming:
         import mlx.core as mx
 
         from kinovsr.pipeline import resolve_pipeline, run_plan
+        from kinovsr.processors.bsvd import default_weights_path
 
+        # Check before running: the runtime reports a stage's missing weights as a
+        # PipelineRuntimeError, so a FileNotFoundError never reaches this frame.
+        weights = default_weights_path("c64")
+        if not weights.is_file():
+            pytest.skip(f"bsvd weights not available at {weights}")
         table = {"processor": "bsvd", "strength": 0.3}
         table.update(config or {})
-        try:
-            plan = resolve_pipeline(
-                {"pipeline": ["den"], "den": table}, input_spec=stream(), settings=SETTINGS
+        plan = resolve_pipeline(
+            {"pipeline": ["den"], "den": table}, input_spec=stream(), settings=SETTINGS
+        )
+        units = [
+            FrameUnit(
+                payload=mx.random.uniform(shape=(48, 64, 3)).astype(mx.float32) * 0.5 + 0.25,
+                pts=i * 960,
+                duration=960,
             )
-            units = [
-                FrameUnit(
-                    payload=mx.random.uniform(shape=(48, 64, 3)).astype(mx.float32) * 0.5 + 0.25,
-                    pts=i * 960,
-                    duration=960,
-                )
-                if isinstance(i, int)
-                else i
-                for i in frames
-            ]
-            context = PipelineContext(settings=SETTINGS)
-            return list(run_plan(plan, units, context))
-        except FileNotFoundError as exc:
-            pytest.skip(f"bsvd weights not available: {exc}")
+            if isinstance(i, int)
+            else i
+            for i in frames
+        ]
+        context = PipelineContext(settings=SETTINGS)
+        return list(run_plan(plan, units, context))
 
     def test_delayed_outputs_keep_their_input_timestamps(self):
         out = self.run(range(6))

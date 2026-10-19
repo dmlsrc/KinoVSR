@@ -4,23 +4,6 @@ from kinovsr.cli.options import Opt
 
 BASICVSRPP_RESTORE_OPTIONS = [
     Opt(
-        flag="--restore",
-        group="Temporal Restore And Deflicker",
-        default="off",
-        metavar="off|VARIANT",
-        profile_tokens=(
-            "decompress_track1",
-            "decompress_track2",
-            "decompress_track3",
-            "denoise",
-            "deblur_dvd",
-            "deblur_gopro",
-        ),
-        family="restore",
-        compositional=True,
-        help="Pre-upscale TEMPORAL restoration (BasicVSR++, recurrent). Unlike the per-frame deblock/denoise stages, this is bidirectional + second-order over a frame window, so it enforces frame-to-frame consistency -- the fix for GOP-periodic compression flicker (artifacts that appear/disappear between keyframes) and temporally-varying sensor noise that per-frame models pulse on. Runs FIRST by default (before deblock/denoise/nafnet) so it stabilizes the sequence before any per-frame stage. Accepts a COMMA-SEPARATED list to chain restorers in one pass, in order -- e.g. 'decompress_track1,denoise' runs temporal deblock then temporal denoise. Variants: off (default); decompress_track1 (NTIRE'21 compressed-video enhancement, the H.264/HEVC deblock choice) / decompress_track2 / decompress_track3; denoise (temporal video denoise -- softens far less than a per-frame denoiser); deblur_dvd / deblur_gopro (real / synthetic motion deblur). Weights downloaded, not bundled -- see basicvsrpp/weights/README.md. Domain note: trained on HEVC/synthetic degradations, so temporal-right but domain-approximate for 2010-era H.264.",
-    ),
-    Opt(
         flag="--restore-weights",
         group="Temporal Restore And Deflicker",
         metavar="PATH",
@@ -30,17 +13,6 @@ BASICVSRPP_RESTORE_OPTIONS = [
         stage_capabilities=("restore",),
         settings_backed=True,
         help="Explicit .safetensors path for --restore (or $BASICVSRPP_RESTORE_WEIGHTS). Use --restore to select a named checkpoint profile.",
-    ),
-    Opt(
-        flag="--restore-strength",
-        group="Temporal Restore And Deflicker",
-        default="1.0",
-        metavar="S[,S...]",
-        family="restore",
-        key="strength",
-        stage_processor="basicvsrpp",
-        stage_capabilities=("restore",),
-        help="Blend each restored frame with the original (1.0 = full restore, default; 0.0 = passthrough). A single value applies to every chained --restore stage; a comma-separated list sets per-stage strengths in order and must match the number of --restore variants -- e.g. --restore decompress_track1,denoise --restore-strength 1.0,0.5 = full deblock then a gentle denoise.",
     ),
     Opt(
         flag="--restore-window",

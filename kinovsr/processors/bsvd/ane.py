@@ -93,7 +93,6 @@ minute at SD sizes - and later runs load it in about a second.
 import hashlib
 import json
 import logging
-import shutil
 import struct
 from pathlib import Path
 from typing import Protocol, cast
@@ -467,11 +466,7 @@ def _convert(
     if package.is_dir():
         return package
     model_bytes, blob = _emit_program(params, input_channels, height, width)
-    staging = directory / "model.partial.mlpackage"
-    shutil.rmtree(staging, ignore_errors=True)
-    builder.write_package(staging, model_bytes, blob)
-    staging.replace(package)
-    return package
+    return runtime.publish_package(package, model_bytes, blob)
 
 
 # ------------------------------------------------------------------ runtime

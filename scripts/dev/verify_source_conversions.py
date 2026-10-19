@@ -205,6 +205,13 @@ RECIPES = [
     ),
     (
         "realplksr",
+        "deh264",
+        "realplksr/1xDeH264_realplksr.safetensors",
+        "bytes",
+        None,
+    ),
+    (
+        "realplksr",
         "public2x",
         "realplksr/2xPublic_realplksr_dysample_layernorm_real.safetensors",
         "bytes",

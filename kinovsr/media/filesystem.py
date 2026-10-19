@@ -43,3 +43,30 @@ def rename_exclusive(source: Path, destination: Path) -> None:
             None,
             os.fspath(destination),
         )
+
+
+def partial_name(destination: Path, attempt: int = 1) -> Path:
+    """``<stem>.partial<suffix>`` beside ``destination``; ``.partial-N`` for later attempts."""
+    counter = "" if attempt == 1 else f"-{attempt}"
+    return destination.with_name(f"{destination.stem}.partial{counter}{destination.suffix}")
+
+
+def create_partial_output(destination: Path, *, attempts: int = 1000) -> Path:
+    """Create, exclusively, the visible file a video is written to before it is final.
+
+    The name is ``<stem>.partial<suffix>`` beside ``destination``, or the first
+    free ``.partial-N``, so an earlier run's leftover is never overwritten. The
+    writer renames it over the destination once finished; a run that fails or
+    is interrupted leaves it where it is.
+    """
+    for attempt in range(1, attempts + 1):
+        candidate = partial_name(destination, attempt)
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise FileExistsError(
+        errno.EEXIST, f"no free partial name in {attempts} attempts", os.fspath(destination)
+    )

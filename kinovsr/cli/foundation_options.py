@@ -4,6 +4,36 @@ from .options import PP_STAGE_NAMES, Opt, pp_order
 
 _PP_STAGES = ", ".join(PP_STAGE_NAMES)
 
+RESTORE_SLOT_OPTIONS = [
+    Opt(
+        flag="--restore",
+        group="Restore And Deflicker",
+        default="off",
+        metavar="off|PROFILE",
+        profile_tokens=(
+            "decompress_track1",
+            "decompress_track2",
+            "decompress_track3",
+            "denoise",
+            "deblur_dvd",
+            "deblur_gopro",
+            "deh264",
+        ),
+        family="restore",
+        compositional=True,
+        help="Pre-upscale restoration profiles, chained left to right with commas. BasicVSR++ decompress_track1/2/3, denoise, and deblur_dvd/gopro use temporal recurrence; RealPLKSR deh264 removes H.264 artifacts per frame at source size. off (default) skips restoration. The restore slot runs before deblock and denoise by default. Compare adjacent frames when using the per-frame deh264 model, which has no temporal consistency mechanism.",
+    ),
+    Opt(
+        flag="--restore-strength",
+        group="Restore And Deflicker",
+        default="1.0",
+        metavar="S[,S...]",
+        family="restore",
+        key="strength",
+        help="Blend each restoration result with its input (0 = passthrough, 1 = full effect; default 1). One value applies to every chained --restore stage, or give a comma-separated value per stage.",
+    ),
+]
+
 SOURCE_AND_OUTPUT_OPTIONS = [
     Opt(
         flag="--video",
@@ -17,7 +47,7 @@ SOURCE_AND_OUTPUT_OPTIONS = [
         default="auto",
         choices=("auto", "native", "ffmpeg"),
         config_table="input",
-        help="Video reader backend. auto (default) = native AVFoundation video, falling back to the ffmpeg compatibility reader when needed. ffmpeg = force the compatibility reader (needs the 'ffmpeg' extra). native = require native video decoding. Native video can still use PyAV for audio when AVAudioFile rejects its container. The ffmpeg reader mirrors color tags, keyframe windows (--gop-align), trims, and audio; its frame indices can differ from the native reader's by an edit-list offset.",
+        help="Video reader backend. auto (default) = native AVFoundation video, except MPEG program streams (VCD and DVD .mpg/.vob files, identified by their content), which AVFoundation reads incompletely and the ffmpeg compatibility reader reads exactly; the ffmpeg reader is also the fallback when native decoding cannot open a file. ffmpeg = force the compatibility reader (needs the 'ffmpeg' extra). native = require native video decoding, program streams included. Native video can still use PyAV for audio when AVAudioFile rejects its container. The ffmpeg reader mirrors color tags, keyframe windows (--gop-align), trims, and audio; its frame indices can differ from the native reader's by an edit-list offset.",
     ),
     Opt(flag="--output-dir", group="Output, Encoding, And Audio", config_table="output", help=""),
     Opt(
@@ -189,17 +219,7 @@ PREPROCESS_SLOT_OPTIONS = [
         type=pp_order,
         metavar="A,B,C",
         compositional=True,
-        help=f"Explicit order for the preprocess stages, comma-separated from {{{_PP_STAGES}}}, e.g. 'deflicker,deblock,denoise'. Only enabled stages run; any enabled stage you omit is appended after the ones you listed, in the default order ({_PP_STAGES}). Note that level runs first by default because a stable exposure improves every temporal stage after it, so listing an explicit order without level moves it last. Overrides --denoise-first when set.",
-    ),
-    Opt(
-        flag="--denoise-first",
-        group="Preprocess Ordering",
-        kind="flag",
-        default=False,
-        family="denoise",
-        key="first",
-        compositional=True,
-        help="Run --denoise before --deblock (default is deblock then denoise). The default suits captured-then-encoded footage: undo the last degradation (compression) first, and a denoiser's white-noise assumption is broken by structured blocking. Use --denoise-first only when noise was added AFTER compression (regrained master, analog/transmission noise).",
+        help=f"Explicit order for the preprocess stages, comma-separated from {{{_PP_STAGES}}}, e.g. 'deflicker,deblock,denoise'. Only enabled stages run; any enabled stage you omit is appended after the ones you listed, in the default order ({_PP_STAGES}). Note that level runs first by default because a stable exposure improves every temporal stage after it, so listing an explicit order without level moves it last.",
     ),
 ]
 

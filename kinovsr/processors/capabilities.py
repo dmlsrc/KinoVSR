@@ -86,7 +86,7 @@ def _no_companion(config: object) -> CompanionSpec | None:  # noqa: ARG001 - hoo
 class CapabilitySpec:
     capability: Capability
     # Profile names this family advertises for the capability, in the
-    # shared vocabulary (planning 07): the existing product tokens.
+    # shared vocabulary: the existing product tokens.
     profiles: tuple[str, ...]
     accepts: StreamConstraint
     # Pure transform: the output StreamSpec this stage produces from a

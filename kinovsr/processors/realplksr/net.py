@@ -49,6 +49,7 @@ from kinovsr.settings import default_settings
 _WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 # Not bundled (download + convert; see weights/README.md).
 _VARIANTS = {
+    "deh264": "1xdeh264_realplksr.safetensors",  # 1x H.264 restoration, GN+PixelShuffle
     "nomos4x": "4xnomoswebphoto_realplksr.safetensors",  # 4x photo, GN+PixelShuffle
     "public2x": "2xpublic_realplksr_dysample_layernorm_real.safetensors",  # 2x, LN+DySample
     "public2x-nn": "2xpublic_realplksr_dysample_layernorm_real_nn.safetensors",  # 2x, no-noise train
@@ -235,7 +236,7 @@ def realplksr(
     p: dict[str, mx.array],
     cfg: tuple[int, int, int, int, int, bool, bool, int] | None = None,
 ) -> mx.array:
-    """Upscale one batch. x: (N,H,W,3) in [0,1] -> (N, scale*H, scale*W, 3)."""
+    """Process one batch. x: (N,H,W,3) in [0,1] -> (N, scale*H, scale*W, 3)."""
     if cfg is None:
         cfg = _config(p)
     _dim, n_blocks, ks, pdim, scale, layer_norm, dysample, groups = cfg
@@ -260,7 +261,7 @@ def make_forward(
     cfg: tuple[int, int, int, int, int, bool, bool, int] | None = None,
     compile: bool = True,
 ) -> Callable[[mx.array], mx.array]:
-    """Per-frame forward x -> upscaled image, mx.compiled once per checkpoint."""
+    """Per-frame forward x -> processed image, mx.compiled once per checkpoint."""
     if cfg is None:
         cfg = _config(p)
 

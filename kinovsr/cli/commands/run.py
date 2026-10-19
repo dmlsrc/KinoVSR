@@ -21,6 +21,7 @@ from kinovsr.config import ConfigError, dump_config
 from kinovsr.config.helpers import typed_value
 from kinovsr.media import video_reader as _vr
 from kinovsr.media.naming import sanitize_output_prefix
+from kinovsr.media.reader import VideoReader, auto_reader
 from kinovsr.media.timespec import parse_frames_or_seconds, resolve_trim
 from kinovsr.pipeline.builder import resolve_capability
 from kinovsr.processors import Capability, Layout, get_factory
@@ -158,19 +159,25 @@ def _run_typed(invocation: Invocation) -> int:
         _log.error("config error: --output-dir is required")
         return 2
 
-    # Reader selection matches the flag surface: ffmpeg = forced, auto =
-    # native with fallback, native = never fall back. The module that
-    # probes is the module the run decodes with.
+    # Reader selection matches the flag surface: ffmpeg = forced, native =
+    # never fall back, auto = auto_reader's choice (the ffmpeg reader for an
+    # MPEG program stream, native otherwise) with the ffmpeg reader as the
+    # fallback when native cannot open the file. The module that probes is
+    # the module the run decodes with.
     video = Path(options.video)
-    reader = None
+    reader: VideoReader = _vr
     if options.reader == "ffmpeg":
         from kinovsr.media import ffmpeg_reader  # noqa: PLC0415 - ffmpeg extra
 
         reader = ffmpeg_reader
+    elif options.reader == "auto":
+        reader = auto_reader(video)
+        if reader is not _vr:
+            _log.info("%s is an MPEG program stream; reading it with the ffmpeg reader", video.name)
     try:
-        _w, _h, fps, total, _tf, _par = (reader or _vr).probe_video(video)
+        _w, _h, fps, total, _tf, _par = reader.probe_video(video)
     except (OSError, RuntimeError, PipelineError) as exc:
-        if options.reader != "auto":
+        if options.reader != "auto" or reader is not _vr:
             _log.error("cannot open %s: %s", video, exc)
             return 2
         from kinovsr.media import ffmpeg_reader  # noqa: PLC0415 - ffmpeg extra
@@ -209,7 +216,7 @@ def _run_typed(invocation: Invocation) -> int:
     except ValueError:
         wants_time_form = False  # resolve_trim reports the bad spec
     if wants_time_form:
-        read_table = getattr(reader or _vr, "read_sample_table", None)
+        read_table = getattr(reader, "read_sample_table", None)
         if read_table is not None:
             try:
                 trim_table = read_table(video)

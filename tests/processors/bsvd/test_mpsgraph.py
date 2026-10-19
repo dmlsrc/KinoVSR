@@ -17,6 +17,10 @@ from kinovsr.processors.bsvd.mps import MpsGraphBSVD
 from kinovsr.processors.bsvd.mps_phases import ScheduledMpsPhaseSuite
 from kinovsr.processors.bsvd.net import _pad_width_reflect
 
+# The 64-channel checkpoint is not bundled; a test that loads it skips without it.
+_C64 = B.default_weights_path("c64")
+_NEEDS_C64 = pytest.mark.skipif(not _C64.is_file(), reason=f"bsvd weights not available at {_C64}")
+
 # --------------------------------------------------------------------------
 # Selection plumbing
 # --------------------------------------------------------------------------
@@ -37,6 +41,7 @@ class TestBackendSelection:
         with pytest.raises(ValueError, match="fp16 only"):
             MpsGraphBSVD(B.default_weights_path("c64"), dtype=mx.float32)
 
+    @_NEEDS_C64
     def test_unaligned_geometry_is_refused(self):
         net = MpsGraphBSVD(B.default_weights_path("c64"))
         frame = mx.zeros((1, 94, 128, net.input_channels), dtype=mx.float16)
@@ -185,6 +190,7 @@ class TestGeometry:
         assert not net.window_capable(240, 320)  # the graph pads it to 384
         assert not net.window_capable(540, 960)  # qHD, padded to 1024
 
+    @_NEEDS_C64
     def test_frames_too_narrow_to_pad_are_refused(self):
         net = MpsGraphBSVD(B.default_weights_path("c64"))
         frame = mx.zeros((1, 96, 64, net.input_channels), dtype=mx.float16)
@@ -259,6 +265,7 @@ class TestWindowRouteFallback:
 @pytest.mark.slow
 @pytest.mark.integration
 @pytest.mark.requires_weights
+@_NEEDS_C64
 def test_gop_aligned_windows_run_at_a_window_capable_geometry(tmp_path, monkeypatch):
     # 256x128 is inside the schedule-window envelope. Where the direct entry
     # could not be built, the run used to fail at the first window; on
@@ -329,6 +336,7 @@ def _own_mpsgraph_archives() -> set[str]:
 @pytest.mark.slow
 @pytest.mark.integration
 @pytest.mark.requires_weights
+@_NEEDS_C64
 class TestParityWithTheMlxReference:
     def test_fill_steady_and_drain_match(self):
         """The full emitted sequence must match the reference frame for

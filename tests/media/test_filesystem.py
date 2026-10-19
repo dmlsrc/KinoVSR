@@ -4,7 +4,7 @@ import errno
 
 import pytest
 
-from kinovsr.media.filesystem import rename_exclusive
+from kinovsr.media.filesystem import create_partial_output, rename_exclusive
 
 pytestmark = pytest.mark.unit
 
@@ -50,3 +50,22 @@ def test_exclusive_rename_failure_names_both_paths(tmp_path):
     message = str(caught.value)
     assert str(source) in message
     assert str(destination) in message
+
+
+def test_partial_output_is_visible_and_never_overwrites(tmp_path):
+    destination = tmp_path / "vsr_clip.mp4"
+    first = create_partial_output(destination)
+    first.write_bytes(b"an earlier run's frames")
+    second = create_partial_output(destination)
+
+    assert first == tmp_path / "vsr_clip.partial.mp4"
+    assert second == tmp_path / "vsr_clip.partial-2.mp4"
+    assert first.read_bytes() == b"an earlier run's frames"
+    assert not destination.exists()
+
+
+def test_partial_output_reports_when_every_name_is_taken(tmp_path):
+    destination = tmp_path / "vsr_clip.mp4"
+    create_partial_output(destination, attempts=1)
+    with pytest.raises(FileExistsError):
+        create_partial_output(destination, attempts=1)

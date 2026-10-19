@@ -1,7 +1,7 @@
 """Product documentation hygiene.
 
-Product docs must stand alone: no machine-local paths, no private
-planning-repo references, no retired commands, plain ASCII, and the
+Product docs must stand alone: no machine-local paths, no references to
+private planning repositories, no retired commands, plain ASCII, and the
 generated processor matrix in sync with the manifests it derives from.
 """
 
@@ -13,11 +13,11 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-DOCS = [REPO / "README.md", *sorted((REPO / "docs").rglob("*.md"))]
+DOCS = [REPO / "README.md", REPO / "CHANGELOG.md", *sorted((REPO / "docs").rglob("*.md"))]
 
 _FORBIDDEN = (
     ("machine-local path", re.compile(r"/Users/|/private/tmp|/tmp/")),
-    ("private planning reference", re.compile(r"KinoVSR-planning|KinoMLX-planning")),
+    ("private planning reference", re.compile(r"\w-planning\b")),
     ("retired harness command", re.compile(r"vsr_harness")),
 )
 

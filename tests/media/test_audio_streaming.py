@@ -228,6 +228,40 @@ def test_native_audio_cursor_seeks_before_bounded_allocation(monkeypatch):
     assert capacities == [3]
 
 
+def test_native_audio_cursor_ends_cleanly_at_and_past_the_end(tmp_path):
+    # Since macOS 27.0.1, AVAudioFile fails a read that starts at or past the
+    # end with kAudioFileEndOfFileError; 27.0 returned NO without an error.
+    from kinovsr.media.audio import _AVAudioFileSource, write_wav_float32
+
+    ramp = mx.arange(1000, dtype=mx.float32)[None] / 1000
+    path = tmp_path / "ramp.wav"
+    write_wav_float32(ramp, path, 48_000)
+    source = _AVAudioFileSource(path, 48_000, 1)
+    try:
+        assert source.read_frames(1000, 1016) == b""
+        assert source.read_frames(1100, 1116) == b""
+        tail = memoryview(source.read_frames(990, 1010)).cast("f")
+        assert tail.tolist() == ramp[0, 990:].tolist()
+        # The writer's next pull starts where the short read stopped.
+        assert source.read_frames(1000, 1016) == b""
+    finally:
+        source.close()
+
+
+def test_native_audio_cursor_takes_only_the_end_of_file_status_as_the_end():
+    import Foundation
+
+    from kinovsr.media.audio import _is_end_of_file
+
+    def error(domain, code):
+        return Foundation.NSError.errorWithDomain_code_userInfo_(domain, code, None)
+
+    assert _is_end_of_file(None)
+    assert _is_end_of_file(error(Foundation.NSOSStatusErrorDomain, -39))
+    assert not _is_end_of_file(error(Foundation.NSOSStatusErrorDomain, -40))
+    assert not _is_end_of_file(error(Foundation.NSCocoaErrorDomain, -39))
+
+
 def test_streaming_sidecar_uses_a_fixed_pcm_pull_budget(tmp_path):
     from kinovsr.media.audio import _SIDECAR_PCM_BUDGET, StreamingAudioTrack
 
@@ -265,16 +299,81 @@ def test_streaming_sidecar_uses_a_fixed_pcm_pull_budget(tmp_path):
     ]
 
 
-def test_ffmpeg_clock_quantization_snaps_but_overlap_fails():
+def test_ffmpeg_clock_quantization_snaps_but_preserves_edits():
     from kinovsr.media.ffmpeg_reader import _audio_segment_start
 
-    path = Path("coarse.mkv")
     tick = Fraction(48)  # 1 ms at 48 kHz
-    assert _audio_segment_start(1008, 1024, tick, path) == 1024
-    assert _audio_segment_start(2064, 2032, tick, path) == 2032
-    assert _audio_segment_start(30_000, 2048, tick, path) == 30_000
-    with pytest.raises(RuntimeError, match="overlaps by 1024 samples"):
-        _audio_segment_start(1024, 2048, tick, path)
+    assert _audio_segment_start(1008, 1024, tick) == 1024
+    assert _audio_segment_start(2064, 2032, tick) == 2032
+    assert _audio_segment_start(30_000, 2048, tick) == 30_000
+    assert _audio_segment_start(1024, 2048, tick) == 1024
+
+
+@pytest.fixture
+def ffmpeg_audio_segments():
+    """Feed timestamped PCM frames through the real bounded FFmpeg cursor."""
+    from kinovsr.media.ffmpeg_reader import _FFmpegAudioSource
+
+    sources = []
+
+    def make(segments, *, stream_time_base=Fraction(1, 48_000)):
+        frames = [
+            SimpleNamespace(
+                pts=start,
+                time_base=Fraction(1, 48_000),
+                samples=count,
+                planes=(array("f", [value]) * count,),
+            )
+            for start, count, value in segments
+        ]
+        container = SimpleNamespace(decode=lambda _stream: iter(frames), close=lambda: None)
+        source = _FFmpegAudioSource(Path("timestamped-audio.mkv"), 48_000, 1, "mono", Fraction(0))
+        source._container = container
+        source._stream = SimpleNamespace(time_base=stream_time_base)
+        resampler = SimpleNamespace(resample=lambda frame: [] if frame is None else [frame])
+        source._segments = iter(source._segment_iter(resampler))
+        source._cursor = 0
+        sources.append(source)
+        return source
+
+    yield make
+    for source in sources:
+        source.close()
+
+
+def test_ffmpeg_cursor_trims_six_sample_overlap_at_sample_12500(ffmpeg_audio_segments):
+    source = ffmpeg_audio_segments([(0, 12_500, 1.0), (12_494, 12, 2.0), (12_506, 4, 3.0)])
+
+    first = source.read_frames(0, 8192)
+    second = source.read_frames(8192, 12_510)
+    samples = memoryview(first + second).cast("f")
+
+    assert len(samples) == 12_510
+    assert list(samples[12_494:12_500]) == [1.0] * 6
+    assert list(samples[12_500:12_506]) == [2.0] * 6
+    assert list(samples[12_506:12_510]) == [3.0] * 4
+
+
+def test_ffmpeg_cursor_corrects_compensating_vorbis_timestamps(ffmpeg_audio_segments):
+    source = ffmpeg_audio_segments([(0, 576, 1.0), (1024, 576, 2.0), (1152, 128, 3.0)])
+
+    samples = memoryview(source.read_frames(0, 1280)).cast("f")
+
+    assert len(samples) == 1280
+    assert list(samples[576:1152]) == [2.0] * 576
+    assert list(samples[1152:1280]) == [3.0] * 128
+
+
+def test_ffmpeg_cursor_uses_container_clock_after_resampling(ffmpeg_audio_segments):
+    source = ffmpeg_audio_segments(
+        [(0, 1045, 1.0), (1034, 1115, 2.0)],
+        stream_time_base=Fraction(1, 1000),
+    )
+
+    samples = memoryview(source.read_frames(0, 2160)).cast("f")
+
+    assert len(samples) == 2160
+    assert list(samples[1045:2160]) == [2.0] * 1115
 
 
 def test_ffmpeg_missing_start_time_uses_first_packet_origin(monkeypatch):
@@ -292,6 +391,7 @@ def test_ffmpeg_missing_start_time_uses_first_packet_origin(monkeypatch):
     class Container:
         def __init__(self):
             self.streams = [stream]
+            self.format = SimpleNamespace(name="matroska,webm", flags=0)
             self.seeks = []
             self.closed = False
 
@@ -311,7 +411,7 @@ def test_ffmpeg_missing_start_time_uses_first_packet_origin(monkeypatch):
     assert ffmpeg_reader._audio_sample_position(10_000, Fraction(1, 1000), origin, 48_000) == 0
 
     decode_container = Container()
-    monkeypatch.setattr(ffmpeg_reader.av, "open", lambda _path: decode_container)
+    monkeypatch.setattr(ffmpeg_reader.av, "open", lambda _path, **_kwargs: decode_container)
     monkeypatch.setattr(ffmpeg_reader.av, "AudioResampler", lambda **_kwargs: object())
     source = ffmpeg_reader._FFmpegAudioSource(Path("offset.mkv"), 48_000, 1, "mono", origin)
 
@@ -341,6 +441,7 @@ def test_ffmpeg_cursor_uses_container_seek_when_audio_stream_seek_fails(monkeypa
     class Container:
         def __init__(self):
             self.streams = [stream]
+            self.format = SimpleNamespace(name="avi", flags=0)
             self.seeks = []
 
         def seek(self, timestamp, **kwargs):
@@ -352,7 +453,7 @@ def test_ffmpeg_cursor_uses_container_seek_when_audio_stream_seek_fails(monkeypa
             pass
 
     container = Container()
-    monkeypatch.setattr(ffmpeg_reader.av, "open", lambda _path: container)
+    monkeypatch.setattr(ffmpeg_reader.av, "open", lambda _path, **_kwargs: container)
     monkeypatch.setattr(ffmpeg_reader.av, "AudioResampler", lambda **_kwargs: object())
     source = ffmpeg_reader._FFmpegAudioSource(
         Path("unseekable.avi"), 48_000, 1, "mono", Fraction(0)

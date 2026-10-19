@@ -13,6 +13,12 @@ from kinovsr.native.writer import AVWriter
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize("interval", [0.0, -1.0, float("nan"), float("inf")])
+def test_a_fragment_interval_must_be_finite_and_positive(tmp_path, interval):
+    with pytest.raises(ValueError, match="fragment_interval must be finite and positive"):
+        AVWriter(tmp_path / "x.mp4", 16, 16, 25, source_pixel_format=0, fragment_interval=interval)
+
+
 class _NativeWriter:
     def __init__(self, *, complete: bool = False) -> None:
         self.complete = complete
@@ -115,7 +121,7 @@ def test_default_append_uses_the_exact_rational_cadence(monkeypatch):
     assert captured[0].timescale == pixel_buffers.VIDEO_TIME_SCALE
 
 
-def test_direct_mlx_rgb_preserves_rounding_and_append_order(monkeypatch):
+def test_direct_mlx_rgb_converts_once_in_append_order(monkeypatch):
     import mlx.core as mx
 
     result = _writer()
@@ -137,9 +143,10 @@ def test_direct_mlx_rgb_preserves_rounding_and_append_order(monkeypatch):
         def appendPixelBuffer_withPresentationTime_(buffer, pts):
             events.append("append")
             assert buffer is yuv_buffer
-            assert pts == (7, 24000)
+            appended.append(pts)
             return True
 
+    appended = []
     result.adaptor = _Adaptor()
     result._wait_for_ready = lambda _input, _label: events.append("ready")
     _patch_native_context(monkeypatch)
@@ -148,9 +155,9 @@ def test_direct_mlx_rgb_preserves_rounding_and_append_order(monkeypatch):
         events.append("pool")
         return yuv_buffer if actual_pool is pool else None
 
-    def convert(rgb, dst, matrix, full):
+    def convert(frame, dst, matrix, full, *, signed):
         events.append("convert")
-        converted.append((rgb, dst, matrix, full))
+        converted.append((frame, dst, matrix, full, signed))
 
     monkeypatch.setattr(writer_module._pb, "pool_create_buffer", pull)
     monkeypatch.setattr(
@@ -158,19 +165,26 @@ def test_direct_mlx_rgb_preserves_rounding_and_append_order(monkeypatch):
         "read_rgbahalf_rgb",
         lambda _buffer: pytest.fail("direct MLX input read RGBAHalf"),
     )
-    monkeypatch.setattr(writer_module._yuv, "rgb_to_yuv422_10", convert)
+    monkeypatch.setattr(writer_module._yuv, "frame_to_yuv422_10", convert)
 
+    # The frame reaches the fused conversion as given; its FP16 rounding and the signed map
+    # happen there (tests/media/test_yuv.py).
     rgb = mx.array([[[0.12345, 0.5, 0.98765]]], dtype=mx.float32)
     result.append_mlx_rgb(rgb, pts_ticks=7, duration_ticks=3)
+    signed = mx.array([[[-0.5, 0.0, 0.75]]], dtype=mx.float16)
+    result.append_mlx_rgb(signed, signed=True, pts_ticks=10, duration_ticks=3)
 
-    assert events == ["ready", "pool", "convert", "append"]
-    assert len(converted) == 1
-    converted_rgb, converted_buffer, matrix, full = converted[0]
-    assert converted_rgb.dtype == mx.float32
-    assert mx.array_equal(converted_rgb, rgb.astype(mx.float16).astype(mx.float32)).item()
-    assert (converted_buffer, matrix, full) == (yuv_buffer, "matrix", False)
-    assert result._explicit_end_ticks == 10
-    assert result.frame_count == 1
+    assert events == ["ready", "pool", "convert", "append"] * 2
+    assert len(converted) == 2
+    assert converted[0][0] is rgb
+    assert converted[1][0] is signed
+    assert [entry[1:] for entry in converted] == [
+        (yuv_buffer, "matrix", False, False),
+        (yuv_buffer, "matrix", False, True),
+    ]
+    assert appended == [(7, 24000), (10, 24000)]
+    assert result._explicit_end_ticks == 13
+    assert result.frame_count == 2
 
 
 def test_direct_mlx_conversion_failure_poison_writer_and_finish(monkeypatch):
@@ -194,8 +208,8 @@ def test_direct_mlx_conversion_failure_poison_writer_and_finish(monkeypatch):
     monkeypatch.setattr(writer_module._pb, "pool_create_buffer", lambda _pool: object())
     monkeypatch.setattr(
         writer_module._yuv,
-        "rgb_to_yuv422_10",
-        lambda *_args: (_ for _ in ()).throw(ValueError("conversion failed")),
+        "frame_to_yuv422_10",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("conversion failed")),
     )
 
     with pytest.raises(ValueError, match="conversion failed"):
@@ -290,7 +304,10 @@ def _patch_native_context(monkeypatch) -> None:
     monkeypatch.setattr(
         writer_module,
         "CoreMedia",
-        SimpleNamespace(CMTimeMake=lambda value, scale: (value, scale)),
+        SimpleNamespace(
+            CMTimeMake=lambda value, scale: (value, scale),
+            CMTimeMakeWithSeconds=lambda seconds, scale: (seconds, scale),
+        ),
     )
 
 
@@ -1604,6 +1621,7 @@ def test_constructor_cancels_writer_when_session_start_raises(
     native.canAddInput_ = lambda _input: True
     native.addInput_ = lambda _input: None
     native.setMovieTimeScale_ = lambda _scale: None
+    native.setMovieFragmentInterval_ = lambda _interval: None
     native.startWriting = lambda: True
 
     def fail_session(_time):

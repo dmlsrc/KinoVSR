@@ -17,7 +17,6 @@ exact.
 
 import json
 import logging
-import shutil
 import time
 from collections.abc import Callable, Iterator
 from functools import cache
@@ -348,11 +347,7 @@ def _convert(
     if package.is_dir():
         return package
     model_bytes, blob = _emit_program(params, input_channels, height, width)
-    staging = package.with_name(f"{package.stem}.partial.mlpackage")
-    shutil.rmtree(staging, ignore_errors=True)
-    builder.write_package(staging, model_bytes, blob)
-    staging.replace(package)
-    return package
+    return runtime.publish_package(package, model_bytes, blob)
 
 
 class ScheduledPhaseSuite:

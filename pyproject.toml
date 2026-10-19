@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kinovsr"
-version = "0.1.0"
+version = "0.2.0"
 description = "MLX-native video super-resolution and restoration for Apple Silicon"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.15"
 license = {text = "MIT"}
 authors = [
     {name = "KinoVSR Contributors"}
@@ -25,15 +25,15 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Multimedia :: Video",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "mlx>=0.32.2",
+    "mlx>=0.32.4",
     # Serializes first-party Core ML model conversions (kinovsr.native.anemil);
     # abi3 wheels, loaded with the modules that build or read those models.
-    "protobuf>=7.36.0",
+    "protobuf>=7.36.2",
     "rich>=15.0.0",
     "pyobjc-core>=12.2.2",
     "pyobjc-framework-AVFoundation>=12.2.2",
@@ -54,29 +54,32 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "av>=18.1.0",
-    "mypy>=2.3.1",
+    "av>=19.0.1",
+    "mypy>=2.4.0",
     # NumPy is a dev/test/diagnostic oracle, not a core runtime dependency.
-    "numpy>=2.5.2",
+    "numpy>=2.5.4",
     "opencv-python-headless>=5.0.0.93",
     "pytest>=9.1.1",
-    "ruff>=0.16.4",
+    "ruff>=0.17.1",
     # Torch is the checkpoint-reading oracle: test fixtures save .pth files,
     # the family-local layout converters read them, and
     # scripts/dev/pth_to_safetensors.py cross-checks the torch-free
     # `kinovsr weights convert`. safetensors (a separate package, not part
     # of torch) is that oracle's writer. Neither is ever a runtime
     # dependency: the product reads and writes safetensors through
-    # mlx.core.
+    # mlx.core. PyTorch publishes its Python 3.15 wheels on its own index
+    # (`uv pip install --torch-backend cpu`); the 2.14 ones were built
+    # against a 3.15 beta and crash on tensor operations outside the main
+    # thread.
     "safetensors>=0.8.0",
-    "torch>=2.13.0",
+    "torch>=2.15.0",
 ]
 ffmpeg = [
-    "av>=18.1.0",
+    "av>=19.0.1",
 ]
 eval = [
-    "av>=18.1.0",
-    "numpy>=2.5.2",
+    "av>=19.0.1",
+    "numpy>=2.5.4",
     "opencv-python-headless>=5.0.0.93",
 ]
 
@@ -92,7 +95,7 @@ kinovsr = "kinovsr.cli.main:main"
 packages = ["kinovsr"]
 
 [tool.pytest.ini_options]
-minversion = "8.0"
+minversion = "9.1.1"
 addopts = "-ra -q --strict-markers --strict-config --import-mode=importlib"
 testpaths = ["tests"]
 python_files = "test_*.py"
@@ -109,7 +112,7 @@ pythonpath = "."
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+target-version = "py315"
 
 [tool.ruff.lint]
 # Match KinoMLX's stricter lint posture: core pycodestyle/pyflakes/import
@@ -162,7 +165,7 @@ extend-immutable-calls = [
 
 [tool.mypy]
 # KinoMLX's type gate: strict, and no explicit Any.
-python_version = "3.14"
+python_version = "3.15"
 strict = true
 disallow_any_explicit = true
 follow_imports = "normal"
